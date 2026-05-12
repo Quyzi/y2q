@@ -1,6 +1,6 @@
+use bytes::Bytes;
 use core::range::RangeInclusive;
 use std::{ops::Deref, time::SystemTime};
-use bytes::Bytes;
 
 pub mod storage;
 pub use storage::filesystem::FilesystemStorage;
@@ -47,22 +47,15 @@ pub enum Error {
     /// The bucket name is empty, contains disallowed characters, or would escape
     /// the storage root (e.g. `..` components).
     #[error("invalid bucket: {bucket}")]
-    InvalidBucket {
-        bucket: String,
-    },
+    InvalidBucket { bucket: String },
 
     /// The key is empty, contains null bytes, or exceeds the maximum length.
     #[error("invalid key: {key}")]
-    InvalidKey {
-        key: String,
-    },
+    InvalidKey { key: String },
 
     /// No object exists at the given `bucket`/`key` address.
     #[error("not found: {bucket}/{key}")]
-    NotFound {
-        bucket: String,
-        key: String,
-    },
+    NotFound { bucket: String, key: String },
 
     /// The object is currently being written to; `since` is when the lock was acquired.
     #[error("object {bucket}/{key} is locked since {since:?}")]
@@ -105,7 +98,12 @@ pub trait Storage {
     /// `range` is an inclusive range of byte offsets. Indices beyond the end of
     /// the object are clamped. Returns an empty [`Bytes`] if `start` is past the
     /// end of the object.
-    async fn get_range(&self, bucket: &str, key: &str, range: RangeInclusive<u64>) -> Result<Bytes, Error>;
+    async fn get_range(
+        &self,
+        bucket: &str,
+        key: &str,
+        range: RangeInclusive<u64>,
+    ) -> Result<Bytes, Error>;
 
     /// Write `payload` to `bucket`/`key`.
     ///

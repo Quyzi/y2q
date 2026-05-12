@@ -42,7 +42,9 @@ impl ResponseError for AppError {
     fn status_code(&self) -> StatusCode {
         match &self.0 {
             CoreError::NotFound { .. } => StatusCode::NOT_FOUND,
-            CoreError::InvalidBucket { .. } | CoreError::InvalidKey { .. } => StatusCode::BAD_REQUEST,
+            CoreError::InvalidBucket { .. } | CoreError::InvalidKey { .. } => {
+                StatusCode::BAD_REQUEST
+            }
             CoreError::Locked { .. } => StatusCode::CONFLICT,
             CoreError::InternalError { .. } => StatusCode::INTERNAL_SERVER_ERROR,
         }
@@ -50,6 +52,8 @@ impl ResponseError for AppError {
 
     fn error_response(&self) -> HttpResponse {
         let status = self.status_code();
-        HttpResponse::build(status).json(ErrorBody { error: self.to_string() })
+        HttpResponse::build(status).json(ErrorBody {
+            error: self.to_string(),
+        })
     }
 }

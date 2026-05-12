@@ -31,6 +31,9 @@ pub async fn handle(
     storage: web::Data<Arc<FilesystemStorage>>,
 ) -> Result<HttpResponse, AppError> {
     let (bucket, key) = path.into_inner();
-    storage.delete(&bucket, &key).await.map_err(AppError::from)?;
+    storage
+        .delete(&bucket, &key)
+        .await
+        .map_err(AppError::from)?;
     Ok(HttpResponse::NoContent().finish())
 }

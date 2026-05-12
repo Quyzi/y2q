@@ -16,11 +16,7 @@ use crate::{Error, Metadata, Object, Storage};
 /// chosen as a stable, well-known constant so the same key always maps to the
 /// same filename regardless of which process or host computes it.
 const Y2Q_NAMESPACE: Uuid = Uuid::from_bytes([
-    0x6b, 0xa7, 0xb8, 0x11,
-    0x9d, 0xad,
-    0x11, 0xd1,
-    0x80, 0xb4,
-    0x00, 0xc0, 0x4f, 0xd4, 0x30, 0xc8,
+    0x6b, 0xa7, 0xb8, 0x11, 0x9d, 0xad, 0x11, 0xd1, 0x80, 0xb4, 0x00, 0xc0, 0x4f, 0xd4, 0x30, 0xc8,
 ]);
 
 /// A [`Storage`] backend that persists objects on a local filesystem.
@@ -48,7 +44,9 @@ impl FilesystemStorage {
     /// The directory need not exist yet; it (and any intermediate directories)
     /// will be created on the first [`Storage::put`] call.
     pub fn new(base_path: impl Into<PathBuf>) -> Self {
-        Self { base_path: base_path.into() }
+        Self {
+            base_path: base_path.into(),
+        }
     }
 
     /// Derive the canonical filesystem path for `(bucket, key)`.
@@ -59,7 +57,11 @@ impl FilesystemStorage {
     fn key_path(&self, bucket: &str, key: &str) -> PathBuf {
         let id = Uuid::new_v5(&Y2Q_NAMESPACE, key.as_bytes());
         let s = id.hyphenated().to_string();
-        self.base_path.join(bucket).join(&s[0..2]).join(&s[2..4]).join(&s)
+        self.base_path
+            .join(bucket)
+            .join(&s[0..2])
+            .join(&s[2..4])
+            .join(&s)
     }
 }
 
@@ -73,9 +75,13 @@ fn validate_bucket(bucket: &str) -> Result<(), Error> {
         || bucket.contains('/')
         || bucket.contains('\\')
         || bucket.contains("..")
-        || !bucket.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+        || !bucket
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
     {
-        return Err(Error::InvalidBucket { bucket: bucket.to_owned() });
+        return Err(Error::InvalidBucket {
+            bucket: bucket.to_owned(),
+        });
     }
     Ok(())
 }
@@ -86,7 +92,9 @@ fn validate_bucket(bucket: &str) -> Result<(), Error> {
 fn validate_key(key: &str) -> Result<(), Error> {
     const MAX_KEY_LEN: usize = 1024;
     if key.is_empty() || key.contains('\0') || key.len() > MAX_KEY_LEN {
-        return Err(Error::InvalidKey { key: key.to_owned() });
+        return Err(Error::InvalidKey {
+            key: key.to_owned(),
+        });
     }
     Ok(())
 }
@@ -116,10 +124,10 @@ fn serialize_metadata(m: &Metadata) -> [u8; 40] {
 /// [`serialize_metadata`].
 fn deserialize_metadata(buf: &[u8; 40]) -> Metadata {
     Metadata {
-        created:         u64::from_le_bytes(buf[0..8].try_into().unwrap()),
-        modified:        u64::from_le_bytes(buf[8..16].try_into().unwrap()),
-        size:            u64::from_le_bytes(buf[16..24].try_into().unwrap()),
-        checksum_md5:    u64::from_le_bytes(buf[24..32].try_into().unwrap()),
+        created: u64::from_le_bytes(buf[0..8].try_into().unwrap()),
+        modified: u64::from_le_bytes(buf[8..16].try_into().unwrap()),
+        size: u64::from_le_bytes(buf[16..24].try_into().unwrap()),
+        checksum_md5: u64::from_le_bytes(buf[24..32].try_into().unwrap()),
         checksum_sha256: u64::from_le_bytes(buf[32..40].try_into().unwrap()),
     }
 }
@@ -235,7 +243,9 @@ async fn check_not_locked(lock_path: &Path, bucket: &str, key: &str) -> Result<(
 /// valid timestamp.
 async fn read_created_timestamp(meta_path: &Path) -> Option<u64> {
     let bytes = tokio::fs::read(meta_path).await.ok()?;
-    if bytes.len() < 8 { return None; }
+    if bytes.len() < 8 {
+        return None;
+    }
     Some(u64::from_le_bytes(bytes[0..8].try_into().unwrap()))
 }
 
@@ -249,9 +259,10 @@ impl Storage for FilesystemStorage {
 
         match tokio::fs::read(&data_path).await {
             Ok(bytes) => Ok(Object::new(Bytes::from(bytes))),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                Err(Error::NotFound { bucket: bucket.to_owned(), key: key.to_owned() })
-            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(Error::NotFound {
+                bucket: bucket.to_owned(),
+                key: key.to_owned(),
+            }),
             Err(e) => Err(Error::InternalError {
                 bucket: bucket.to_owned(),
                 key: key.to_owned(),
@@ -276,7 +287,10 @@ impl Storage for FilesystemStorage {
         let data = match tokio::fs::read(&data_path).await {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Err(Error::NotFound { bucket: bucket.to_owned(), key: key.to_owned() });
+                return Err(Error::NotFound {
+                    bucket: bucket.to_owned(),
+                    key: key.to_owned(),
+                });
             }
             Err(e) => {
                 return Err(Error::InternalError {
@@ -307,12 +321,14 @@ impl Storage for FilesystemStorage {
         let tmp_path = data_path.with_extension("tmp");
 
         if let Some(parent) = data_path.parent() {
-            tokio::fs::create_dir_all(parent).await.map_err(|e| Error::InternalError {
-                bucket: bucket.to_owned(),
-                key: key.to_owned(),
-                operation: "put".to_owned(),
-                message: e.to_string(),
-            })?;
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| Error::InternalError {
+                    bucket: bucket.to_owned(),
+                    key: key.to_owned(),
+                    operation: "put".to_owned(),
+                    message: e.to_string(),
+                })?;
         }
 
         let _guard = LockGuard::acquire(lock_path, bucket, key).await?;
@@ -336,26 +352,30 @@ impl Storage for FilesystemStorage {
             checksum_sha256,
         };
 
-        tokio::fs::write(&tmp_path, data).await.map_err(|e| Error::InternalError {
-            bucket: bucket.to_owned(),
-            key: key.to_owned(),
-            operation: "put".to_owned(),
-            message: e.to_string(),
-        })?;
-        tokio::fs::rename(&tmp_path, &data_path).await.map_err(|e| Error::InternalError {
-            bucket: bucket.to_owned(),
-            key: key.to_owned(),
-            operation: "put".to_owned(),
-            message: e.to_string(),
-        })?;
-        tokio::fs::write(&meta_path, serialize_metadata(&metadata)).await.map_err(|e| {
-            Error::InternalError {
+        tokio::fs::write(&tmp_path, data)
+            .await
+            .map_err(|e| Error::InternalError {
                 bucket: bucket.to_owned(),
                 key: key.to_owned(),
                 operation: "put".to_owned(),
                 message: e.to_string(),
-            }
-        })?;
+            })?;
+        tokio::fs::rename(&tmp_path, &data_path)
+            .await
+            .map_err(|e| Error::InternalError {
+                bucket: bucket.to_owned(),
+                key: key.to_owned(),
+                operation: "put".to_owned(),
+                message: e.to_string(),
+            })?;
+        tokio::fs::write(&meta_path, serialize_metadata(&metadata))
+            .await
+            .map_err(|e| Error::InternalError {
+                bucket: bucket.to_owned(),
+                key: key.to_owned(),
+                operation: "put".to_owned(),
+                message: e.to_string(),
+            })?;
 
         Ok(is_overwrite)
     }
@@ -373,7 +393,10 @@ impl Storage for FilesystemStorage {
         let data = match tokio::fs::read(&data_path).await {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Err(Error::NotFound { bucket: bucket.to_owned(), key: key.to_owned() });
+                return Err(Error::NotFound {
+                    bucket: bucket.to_owned(),
+                    key: key.to_owned(),
+                });
             }
             Err(e) => {
                 return Err(Error::InternalError {
@@ -402,15 +425,20 @@ impl Storage for FilesystemStorage {
         check_not_locked(&lock_path, bucket, key).await?;
 
         if !tokio::fs::try_exists(&data_path).await.unwrap_or(false) {
-            return Err(Error::NotFound { bucket: bucket.to_owned(), key: key.to_owned() });
+            return Err(Error::NotFound {
+                bucket: bucket.to_owned(),
+                key: key.to_owned(),
+            });
         }
 
-        let bytes = tokio::fs::read(&meta_path).await.map_err(|e| Error::InternalError {
-            bucket: bucket.to_owned(),
-            key: key.to_owned(),
-            operation: "describe".to_owned(),
-            message: e.to_string(),
-        })?;
+        let bytes = tokio::fs::read(&meta_path)
+            .await
+            .map_err(|e| Error::InternalError {
+                bucket: bucket.to_owned(),
+                key: key.to_owned(),
+                operation: "describe".to_owned(),
+                message: e.to_string(),
+            })?;
 
         if bytes.len() < 40 {
             return Err(Error::InternalError {
@@ -444,7 +472,9 @@ mod tests {
     #[tokio::test]
     async fn put_then_get_roundtrip() {
         let (s, _dir) = make_storage();
-        s.put("bucket1", "my-key", make_object(b"hello world")).await.unwrap();
+        s.put("bucket1", "my-key", make_object(b"hello world"))
+            .await
+            .unwrap();
         let got = s.get("bucket1", "my-key").await.unwrap();
         assert_eq!(&got[..], b"hello world");
     }
@@ -498,7 +528,9 @@ mod tests {
         let (s, _dir) = make_storage();
         s.put("b", "k", make_object(b"x")).await.unwrap();
         let lock_path = s.key_path("b", "k").with_extension("lock");
-        tokio::fs::write(&lock_path, 1_000_000_000u64.to_le_bytes()).await.unwrap();
+        tokio::fs::write(&lock_path, 1_000_000_000u64.to_le_bytes())
+            .await
+            .unwrap();
         let err = s.get("b", "k").await.unwrap_err();
         assert!(matches!(err, crate::Error::Locked { .. }));
         tokio::fs::remove_file(&lock_path).await.unwrap();

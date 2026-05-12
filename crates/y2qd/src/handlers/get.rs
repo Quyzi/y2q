@@ -6,8 +6,8 @@
 
 use std::sync::Arc;
 
-use actix_web::{HttpRequest, HttpResponse, web};
 use actix_web::http::header;
+use actix_web::{HttpRequest, HttpResponse, web};
 use y2q_core::{FilesystemStorage, Storage};
 
 use crate::error::{AppError, ErrorBody};
@@ -83,5 +83,9 @@ fn parse_byte_range(s: &str) -> Option<(u64, u64)> {
     let (start_s, end_s) = s.split_once('-')?;
     let start = start_s.trim().parse::<u64>().ok()?;
     let end = end_s.trim().parse::<u64>().ok()?;
-    if start <= end { Some((start, end)) } else { None }
+    if start <= end {
+        Some((start, end))
+    } else {
+        None
+    }
 }
