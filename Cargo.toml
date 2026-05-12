@@ -1,7 +1,7 @@
 [workspace]
 members = [
     "crates/y2q-core",
-    "crates/y2q",
+    "crates/y2qd",
 ]
 resolver = "2"
 
