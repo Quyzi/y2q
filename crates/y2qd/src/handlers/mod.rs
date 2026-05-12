@@ -15,6 +15,7 @@ pub(crate) mod list_buckets;
 pub(crate) mod list_objects;
 pub(crate) mod metrics;
 pub(crate) mod put;
+pub(crate) mod rebuild;
 
 // Re-exported so the ApiDoc derive in main.rs can reference these by a stable
 // crate-relative path without exposing the submodule structure publicly.
@@ -24,6 +25,11 @@ pub(crate) mod put;
 pub fn configure(cfg: &mut web::ServiceConfig) {
     cfg.service(web::resource("/").route(web::get().to(list_buckets::handle)));
     cfg.service(web::resource("/{bucket}/").route(web::get().to(list_objects::handle)));
+    cfg.service(
+        web::resource("/_admin/rebuild")
+            .route(web::post().to(rebuild::start))
+            .route(web::get().to(rebuild::status)),
+    );
 
     cfg.service(
         web::resource("/{bucket}/{tail}*")

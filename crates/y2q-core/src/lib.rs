@@ -155,6 +155,10 @@ pub enum Error {
         operation: String,
         message: String,
     },
+
+    /// A cache rebuild was requested while one is already in progress.
+    #[error("rebuild already in progress")]
+    RebuildAlreadyRunning,
 }
 
 /// Async interface for object storage backends.
@@ -226,13 +230,36 @@ pub trait Listing: Storage {
     async fn list_objects(&self, bucket: &str, options: ListOptions) -> Result<ListPage, Error>;
 }
 
+/// Reported state of the secondary-index rebuild process.
+///
+/// Returned by [`StorageExt::rebuild_progress`]. A rebuild is fire-and-forget:
+/// [`StorageExt::rebuild_cache`] spawns the work and returns immediately; the
+/// caller polls progress through this enum.
+#[derive(Debug, Clone)]
 pub enum CacheRebuildStatus {
+    /// No rebuild has been started since the process started.
+    Idle,
+    /// A rebuild is in progress; `u8` is percent complete (0..=100).
     Running(u8),
+    /// The most recent rebuild finished successfully.
     Completed,
+    /// The most recent rebuild aborted; `String` is a short human reason.
+    Failed(String),
 }
 
+/// Administrative operations on a [`Storage`] backend.
+///
+/// Currently exposes a way to rebuild the secondary metadata cache from the
+/// on-disk source of truth, and to query the progress of that rebuild.
 #[allow(async_fn_in_trait)]
 pub trait StorageExt: Storage {
+    /// Kick off a background rebuild of the secondary metadata cache.
+    ///
+    /// Returns `Ok(())` as soon as the background task is spawned, or
+    /// [`Error::RebuildAlreadyRunning`] if one is already in flight. Poll
+    /// [`StorageExt::rebuild_progress`] to observe completion.
     async fn rebuild_cache(&self) -> Result<(), Error>;
+
+    /// Return the current state of the background rebuild.
     async fn rebuild_progress(&self) -> Result<CacheRebuildStatus, Error>;
 }

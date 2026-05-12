@@ -27,6 +27,7 @@ pub struct ErrorBody {
 /// | `LabelValueTooLong`     | 400         |
 /// | `TooManyLabels`         | 400         |
 /// | `Locked`                | 409         |
+/// | `RebuildAlreadyRunning` | 409         |
 /// | `Index`                 | 500         |
 /// | `InternalError`         | 500         |
 #[derive(Debug)]
@@ -55,7 +56,7 @@ impl ResponseError for AppError {
             | CoreError::LabelNameTooLong { .. }
             | CoreError::LabelValueTooLong { .. }
             | CoreError::TooManyLabels { .. } => StatusCode::BAD_REQUEST,
-            CoreError::Locked { .. } => StatusCode::CONFLICT,
+            CoreError::Locked { .. } | CoreError::RebuildAlreadyRunning => StatusCode::CONFLICT,
             CoreError::Index { .. } | CoreError::InternalError { .. } => {
                 StatusCode::INTERNAL_SERVER_ERROR
             }
