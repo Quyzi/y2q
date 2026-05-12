@@ -1,18 +1,18 @@
-[package]
-name = "pqstor"
-version = "0.1.0"
-edition = "2024"
+[workspace]
+members = [
+    "crates/pqstor-core",
+    "crates/pqstor",
+]
+resolver = "2"
 
-[dependencies]
-bytes = { version = "1.11.1", features = ["serde"] }
-figment = { version = "0.10.19", features = ["toml"] }
-md-5 = "0.10"
-pqcrypto = { version = "0.18.1", features = ["serialization"] }
-sha2 = "0.10"
+[workspace.dependencies]
+bytes     = { version = "1.11.1", features = ["serde"] }
+figment   = { version = "0.10.19", features = ["toml"] }
+md-5      = "0.10"
+pqcrypto  = { version = "0.18.1", features = ["serialization"] }
+sha2      = "0.10"
 thiserror = "2.0.18"
-tokio = { version = "1.52.3", features = ["full"] }
-tracing = "0.1.44"
-uuid = { version = "1", features = ["v5"] }
-
-[dev-dependencies]
-tempfile = "3"
+tokio     = { version = "1.52.3", features = ["full"] }
+tracing   = "0.1.44"
+uuid      = { version = "1", features = ["v5"] }
+tempfile  = "3"
