@@ -57,16 +57,21 @@ pub(crate) mod observability;
         handlers::head::handle,
         handlers::list_buckets::handle,
         handlers::list_objects::handle,
+        handlers::rebuild::start,
+        handlers::rebuild::status,
     ),
     components(schemas(
         error::ErrorBody,
         handlers::list_buckets::ListBucketsResponse,
         handlers::list_objects::ListObjectsResponse,
         handlers::list_objects::MetadataView,
+        handlers::rebuild::RebuildStartResponse,
+        handlers::rebuild::RebuildStatusResponse,
     )),
     tags(
         (name = "objects", description = "Object storage — read, write, and delete objects addressed by bucket/key"),
         (name = "listing", description = "Enumerate buckets and the objects within them"),
+        (name = "admin", description = "Administrative operations — secondary-index rebuild"),
     ),
 )]
 struct ApiDoc;

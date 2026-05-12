@@ -252,6 +252,43 @@ impl MetadataIndex {
         })?
     }
 
+    /// Return every `(bucket, key)` pair currently stored in the objects
+    /// table, in the order they appear on disk (encoded-key order, not
+    /// string order).
+    ///
+    /// Used by cache-rebuild reconciliation to find rows that should be
+    /// removed because their on-disk sidecar no longer exists. Holds the
+    /// entire key set in memory — fine for the target scale of ~10⁵ objects
+    /// per bucket.
+    pub async fn list_all_keys(&self) -> Result<Vec<(String, String)>, Error> {
+        let db = self.db.clone();
+
+        tokio::task::spawn_blocking(move || -> Result<Vec<(String, String)>, Error> {
+            let txn = db.begin_read().map_err(map_redb)?;
+            let table = txn.open_table(OBJECTS).map_err(map_redb)?;
+            let mut out = Vec::new();
+            for entry in table.iter().map_err(map_redb)? {
+                let (k, _v) = entry.map_err(map_redb)?;
+                let Some((bucket, rest)) = read_len_prefixed(k.value()) else {
+                    return Err(Error::Index {
+                        message: "malformed object key in index".to_owned(),
+                    });
+                };
+                let Some((key, _)) = read_len_prefixed(rest) else {
+                    return Err(Error::Index {
+                        message: "malformed object key in index".to_owned(),
+                    });
+                };
+                out.push((bucket, key));
+            }
+            Ok(out)
+        })
+        .await
+        .map_err(|e| Error::Index {
+            message: format!("join: {e}"),
+        })?
+    }
+
     /// Scan one page of objects in `bucket`, optionally filtered by `prefix`,
     /// resumed past `after`, and capped at `limit` items.
     ///

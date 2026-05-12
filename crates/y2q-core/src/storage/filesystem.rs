@@ -11,8 +11,8 @@ use sha2::Digest;
 use uuid::Uuid;
 
 use crate::{
-    DEFAULT_LIST_LIMIT, Error, ListOptions, ListPage, Listing, MAX_LIST_LIMIT, Metadata,
-    MetadataIndex, Object, PutOptions, Storage,
+    CacheRebuildStatus, DEFAULT_LIST_LIMIT, Error, ListOptions, ListPage, Listing, MAX_LIST_LIMIT,
+    Metadata, MetadataIndex, Object, PutOptions, Storage, StorageExt,
 };
 
 /// UUID v5 namespace used to derive deterministic filenames from object keys.
@@ -47,6 +47,7 @@ const Y2Q_NAMESPACE: Uuid = Uuid::from_bytes([
 pub struct FilesystemStorage {
     base_path: PathBuf,
     index: Arc<MetadataIndex>,
+    rebuild_state: Arc<tokio::sync::Mutex<CacheRebuildStatus>>,
 }
 
 impl FilesystemStorage {
@@ -83,6 +84,7 @@ impl FilesystemStorage {
         Ok(Self {
             base_path,
             index: Arc::new(index),
+            rebuild_state: Arc::new(tokio::sync::Mutex::new(CacheRebuildStatus::Idle)),
         })
     }
 
@@ -526,6 +528,148 @@ impl Listing for FilesystemStorage {
     }
 }
 
+impl StorageExt for FilesystemStorage {
+    /// Spawn a background task that reconciles the secondary index against the
+    /// on-disk sidecar tree. Returns [`Error::RebuildAlreadyRunning`] if a
+    /// rebuild is already in progress.
+    async fn rebuild_cache(&self) -> Result<(), Error> {
+        {
+            let mut state = self.rebuild_state.lock().await;
+            if matches!(*state, CacheRebuildStatus::Running(_)) {
+                return Err(Error::RebuildAlreadyRunning);
+            }
+            *state = CacheRebuildStatus::Running(0);
+        }
+
+        let base_path = self.base_path.clone();
+        let index = self.index.clone();
+        let state = self.rebuild_state.clone();
+        tokio::spawn(async move {
+            let result = run_rebuild(base_path, index, state.clone()).await;
+            let mut s = state.lock().await;
+            *s = match result {
+                Ok(()) => CacheRebuildStatus::Completed,
+                Err(msg) => {
+                    tracing::error!(error = %msg, "cache rebuild failed");
+                    CacheRebuildStatus::Failed(msg)
+                }
+            };
+        });
+
+        Ok(())
+    }
+
+    async fn rebuild_progress(&self) -> Result<CacheRebuildStatus, Error> {
+        Ok(self.rebuild_state.lock().await.clone())
+    }
+}
+
+/// Walk every `.meta` sidecar under `base_path`, upsert it into `index`, and
+/// then drop any index rows that no longer have a sidecar on disk. Updates
+/// `state` with `Running(pct)` periodically; capped at 99 until the call site
+/// transitions to `Completed`.
+async fn run_rebuild(
+    base_path: PathBuf,
+    index: Arc<MetadataIndex>,
+    state: Arc<tokio::sync::Mutex<CacheRebuildStatus>>,
+) -> Result<(), String> {
+    let sidecars = collect_sidecars(&base_path)
+        .await
+        .map_err(|e| format!("enumerate sidecars: {e}"))?;
+    let total = sidecars.len();
+
+    let mut seen: std::collections::HashSet<(String, String)> =
+        std::collections::HashSet::with_capacity(total);
+    let report_every = (total / 100).max(1);
+
+    for (i, path) in sidecars.into_iter().enumerate() {
+        match read_metadata_sidecar(&path).await {
+            Ok(meta) => {
+                if let Err(e) = index.upsert(&meta).await {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "rebuild: index upsert failed; continuing"
+                    );
+                }
+                seen.insert((meta.bucket, meta.key));
+            }
+            Err(e) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "rebuild: failed to read sidecar; skipping"
+                );
+            }
+        }
+        if i % report_every == 0 && total > 0 {
+            let pct = (((i + 1) * 100 / total) as u8).min(99);
+            *state.lock().await = CacheRebuildStatus::Running(pct);
+        }
+    }
+
+    let all_keys = index
+        .list_all_keys()
+        .await
+        .map_err(|e| format!("list index keys: {e}"))?;
+    for (bucket, key) in all_keys {
+        if !seen.contains(&(bucket.clone(), key.clone()))
+            && let Err(e) = index.remove(&bucket, &key).await
+        {
+            tracing::warn!(
+                bucket = %bucket,
+                key = %key,
+                error = %e,
+                "rebuild: stale index row removal failed; continuing"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Recursively gather every `*.meta` path under `base_path/<bucket>/xx/yy/`.
+///
+/// Bucket directories whose name fails [`validate_bucket`] are skipped, which
+/// excludes reserved files like `_y2q_index.redb`.
+async fn collect_sidecars(base_path: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let mut out = Vec::new();
+    let mut buckets = tokio::fs::read_dir(base_path).await?;
+    while let Some(b_entry) = buckets.next_entry().await? {
+        if !b_entry.file_type().await?.is_dir() {
+            continue;
+        }
+        let bucket_name = match b_entry.file_name().into_string() {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        if validate_bucket(&bucket_name).is_err() {
+            continue;
+        }
+        let bucket_path = b_entry.path();
+        let mut l1 = tokio::fs::read_dir(&bucket_path).await?;
+        while let Some(l1_entry) = l1.next_entry().await? {
+            if !l1_entry.file_type().await?.is_dir() {
+                continue;
+            }
+            let mut l2 = tokio::fs::read_dir(l1_entry.path()).await?;
+            while let Some(l2_entry) = l2.next_entry().await? {
+                if !l2_entry.file_type().await?.is_dir() {
+                    continue;
+                }
+                let mut files = tokio::fs::read_dir(l2_entry.path()).await?;
+                while let Some(f) = files.next_entry().await? {
+                    let p = f.path();
+                    if p.extension().is_some_and(|e| e == "meta") {
+                        out.push(p);
+                    }
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -896,5 +1040,150 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, crate::Error::InvalidBucket { .. }));
+    }
+
+    async fn wait_until_done(s: &FilesystemStorage) -> CacheRebuildStatus {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let st = s.rebuild_progress().await.unwrap();
+                if matches!(
+                    st,
+                    CacheRebuildStatus::Completed | CacheRebuildStatus::Failed(_)
+                ) {
+                    return st;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("rebuild did not finish in time")
+    }
+
+    #[tokio::test]
+    async fn rebuild_repopulates_empty_index() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path().join("data");
+        let index_a = dir.path().join("index_a.redb");
+        let index_b = dir.path().join("index_b.redb");
+
+        {
+            let s = FilesystemStorage::new(&base, &index_a).unwrap();
+            s.put("b1", "k1", make_object(b"v1"), opts(&[("env", "prod")]))
+                .await
+                .unwrap();
+            s.put("b1", "k2", make_object(b"v2"), opts(&[("env", "dev")]))
+                .await
+                .unwrap();
+            s.put("b2", "x", make_object(b"x"), PutOptions::default())
+                .await
+                .unwrap();
+        }
+
+        let s2 = FilesystemStorage::new(&base, &index_b).unwrap();
+        assert!(s2.list_buckets().await.unwrap().is_empty());
+        assert!(
+            s2.index()
+                .lookup_by_label("env", "prod")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        s2.rebuild_cache().await.unwrap();
+        let status = wait_until_done(&s2).await;
+        assert!(matches!(status, CacheRebuildStatus::Completed));
+
+        let mut buckets = s2.list_buckets().await.unwrap();
+        buckets.sort();
+        assert_eq!(buckets, vec!["b1".to_owned(), "b2".to_owned()]);
+        assert_eq!(
+            s2.index().lookup_by_label("env", "prod").await.unwrap(),
+            vec![("b1".to_owned(), "k1".to_owned())]
+        );
+    }
+
+    #[tokio::test]
+    async fn rebuild_drops_stale_entries() {
+        let (s, _dir) = make_storage();
+        s.put("b", "alive", make_object(b"a"), PutOptions::default())
+            .await
+            .unwrap();
+        s.put("b", "ghost", make_object(b"g"), PutOptions::default())
+            .await
+            .unwrap();
+
+        let ghost_data = s.key_path("b", "ghost");
+        tokio::fs::remove_file(&ghost_data).await.unwrap();
+        tokio::fs::remove_file(ghost_data.with_extension("meta"))
+            .await
+            .unwrap();
+
+        assert!(
+            s.index()
+                .lookup_by_key("b", "ghost")
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        s.rebuild_cache().await.unwrap();
+        let status = wait_until_done(&s).await;
+        assert!(matches!(status, CacheRebuildStatus::Completed));
+
+        assert!(
+            s.index()
+                .lookup_by_key("b", "ghost")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            s.index()
+                .lookup_by_key("b", "alive")
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn rebuild_progress_reaches_completed() {
+        let (s, _dir) = make_storage();
+        for i in 0..10 {
+            s.put(
+                "b",
+                &format!("k{i}"),
+                make_object(b"v"),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap();
+        }
+        assert!(matches!(
+            s.rebuild_progress().await.unwrap(),
+            CacheRebuildStatus::Idle
+        ));
+        s.rebuild_cache().await.unwrap();
+        let status = wait_until_done(&s).await;
+        assert!(matches!(status, CacheRebuildStatus::Completed));
+    }
+
+    #[tokio::test]
+    async fn rebuild_rejects_concurrent_calls() {
+        let (s, _dir) = make_storage();
+        for i in 0..200 {
+            s.put(
+                "b",
+                &format!("k{i}"),
+                make_object(b"v"),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap();
+        }
+        s.rebuild_cache().await.unwrap();
+        let err = s.rebuild_cache().await.unwrap_err();
+        assert!(matches!(err, crate::Error::RebuildAlreadyRunning));
+        let _ = wait_until_done(&s).await;
     }
 }
