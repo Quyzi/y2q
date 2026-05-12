@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use redb::{Database, ReadableTable, TableDefinition};
 
-use crate::{Error, Metadata};
+use crate::{Error, ListPage, Metadata};
 
 /// `(bucket, key)` (length-prefixed) → JSON-serialized [`Metadata`].
 const OBJECTS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("objects");
@@ -209,6 +209,87 @@ impl MetadataIndex {
             message: format!("join: {e}"),
         })?
     }
+
+    /// Scan one page of objects in `bucket`, optionally filtered by `prefix`,
+    /// resumed past `after`, and capped at `limit` items.
+    ///
+    /// Results are sorted ascending by key. The returned [`ListPage::next`] is
+    /// `Some(last_key)` if more results may follow, or `None` if the listing
+    /// is exhausted.
+    ///
+    /// Implementation note: the redb composite key encoding sorts by encoded
+    /// bytes (length prefix first), which does not match string order. We
+    /// therefore range-scan only the rows belonging to `bucket`, then sort
+    /// and paginate in memory. This is acceptable for buckets up to ~10⁵
+    /// objects; beyond that the encoding should be migrated to a
+    /// string-sortable form.
+    pub async fn scan_objects(
+        &self,
+        bucket: &str,
+        prefix: Option<&str>,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<ListPage, Error> {
+        let db = self.db.clone();
+        let bucket = bucket.to_owned();
+        let prefix = prefix.map(str::to_owned);
+        let after = after.map(str::to_owned);
+
+        tokio::task::spawn_blocking(move || -> Result<ListPage, Error> {
+            let txn = db.begin_read().map_err(map_redb)?;
+            let table = txn.open_table(OBJECTS).map_err(map_redb)?;
+
+            let bucket_prefix = encode_bucket_prefix(&bucket);
+            let mut items: Vec<Metadata> = Vec::new();
+            for entry in table
+                .range::<&[u8]>(bucket_prefix.as_slice()..)
+                .map_err(map_redb)?
+            {
+                let (k, v) = entry.map_err(map_redb)?;
+                if !k.value().starts_with(&bucket_prefix) {
+                    break;
+                }
+                let m: Metadata = serde_json::from_slice(v.value()).map_err(|e| Error::Index {
+                    message: format!("deserialize metadata: {e}"),
+                })?;
+                items.push(m);
+            }
+            items.sort_by(|a, b| a.key.cmp(&b.key));
+
+            let after_ref = after.as_deref();
+            let prefix_ref = prefix.as_deref();
+            let mut page: Vec<Metadata> = Vec::with_capacity(limit);
+            let mut overflowed = false;
+            for m in items {
+                if let Some(p) = prefix_ref
+                    && !m.key.starts_with(p)
+                {
+                    continue;
+                }
+                if let Some(a) = after_ref
+                    && m.key.as_str() <= a
+                {
+                    continue;
+                }
+                if page.len() == limit {
+                    overflowed = true;
+                    break;
+                }
+                page.push(m);
+            }
+
+            let next = if overflowed {
+                page.last().map(|m| m.key.clone())
+            } else {
+                None
+            };
+            Ok(ListPage { items: page, next })
+        })
+        .await
+        .map_err(|e| Error::Index {
+            message: format!("join: {e}"),
+        })?
+    }
 }
 
 fn map_redb<E: std::fmt::Display>(e: E) -> Error {
@@ -231,6 +312,14 @@ fn encode_object_key(bucket: &str, key: &str) -> Vec<u8> {
     let mut out = Vec::with_capacity(8 + bucket.len() + key.len());
     write_len_prefixed(&mut out, bucket);
     write_len_prefixed(&mut out, key);
+    out
+}
+
+/// Encode just the length-prefixed bucket portion of an object key, used as a
+/// `starts_with` predicate and range-scan start when listing a bucket.
+fn encode_bucket_prefix(bucket: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + bucket.len());
+    write_len_prefixed(&mut out, bucket);
     out
 }
 

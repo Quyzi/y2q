@@ -55,10 +55,18 @@ pub(crate) mod observability;
         handlers::put::handle,
         handlers::delete::handle,
         handlers::head::handle,
+        handlers::list_buckets::handle,
+        handlers::list_objects::handle,
     ),
-    components(schemas(error::ErrorBody)),
+    components(schemas(
+        error::ErrorBody,
+        handlers::list_buckets::ListBucketsResponse,
+        handlers::list_objects::ListObjectsResponse,
+        handlers::list_objects::MetadataView,
+    )),
     tags(
         (name = "objects", description = "Object storage — read, write, and delete objects addressed by bucket/key"),
+        (name = "listing", description = "Enumerate buckets and the objects within them"),
     ),
 )]
 struct ApiDoc;
