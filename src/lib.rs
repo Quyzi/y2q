@@ -1,6 +1,5 @@
 use core::range::RangeInclusive;
-use std::ops::Deref;
-
+use std::{ops::Deref, time::Instant};
 use bytes::Bytes;
 
 pub struct Object(Bytes);
@@ -33,6 +32,12 @@ pub enum Error {
     NotFound {
         bucket: String,
         key: String
+    },
+
+    Locked {
+        bucket: String,
+        key: String,
+        since: Instant, 
     },
 
     InternalError {
