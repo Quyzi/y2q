@@ -448,8 +448,17 @@ checksum = "94e851c7654eed9e68d7d27164c454961a616cf8c203d500607ef22c737b51bb"
 name = "pqstor"
 version = "0.1.0"
 dependencies = [
- "bytes",
  "figment",
+ "pqstor-core",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "pqstor-core"
+version = "0.1.0"
+dependencies = [
+ "bytes",
  "md-5",
  "pqcrypto",
  "sha2",
