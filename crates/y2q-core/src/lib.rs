@@ -225,3 +225,14 @@ pub trait Listing: Storage {
     /// `options`. Results are sorted ascending by key.
     async fn list_objects(&self, bucket: &str, options: ListOptions) -> Result<ListPage, Error>;
 }
+
+pub enum CacheRebuildStatus {
+    Running(u8),
+    Completed,
+}
+
+#[allow(async_fn_in_trait)]
+pub trait StorageExt: Storage {
+    async fn rebuild_cache(&self) -> Result<(), Error>;
+    async fn rebuild_progress(&self) -> Result<CacheRebuildStatus, Error>;
+}
