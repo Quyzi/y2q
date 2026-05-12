@@ -6,13 +6,20 @@ members = [
 resolver = "2"
 
 [workspace.dependencies]
-bytes     = { version = "1.11.1", features = ["serde"] }
-figment   = { version = "0.10.19", features = ["toml"] }
-md-5      = "0.10"
-pqcrypto  = { version = "0.18.1", features = ["serialization"] }
-sha2      = "0.10"
-thiserror = "2.0.18"
-tokio     = { version = "1.52.3", features = ["full"] }
-tracing   = "0.1.44"
-uuid      = { version = "1", features = ["v5"] }
-tempfile  = "3"
+actix-web          = "4"
+utoipa             = "5"
+utoipa-swagger-ui  = { version = "9", features = ["actix-web"] }
+bytes              = { version = "1.11.1", features = ["serde"] }
+figment            = { version = "0.10.19", features = ["toml", "env"] }
+md-5               = "0.10"
+pqcrypto           = { version = "0.18.1", features = ["serialization"] }
+serde              = { version = "1", features = ["derive"] }
+serde_json         = "1"
+sha2               = "0.10"
+thiserror          = "2.0.18"
+tokio              = { version = "1.52.3", features = ["full"] }
+tracing            = "0.1.44"
+tracing-actix-web  = "0.7"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid               = { version = "1", features = ["v5"] }
+tempfile           = "3"
