@@ -1771,6 +1771,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "redb"
+version = "2.6.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8eca1e9d98d5a7e9002d0013e18d5a9b000aee942eb134883a82f06ebffb6c01"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "redox_syscall"
 version = "0.5.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2969,9 +2978,13 @@ checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
 name = "y2q-core"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "bytes",
  "md-5",
  "pqcrypto",
+ "redb",
+ "serde",
+ "serde_json",
  "sha2",
  "tempfile",
  "thiserror",

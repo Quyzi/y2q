@@ -9,6 +9,7 @@ use actix_web::web;
 pub(crate) mod delete;
 pub(crate) mod get;
 pub(crate) mod head;
+pub(crate) mod labels;
 pub(crate) mod metrics;
 pub(crate) mod put;
 

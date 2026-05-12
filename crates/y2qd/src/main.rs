@@ -82,19 +82,28 @@ async fn main() -> std::io::Result<()> {
             Matcher::Suffix(observability::PAYLOAD_METRIC_SUFFIX.to_string()),
             observability::PAYLOAD_BUCKETS_BYTES,
         )
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
+        .map_err(std::io::Error::other)?
         .set_buckets_for_metric(
             Matcher::Full(observability::DURATION_METRIC_NAME.to_string()),
             observability::DURATION_BUCKETS_MILLIS,
         )
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
+        .map_err(std::io::Error::other)?
         .install_recorder()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
     observability::describe_metrics();
     let metrics_data = web::Data::new(metrics_handle);
 
-    let storage = Arc::new(FilesystemStorage::new(&cfg.storage.base_path));
+    let index_path = cfg
+        .storage
+        .index_path
+        .clone()
+        .unwrap_or_else(|| format!("{}/_y2q_index.redb", cfg.storage.base_path));
+    let storage = Arc::new(
+        FilesystemStorage::new(&cfg.storage.base_path, &index_path)
+            .map_err(|e| std::io::Error::other(format!("storage init: {e}")))?,
+    );
     let storage_data = web::Data::new(storage);
+    let label_limits = web::Data::new(config::LabelLimits::from(&cfg.storage));
     let openapi = ApiDoc::openapi();
 
     let max_body_bytes = cfg.server.max_body_bytes;
@@ -103,6 +112,7 @@ async fn main() -> std::io::Result<()> {
             .wrap(TracingLogger::default())
             .wrap(from_fn(observability::metrics_middleware))
             .app_data(storage_data.clone())
+            .app_data(label_limits.clone())
             .app_data(web::PayloadConfig::new(max_body_bytes))
             .app_data(metrics_data.clone())
             .service(

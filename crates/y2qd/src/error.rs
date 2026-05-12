@@ -16,13 +16,19 @@ pub struct ErrorBody {
 /// [`ResponseError`], mapping each core error variant to an appropriate HTTP
 /// status code and a JSON body of the form `{"error": "<message>"}`.
 ///
-/// | Core error variant | HTTP status |
-/// |--------------------|-------------|
-/// | `NotFound`         | 404         |
-/// | `InvalidBucket`    | 400         |
-/// | `InvalidKey`       | 400         |
-/// | `Locked`           | 409         |
-/// | `InternalError`    | 500         |
+/// | Core error variant      | HTTP status |
+/// |-------------------------|-------------|
+/// | `NotFound`              | 404         |
+/// | `InvalidBucket`         | 400         |
+/// | `InvalidKey`            | 400         |
+/// | `ReservedLabel`         | 400         |
+/// | `InvalidLabelValue`     | 400         |
+/// | `LabelNameTooLong`      | 400         |
+/// | `LabelValueTooLong`     | 400         |
+/// | `TooManyLabels`         | 400         |
+/// | `Locked`                | 409         |
+/// | `Index`                 | 500         |
+/// | `InternalError`         | 500         |
 #[derive(Debug)]
 pub struct AppError(pub CoreError);
 
@@ -42,11 +48,17 @@ impl ResponseError for AppError {
     fn status_code(&self) -> StatusCode {
         match &self.0 {
             CoreError::NotFound { .. } => StatusCode::NOT_FOUND,
-            CoreError::InvalidBucket { .. } | CoreError::InvalidKey { .. } => {
-                StatusCode::BAD_REQUEST
-            }
+            CoreError::InvalidBucket { .. }
+            | CoreError::InvalidKey { .. }
+            | CoreError::ReservedLabel { .. }
+            | CoreError::InvalidLabelValue { .. }
+            | CoreError::LabelNameTooLong { .. }
+            | CoreError::LabelValueTooLong { .. }
+            | CoreError::TooManyLabels { .. } => StatusCode::BAD_REQUEST,
             CoreError::Locked { .. } => StatusCode::CONFLICT,
-            CoreError::InternalError { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+            CoreError::Index { .. } | CoreError::InternalError { .. } => {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
         }
     }
 

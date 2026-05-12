@@ -1,0 +1,153 @@
+//! Parse `X-Y2Q-<label>` request headers into a label map.
+//!
+//! Reserved names emitted by the server on HEAD (`created`, `modified`,
+//! `checksum-md5`, `checksum-sha256`) cannot be supplied by clients on PUT.
+
+use std::collections::BTreeMap;
+
+use actix_web::HttpRequest;
+use y2q_core::Error as CoreError;
+
+use crate::config::LabelLimits;
+use crate::error::AppError;
+
+const HEADER_PREFIX: &str = "x-y2q-";
+const RESERVED: &[&str] = &["created", "modified", "checksum-md5", "checksum-sha256"];
+
+/// Extract custom labels from `X-Y2Q-<name>` request headers.
+///
+/// - Header names are lowercased; the `x-y2q-` prefix is stripped.
+/// - Names matching any reserved system header (case-insensitive) cause a
+///   400 [`Error::ReservedLabel`].
+/// - Non-UTF-8 values cause 400 [`Error::InvalidLabelValue`].
+/// - Names and values exceeding the configured limits cause 400 errors.
+/// - When the same label is sent multiple times, **last value wins**.
+///
+/// [`Error::ReservedLabel`]: y2q_core::Error::ReservedLabel
+/// [`Error::InvalidLabelValue`]: y2q_core::Error::InvalidLabelValue
+pub fn extract_labels(
+    req: &HttpRequest,
+    limits: &LabelLimits,
+) -> Result<BTreeMap<String, String>, AppError> {
+    let mut out: BTreeMap<String, String> = BTreeMap::new();
+    for (name, value) in req.headers().iter() {
+        let lower = name.as_str().to_ascii_lowercase();
+        let Some(label) = lower.strip_prefix(HEADER_PREFIX) else {
+            continue;
+        };
+        if label.is_empty() {
+            continue;
+        }
+        if RESERVED.contains(&label) {
+            return Err(AppError(CoreError::ReservedLabel {
+                name: label.to_owned(),
+            }));
+        }
+        if label.len() > limits.max_label_name_bytes {
+            return Err(AppError(CoreError::LabelNameTooLong {
+                name: label.to_owned(),
+            }));
+        }
+        let value_str = value.to_str().map_err(|_| {
+            AppError(CoreError::InvalidLabelValue {
+                name: label.to_owned(),
+            })
+        })?;
+        if value_str.len() > limits.max_label_value_bytes {
+            return Err(AppError(CoreError::LabelValueTooLong {
+                name: label.to_owned(),
+            }));
+        }
+        out.insert(label.to_owned(), value_str.to_owned());
+    }
+    if out.len() > limits.max_labels {
+        return Err(AppError(CoreError::TooManyLabels { count: out.len() }));
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use actix_web::test::TestRequest;
+
+    fn limits() -> LabelLimits {
+        LabelLimits {
+            max_labels: 4,
+            max_label_name_bytes: 16,
+            max_label_value_bytes: 32,
+        }
+    }
+
+    #[test]
+    fn extracts_lowercased_labels() {
+        let req = TestRequest::default()
+            .insert_header(("X-Y2Q-Env", "prod"))
+            .insert_header(("X-Y2Q-Owner", "alice"))
+            .to_http_request();
+        let labels = extract_labels(&req, &limits()).unwrap();
+        assert_eq!(labels.get("env").map(String::as_str), Some("prod"));
+        assert_eq!(labels.get("owner").map(String::as_str), Some("alice"));
+    }
+
+    #[test]
+    fn ignores_unrelated_headers() {
+        let req = TestRequest::default()
+            .insert_header(("Content-Type", "application/octet-stream"))
+            .to_http_request();
+        let labels = extract_labels(&req, &limits()).unwrap();
+        assert!(labels.is_empty());
+    }
+
+    #[test]
+    fn rejects_each_reserved_name_case_insensitively() {
+        for header in [
+            "X-Y2Q-Created",
+            "X-Y2Q-Modified",
+            "x-y2q-CHECKSUM-MD5",
+            "X-Y2Q-checksum-sha256",
+        ] {
+            let req = TestRequest::default()
+                .insert_header((header, "1"))
+                .to_http_request();
+            let err = extract_labels(&req, &limits()).unwrap_err();
+            assert!(
+                matches!(err.0, CoreError::ReservedLabel { .. }),
+                "expected ReservedLabel for {header}, got {:?}",
+                err.0
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_too_many_labels() {
+        let req = TestRequest::default()
+            .insert_header(("X-Y2Q-a", "1"))
+            .insert_header(("X-Y2Q-b", "2"))
+            .insert_header(("X-Y2Q-c", "3"))
+            .insert_header(("X-Y2Q-d", "4"))
+            .insert_header(("X-Y2Q-e", "5"))
+            .to_http_request();
+        let err = extract_labels(&req, &limits()).unwrap_err();
+        assert!(matches!(err.0, CoreError::TooManyLabels { .. }));
+    }
+
+    #[test]
+    fn rejects_oversize_name() {
+        let req = TestRequest::default()
+            .insert_header(("X-Y2Q-aaaaaaaaaaaaaaaaa", "v"))
+            .to_http_request();
+        let err = extract_labels(&req, &limits()).unwrap_err();
+        assert!(matches!(err.0, CoreError::LabelNameTooLong { .. }));
+    }
+
+    #[test]
+    fn rejects_oversize_value() {
+        let big = "x".repeat(33);
+        let req = TestRequest::default()
+            .insert_header(("X-Y2Q-env", big.as_str()))
+            .to_http_request();
+        let err = extract_labels(&req, &limits()).unwrap_err();
+        assert!(matches!(err.0, CoreError::LabelValueTooLong { .. }));
+    }
+}
