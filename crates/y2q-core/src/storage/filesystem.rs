@@ -15,7 +15,7 @@ use crate::{Error, Metadata, Object, Storage};
 /// This is the RFC 4122 URL namespace (`6ba7b811-9dad-11d1-80b4-00c04fd430c8`),
 /// chosen as a stable, well-known constant so the same key always maps to the
 /// same filename regardless of which process or host computes it.
-const PQSTOR_NAMESPACE: Uuid = Uuid::from_bytes([
+const Y2Q_NAMESPACE: Uuid = Uuid::from_bytes([
     0x6b, 0xa7, 0xb8, 0x11,
     0x9d, 0xad,
     0x11, 0xd1,
@@ -57,7 +57,7 @@ impl FilesystemStorage {
     /// Callers can append extensions (`.meta`, `.lock`, `.tmp`) to get the
     /// paths of related sidecar files.
     fn key_path(&self, bucket: &str, key: &str) -> PathBuf {
-        let id = Uuid::new_v5(&PQSTOR_NAMESPACE, key.as_bytes());
+        let id = Uuid::new_v5(&Y2Q_NAMESPACE, key.as_bytes());
         let s = id.hyphenated().to_string();
         self.base_path.join(bucket).join(&s[0..2]).join(&s[2..4]).join(&s)
     }

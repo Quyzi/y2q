@@ -445,31 +445,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94e851c7654eed9e68d7d27164c454961a616cf8c203d500607ef22c737b51bb"
 
 [[package]]
-name = "pqstor"
-version = "0.1.0"
-dependencies = [
- "figment",
- "pqstor-core",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "pqstor-core"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "md-5",
- "pqcrypto",
- "sha2",
- "tempfile",
- "thiserror",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
 name = "proc-macro2"
 version = "1.0.106"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -901,3 +876,28 @@ name = "wit-bindgen"
 version = "0.57.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
+
+[[package]]
+name = "y2q"
+version = "0.1.0"
+dependencies = [
+ "figment",
+ "tokio",
+ "tracing",
+ "y2q-core",
+]
+
+[[package]]
+name = "y2q-core"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "md-5",
+ "pqcrypto",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "uuid",
+]

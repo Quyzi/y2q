@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-`pqstor` is a post-quantum secure storage system written in Rust (edition 2024). It is early in development.
+`y2q` is a post-quantum secure storage system written in Rust (edition 2024). It is early in development.
 
 ## Commands
 
@@ -29,7 +29,7 @@ cargo fmt                # format
 ## Architecture Notes
 
 The project is in early scaffolding. As it grows, the intended shape is:
-- Async entry point (`#[tokio::main]`) in `src/main.rs`
+- Async entry point (`#[tokio::main]`) in `crates/y2q/src/main.rs`
 - Configuration loaded via `figment` (TOML + env overrides)
 - Post-quantum crypto operations via `pqcrypto` — prefer its KEM and signature APIs over rolling custom crypto
 - Structured errors using `thiserror` — define domain error enums rather than using `anyhow` or `Box<dyn Error>`
