@@ -1,14 +1,16 @@
 use core::range::RangeInclusive;
 use std::{
     path::{Path, PathBuf},
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use base64::Engine;
 use bytes::Bytes;
 use sha2::Digest;
 use uuid::Uuid;
 
-use crate::{Error, Metadata, Object, Storage};
+use crate::{Error, Metadata, MetadataIndex, Object, PutOptions, Storage};
 
 /// UUID v5 namespace used to derive deterministic filenames from object keys.
 ///
@@ -26,7 +28,7 @@ const Y2Q_NAMESPACE: Uuid = Uuid::from_bytes([
 ///
 /// ```text
 /// <base_path>/<bucket>/<xx>/<yy>/<uuid>        — object data
-/// <base_path>/<bucket>/<xx>/<yy>/<uuid>.meta   — 40-byte metadata sidecar
+/// <base_path>/<bucket>/<xx>/<yy>/<uuid>.meta   — JSON metadata sidecar
 /// <base_path>/<bucket>/<xx>/<yy>/<uuid>.lock   — ephemeral write-lock file
 /// ```
 ///
@@ -34,19 +36,56 @@ const Y2Q_NAMESPACE: Uuid = Uuid::from_bytes([
 /// derived from the object key, and `<uuid>` is the full UUID. The sharding
 /// keeps directory entry counts manageable on filesystems with per-directory
 /// limits (e.g. ext3 without `dir_index`).
+///
+/// A secondary [`MetadataIndex`] (redb-backed) is kept in sync on every
+/// `put` / `delete`. The on-disk sidecar is the source of truth: index
+/// failures are logged but do not fail the operation, since the index can be
+/// rebuilt from a sidecar scan.
 pub struct FilesystemStorage {
     base_path: PathBuf,
+    index: Arc<MetadataIndex>,
 }
 
 impl FilesystemStorage {
-    /// Create a new `FilesystemStorage` rooted at `base_path`.
+    /// Create a new `FilesystemStorage` rooted at `base_path`, with a
+    /// secondary metadata index file at `index_path`.
     ///
-    /// The directory need not exist yet; it (and any intermediate directories)
-    /// will be created on the first [`Storage::put`] call.
-    pub fn new(base_path: impl Into<PathBuf>) -> Self {
-        Self {
-            base_path: base_path.into(),
+    /// `base_path` is created if it does not yet exist, then canonicalized so
+    /// that `Metadata::disk_path` is consistently absolute. The parent of
+    /// `index_path` is also created on demand.
+    pub fn new(base_path: impl Into<PathBuf>, index_path: impl AsRef<Path>) -> Result<Self, Error> {
+        let base_path = base_path.into();
+        std::fs::create_dir_all(&base_path).map_err(|e| Error::InternalError {
+            bucket: String::new(),
+            key: String::new(),
+            operation: "open".to_owned(),
+            message: format!("create base_path: {e}"),
+        })?;
+        let base_path = std::fs::canonicalize(&base_path).map_err(|e| Error::InternalError {
+            bucket: String::new(),
+            key: String::new(),
+            operation: "open".to_owned(),
+            message: format!("canonicalize base_path: {e}"),
+        })?;
+        let index_path = index_path.as_ref();
+        if let Some(parent) = index_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| Error::InternalError {
+                bucket: String::new(),
+                key: String::new(),
+                operation: "open".to_owned(),
+                message: format!("create index parent: {e}"),
+            })?;
         }
+        let index = MetadataIndex::open(index_path)?;
+        Ok(Self {
+            base_path,
+            index: Arc::new(index),
+        })
+    }
+
+    /// Access the underlying metadata index, e.g. for `lookup_by_label`.
+    pub fn index(&self) -> &MetadataIndex {
+        &self.index
     }
 
     /// Derive the canonical filesystem path for `(bucket, key)`.
@@ -99,47 +138,26 @@ fn validate_key(key: &str) -> Result<(), Error> {
     Ok(())
 }
 
-/// Encode a [`Metadata`] value into the 40-byte on-disk format.
-///
-/// Layout (all fields little-endian `u64`):
-///
-/// | Offset | Field             |
-/// |--------|-------------------|
-/// | 0–7    | `created`         |
-/// | 8–15   | `modified`        |
-/// | 16–23  | `size`            |
-/// | 24–31  | `checksum_md5`    |
-/// | 32–39  | `checksum_sha256` |
-fn serialize_metadata(m: &Metadata) -> [u8; 40] {
-    let mut buf = [0u8; 40];
-    buf[0..8].copy_from_slice(&m.created.to_le_bytes());
-    buf[8..16].copy_from_slice(&m.modified.to_le_bytes());
-    buf[16..24].copy_from_slice(&m.size.to_le_bytes());
-    buf[24..32].copy_from_slice(&m.checksum_md5.to_le_bytes());
-    buf[32..40].copy_from_slice(&m.checksum_sha256.to_le_bytes());
-    buf
+/// Encode `metadata` as pretty-printed JSON for the on-disk sidecar.
+fn encode_metadata(meta: &Metadata) -> Result<Vec<u8>, std::io::Error> {
+    serde_json::to_vec_pretty(meta)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
 
-/// Decode a [`Metadata`] value from the 40-byte on-disk format produced by
-/// [`serialize_metadata`].
-fn deserialize_metadata(buf: &[u8; 40]) -> Metadata {
-    Metadata {
-        created: u64::from_le_bytes(buf[0..8].try_into().unwrap()),
-        modified: u64::from_le_bytes(buf[8..16].try_into().unwrap()),
-        size: u64::from_le_bytes(buf[16..24].try_into().unwrap()),
-        checksum_md5: u64::from_le_bytes(buf[24..32].try_into().unwrap()),
-        checksum_sha256: u64::from_le_bytes(buf[32..40].try_into().unwrap()),
-    }
+/// Read and parse the JSON metadata sidecar at `path`.
+async fn read_metadata_sidecar(path: &Path) -> Result<Metadata, std::io::Error> {
+    let bytes = tokio::fs::read(path).await?;
+    serde_json::from_slice(&bytes)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
 
-/// Compute the MD5 and SHA-256 checksums of `data`, returning each as the
-/// first 8 bytes of the digest interpreted as a little-endian `u64`.
-fn compute_checksums(data: &[u8]) -> (u64, u64) {
+/// Compute the MD5 and SHA-256 checksums of `data`, returning each as the full
+/// digest encoded with standard base64 (RFC 4648 §4, padded).
+fn compute_checksums(data: &[u8]) -> (String, String) {
     let md5_digest = md5::Md5::digest(data);
     let sha256_digest = sha2::Sha256::digest(data);
-    let md5_u64 = u64::from_le_bytes(md5_digest[0..8].try_into().unwrap());
-    let sha256_u64 = u64::from_le_bytes(sha256_digest[0..8].try_into().unwrap());
-    (md5_u64, sha256_u64)
+    let engine = base64::engine::general_purpose::STANDARD;
+    (engine.encode(md5_digest), engine.encode(sha256_digest))
 }
 
 /// Return the current time as nanoseconds since the Unix epoch.
@@ -237,16 +255,14 @@ async fn check_not_locked(lock_path: &Path, bucket: &str, key: &str) -> Result<(
     Ok(())
 }
 
-/// Read the `created` timestamp (first 8 bytes) from an existing `.meta` file.
+/// Read the `created` timestamp from an existing JSON metadata sidecar.
 ///
-/// Returns `None` if the file does not exist or is too short to contain a
-/// valid timestamp.
+/// Returns `None` if the file does not exist or cannot be parsed.
 async fn read_created_timestamp(meta_path: &Path) -> Option<u64> {
-    let bytes = tokio::fs::read(meta_path).await.ok()?;
-    if bytes.len() < 8 {
-        return None;
-    }
-    Some(u64::from_le_bytes(bytes[0..8].try_into().unwrap()))
+    read_metadata_sidecar(meta_path)
+        .await
+        .ok()
+        .map(|m| m.created)
 }
 
 impl Storage for FilesystemStorage {
@@ -311,7 +327,13 @@ impl Storage for FilesystemStorage {
         Ok(Bytes::copy_from_slice(&data[start..=end]))
     }
 
-    async fn put(&self, bucket: &str, key: &str, payload: Object) -> Result<bool, Error> {
+    async fn put(
+        &self,
+        bucket: &str,
+        key: &str,
+        payload: Object,
+        options: PutOptions,
+    ) -> Result<bool, Error> {
         validate_bucket(bucket)?;
         validate_key(key)?;
 
@@ -350,6 +372,11 @@ impl Storage for FilesystemStorage {
             size: data.len() as u64,
             checksum_md5,
             checksum_sha256,
+            bucket: bucket.to_owned(),
+            key: key.to_owned(),
+            disk_path: data_path.clone(),
+            url_path: format!("{bucket}/{key}"),
+            labels: options.labels,
         };
 
         tokio::fs::write(&tmp_path, data)
@@ -368,7 +395,14 @@ impl Storage for FilesystemStorage {
                 operation: "put".to_owned(),
                 message: e.to_string(),
             })?;
-        tokio::fs::write(&meta_path, serialize_metadata(&metadata))
+
+        let encoded = encode_metadata(&metadata).map_err(|e| Error::InternalError {
+            bucket: bucket.to_owned(),
+            key: key.to_owned(),
+            operation: "put".to_owned(),
+            message: e.to_string(),
+        })?;
+        tokio::fs::write(&meta_path, &encoded)
             .await
             .map_err(|e| Error::InternalError {
                 bucket: bucket.to_owned(),
@@ -376,6 +410,15 @@ impl Storage for FilesystemStorage {
                 operation: "put".to_owned(),
                 message: e.to_string(),
             })?;
+
+        if let Err(e) = self.index.upsert(&metadata).await {
+            tracing::warn!(
+                bucket = bucket,
+                key = key,
+                error = %e,
+                "metadata index upsert failed; sidecar is authoritative"
+            );
+        }
 
         Ok(is_overwrite)
     }
@@ -411,6 +454,15 @@ impl Storage for FilesystemStorage {
         tokio::fs::remove_file(&data_path).await.ok();
         tokio::fs::remove_file(&meta_path).await.ok();
 
+        if let Err(e) = self.index.remove(bucket, key).await {
+            tracing::warn!(
+                bucket = bucket,
+                key = key,
+                error = %e,
+                "metadata index remove failed; sidecar is authoritative"
+            );
+        }
+
         Ok(Object::new(Bytes::from(data)))
     }
 
@@ -431,37 +483,28 @@ impl Storage for FilesystemStorage {
             });
         }
 
-        let bytes = tokio::fs::read(&meta_path)
+        read_metadata_sidecar(&meta_path)
             .await
             .map_err(|e| Error::InternalError {
                 bucket: bucket.to_owned(),
                 key: key.to_owned(),
                 operation: "describe".to_owned(),
                 message: e.to_string(),
-            })?;
-
-        if bytes.len() < 40 {
-            return Err(Error::InternalError {
-                bucket: bucket.to_owned(),
-                key: key.to_owned(),
-                operation: "describe".to_owned(),
-                message: "metadata file is truncated".to_owned(),
-            });
-        }
-
-        let arr: &[u8; 40] = bytes[0..40].try_into().unwrap();
-        Ok(deserialize_metadata(arr))
+            })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
     use tempfile::TempDir;
 
     fn make_storage() -> (FilesystemStorage, TempDir) {
         let dir = TempDir::new().unwrap();
-        let storage = FilesystemStorage::new(dir.path());
+        let base = dir.path().join("data");
+        let index = dir.path().join("index.redb");
+        let storage = FilesystemStorage::new(base, index).unwrap();
         (storage, dir)
     }
 
@@ -469,12 +512,25 @@ mod tests {
         Object::new(Bytes::copy_from_slice(data))
     }
 
+    fn opts(labels: &[(&str, &str)]) -> PutOptions {
+        let mut m = BTreeMap::new();
+        for (k, v) in labels {
+            m.insert((*k).to_owned(), (*v).to_owned());
+        }
+        PutOptions { labels: m }
+    }
+
     #[tokio::test]
     async fn put_then_get_roundtrip() {
         let (s, _dir) = make_storage();
-        s.put("bucket1", "my-key", make_object(b"hello world"))
-            .await
-            .unwrap();
+        s.put(
+            "bucket1",
+            "my-key",
+            make_object(b"hello world"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
         let got = s.get("bucket1", "my-key").await.unwrap();
         assert_eq!(&got[..], b"hello world");
     }
@@ -482,8 +538,14 @@ mod tests {
     #[tokio::test]
     async fn put_returns_overwrite_flag() {
         let (s, _dir) = make_storage();
-        let first = s.put("bucket1", "k", make_object(b"v1")).await.unwrap();
-        let second = s.put("bucket1", "k", make_object(b"v2")).await.unwrap();
+        let first = s
+            .put("bucket1", "k", make_object(b"v1"), PutOptions::default())
+            .await
+            .unwrap();
+        let second = s
+            .put("bucket1", "k", make_object(b"v2"), PutOptions::default())
+            .await
+            .unwrap();
         assert!(!first);
         assert!(second);
     }
@@ -492,20 +554,34 @@ mod tests {
     async fn describe_after_put() {
         let (s, _dir) = make_storage();
         let data = b"test payload";
-        s.put("b", "k", make_object(data)).await.unwrap();
+        s.put("b", "k", make_object(data), PutOptions::default())
+            .await
+            .unwrap();
         let meta = s.describe("b", "k").await.unwrap();
         assert_eq!(meta.size, data.len() as u64);
         assert!(meta.created > 0);
         assert!(meta.modified >= meta.created);
+        assert_eq!(meta.bucket, "b");
+        assert_eq!(meta.key, "k");
+        assert_eq!(meta.url_path, "b/k");
+        assert!(meta.labels.is_empty());
+        assert!(meta.disk_path.is_absolute());
+        // Base64 MD5 = 24 chars (16 raw + padding), SHA-256 = 44 chars.
+        assert_eq!(meta.checksum_md5.len(), 24);
+        assert_eq!(meta.checksum_sha256.len(), 44);
     }
 
     #[tokio::test]
     async fn overwrite_preserves_created() {
         let (s, _dir) = make_storage();
-        s.put("b", "k", make_object(b"v1")).await.unwrap();
+        s.put("b", "k", make_object(b"v1"), PutOptions::default())
+            .await
+            .unwrap();
         let meta1 = s.describe("b", "k").await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-        s.put("b", "k", make_object(b"v2")).await.unwrap();
+        s.put("b", "k", make_object(b"v2"), PutOptions::default())
+            .await
+            .unwrap();
         let meta2 = s.describe("b", "k").await.unwrap();
         assert_eq!(meta1.created, meta2.created);
         assert!(meta2.modified >= meta2.created);
@@ -514,7 +590,9 @@ mod tests {
     #[tokio::test]
     async fn delete_removes_files() {
         let (s, _dir) = make_storage();
-        s.put("b", "k", make_object(b"data")).await.unwrap();
+        s.put("b", "k", make_object(b"data"), PutOptions::default())
+            .await
+            .unwrap();
         s.delete("b", "k").await.unwrap();
         let err = s.get("b", "k").await.unwrap_err();
         assert!(matches!(err, crate::Error::NotFound { .. }));
@@ -526,7 +604,9 @@ mod tests {
     #[tokio::test]
     async fn locked_object_returns_error() {
         let (s, _dir) = make_storage();
-        s.put("b", "k", make_object(b"x")).await.unwrap();
+        s.put("b", "k", make_object(b"x"), PutOptions::default())
+            .await
+            .unwrap();
         let lock_path = s.key_path("b", "k").with_extension("lock");
         tokio::fs::write(&lock_path, 1_000_000_000u64.to_le_bytes())
             .await
@@ -539,7 +619,9 @@ mod tests {
     #[tokio::test]
     async fn get_range_returns_slice() {
         let (s, _dir) = make_storage();
-        s.put("b", "k", make_object(b"abcdefgh")).await.unwrap();
+        s.put("b", "k", make_object(b"abcdefgh"), PutOptions::default())
+            .await
+            .unwrap();
         let slice = s.get_range("b", "k", (2u64..=5u64).into()).await.unwrap();
         assert_eq!(&slice[..], b"cdef");
     }
@@ -558,5 +640,90 @@ mod tests {
         let (s, _dir) = make_storage();
         let err = s.get("bucket", "no-such-key").await.unwrap_err();
         assert!(matches!(err, crate::Error::NotFound { .. }));
+    }
+
+    #[tokio::test]
+    async fn put_with_labels_roundtrips_via_describe() {
+        let (s, _dir) = make_storage();
+        s.put(
+            "b",
+            "k",
+            make_object(b"x"),
+            opts(&[("env", "prod"), ("owner", "alice")]),
+        )
+        .await
+        .unwrap();
+        let meta = s.describe("b", "k").await.unwrap();
+        assert_eq!(meta.labels.get("env").map(String::as_str), Some("prod"));
+        assert_eq!(meta.labels.get("owner").map(String::as_str), Some("alice"));
+    }
+
+    #[tokio::test]
+    async fn index_lookup_by_label() {
+        let (s, _dir) = make_storage();
+        s.put("b", "k1", make_object(b"a"), opts(&[("env", "prod")]))
+            .await
+            .unwrap();
+        s.put("b", "k2", make_object(b"b"), opts(&[("env", "prod")]))
+            .await
+            .unwrap();
+        s.put("b", "k3", make_object(b"c"), opts(&[("env", "dev")]))
+            .await
+            .unwrap();
+        let mut prods = s.index().lookup_by_label("env", "prod").await.unwrap();
+        prods.sort();
+        assert_eq!(
+            prods,
+            vec![
+                ("b".to_owned(), "k1".to_owned()),
+                ("b".to_owned(), "k2".to_owned()),
+            ]
+        );
+        let devs = s.index().lookup_by_label("env", "dev").await.unwrap();
+        assert_eq!(devs, vec![("b".to_owned(), "k3".to_owned())]);
+    }
+
+    #[tokio::test]
+    async fn overwrite_replaces_labels() {
+        let (s, _dir) = make_storage();
+        s.put("b", "k", make_object(b"v1"), opts(&[("env", "prod")]))
+            .await
+            .unwrap();
+        s.put("b", "k", make_object(b"v2"), opts(&[("env", "dev")]))
+            .await
+            .unwrap();
+        let prods = s.index().lookup_by_label("env", "prod").await.unwrap();
+        assert!(prods.is_empty(), "old label should be removed on overwrite");
+        let devs = s.index().lookup_by_label("env", "dev").await.unwrap();
+        assert_eq!(devs, vec![("b".to_owned(), "k".to_owned())]);
+    }
+
+    #[tokio::test]
+    async fn index_cleared_on_delete() {
+        let (s, _dir) = make_storage();
+        s.put("b", "k", make_object(b"v"), opts(&[("env", "prod")]))
+            .await
+            .unwrap();
+        s.delete("b", "k").await.unwrap();
+        let hits = s.index().lookup_by_label("env", "prod").await.unwrap();
+        assert!(hits.is_empty());
+        let row = s.index().lookup_by_key("b", "k").await.unwrap();
+        assert!(row.is_none());
+    }
+
+    #[tokio::test]
+    async fn index_survives_reopen() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path().join("data");
+        let index = dir.path().join("index.redb");
+        {
+            let s = FilesystemStorage::new(&base, &index).unwrap();
+            s.put("b", "k", make_object(b"v"), opts(&[("env", "prod")]))
+                .await
+                .unwrap();
+        }
+        let s2 = FilesystemStorage::new(&base, &index).unwrap();
+        let hits = s2.index().lookup_by_label("env", "prod").await.unwrap();
+        assert_eq!(hits, vec![("b".to_owned(), "k".to_owned())]);
     }
 }

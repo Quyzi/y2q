@@ -17,9 +17,11 @@ use crate::error::{AppError, ErrorBody};
 /// | `Content-Type` | `application/octet-stream` |
 /// | `X-Y2Q-Created` | Nanoseconds since Unix epoch when first written |
 /// | `X-Y2Q-Modified` | Nanoseconds since Unix epoch when last overwritten |
-/// | `X-Y2Q-Checksum-MD5` | First 8 bytes of the MD5 digest as 16 lowercase hex chars |
-/// | `X-Y2Q-Checksum-SHA256` | First 8 bytes of the SHA-256 digest as 16 lowercase hex chars |
+/// | `X-Y2Q-Checksum-MD5` | Full 16-byte MD5 digest as standard base64 (24 chars) |
+/// | `X-Y2Q-Checksum-SHA256` | Full 32-byte SHA-256 digest as standard base64 (44 chars) |
+/// | `X-Y2Q-<label>` | Any custom label attached to the object on PUT |
 ///
+/// Custom label names are echoed back lowercased.
 /// Returns 404 if the object does not exist.
 #[utoipa::path(
     head,
@@ -32,7 +34,8 @@ use crate::error::{AppError, ErrorBody};
     responses(
         (status = 200, description = "Object exists. Metadata is returned in response headers: \
             `X-Y2Q-Created` (ns since epoch), `X-Y2Q-Modified` (ns since epoch), \
-            `X-Y2Q-Checksum-MD5` (16 hex chars), `X-Y2Q-Checksum-SHA256` (16 hex chars)."),
+            `X-Y2Q-Checksum-MD5` (base64, 24 chars), `X-Y2Q-Checksum-SHA256` (base64, 44 chars), \
+            plus any `X-Y2Q-<label>` headers attached on PUT."),
         (status = 400, description = "Invalid bucket or key", body = ErrorBody, content_type = "application/json"),
         (status = 404, description = "Object not found", body = ErrorBody, content_type = "application/json"),
         (status = 500, description = "Internal error", body = ErrorBody, content_type = "application/json"),
@@ -49,15 +52,18 @@ pub async fn handle(
         .await
         .map_err(AppError::from)?;
 
-    Ok(HttpResponse::Ok()
+    let mut builder = HttpResponse::Ok();
+    builder
         .insert_header(("Content-Length", meta.size.to_string()))
         .insert_header(("Content-Type", "application/octet-stream"))
         .insert_header(("X-Y2Q-Created", meta.created.to_string()))
         .insert_header(("X-Y2Q-Modified", meta.modified.to_string()))
-        .insert_header(("X-Y2Q-Checksum-MD5", format!("{:016x}", meta.checksum_md5)))
-        .insert_header((
-            "X-Y2Q-Checksum-SHA256",
-            format!("{:016x}", meta.checksum_sha256),
-        ))
-        .finish())
+        .insert_header(("X-Y2Q-Checksum-MD5", meta.checksum_md5.clone()))
+        .insert_header(("X-Y2Q-Checksum-SHA256", meta.checksum_sha256.clone()));
+
+    for (name, value) in &meta.labels {
+        builder.insert_header((format!("X-Y2Q-{}", name), value.clone()));
+    }
+
+    Ok(builder.finish())
 }

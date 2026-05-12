@@ -43,29 +43,28 @@ pub async fn handle(
 ) -> Result<HttpResponse, AppError> {
     let (bucket, key) = path.into_inner();
 
-    if let Some(range_header) = req.headers().get(header::RANGE) {
-        if let Ok(range_str) = range_header.to_str() {
-            if let Some((start, end)) = parse_byte_range(range_str) {
-                let data = storage
-                    .get_range(&bucket, &key, (start..=end).into())
-                    .await
-                    .map_err(AppError::from)?;
-                // describe() is called after get_range() to include the total
-                // size in the Content-Range header, as required by RFC 7233.
-                let meta = storage
-                    .describe(&bucket, &key)
-                    .await
-                    .map_err(AppError::from)?;
+    if let Some(range_header) = req.headers().get(header::RANGE)
+        && let Ok(range_str) = range_header.to_str()
+        && let Some((start, end)) = parse_byte_range(range_str)
+    {
+        let data = storage
+            .get_range(&bucket, &key, (start..=end).into())
+            .await
+            .map_err(AppError::from)?;
+        // describe() is called after get_range() to include the total
+        // size in the Content-Range header, as required by RFC 7233.
+        let meta = storage
+            .describe(&bucket, &key)
+            .await
+            .map_err(AppError::from)?;
 
-                return Ok(HttpResponse::PartialContent()
-                    .insert_header((header::CONTENT_TYPE, "application/octet-stream"))
-                    .insert_header((
-                        header::CONTENT_RANGE,
-                        format!("bytes {}-{}/{}", start, end, meta.size),
-                    ))
-                    .body(data));
-            }
-        }
+        return Ok(HttpResponse::PartialContent()
+            .insert_header((header::CONTENT_TYPE, "application/octet-stream"))
+            .insert_header((
+                header::CONTENT_RANGE,
+                format!("bytes {}-{}/{}", start, end, meta.size),
+            ))
+            .body(data));
     }
 
     let object = storage.get(&bucket, &key).await.map_err(AppError::from)?;
