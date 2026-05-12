@@ -10,7 +10,10 @@ use bytes::Bytes;
 use sha2::Digest;
 use uuid::Uuid;
 
-use crate::{Error, Metadata, MetadataIndex, Object, PutOptions, Storage};
+use crate::{
+    DEFAULT_LIST_LIMIT, Error, ListOptions, ListPage, Listing, MAX_LIST_LIMIT, Metadata,
+    MetadataIndex, Object, PutOptions, Storage,
+};
 
 /// UUID v5 namespace used to derive deterministic filenames from object keys.
 ///
@@ -494,6 +497,68 @@ impl Storage for FilesystemStorage {
     }
 }
 
+impl Listing for FilesystemStorage {
+    /// Enumerate bucket directories under `base_path`.
+    ///
+    /// Entries that are not directories, or whose names fail
+    /// [`validate_bucket`], are silently skipped — this lets the index
+    /// sidecar file (and any future system files) live alongside real
+    /// buckets without leaking into listings.
+    async fn list_buckets(&self) -> Result<Vec<String>, Error> {
+        let mk_err = |message: String| Error::InternalError {
+            bucket: String::new(),
+            key: String::new(),
+            operation: "list_buckets".to_owned(),
+            message,
+        };
+
+        let mut entries = tokio::fs::read_dir(&self.base_path)
+            .await
+            .map_err(|e| mk_err(format!("read_dir base_path: {e}")))?;
+
+        let mut buckets = Vec::new();
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .map_err(|e| mk_err(format!("next_entry: {e}")))?
+        {
+            let file_type = entry
+                .file_type()
+                .await
+                .map_err(|e| mk_err(format!("file_type: {e}")))?;
+            if !file_type.is_dir() {
+                continue;
+            }
+            let Ok(name) = entry.file_name().into_string() else {
+                continue;
+            };
+            if validate_bucket(&name).is_err() {
+                continue;
+            }
+            buckets.push(name);
+        }
+        buckets.sort();
+        Ok(buckets)
+    }
+
+    async fn list_objects(&self, bucket: &str, options: ListOptions) -> Result<ListPage, Error> {
+        validate_bucket(bucket)?;
+        let limit = options
+            .limit
+            .filter(|&n| n > 0)
+            .unwrap_or(DEFAULT_LIST_LIMIT)
+            .min(MAX_LIST_LIMIT);
+        self.index
+            .scan_objects(
+                bucket,
+                options.prefix.as_deref(),
+                options.after.as_deref(),
+                limit,
+            )
+            .await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -725,5 +790,144 @@ mod tests {
         let s2 = FilesystemStorage::new(&base, &index).unwrap();
         let hits = s2.index().lookup_by_label("env", "prod").await.unwrap();
         assert_eq!(hits, vec![("b".to_owned(), "k".to_owned())]);
+    }
+
+    #[tokio::test]
+    async fn list_buckets_empty() {
+        let (s, _dir) = make_storage();
+        let buckets = s.list_buckets().await.unwrap();
+        assert!(buckets.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_buckets_returns_sorted_unique() {
+        let (s, _dir) = make_storage();
+        s.put("zeta", "a", make_object(b"x"), PutOptions::default())
+            .await
+            .unwrap();
+        s.put("alpha", "a", make_object(b"x"), PutOptions::default())
+            .await
+            .unwrap();
+        s.put("alpha", "b", make_object(b"x"), PutOptions::default())
+            .await
+            .unwrap();
+        s.put("mid", "a", make_object(b"x"), PutOptions::default())
+            .await
+            .unwrap();
+        let buckets = s.list_buckets().await.unwrap();
+        assert_eq!(buckets, vec!["alpha", "mid", "zeta"]);
+    }
+
+    #[tokio::test]
+    async fn list_objects_empty_bucket() {
+        let (s, _dir) = make_storage();
+        let page = s
+            .list_objects("nobody", ListOptions::default())
+            .await
+            .unwrap();
+        assert!(page.items.is_empty());
+        assert!(page.next.is_none());
+    }
+
+    #[tokio::test]
+    async fn list_objects_sorted_by_string_key_not_encoded_order() {
+        // Regression: redb's length-prefixed encoding puts shorter encoded
+        // keys first, so "abz" (len 3) would sort before "abcd" (len 4) in
+        // raw redb order. The trait must return string-sorted results.
+        let (s, _dir) = make_storage();
+        for k in &["abz", "abcd", "aa"] {
+            s.put("b", k, make_object(b"x"), PutOptions::default())
+                .await
+                .unwrap();
+        }
+        let page = s.list_objects("b", ListOptions::default()).await.unwrap();
+        let keys: Vec<_> = page.items.iter().map(|m| m.key.as_str()).collect();
+        assert_eq!(keys, vec!["aa", "abcd", "abz"]);
+        assert!(page.next.is_none());
+    }
+
+    #[tokio::test]
+    async fn list_objects_prefix_filter() {
+        let (s, _dir) = make_storage();
+        for k in &["foo/a", "foo/b", "bar/a"] {
+            s.put("b", k, make_object(b"x"), PutOptions::default())
+                .await
+                .unwrap();
+        }
+        let page = s
+            .list_objects(
+                "b",
+                ListOptions {
+                    prefix: Some("foo/".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let keys: Vec<_> = page.items.iter().map(|m| m.key.as_str()).collect();
+        assert_eq!(keys, vec!["foo/a", "foo/b"]);
+    }
+
+    #[tokio::test]
+    async fn list_objects_pagination_with_cursor() {
+        let (s, _dir) = make_storage();
+        for k in &["a", "b", "c", "d"] {
+            s.put("b", k, make_object(b"x"), PutOptions::default())
+                .await
+                .unwrap();
+        }
+        let p1 = s
+            .list_objects(
+                "b",
+                ListOptions {
+                    limit: Some(2),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let keys1: Vec<_> = p1.items.iter().map(|m| m.key.as_str()).collect();
+        assert_eq!(keys1, vec!["a", "b"]);
+        assert_eq!(p1.next.as_deref(), Some("b"));
+
+        let p2 = s
+            .list_objects(
+                "b",
+                ListOptions {
+                    after: p1.next,
+                    limit: Some(2),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let keys2: Vec<_> = p2.items.iter().map(|m| m.key.as_str()).collect();
+        assert_eq!(keys2, vec!["c", "d"]);
+        assert!(p2.next.is_none(), "final page should not signal more");
+    }
+
+    #[tokio::test]
+    async fn list_objects_does_not_leak_other_buckets() {
+        let (s, _dir) = make_storage();
+        s.put("b1", "a", make_object(b"x"), PutOptions::default())
+            .await
+            .unwrap();
+        s.put("b2", "a", make_object(b"y"), PutOptions::default())
+            .await
+            .unwrap();
+        let page = s.list_objects("b1", ListOptions::default()).await.unwrap();
+        let keys: Vec<_> = page.items.iter().map(|m| m.key.as_str()).collect();
+        assert_eq!(keys, vec!["a"]);
+        assert_eq!(page.items[0].bucket, "b1");
+    }
+
+    #[tokio::test]
+    async fn list_objects_invalid_bucket() {
+        let (s, _dir) = make_storage();
+        let err = s
+            .list_objects("bad/bucket", ListOptions::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, crate::Error::InvalidBucket { .. }));
     }
 }
