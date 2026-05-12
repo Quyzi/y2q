@@ -498,47 +498,14 @@ impl Storage for FilesystemStorage {
 }
 
 impl Listing for FilesystemStorage {
-    /// Enumerate bucket directories under `base_path`.
+    /// Enumerate every bucket that has at least one object, by reading the
+    /// secondary index. Buckets are returned sorted ascending.
     ///
-    /// Entries that are not directories, or whose names fail
-    /// [`validate_bucket`], are silently skipped — this lets the index
-    /// sidecar file (and any future system files) live alongside real
-    /// buckets without leaking into listings.
+    /// The index is the source of truth here: an empty bucket directory on
+    /// disk (e.g. leftover from a deleted object) does not surface, and any
+    /// bucket present in the index is listed.
     async fn list_buckets(&self) -> Result<Vec<String>, Error> {
-        let mk_err = |message: String| Error::InternalError {
-            bucket: String::new(),
-            key: String::new(),
-            operation: "list_buckets".to_owned(),
-            message,
-        };
-
-        let mut entries = tokio::fs::read_dir(&self.base_path)
-            .await
-            .map_err(|e| mk_err(format!("read_dir base_path: {e}")))?;
-
-        let mut buckets = Vec::new();
-        while let Some(entry) = entries
-            .next_entry()
-            .await
-            .map_err(|e| mk_err(format!("next_entry: {e}")))?
-        {
-            let file_type = entry
-                .file_type()
-                .await
-                .map_err(|e| mk_err(format!("file_type: {e}")))?;
-            if !file_type.is_dir() {
-                continue;
-            }
-            let Ok(name) = entry.file_name().into_string() else {
-                continue;
-            };
-            if validate_bucket(&name).is_err() {
-                continue;
-            }
-            buckets.push(name);
-        }
-        buckets.sort();
-        Ok(buckets)
+        self.index.list_buckets().await
     }
 
     async fn list_objects(&self, bucket: &str, options: ListOptions) -> Result<ListPage, Error> {
