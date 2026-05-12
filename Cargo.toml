@@ -1,7 +1,7 @@
 [workspace]
 members = [
-    "crates/pqstor-core",
-    "crates/pqstor",
+    "crates/y2q-core",
+    "crates/y2q",
 ]
 resolver = "2"
 
