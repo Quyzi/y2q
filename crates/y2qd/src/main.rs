@@ -30,7 +30,8 @@
 
 use std::sync::Arc;
 
-use actix_web::{App, HttpServer, web};
+use actix_web::{App, HttpServer, middleware::from_fn, web};
+use metrics_exporter_prometheus::Matcher;
 use tracing_actix_web::TracingLogger;
 use tracing_subscriber::EnvFilter;
 use utoipa::OpenApi;
@@ -40,6 +41,7 @@ use y2q_core::FilesystemStorage;
 mod config;
 mod error;
 mod handlers;
+pub(crate) mod observability;
 
 #[derive(OpenApi)]
 #[openapi(
@@ -69,9 +71,27 @@ async fn main() -> std::io::Result<()> {
         )
         .init();
 
-    let cfg = config::Config::load().expect("failed to load config (config.toml or Y2QD_* env vars)");
+    let cfg =
+        config::Config::load().expect("failed to load config (config.toml or Y2QD_* env vars)");
 
     tracing::info!(host = %cfg.server.host, port = cfg.server.port, "starting y2qd");
+
+    let metrics_handle = metrics_exporter_prometheus::PrometheusBuilder::new()
+        .with_recommended_naming(true)
+        .set_buckets_for_metric(
+            Matcher::Suffix(observability::PAYLOAD_METRIC_SUFFIX.to_string()),
+            observability::PAYLOAD_BUCKETS_BYTES,
+        )
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
+        .set_buckets_for_metric(
+            Matcher::Full(observability::DURATION_METRIC_NAME.to_string()),
+            observability::DURATION_BUCKETS_MILLIS,
+        )
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
+        .install_recorder()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    observability::describe_metrics();
+    let metrics_data = web::Data::new(metrics_handle);
 
     let storage = Arc::new(FilesystemStorage::new(&cfg.storage.base_path));
     let storage_data = web::Data::new(storage);
@@ -81,11 +101,12 @@ async fn main() -> std::io::Result<()> {
     HttpServer::new(move || {
         App::new()
             .wrap(TracingLogger::default())
+            .wrap(from_fn(observability::metrics_middleware))
             .app_data(storage_data.clone())
             .app_data(web::PayloadConfig::new(max_body_bytes))
+            .app_data(metrics_data.clone())
             .service(
-                SwaggerUi::new("/swagger-ui/{_:.*}")
-                    .url("/api-docs/openapi.json", openapi.clone()),
+                SwaggerUi::new("/swagger-ui/{_:.*}").url("/api-docs/openapi.json", openapi.clone()),
             )
             .configure(handlers::configure)
     })

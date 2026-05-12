@@ -44,7 +44,10 @@ pub async fn handle(
     storage: web::Data<Arc<FilesystemStorage>>,
 ) -> Result<HttpResponse, AppError> {
     let (bucket, key) = path.into_inner();
-    let meta = storage.describe(&bucket, &key).await.map_err(AppError::from)?;
+    let meta = storage
+        .describe(&bucket, &key)
+        .await
+        .map_err(AppError::from)?;
 
     Ok(HttpResponse::Ok()
         .insert_header(("Content-Length", meta.size.to_string()))
@@ -52,6 +55,9 @@ pub async fn handle(
         .insert_header(("X-Y2Q-Created", meta.created.to_string()))
         .insert_header(("X-Y2Q-Modified", meta.modified.to_string()))
         .insert_header(("X-Y2Q-Checksum-MD5", format!("{:016x}", meta.checksum_md5)))
-        .insert_header(("X-Y2Q-Checksum-SHA256", format!("{:016x}", meta.checksum_sha256)))
+        .insert_header((
+            "X-Y2Q-Checksum-SHA256",
+            format!("{:016x}", meta.checksum_sha256),
+        ))
         .finish())
 }

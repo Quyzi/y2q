@@ -9,6 +9,7 @@ use actix_web::web;
 pub(crate) mod delete;
 pub(crate) mod get;
 pub(crate) mod head;
+pub(crate) mod metrics;
 pub(crate) mod put;
 
 // Re-exported so the ApiDoc derive in main.rs can reference these by a stable
@@ -24,4 +25,5 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             .route(web::delete().to(delete::handle))
             .route(web::head().to(head::handle)),
     );
+    cfg.service(web::resource("/metrics").route(web::get().to(metrics::handle)));
 }
