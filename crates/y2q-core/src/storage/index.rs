@@ -210,6 +210,48 @@ impl MetadataIndex {
         })?
     }
 
+    /// Return every distinct bucket name that has at least one row in the
+    /// `objects` table, sorted ascending.
+    ///
+    /// Skip-ahead implementation: after reading one row from bucket `B`, jump
+    /// the range cursor to the lex-successor of `B`'s encoded prefix, so this
+    /// is O(num_buckets) reads rather than O(num_objects).
+    pub async fn list_buckets(&self) -> Result<Vec<String>, Error> {
+        let db = self.db.clone();
+
+        tokio::task::spawn_blocking(move || -> Result<Vec<String>, Error> {
+            let txn = db.begin_read().map_err(map_redb)?;
+            let table = txn.open_table(OBJECTS).map_err(map_redb)?;
+
+            let mut buckets = Vec::new();
+            let mut start: Vec<u8> = Vec::new();
+            loop {
+                let mut iter = table.range::<&[u8]>(start.as_slice()..).map_err(map_redb)?;
+                let Some(entry) = iter.next() else { break };
+                let (k, _v) = entry.map_err(map_redb)?;
+                let Some((bucket, _rest)) = read_len_prefixed(k.value()) else {
+                    return Err(Error::Index {
+                        message: "malformed object key in index".to_owned(),
+                    });
+                };
+                let bucket_prefix = encode_bucket_prefix(&bucket);
+                buckets.push(bucket);
+                let Some(next) = next_lex_after(&bucket_prefix) else {
+                    break;
+                };
+                start = next;
+            }
+            // Encoded keys sort by length first, then bytes — undo that so
+            // the caller sees plain string order.
+            buckets.sort();
+            Ok(buckets)
+        })
+        .await
+        .map_err(|e| Error::Index {
+            message: format!("join: {e}"),
+        })?
+    }
+
     /// Scan one page of objects in `bucket`, optionally filtered by `prefix`,
     /// resumed past `after`, and capped at `limit` items.
     ///
@@ -321,6 +363,21 @@ fn encode_bucket_prefix(bucket: &str) -> Vec<u8> {
     let mut out = Vec::with_capacity(4 + bucket.len());
     write_len_prefixed(&mut out, bucket);
     out
+}
+
+/// Smallest byte sequence strictly greater than every key that starts with
+/// `prefix`. Returns `None` only if `prefix` is entirely `0xFF` bytes, in
+/// which case no such successor exists.
+fn next_lex_after(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut v = prefix.to_vec();
+    for i in (0..v.len()).rev() {
+        if v[i] < 0xFF {
+            v[i] += 1;
+            v.truncate(i + 1);
+            return Some(v);
+        }
+    }
+    None
 }
 
 fn encode_label_key(name: &str, value: &str, bucket: &str, key: &str) -> Vec<u8> {
