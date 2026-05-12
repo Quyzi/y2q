@@ -18,7 +18,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use redb::{Database, ReadableTable, TableDefinition};
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 
 use crate::{Error, ListPage, Metadata};
 
