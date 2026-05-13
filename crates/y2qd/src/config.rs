@@ -48,10 +48,30 @@ fn default_max_label_value_bytes() -> usize {
     1024
 }
 
+/// Selected storage backend implementation.
+///
+/// Maps to the on-disk format and I/O strategy used at runtime. Set via
+/// `[storage] backend = "..."` in `config.toml` or `Y2QD_STORAGE__BACKEND`.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum StorageBackend {
+    /// Portable [`tokio::fs`]-based backend
+    /// ([`y2q_core::FilesystemStorage`]). Default.
+    #[default]
+    Filesystem,
+    /// Linux-only `io_uring` fast path
+    /// ([`y2q_core::UringStorage`](https://docs.rs/y2q-core)).
+    /// Requires the `uring` cargo feature and a Linux kernel ≥ 5.6.
+    Uring,
+}
+
 /// Object storage settings.
 #[derive(Debug, Deserialize)]
 pub struct StorageConfig {
-    /// Root directory for [`y2q_core::FilesystemStorage`].
+    /// Which backend implementation to use. Defaults to `filesystem`.
+    #[serde(default)]
+    pub backend: StorageBackend,
+    /// Root directory for the selected storage backend.
     /// The directory is created on first write if it does not exist.
     pub base_path: String,
     /// Path to the redb-backed metadata index file. Defaults to
