@@ -23,13 +23,14 @@ tokio-uring   = { workspace = true, optional = true }
 aligned-vec   = { workspace = true, optional = true }
 async-channel = { workspace = true, optional = true }
 crc32fast     = { workspace = true, optional = true }
+libc          = { workspace = true, optional = true }
 
 [features]
 default = []
 # Enables the io_uring-based UringStorage backend. Linux-only at runtime:
 # the module is `#[cfg(target_os = "linux")]`, so on other targets the
 # feature is accepted but contributes nothing.
-uring = ["dep:tokio-uring", "dep:aligned-vec", "dep:async-channel", "dep:crc32fast"]
+uring = ["dep:tokio-uring", "dep:aligned-vec", "dep:async-channel", "dep:crc32fast", "dep:libc"]
 
 [dev-dependencies]
 tempfile = { workspace = true }

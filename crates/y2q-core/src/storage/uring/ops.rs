@@ -6,13 +6,15 @@
 //! op off its queue, runs the matching handler inside the uring runtime,
 //! then signals completion through the oneshot.
 //!
-//! The handlers in this file are the small-object buffered-uring path. The
-//! `O_DIRECT` large-object path is added in a subsequent step and dispatches
-//! from inside `do_put` based on payload size.
+//! The PUT handler dispatches between a buffered path and an `O_DIRECT`
+//! large-object path based on payload size; see [`do_put`] for the split.
+//! Read paths (get / get_range / describe / delete) honour the decoded
+//! header's `data_offset` so they work for both layouts transparently.
 
 use core::range::RangeInclusive;
 use std::{
     collections::BTreeMap,
+    os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -25,7 +27,10 @@ use tokio_uring::fs::{File, OpenOptions};
 
 use crate::{Error, Metadata, Object};
 
-use super::format::{self, HEADER_SIZE, Header};
+use super::{
+    buffer::{AlignedBuf, DIRECT_IO_ALIGN, DIRECT_IO_CHUNK},
+    format::{self, HEADER_SIZE, Header},
+};
 
 /// One unit of work submitted to a uring worker.
 pub(super) enum UringOp {
@@ -46,7 +51,7 @@ pub(super) enum UringOp {
         range: RangeInclusive<u64>,
         reply: oneshot::Sender<Result<Bytes, Error>>,
     },
-    /// Write a new object (durably) using the temp-file + atomic-rename pattern.
+    /// Write a new object durably using the temp-file + atomic-rename pattern.
     Put {
         obj_path: PathBuf,
         tmp_path: PathBuf,
@@ -56,6 +61,9 @@ pub(super) enum UringOp {
         url_path: String,
         payload: Bytes,
         labels: BTreeMap<String, String>,
+        /// Threshold at or above which the worker uses the `O_DIRECT` path.
+        /// `0` disables the threshold (always buffered).
+        large_object_bytes: u64,
         reply: oneshot::Sender<Result<(bool, Metadata), Error>>,
     },
     /// Read the object, then unlink it. Returns the deleted bytes.
@@ -107,11 +115,20 @@ pub(super) async fn handle(op: UringOp) {
             url_path,
             payload,
             labels,
+            large_object_bytes,
             reply,
         } => {
             let _ = reply.send(
                 do_put(
-                    obj_path, tmp_path, lock_path, bucket, key, url_path, payload, labels,
+                    obj_path,
+                    tmp_path,
+                    lock_path,
+                    bucket,
+                    key,
+                    url_path,
+                    payload,
+                    labels,
+                    large_object_bytes,
                 )
                 .await,
             );
@@ -311,7 +328,7 @@ async fn do_get(
 
     let data_len = header.data_len as usize;
     let buf = vec![0u8; data_len];
-    let (res, buf) = file.read_exact_at(buf, Header::DATA_OFFSET).await;
+    let (res, buf) = file.read_exact_at(buf, header.data_offset as u64).await;
     let _ = file.close().await;
     res.map_err(|e| internal(&bucket, &key, "get", format!("read data: {e}")))?;
     Ok(Object::new(Bytes::from(buf)))
@@ -332,12 +349,12 @@ async fn do_get_range(
         return Ok(Bytes::new());
     }
     let start = range.start;
-    // RangeInclusive end is `last`; clamp to data_len-1, then convert to a
-    // length so it fits a single read_exact_at.
     let end_inclusive = range.last.min(header.data_len - 1);
     let len = (end_inclusive - start + 1) as usize;
     let buf = vec![0u8; len];
-    let (res, buf) = file.read_exact_at(buf, Header::DATA_OFFSET + start).await;
+    let (res, buf) = file
+        .read_exact_at(buf, header.data_offset as u64 + start)
+        .await;
     let _ = file.close().await;
     res.map_err(|e| internal(&bucket, &key, "get_range", format!("read data: {e}")))?;
     Ok(Bytes::from(buf))
@@ -354,7 +371,7 @@ async fn do_delete(
 
     let data_len = header.data_len as usize;
     let buf = vec![0u8; data_len];
-    let (res, buf) = file.read_exact_at(buf, Header::DATA_OFFSET).await;
+    let (res, buf) = file.read_exact_at(buf, header.data_offset as u64).await;
     let _ = file.close().await;
     res.map_err(|e| internal(&bucket, &key, "delete", format!("read data: {e}")))?;
 
@@ -364,7 +381,7 @@ async fn do_delete(
     Ok(Object::new(Bytes::from(buf)))
 }
 
-#[allow(clippy::too_many_arguments)] // small-object handler, kept flat on purpose
+#[allow(clippy::too_many_arguments)]
 async fn do_put(
     obj_path: PathBuf,
     tmp_path: PathBuf,
@@ -374,6 +391,7 @@ async fn do_put(
     url_path: String,
     payload: Bytes,
     labels: BTreeMap<String, String>,
+    large_object_bytes: u64,
 ) -> Result<(bool, Metadata), Error> {
     if let Some(parent) = obj_path.parent() {
         std::fs::create_dir_all(parent)
@@ -394,10 +412,9 @@ async fn do_put(
         Err(e) => return Err(internal(&bucket, &key, "put", format!("stat existing: {e}"))),
     };
 
-    // Stream the checksums chunk-by-chunk. For the buffered small-object
-    // path the payload is already resident, so the streaming pattern is here
-    // mainly to mirror the large-object path (step 5) and keep the hashers
-    // wired the same way regardless of size.
+    // Stream the checksums chunk-by-chunk. Memory is the same as a single
+    // hash call (the payload is already resident here), but the streaming
+    // shape mirrors how the O_DIRECT path consumes the buffer in chunks.
     const HASH_CHUNK: usize = 1024 * 1024;
     let mut md5_hasher = md5::Md5::new();
     let mut sha_hasher = sha2::Sha256::new();
@@ -411,7 +428,7 @@ async fn do_put(
 
     let now = now_nanos();
     let created = prior_created.unwrap_or(now);
-    let metadata = Metadata {
+    let mut metadata = Metadata {
         created,
         modified: now,
         size: payload.len() as u64,
@@ -427,56 +444,240 @@ async fn do_put(
     let meta_bytes = serde_json::to_vec(&metadata)
         .map_err(|e| internal(&bucket, &key, "put", format!("encode meta: {e}")))?;
 
+    let use_direct = large_object_bytes > 0 && payload.len() as u64 >= large_object_bytes;
+    if use_direct {
+        match put_via_direct(&obj_path, &tmp_path, &bucket, &key, &payload, &meta_bytes).await {
+            Ok(true) => return Ok((is_overwrite, metadata)),
+            Ok(false) => {
+                tracing::warn!(
+                    bucket = %bucket,
+                    key = %key,
+                    "O_DIRECT not supported on this filesystem; falling back to buffered path"
+                );
+            }
+            Err(e) => return Err(e),
+        }
+        // Mark the metadata so a future re-PUT (or `rebuild_cache`) can see
+        // the fallback happened. Cheap; this branch is rare.
+        metadata.labels.insert("y2q.direct_io".to_owned(), "fallback".to_owned());
+    }
+
+    put_via_buffered(&obj_path, &tmp_path, &bucket, &key, &payload, &meta_bytes).await?;
+    Ok((is_overwrite, metadata))
+}
+
+/// Buffered write path: one fd, four positioned writes, fdatasync, rename,
+/// dir-fsync. Uses [`Header::MIN_DATA_OFFSET`], no padding.
+async fn put_via_buffered(
+    obj_path: &Path,
+    tmp_path: &Path,
+    bucket: &str,
+    key: &str,
+    payload: &Bytes,
+    meta_bytes: &[u8],
+) -> Result<(), Error> {
     let header = Header {
         data_len: payload.len() as u64,
         meta_len: meta_bytes.len() as u32,
+        data_offset: Header::MIN_DATA_OFFSET,
         flags: format::flags::DURABLE,
         version: format::VERSION,
     };
     let header_bytes = header.encode().to_vec();
     let trailer_bytes = header.encode().to_vec();
 
-    // Write [header | data | meta | trailer] as four positioned writes into
-    // a freshly-truncated tmp file. Each call submits via io_uring.
     let tmp = OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
-        .open(&tmp_path)
+        .open(tmp_path)
         .await
-        .map_err(|e| internal(&bucket, &key, "put", format!("open tmp: {e}")))?;
+        .map_err(|e| internal(bucket, key, "put", format!("open tmp: {e}")))?;
 
     let (res, _) = tmp.write_all_at(header_bytes, 0).await;
-    res.map_err(|e| internal(&bucket, &key, "put", format!("write header: {e}")))?;
-    // For step 4 we copy the payload into an owned Vec; the zero-copy
-    // registered-buffer path lands with the O_DIRECT step.
-    let (res, _) = tmp.write_all_at(payload.to_vec(), Header::DATA_OFFSET).await;
-    res.map_err(|e| internal(&bucket, &key, "put", format!("write data: {e}")))?;
-    let (res, _) = tmp.write_all_at(meta_bytes, header.meta_offset()).await;
-    res.map_err(|e| internal(&bucket, &key, "put", format!("write meta: {e}")))?;
-    let (res, _) = tmp.write_all_at(trailer_bytes, header.trailer_offset()).await;
-    res.map_err(|e| internal(&bucket, &key, "put", format!("write trailer: {e}")))?;
+    res.map_err(|e| internal(bucket, key, "put", format!("write header: {e}")))?;
+    let (res, _) = tmp
+        .write_all_at(payload.to_vec(), header.data_offset as u64)
+        .await;
+    res.map_err(|e| internal(bucket, key, "put", format!("write data: {e}")))?;
+    let (res, _) = tmp
+        .write_all_at(meta_bytes.to_vec(), header.meta_offset())
+        .await;
+    res.map_err(|e| internal(bucket, key, "put", format!("write meta: {e}")))?;
+    let (res, _) = tmp
+        .write_all_at(trailer_bytes, header.trailer_offset())
+        .await;
+    res.map_err(|e| internal(bucket, key, "put", format!("write trailer: {e}")))?;
 
     tmp.sync_data()
         .await
-        .map_err(|e| internal(&bucket, &key, "put", format!("fdatasync: {e}")))?;
+        .map_err(|e| internal(bucket, key, "put", format!("fdatasync: {e}")))?;
     let _ = tmp.close().await;
 
-    tokio_uring::fs::rename(&tmp_path, &obj_path)
-        .await
-        .map_err(|e| internal(&bucket, &key, "put", format!("rename: {e}")))?;
+    finalize_rename_and_dir_fsync(tmp_path, obj_path, bucket, key).await
+}
 
-    // fsync the parent directory so the new dirent entry is durable. tokio-uring
-    // can open directories but doesn't expose a directory-only sync method;
-    // a synchronous fsync on a freshly opened std::fs::File is the simplest
-    // portable option and runs in ~tens of microseconds on NVMe.
+/// `O_DIRECT` write path:
+///   - two fds to the same tmp file (one with `O_DIRECT`, one without)
+///   - 4 KiB-padded layout (`data_offset = 4096`)
+///   - aligned bulk of data goes through the `O_DIRECT` fd in 1 MiB chunks
+///   - header, non-aligned data tail, meta, trailer go through the
+///     buffered fd
+///   - single fdatasync covers both fds (same inode)
+///
+/// Returns `Ok(true)` if the path completed successfully, `Ok(false)` if
+/// the underlying filesystem doesn't support `O_DIRECT` and the caller
+/// should fall back to the buffered path. Other I/O errors propagate as
+/// `Err`.
+async fn put_via_direct(
+    obj_path: &Path,
+    tmp_path: &Path,
+    bucket: &str,
+    key: &str,
+    payload: &Bytes,
+    meta_bytes: &[u8],
+) -> Result<bool, Error> {
+    // Try the O_DIRECT open first so the EINVAL case has zero cleanup. If
+    // it succeeds it has also created and truncated the tmp file, so the
+    // buffered fd that follows just opens-without-create.
+    let probe = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .custom_flags(libc::O_DIRECT)
+        .open(tmp_path)
+        .await;
+    let fd_direct = match probe {
+        Ok(f) => f,
+        Err(e) if e.raw_os_error() == Some(libc::EINVAL) => return Ok(false),
+        Err(e) => return Err(internal(bucket, key, "put", format!("open O_DIRECT: {e}"))),
+    };
+    let fd_buffered = match OpenOptions::new().write(true).open(tmp_path).await {
+        Ok(f) => f,
+        Err(e) => {
+            let _ = fd_direct.close().await;
+            let _ = tokio_uring::fs::remove_file(tmp_path).await;
+            return Err(internal(bucket, key, "put", format!("open buffered fd: {e}")));
+        }
+    };
+
+    let data_offset = format::MIN_DIRECT_DATA_OFFSET;
+    let header = Header {
+        data_len: payload.len() as u64,
+        meta_len: meta_bytes.len() as u32,
+        data_offset,
+        flags: format::flags::DURABLE | format::flags::WRITTEN_O_DIRECT,
+        version: format::VERSION,
+    };
+    let header_bytes = header.encode().to_vec();
+    let trailer_bytes = header.encode().to_vec();
+
+    // Header at offset 0 — buffered (the kernel will leave [64, 4096) as a
+    // sparse hole; reads of that range return zero, which is what we want).
+    let (res, _) = fd_buffered.write_all_at(header_bytes, 0).await;
+    if let Err(e) = res {
+        cleanup_direct_failure(fd_direct, fd_buffered, tmp_path).await;
+        return Err(internal(bucket, key, "put", format!("write header: {e}")));
+    }
+
+    // Aligned bulk via O_DIRECT in DIRECT_IO_CHUNK-sized chunks.
+    let data_len = payload.len() as u64;
+    let aligned_bulk_bytes = (data_len / DIRECT_IO_ALIGN as u64) * DIRECT_IO_ALIGN as u64;
+    let tail_bytes = data_len - aligned_bulk_bytes;
+
+    let mut written: u64 = 0;
+    while written < aligned_bulk_bytes {
+        let remaining = aligned_bulk_bytes - written;
+        let chunk_len = remaining.min(DIRECT_IO_CHUNK as u64) as usize;
+        let start = written as usize;
+        let buf = AlignedBuf::from_slice(&payload[start..start + chunk_len]);
+        let offset = data_offset as u64 + written;
+        let (res, _) = fd_direct.write_all_at(buf, offset).await;
+        if let Err(e) = res {
+            cleanup_direct_failure(fd_direct, fd_buffered, tmp_path).await;
+            return Err(internal(
+                bucket,
+                key,
+                "put",
+                format!("write data chunk @ {offset}: {e}"),
+            ));
+        }
+        written += chunk_len as u64;
+    }
+
+    // Tail: at most DIRECT_IO_ALIGN-1 bytes, written via the buffered fd
+    // since its offset and length are not block-aligned.
+    if tail_bytes > 0 {
+        let start = aligned_bulk_bytes as usize;
+        let tail_vec = payload[start..].to_vec();
+        let tail_offset = data_offset as u64 + aligned_bulk_bytes;
+        let (res, _) = fd_buffered.write_all_at(tail_vec, tail_offset).await;
+        if let Err(e) = res {
+            cleanup_direct_failure(fd_direct, fd_buffered, tmp_path).await;
+            return Err(internal(bucket, key, "put", format!("write data tail: {e}")));
+        }
+    }
+
+    // Meta + trailer via the buffered fd.
+    let (res, _) = fd_buffered
+        .write_all_at(meta_bytes.to_vec(), header.meta_offset())
+        .await;
+    if let Err(e) = res {
+        cleanup_direct_failure(fd_direct, fd_buffered, tmp_path).await;
+        return Err(internal(bucket, key, "put", format!("write meta: {e}")));
+    }
+    let (res, _) = fd_buffered
+        .write_all_at(trailer_bytes, header.trailer_offset())
+        .await;
+    if let Err(e) = res {
+        cleanup_direct_failure(fd_direct, fd_buffered, tmp_path).await;
+        return Err(internal(bucket, key, "put", format!("write trailer: {e}")));
+    }
+
+    // Single fdatasync — both fds point at the same inode, so this flushes
+    // the data and size metadata for everything written via either fd plus
+    // any in-flight O_DIRECT submissions.
+    if let Err(e) = fd_buffered.sync_data().await {
+        cleanup_direct_failure(fd_direct, fd_buffered, tmp_path).await;
+        return Err(internal(bucket, key, "put", format!("fdatasync: {e}")));
+    }
+    let _ = fd_direct.close().await;
+    let _ = fd_buffered.close().await;
+
+    finalize_rename_and_dir_fsync(tmp_path, obj_path, bucket, key).await?;
+    Ok(true)
+}
+
+/// Close both fds and unlink the tmp file on error so we don't leak
+/// partial writes between PUT attempts.
+async fn cleanup_direct_failure(fd_direct: File, fd_buffered: File, tmp_path: &Path) {
+    let _ = fd_direct.close().await;
+    let _ = fd_buffered.close().await;
+    let _ = tokio_uring::fs::remove_file(tmp_path).await;
+}
+
+/// Atomically replace the destination object with the tmp file, then fsync
+/// the parent directory so the dirent change is durable.
+///
+/// tokio-uring can open directories but doesn't expose a directory-only
+/// sync method, so we use a synchronous `fsync` on a freshly opened
+/// `std::fs::File` — a single syscall, ~tens of microseconds on NVMe.
+async fn finalize_rename_and_dir_fsync(
+    tmp_path: &Path,
+    obj_path: &Path,
+    bucket: &str,
+    key: &str,
+) -> Result<(), Error> {
+    tokio_uring::fs::rename(tmp_path, obj_path)
+        .await
+        .map_err(|e| internal(bucket, key, "put", format!("rename: {e}")))?;
+
     if let Some(parent) = obj_path.parent()
         && let Ok(dir) = std::fs::File::open(parent)
     {
         let _ = dir.sync_all();
     }
-
-    Ok((is_overwrite, metadata))
+    Ok(())
 }
 
 /// Read the `created` timestamp from an existing object by parsing its

@@ -38,7 +38,6 @@ pub struct UringStorage {
     index: Arc<MetadataIndex>,
     #[allow(dead_code)] // wired in subsequent steps (rebuild_cache)
     rebuild_state: Arc<tokio::sync::Mutex<CacheRebuildStatus>>,
-    #[allow(dead_code)] // referenced in subsequent steps (O_DIRECT threshold)
     config: UringConfig,
     pool: WorkerPool,
 }
@@ -248,6 +247,7 @@ impl Storage for UringStorage {
             url_path: format!("{bucket}/{key}"),
             payload: payload.into_inner(),
             labels: options.labels,
+            large_object_bytes: self.config.large_object_bytes,
             reply,
         };
         let (is_overwrite, metadata) = self.dispatch(op, bucket, key, "put", reply_rx).await?;
@@ -360,6 +360,44 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    /// Build a UringStorage with a custom large-object threshold so tests can
+    /// trigger the `O_DIRECT` path without allocating multi-MiB payloads.
+    fn make_storage_with_threshold(
+        dir: &TempDir,
+        workers: usize,
+        large_object_bytes: u64,
+    ) -> UringStorage {
+        UringStorage::new(
+            dir.path(),
+            dir.path().join("idx.redb"),
+            UringConfig {
+                workers,
+                large_object_bytes,
+            },
+        )
+        .unwrap()
+    }
+
+    /// A TempDir on a disk-backed filesystem so tests actually exercise
+    /// `O_DIRECT` (the default `/tmp` is usually tmpfs, which returns EINVAL
+    /// on O_DIRECT and would force the fallback path). The workspace's
+    /// `target/` lives under `$CARGO_MANIFEST_DIR/../../target` and is btrfs
+    /// or ext4 on every dev box.
+    fn disk_backed_tempdir() -> TempDir {
+        let parent = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("target")
+            .join("uring-test-tmp");
+        std::fs::create_dir_all(&parent).unwrap();
+        tempfile::Builder::new()
+            .prefix("y2q-uring-")
+            .tempdir_in(&parent)
+            .unwrap()
     }
 
     fn payload(bytes: &[u8]) -> Object {
@@ -513,5 +551,143 @@ mod tests {
         let storage = make_storage(&dir, 1);
         let err = storage.get("../escape", "k").await.unwrap_err();
         assert!(matches!(err, Error::InvalidBucket { .. }));
+    }
+
+    /// Round-trip a payload whose size is an exact multiple of the 4 KiB
+    /// alignment block — the O_DIRECT bulk consumes the whole payload, no
+    /// non-aligned tail. Uses a disk-backed tempdir so the O_DIRECT path
+    /// actually runs (tmpfs fallback would still pass this test, but defeats
+    /// the purpose).
+    #[tokio::test]
+    async fn put_then_get_round_trips_aligned_large_object() {
+        let dir = disk_backed_tempdir();
+        // Threshold of 8 KiB makes 16 KiB qualify as "large".
+        let storage = make_storage_with_threshold(&dir, 2, 8 * 1024);
+        // 16 KiB of distinct bytes so corruption would show up in the
+        // assertion below.
+        let body: Vec<u8> = (0..16 * 1024).map(|i| (i % 251) as u8).collect();
+        storage
+            .put("b", "k", payload(&body), PutOptions::default())
+            .await
+            .unwrap();
+        let got = storage.get("b", "k").await.unwrap();
+        assert_eq!(&got[..], body.as_slice());
+        let meta = storage.describe("b", "k").await.unwrap();
+        assert_eq!(meta.size, body.len() as u64);
+    }
+
+    /// Round-trip a payload whose size has a non-aligned tail. Exercises the
+    /// split between the O_DIRECT aligned bulk and the buffered tail write.
+    #[tokio::test]
+    async fn put_then_get_round_trips_large_object_with_tail() {
+        let dir = disk_backed_tempdir();
+        let storage = make_storage_with_threshold(&dir, 2, 8 * 1024);
+        // 18 KiB = 4 KiB-aligned bulk (16 KiB) + 2 KiB tail. The tail
+        // exercises the buffered fd's write_all_at path.
+        let body: Vec<u8> = (0..18 * 1024).map(|i| (i % 251) as u8).collect();
+        storage
+            .put("b", "k", payload(&body), PutOptions::default())
+            .await
+            .unwrap();
+        let got = storage.get("b", "k").await.unwrap();
+        assert_eq!(&got[..], body.as_slice());
+    }
+
+    /// `get_range` against an O_DIRECT-written object must work the same as
+    /// for a buffered one — the read path uses `header.data_offset` so the
+    /// 4 KiB pad in front of the data is invisible to callers.
+    #[tokio::test]
+    async fn get_range_works_on_large_object_with_tail() {
+        let dir = disk_backed_tempdir();
+        let storage = make_storage_with_threshold(&dir, 1, 8 * 1024);
+        let body: Vec<u8> = (0..18 * 1024).map(|i| (i % 251) as u8).collect();
+        storage
+            .put("b", "k", payload(&body), PutOptions::default())
+            .await
+            .unwrap();
+
+        // Cross the boundary between aligned bulk (16 KiB) and the 2 KiB tail
+        // so we exercise both write regions in one read.
+        let slice = storage
+            .get_range(
+                "b",
+                "k",
+                RangeInclusive {
+                    start: 16_000,
+                    last: 17_500,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(slice.len(), 1501);
+        assert_eq!(&slice[..], &body[16_000..=17_500]);
+    }
+
+    /// A payload below the threshold must take the buffered path even when
+    /// large_object_bytes is configured. Use a 4 KiB body with a 64 KiB
+    /// threshold and verify the header's data_offset is the buffered value
+    /// (64) rather than the O_DIRECT-aligned value (4096).
+    #[tokio::test]
+    async fn small_object_below_threshold_uses_buffered_layout() {
+        let dir = disk_backed_tempdir();
+        let storage = make_storage_with_threshold(&dir, 1, 64 * 1024);
+        let body = vec![9u8; 4 * 1024];
+        storage
+            .put("b", "k", payload(&body), PutOptions::default())
+            .await
+            .unwrap();
+
+        // Inspect the on-disk header directly to confirm the buffered layout.
+        let obj_path = storage.obj_path("b", "k");
+        let bytes = std::fs::read(&obj_path).unwrap();
+        assert!(bytes.len() >= super::super::format::HEADER_SIZE);
+        let header_arr: [u8; super::super::format::HEADER_SIZE] = bytes
+            [..super::super::format::HEADER_SIZE]
+            .try_into()
+            .unwrap();
+        let header = super::super::format::Header::decode(&header_arr).unwrap();
+        assert_eq!(header.data_offset, super::super::format::Header::MIN_DATA_OFFSET);
+        assert_eq!(
+            header.flags & super::super::format::flags::WRITTEN_O_DIRECT,
+            0,
+            "small object should not have the O_DIRECT flag"
+        );
+    }
+
+    /// Regression guard for the dispatch logic: a payload that exceeds the
+    /// threshold must take the O_DIRECT path, producing a header with the
+    /// `WRITTEN_O_DIRECT` flag set and `data_offset = 4096`.
+    ///
+    /// Uses `disk_backed_tempdir()` which lives under the workspace's
+    /// `target/`, so the underlying filesystem (btrfs/ext4/xfs) supports
+    /// O_DIRECT on every Linux dev box. If you genuinely need to run this
+    /// on tmpfs, expect a failure — that's the test's job.
+    #[tokio::test]
+    async fn large_object_writes_with_o_direct_flag_set() {
+        let dir = disk_backed_tempdir();
+        let storage = make_storage_with_threshold(&dir, 1, 8 * 1024);
+        let body = vec![5u8; 16 * 1024];
+        storage
+            .put("b", "k", payload(&body), PutOptions::default())
+            .await
+            .unwrap();
+
+        let obj_path = storage.obj_path("b", "k");
+        let bytes = std::fs::read(&obj_path).unwrap();
+        let header_arr: [u8; super::super::format::HEADER_SIZE] = bytes
+            [..super::super::format::HEADER_SIZE]
+            .try_into()
+            .unwrap();
+        let header = super::super::format::Header::decode(&header_arr).unwrap();
+        assert_ne!(
+            header.flags & super::super::format::flags::WRITTEN_O_DIRECT,
+            0,
+            "expected WRITTEN_O_DIRECT flag; underlying FS may not support O_DIRECT \
+             (this test requires the workspace target dir on ext4/btrfs/xfs)"
+        );
+        assert_eq!(
+            header.data_offset,
+            super::super::format::MIN_DIRECT_DATA_OFFSET
+        );
     }
 }
