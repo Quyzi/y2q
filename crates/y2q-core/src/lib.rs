@@ -7,6 +7,9 @@ pub mod storage;
 pub use storage::filesystem::FilesystemStorage;
 pub use storage::index::MetadataIndex;
 
+#[cfg(all(target_os = "linux", feature = "uring"))]
+pub use storage::uring::UringStorage;
+
 /// A stored binary object. Wraps [`bytes::Bytes`] for cheap cloning and slicing.
 #[derive(Debug)]
 pub struct Object(Bytes);

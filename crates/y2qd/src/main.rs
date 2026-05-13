@@ -111,10 +111,21 @@ async fn main() -> std::io::Result<()> {
         .index_path
         .clone()
         .unwrap_or_else(|| format!("{}/_y2q_index.redb", cfg.storage.base_path));
-    let storage = Arc::new(
-        FilesystemStorage::new(&cfg.storage.base_path, &index_path)
-            .map_err(|e| std::io::Error::other(format!("storage init: {e}")))?,
-    );
+    let storage = match cfg.storage.backend {
+        config::StorageBackend::Filesystem => Arc::new(
+            FilesystemStorage::new(&cfg.storage.base_path, &index_path)
+                .map_err(|e| std::io::Error::other(format!("storage init: {e}")))?,
+        ),
+        config::StorageBackend::Uring => {
+            // The uring backend is currently a stub. Once its trait impls
+            // are real, this branch will construct a `UringStorage` and the
+            // handlers will be made generic over `Storage + Listing + StorageExt`.
+            return Err(std::io::Error::other(
+                "storage backend `uring` is not yet implemented; \
+                 set storage.backend = \"filesystem\" or unset it",
+            ));
+        }
+    };
     let storage_data = web::Data::new(storage);
     let label_limits = web::Data::new(config::LabelLimits::from(&cfg.storage));
     let openapi = ApiDoc::openapi();
