@@ -17,12 +17,6 @@
 //!
 //! All multi-byte fields are little-endian.
 
-// The format API is exercised by this module's own tests but not yet
-// referenced from the trait impls — that wiring lands with the PUT/GET
-// implementation. Remove this attribute when the read/write paths hook
-// `Header::encode` / `Header::decode` into the worker handlers.
-#![allow(dead_code)]
-
 /// 4-byte magic prefix identifying this format: `b"Y2QO"` (y2q object).
 pub const MAGIC: [u8; 4] = *b"Y2QO";
 
@@ -86,6 +80,7 @@ impl Header {
     }
 
     /// Total length of the on-disk file: `2*header + data + meta`.
+    #[allow(dead_code)] // used by tests now; production callers land with rebuild_cache
     pub fn total_len(&self) -> u64 {
         2 * HEADER_SIZE as u64 + self.data_len + self.meta_len as u64
     }

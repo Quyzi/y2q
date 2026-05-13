@@ -19,6 +19,14 @@ impl Object {
     pub fn new(bytes: Bytes) -> Self {
         Self(bytes)
     }
+
+    /// Consume the `Object` and return its inner [`bytes::Bytes`] payload.
+    ///
+    /// Useful when handing the payload off to backends that need to move
+    /// the buffer (e.g. a worker pool that takes ownership of the bytes).
+    pub fn into_inner(self) -> Bytes {
+        self.0
+    }
 }
 
 impl Deref for Object {
