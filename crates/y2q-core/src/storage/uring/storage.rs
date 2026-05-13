@@ -1,37 +1,46 @@
 //! The `UringStorage` backend struct and its trait implementations.
 //!
-//! This file is currently a skeleton: all I/O methods are `todo!()` and the
-//! type only carries enough state to round-trip configuration. The shape is
-//! deliberately mirror-image of [`crate::FilesystemStorage`] so callers can
-//! swap one for the other once the implementations land.
+//! Currently in progress: [`UringStorage::describe`] is wired end-to-end
+//! through the worker-pool bridge; every other method is still `todo!()`.
 
 use core::range::RangeInclusive;
 use std::{path::PathBuf, sync::Arc};
 
 use bytes::Bytes;
+use uuid::Uuid;
 
 use crate::{
     CacheRebuildStatus, Error, ListOptions, ListPage, Listing, Metadata, MetadataIndex, Object,
     PutOptions, Storage, StorageExt,
 };
 
+use super::{ops::UringOp, runtime::WorkerPool};
+
+/// UUID v5 namespace used to derive deterministic filenames from object keys.
+///
+/// Matches the constant used by [`crate::FilesystemStorage`] so the two
+/// backends agree on path layout while we transition the on-disk format.
+const Y2Q_NAMESPACE: Uuid = Uuid::from_bytes([
+    0x6b, 0xa7, 0xb8, 0x11, 0x9d, 0xad, 0x11, 0xd1, 0x80, 0xb4, 0x00, 0xc0, 0x4f, 0xd4, 0x30, 0xc8,
+]);
+
 /// io_uring-backed object storage backend.
 ///
 /// One file per object using the single-file format defined in
-/// [`super::format`]. PUTs are durable by default (`fdatasync` on the data
-/// file plus `fsync` on the parent directory).
+/// [`super::format`] (landing in a subsequent step — for now the backend
+/// reads metadata sidecars in the same layout as [`crate::FilesystemStorage`]).
+/// PUTs are durable by default once they're implemented.
 ///
 /// All I/O is dispatched to a dedicated `tokio-uring` worker pool — see
 /// [`super::runtime`] — keeping the actix-web tokio runtime unblocked.
 pub struct UringStorage {
-    #[allow(dead_code)] // wired in subsequent steps
     base_path: PathBuf,
-    #[allow(dead_code)]
     index: Arc<MetadataIndex>,
-    #[allow(dead_code)]
+    #[allow(dead_code)] // wired in subsequent steps
     rebuild_state: Arc<tokio::sync::Mutex<CacheRebuildStatus>>,
-    #[allow(dead_code)]
+    #[allow(dead_code)] // referenced in subsequent steps
     config: UringConfig,
+    pool: WorkerPool,
 }
 
 /// Tunables for [`UringStorage`].
@@ -60,8 +69,8 @@ impl UringStorage {
     /// Construct a new `UringStorage` rooted at `base_path`, with its secondary
     /// metadata index file at `index_path`.
     ///
-    /// This currently builds the struct but does not spin up the worker pool
-    /// or open any uring instances; those land with the first real I/O method.
+    /// Spins up `config.workers` dedicated tokio-uring threads. Requires a
+    /// Linux kernel with `io_uring` enabled (≥ 5.6).
     pub fn new(
         base_path: impl Into<PathBuf>,
         index_path: impl AsRef<std::path::Path>,
@@ -90,11 +99,13 @@ impl UringStorage {
             })?;
         }
         let index = MetadataIndex::open(index_path)?;
+        let pool = WorkerPool::spawn(&config);
         Ok(Self {
             base_path,
             index: Arc::new(index),
             rebuild_state: Arc::new(tokio::sync::Mutex::new(CacheRebuildStatus::Idle)),
             config,
+            pool,
         })
     }
 
@@ -102,6 +113,50 @@ impl UringStorage {
     pub fn index(&self) -> &MetadataIndex {
         &self.index
     }
+
+    /// Derive the canonical on-disk path of the metadata sidecar for
+    /// `(bucket, key)`. Matches the [`FilesystemStorage`](crate::FilesystemStorage)
+    /// layout: `<base>/<bucket>/<xx>/<yy>/<uuid>.meta`.
+    fn meta_path(&self, bucket: &str, key: &str) -> PathBuf {
+        let id = Uuid::new_v5(&Y2Q_NAMESPACE, key.as_bytes());
+        let s = id.hyphenated().to_string();
+        let mut p = self
+            .base_path
+            .join(bucket)
+            .join(&s[0..2])
+            .join(&s[2..4])
+            .join(&s);
+        p.set_extension("meta");
+        p
+    }
+}
+
+/// Validate that `bucket` is a safe directory name.
+fn validate_bucket(bucket: &str) -> Result<(), Error> {
+    if bucket.is_empty()
+        || bucket.contains('/')
+        || bucket.contains('\\')
+        || bucket.contains("..")
+        || !bucket
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(Error::InvalidBucket {
+            bucket: bucket.to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// Validate that `key` is a legal object key.
+fn validate_key(key: &str) -> Result<(), Error> {
+    const MAX_KEY_LEN: usize = 1024;
+    if key.is_empty() || key.contains('\0') || key.len() > MAX_KEY_LEN {
+        return Err(Error::InvalidKey {
+            key: key.to_owned(),
+        });
+    }
+    Ok(())
 }
 
 impl Storage for UringStorage {
@@ -132,8 +187,34 @@ impl Storage for UringStorage {
         todo!("UringStorage::delete")
     }
 
-    async fn describe(&self, _bucket: &str, _key: &str) -> Result<Metadata, Error> {
-        todo!("UringStorage::describe")
+    async fn describe(&self, bucket: &str, key: &str) -> Result<Metadata, Error> {
+        validate_bucket(bucket)?;
+        validate_key(key)?;
+
+        let path = self.meta_path(bucket, key);
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let op = UringOp::Describe {
+            path,
+            bucket: bucket.to_owned(),
+            key: key.to_owned(),
+            reply: reply_tx,
+        };
+        self.pool
+            .dispatch_for_key(bucket, key)
+            .send(op)
+            .await
+            .map_err(|_| Error::InternalError {
+                bucket: bucket.to_owned(),
+                key: key.to_owned(),
+                operation: "describe".to_owned(),
+                message: "uring worker pool closed".to_owned(),
+            })?;
+        reply_rx.await.map_err(|_| Error::InternalError {
+            bucket: bucket.to_owned(),
+            key: key.to_owned(),
+            operation: "describe".to_owned(),
+            message: "uring worker dropped reply".to_owned(),
+        })?
     }
 }
 
@@ -154,5 +235,68 @@ impl StorageExt for UringStorage {
 
     async fn rebuild_progress(&self) -> Result<CacheRebuildStatus, Error> {
         todo!("UringStorage::rebuild_progress")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use tempfile::TempDir;
+
+    /// End-to-end smoke test for the worker-pool bridge:
+    /// `tokio` test runtime → `async_channel` → `tokio-uring` worker → `openat`
+    /// → `statx` → `read_exact_at` → JSON decode → `oneshot` reply → assertion.
+    /// If any layer of the bridge is broken this test fails or hangs.
+    #[tokio::test]
+    async fn describe_roundtrips_via_uring_bridge() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path().to_path_buf();
+        let index_path = base.join("idx.redb");
+        let config = UringConfig {
+            workers: 2,
+            ..UringConfig::default()
+        };
+        let storage = UringStorage::new(&base, &index_path, config).unwrap();
+
+        let bucket = "test";
+        let key = "hello/world";
+        let path = storage.meta_path(bucket, key);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let expected = Metadata {
+            created: 1,
+            modified: 2,
+            size: 42,
+            checksum_md5: "md5".to_owned(),
+            checksum_sha256: "sha".to_owned(),
+            bucket: bucket.to_owned(),
+            key: key.to_owned(),
+            disk_path: path.clone(),
+            url_path: format!("{bucket}/{key}"),
+            labels: BTreeMap::new(),
+        };
+        std::fs::write(&path, serde_json::to_vec(&expected).unwrap()).unwrap();
+
+        let got = storage.describe(bucket, key).await.unwrap();
+        assert_eq!(got.bucket, expected.bucket);
+        assert_eq!(got.key, expected.key);
+        assert_eq!(got.size, 42);
+        assert_eq!(got.created, 1);
+    }
+
+    #[tokio::test]
+    async fn describe_returns_not_found_for_missing_object() {
+        let dir = TempDir::new().unwrap();
+        let storage = UringStorage::new(
+            dir.path(),
+            dir.path().join("idx.redb"),
+            UringConfig {
+                workers: 1,
+                ..UringConfig::default()
+            },
+        )
+        .unwrap();
+        let err = storage.describe("test", "nope").await.unwrap_err();
+        assert!(matches!(err, Error::NotFound { .. }), "got {err:?}");
     }
 }
