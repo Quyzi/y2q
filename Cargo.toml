@@ -12,6 +12,7 @@ async-channel               = "2"
 base64                      = "0.22"
 crc32fast                   = "1.4"
 criterion                   = { version = "0.5", features = ["async_tokio"] }
+libc                        = "0.2"
 utoipa                      = "5"
 utoipa-swagger-ui           = { version = "9", features = ["actix-web"] }
 bytes                       = { version = "1.11.1", features = ["serde"] }

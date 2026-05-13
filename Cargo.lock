@@ -3100,6 +3100,7 @@ dependencies = [
  "base64",
  "bytes",
  "crc32fast",
+ "libc",
  "md-5",
  "pqcrypto",
  "redb",
