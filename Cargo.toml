@@ -19,7 +19,8 @@ bytes                       = { version = "1.11.1", features = ["serde"] }
 figment                     = { version = "0.10.19", features = ["toml", "env"] }
 md-5                        = "0.10"
 metrics                     = "0.24"
-metrics-exporter-prometheus = "0.18"
+metrics-exporter-prometheus = "0.17"
+metrics-rs-dashboard-actix  = "0.1"
 pqcrypto                    = { version = "0.18.1", features = ["serialization"] }
 redb                        = "4.1.0"
 serde                       = { version = "1", features = ["derive"] }

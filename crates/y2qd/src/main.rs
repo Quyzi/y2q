@@ -24,6 +24,11 @@
 //! Available at `/swagger-ui/` when the server is running.
 //! The raw OpenAPI JSON is served at `/api-docs/openapi.json`.
 //!
+//! # Metrics
+//!
+//! An interactive dashboard is served at `/metrics/dashboard`.
+//! Prometheus scrape endpoint: `/metrics/prometheus`.
+//!
 //! # Logging
 //!
 //! Set `RUST_LOG` to control verbosity, e.g. `RUST_LOG=y2qd=debug,actix_web=info`.
@@ -33,6 +38,7 @@ use std::sync::Arc;
 use actix_web::{App, HttpServer, middleware::from_fn, web};
 use clap::Parser;
 use metrics_exporter_prometheus::Matcher;
+use metrics_rs_dashboard_actix::{DashboardInput, create_metrics_actx_scope};
 use tracing_actix_web::TracingLogger;
 use tracing_subscriber::EnvFilter;
 use utoipa::OpenApi;
@@ -100,23 +106,6 @@ async fn main() -> std::io::Result<()> {
 
     tracing::info!(host = %cfg.server.host, port = cfg.server.port, "starting y2qd");
 
-    let metrics_handle = metrics_exporter_prometheus::PrometheusBuilder::new()
-        .with_recommended_naming(true)
-        .set_buckets_for_metric(
-            Matcher::Suffix(observability::PAYLOAD_METRIC_SUFFIX.to_string()),
-            observability::PAYLOAD_BUCKETS_BYTES,
-        )
-        .map_err(std::io::Error::other)?
-        .set_buckets_for_metric(
-            Matcher::Full(observability::DURATION_METRIC_NAME.to_string()),
-            observability::DURATION_BUCKETS_MILLIS,
-        )
-        .map_err(std::io::Error::other)?
-        .install_recorder()
-        .map_err(std::io::Error::other)?;
-    observability::describe_metrics();
-    let metrics_data = web::Data::new(metrics_handle);
-
     let index_path = cfg
         .storage
         .index_path
@@ -145,16 +134,41 @@ async fn main() -> std::io::Result<()> {
 
     let max_body_bytes = cfg.server.max_body_bytes;
     HttpServer::new(move || {
+        // The dashboard crate installs its own Prometheus recorder on first
+        // call (once per process via once_cell). Custom histogram buckets are
+        // threaded through DashboardInput so the recorder is configured
+        // identically across all worker threads.
+        let dashboard_input = DashboardInput {
+            buckets_for_metrics: vec![
+                (
+                    Matcher::Suffix(observability::PAYLOAD_METRIC_SUFFIX.to_string()),
+                    observability::PAYLOAD_BUCKETS_BYTES,
+                ),
+                (
+                    Matcher::Full(observability::DURATION_METRIC_NAME.to_string()),
+                    observability::DURATION_BUCKETS_MILLIS,
+                ),
+            ],
+        };
+        let dashboard_scope = create_metrics_actx_scope(&dashboard_input)
+            .expect("failed to create metrics dashboard scope");
+        // describe_* is idempotent; call it here so HELP/TYPE lines appear
+        // in the output as soon as the recorder is installed.
+        observability::describe_metrics();
+
         App::new()
             .wrap(TracingLogger::default())
             .wrap(from_fn(observability::metrics_middleware))
             .app_data(storage_data.clone())
             .app_data(label_limits.clone())
             .app_data(web::PayloadConfig::new(max_body_bytes))
-            .app_data(metrics_data.clone())
             .service(
                 SwaggerUi::new("/swagger-ui/{_:.*}").url("/api-docs/openapi.json", openapi.clone()),
             )
+            // Dashboard scope must be registered before handlers::configure,
+            // which contains the greedy /{bucket}/{tail}* pattern that would
+            // otherwise capture /metrics/dashboard.
+            .service(dashboard_scope)
             .configure(handlers::configure)
     })
     .bind((cfg.server.host.as_str(), cfg.server.port))?
