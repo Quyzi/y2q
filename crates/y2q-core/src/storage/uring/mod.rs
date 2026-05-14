@@ -15,4 +15,4 @@ mod ops;
 mod runtime;
 mod storage;
 
-pub use storage::UringStorage;
+pub use storage::{UringConfig, UringStorage};

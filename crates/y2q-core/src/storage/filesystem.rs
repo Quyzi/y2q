@@ -332,6 +332,11 @@ impl Storage for FilesystemStorage {
         Ok(Bytes::copy_from_slice(&data[start..=end]))
     }
 
+    // NOTE on durability: this backend currently performs best-effort writes
+    // regardless of `options.sync`. The metadata sidecar and object data are
+    // written via `tokio::fs::write` (which does not fsync) and the rename is
+    // atomic but unfenced. A later change may upgrade this backend to honour
+    // `SyncLevel::Durable`; the field is accepted today so the API is stable.
     async fn put(
         &self,
         bucket: &str,
@@ -341,6 +346,7 @@ impl Storage for FilesystemStorage {
     ) -> Result<bool, Error> {
         validate_bucket(bucket)?;
         validate_key(key)?;
+        let _ = &options.sync; // documented above; honoured by UringStorage
 
         let data_path = self.key_path(bucket, key);
         let meta_path = data_path.with_extension("meta");
@@ -693,7 +699,10 @@ mod tests {
         for (k, v) in labels {
             m.insert((*k).to_owned(), (*v).to_owned());
         }
-        PutOptions { labels: m }
+        PutOptions {
+            labels: m,
+            ..Default::default()
+        }
     }
 
     #[tokio::test]

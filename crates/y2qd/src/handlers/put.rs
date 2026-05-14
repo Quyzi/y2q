@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use actix_web::{HttpRequest, HttpResponse, web};
-use y2q_core::{FilesystemStorage, Object, PutOptions, Storage};
+use y2q_core::{AnyStorage, Object, PutOptions, Storage, SyncLevel};
 
 use crate::config::LabelLimits;
 use crate::error::{AppError, ErrorBody};
@@ -51,14 +51,15 @@ pub async fn handle(
     path: web::Path<(String, String)>,
     req: HttpRequest,
     body: web::Bytes,
-    storage: web::Data<Arc<FilesystemStorage>>,
+    storage: web::Data<Arc<AnyStorage>>,
     limits: web::Data<LabelLimits>,
 ) -> Result<HttpResponse, AppError> {
     let (bucket, key) = path.into_inner();
     let labels = extract_labels(&req, limits.get_ref())?;
+    let sync = parse_sync_header(&req)?;
     let payload = Object::new(body);
     let was_overwrite = storage
-        .put(&bucket, &key, payload, PutOptions { labels })
+        .put(&bucket, &key, payload, PutOptions { labels, sync })
         .await
         .map_err(AppError::from)?;
 
@@ -66,5 +67,28 @@ pub async fn handle(
         Ok(HttpResponse::Ok().finish())
     } else {
         Ok(HttpResponse::Created().finish())
+    }
+}
+
+/// Parse the optional `X-Y2Q-Sync` request header into a [`SyncLevel`].
+///
+/// Accepts `durable` (default; same as omitting the header) or `best-effort`.
+/// Any other value returns a 400 via the existing `InvalidLabelValue` shape
+/// since `sync` lives in the same header namespace as user labels.
+fn parse_sync_header(req: &HttpRequest) -> Result<SyncLevel, AppError> {
+    let Some(raw) = req.headers().get("x-y2q-sync") else {
+        return Ok(SyncLevel::default());
+    };
+    let value = raw.to_str().map_err(|_| {
+        AppError(y2q_core::Error::InvalidLabelValue {
+            name: "sync".to_owned(),
+        })
+    })?;
+    match value.trim().to_ascii_lowercase().as_str() {
+        "durable" => Ok(SyncLevel::Durable),
+        "best-effort" | "besteffort" => Ok(SyncLevel::BestEffort),
+        _ => Err(AppError(y2q_core::Error::InvalidLabelValue {
+            name: "sync".to_owned(),
+        })),
     }
 }

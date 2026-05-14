@@ -5,7 +5,7 @@ use std::sync::Arc;
 use actix_web::{HttpResponse, web};
 use serde::Serialize;
 use utoipa::ToSchema;
-use y2q_core::{FilesystemStorage, Listing};
+use y2q_core::{AnyStorage, Listing};
 
 use crate::error::{AppError, ErrorBody};
 
@@ -27,7 +27,7 @@ pub struct ListBucketsResponse {
     ),
     tag = "listing",
 )]
-pub async fn handle(storage: web::Data<Arc<FilesystemStorage>>) -> Result<HttpResponse, AppError> {
+pub async fn handle(storage: web::Data<Arc<AnyStorage>>) -> Result<HttpResponse, AppError> {
     let buckets = storage.list_buckets().await.map_err(AppError::from)?;
     Ok(HttpResponse::Ok().json(ListBucketsResponse { buckets }))
 }

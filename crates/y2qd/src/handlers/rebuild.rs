@@ -10,7 +10,7 @@ use std::sync::Arc;
 use actix_web::{HttpResponse, web};
 use serde::Serialize;
 use utoipa::ToSchema;
-use y2q_core::{CacheRebuildStatus, FilesystemStorage, StorageExt};
+use y2q_core::{CacheRebuildStatus, AnyStorage, StorageExt};
 
 use crate::error::{AppError, ErrorBody};
 
@@ -78,7 +78,7 @@ pub struct RebuildStartResponse {
     ),
     tag = "admin",
 )]
-pub async fn start(storage: web::Data<Arc<FilesystemStorage>>) -> Result<HttpResponse, AppError> {
+pub async fn start(storage: web::Data<Arc<AnyStorage>>) -> Result<HttpResponse, AppError> {
     storage.rebuild_cache().await.map_err(AppError::from)?;
     Ok(HttpResponse::Accepted().json(RebuildStartResponse { status: "running" }))
 }
@@ -94,7 +94,7 @@ pub async fn start(storage: web::Data<Arc<FilesystemStorage>>) -> Result<HttpRes
     ),
     tag = "admin",
 )]
-pub async fn status(storage: web::Data<Arc<FilesystemStorage>>) -> Result<HttpResponse, AppError> {
+pub async fn status(storage: web::Data<Arc<AnyStorage>>) -> Result<HttpResponse, AppError> {
     let s = storage.rebuild_progress().await.map_err(AppError::from)?;
     Ok(HttpResponse::Ok().json(RebuildStatusResponse::from(s)))
 }

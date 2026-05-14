@@ -12,7 +12,13 @@ use crate::config::LabelLimits;
 use crate::error::AppError;
 
 const HEADER_PREFIX: &str = "x-y2q-";
+/// Server-emitted metadata header names that clients may not supply on PUT.
+/// Used by HEAD to surface object state; sending these on a PUT yields 400.
 const RESERVED: &[&str] = &["created", "modified", "checksum-md5", "checksum-sha256"];
+/// Header names in the `X-Y2Q-` namespace that are consumed by dedicated
+/// handler logic and must not be persisted as user labels. The extractor
+/// silently skips them — the relevant handler parses them separately.
+const CONSUMED_BY_HANDLER: &[&str] = &["sync"];
 
 /// Extract custom labels from `X-Y2Q-<name>` request headers.
 ///
@@ -36,6 +42,12 @@ pub fn extract_labels(
             continue;
         };
         if label.is_empty() {
+            continue;
+        }
+        if CONSUMED_BY_HANDLER.contains(&label) {
+            // Skip silently — the put handler parses these separately. A
+            // value-level error (e.g. malformed `X-Y2Q-Sync`) is surfaced
+            // there, not here.
             continue;
         }
         if RESERVED.contains(&label) {
@@ -97,6 +109,19 @@ mod tests {
             .to_http_request();
         let labels = extract_labels(&req, &limits()).unwrap();
         assert!(labels.is_empty());
+    }
+
+    #[test]
+    fn skips_handler_consumed_sync_header() {
+        // X-Y2Q-Sync is consumed by the put handler, not stored as a label.
+        // The extractor must silently drop it (not error, not persist).
+        let req = TestRequest::default()
+            .insert_header(("X-Y2Q-Sync", "best-effort"))
+            .insert_header(("X-Y2Q-env", "prod"))
+            .to_http_request();
+        let labels = extract_labels(&req, &limits()).unwrap();
+        assert!(!labels.contains_key("sync"));
+        assert_eq!(labels.get("env").map(String::as_str), Some("prod"));
     }
 
     #[test]

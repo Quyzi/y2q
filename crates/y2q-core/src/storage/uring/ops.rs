@@ -25,7 +25,7 @@ use sha2::Digest;
 use tokio::sync::oneshot;
 use tokio_uring::fs::{File, OpenOptions};
 
-use crate::{Error, Metadata, Object};
+use crate::{Error, Metadata, Object, SyncLevel};
 
 use super::{
     buffer::{AlignedBuf, DIRECT_IO_ALIGN, DIRECT_IO_CHUNK},
@@ -51,7 +51,7 @@ pub(super) enum UringOp {
         range: RangeInclusive<u64>,
         reply: oneshot::Sender<Result<Bytes, Error>>,
     },
-    /// Write a new object durably using the temp-file + atomic-rename pattern.
+    /// Write a new object using the temp-file + atomic-rename pattern.
     Put {
         obj_path: PathBuf,
         tmp_path: PathBuf,
@@ -64,6 +64,8 @@ pub(super) enum UringOp {
         /// Threshold at or above which the worker uses the `O_DIRECT` path.
         /// `0` disables the threshold (always buffered).
         large_object_bytes: u64,
+        /// Whether to fdatasync + fsync the parent dir before returning.
+        sync: SyncLevel,
         reply: oneshot::Sender<Result<(bool, Metadata), Error>>,
     },
     /// Read the object, then unlink it. Returns the deleted bytes.
@@ -129,6 +131,7 @@ pub(super) async fn handle(op: UringOp) {
             payload,
             labels,
             large_object_bytes,
+            sync,
             reply,
         } => {
             let _ = reply.send(
@@ -142,6 +145,7 @@ pub(super) async fn handle(op: UringOp) {
                     payload,
                     labels,
                     large_object_bytes,
+                    sync,
                 )
                 .await,
             );
@@ -445,6 +449,7 @@ async fn do_put(
     payload: Bytes,
     labels: BTreeMap<String, String>,
     large_object_bytes: u64,
+    sync: SyncLevel,
 ) -> Result<(bool, Metadata), Error> {
     if let Some(parent) = obj_path.parent() {
         std::fs::create_dir_all(parent)
@@ -499,7 +504,9 @@ async fn do_put(
 
     let use_direct = large_object_bytes > 0 && payload.len() as u64 >= large_object_bytes;
     if use_direct {
-        match put_via_direct(&obj_path, &tmp_path, &bucket, &key, &payload, &meta_bytes).await {
+        match put_via_direct(&obj_path, &tmp_path, &bucket, &key, &payload, &meta_bytes, sync)
+            .await
+        {
             Ok(true) => return Ok((is_overwrite, metadata)),
             Ok(false) => {
                 tracing::warn!(
@@ -515,12 +522,12 @@ async fn do_put(
         metadata.labels.insert("y2q.direct_io".to_owned(), "fallback".to_owned());
     }
 
-    put_via_buffered(&obj_path, &tmp_path, &bucket, &key, &payload, &meta_bytes).await?;
+    put_via_buffered(&obj_path, &tmp_path, &bucket, &key, &payload, &meta_bytes, sync).await?;
     Ok((is_overwrite, metadata))
 }
 
-/// Buffered write path: one fd, four positioned writes, fdatasync, rename,
-/// dir-fsync. Uses [`Header::MIN_DATA_OFFSET`], no padding.
+/// Buffered write path: one fd, four positioned writes, optional fdatasync,
+/// rename, optional dir-fsync. Uses [`Header::MIN_DATA_OFFSET`], no padding.
 async fn put_via_buffered(
     obj_path: &Path,
     tmp_path: &Path,
@@ -528,12 +535,17 @@ async fn put_via_buffered(
     key: &str,
     payload: &Bytes,
     meta_bytes: &[u8],
+    sync: SyncLevel,
 ) -> Result<(), Error> {
+    let mut header_flags = 0u16;
+    if sync == SyncLevel::Durable {
+        header_flags |= format::flags::DURABLE;
+    }
     let header = Header {
         data_len: payload.len() as u64,
         meta_len: meta_bytes.len() as u32,
         data_offset: Header::MIN_DATA_OFFSET,
-        flags: format::flags::DURABLE,
+        flags: header_flags,
         version: format::VERSION,
     };
     let header_bytes = header.encode().to_vec();
@@ -562,12 +574,14 @@ async fn put_via_buffered(
         .await;
     res.map_err(|e| internal(bucket, key, "put", format!("write trailer: {e}")))?;
 
-    tmp.sync_data()
-        .await
-        .map_err(|e| internal(bucket, key, "put", format!("fdatasync: {e}")))?;
+    if sync == SyncLevel::Durable {
+        tmp.sync_data()
+            .await
+            .map_err(|e| internal(bucket, key, "put", format!("fdatasync: {e}")))?;
+    }
     let _ = tmp.close().await;
 
-    finalize_rename_and_dir_fsync(tmp_path, obj_path, bucket, key).await
+    finalize_rename_and_dir_fsync(tmp_path, obj_path, bucket, key, sync).await
 }
 
 /// `O_DIRECT` write path:
@@ -589,6 +603,7 @@ async fn put_via_direct(
     key: &str,
     payload: &Bytes,
     meta_bytes: &[u8],
+    sync: SyncLevel,
 ) -> Result<bool, Error> {
     // Try the O_DIRECT open first so the EINVAL case has zero cleanup. If
     // it succeeds it has also created and truncated the tmp file, so the
@@ -615,11 +630,15 @@ async fn put_via_direct(
     };
 
     let data_offset = format::MIN_DIRECT_DATA_OFFSET;
+    let mut header_flags = format::flags::WRITTEN_O_DIRECT;
+    if sync == SyncLevel::Durable {
+        header_flags |= format::flags::DURABLE;
+    }
     let header = Header {
         data_len: payload.len() as u64,
         meta_len: meta_bytes.len() as u32,
         data_offset,
-        flags: format::flags::DURABLE | format::flags::WRITTEN_O_DIRECT,
+        flags: header_flags,
         version: format::VERSION,
     };
     let header_bytes = header.encode().to_vec();
@@ -687,17 +706,19 @@ async fn put_via_direct(
         return Err(internal(bucket, key, "put", format!("write trailer: {e}")));
     }
 
-    // Single fdatasync — both fds point at the same inode, so this flushes
-    // the data and size metadata for everything written via either fd plus
-    // any in-flight O_DIRECT submissions.
-    if let Err(e) = fd_buffered.sync_data().await {
+    // Single fdatasync (when Durable) — both fds point at the same inode,
+    // so this flushes the data and size metadata for everything written via
+    // either fd plus any in-flight O_DIRECT submissions.
+    if sync == SyncLevel::Durable
+        && let Err(e) = fd_buffered.sync_data().await
+    {
         cleanup_direct_failure(fd_direct, fd_buffered, tmp_path).await;
         return Err(internal(bucket, key, "put", format!("fdatasync: {e}")));
     }
     let _ = fd_direct.close().await;
     let _ = fd_buffered.close().await;
 
-    finalize_rename_and_dir_fsync(tmp_path, obj_path, bucket, key).await?;
+    finalize_rename_and_dir_fsync(tmp_path, obj_path, bucket, key, sync).await?;
     Ok(true)
 }
 
@@ -709,8 +730,9 @@ async fn cleanup_direct_failure(fd_direct: File, fd_buffered: File, tmp_path: &P
     let _ = tokio_uring::fs::remove_file(tmp_path).await;
 }
 
-/// Atomically replace the destination object with the tmp file, then fsync
-/// the parent directory so the dirent change is durable.
+/// Atomically replace the destination object with the tmp file, then —
+/// when [`SyncLevel::Durable`] — fsync the parent directory so the dirent
+/// change survives a power loss.
 ///
 /// tokio-uring can open directories but doesn't expose a directory-only
 /// sync method, so we use a synchronous `fsync` on a freshly opened
@@ -720,12 +742,14 @@ async fn finalize_rename_and_dir_fsync(
     obj_path: &Path,
     bucket: &str,
     key: &str,
+    sync: SyncLevel,
 ) -> Result<(), Error> {
     tokio_uring::fs::rename(tmp_path, obj_path)
         .await
         .map_err(|e| internal(bucket, key, "put", format!("rename: {e}")))?;
 
-    if let Some(parent) = obj_path.parent()
+    if sync == SyncLevel::Durable
+        && let Some(parent) = obj_path.parent()
         && let Ok(dir) = std::fs::File::open(parent)
     {
         let _ = dir.sync_all();
