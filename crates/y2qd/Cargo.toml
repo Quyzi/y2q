@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 y2q-core                    = { path = "../y2q-core" }
+clap                        = { workspace = true }
 actix-web                   = { workspace = true }
 metrics                     = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
