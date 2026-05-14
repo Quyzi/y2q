@@ -4,9 +4,11 @@
 //! environment variables (highest), so any field can be overridden at runtime
 //! without editing the file.
 
+use std::path::Path;
+
 use figment::{
     Figment,
-    providers::{Env, Format, Toml},
+    providers::{Env, Format, Serialized, Toml},
 };
 use serde::Deserialize;
 
@@ -112,21 +114,69 @@ impl From<&StorageConfig> for LabelLimits {
 }
 
 impl Config {
-    /// Load configuration from `config.toml` in the current directory,
-    /// with `Y2QD_*` environment variable overrides.
+    /// Load configuration from the TOML file named by `--config` (default: `config.toml`),
+    /// then layer `Y2QD_*` environment variables, then any `--set KEY=VALUE` overrides
+    /// (highest priority).
     ///
-    /// Nested keys use `__` as the separator, e.g. `Y2QD_SERVER__HOST`
-    /// overrides `server.host`.
+    /// Nested keys in `--set` use `.` as the separator, e.g. `server.port=9090`.
+    /// Environment variable keys use `__`, e.g. `Y2QD_SERVER__HOST`.
     ///
     /// # Errors
     ///
     /// Returns a [`figment::Error`] if required keys are missing or a value
     /// cannot be parsed into the expected type.
-    pub fn load() -> Result<Self, Box<figment::Error>> {
-        Figment::new()
-            .merge(Toml::file("config.toml"))
-            .merge(Env::prefixed("Y2QD_").split("__"))
-            .extract()
-            .map_err(Box::new)
+    pub fn load(cli: &crate::cli::Cli) -> Result<Self, Box<figment::Error>> {
+        let config_path = cli
+            .config
+            .as_deref()
+            .unwrap_or_else(|| Path::new("config.toml"));
+
+        let mut figment = Figment::new()
+            .merge(Toml::file(config_path))
+            .merge(Env::prefixed("Y2QD_").split("__"));
+
+        for (key, val) in &cli.overrides {
+            let parts: Vec<&str> = key.split('.').collect();
+            let json_val = coerce_cli_value(val);
+            let mut map = serde_json::Map::new();
+            insert_nested(&mut map, &parts, json_val);
+            figment =
+                figment.merge(Serialized::globals(serde_json::Value::Object(map)));
+        }
+
+        figment.extract().map_err(Box::new)
+    }
+}
+
+/// Parse a CLI string value as an integer, boolean, or string in that order.
+fn coerce_cli_value(s: &str) -> serde_json::Value {
+    if let Ok(n) = s.parse::<i64>() {
+        return serde_json::Value::Number(n.into());
+    }
+    match s {
+        "true" => return serde_json::Value::Bool(true),
+        "false" => return serde_json::Value::Bool(false),
+        _ => {}
+    }
+    serde_json::Value::String(s.to_string())
+}
+
+fn insert_nested(
+    map: &mut serde_json::Map<String, serde_json::Value>,
+    keys: &[&str],
+    value: serde_json::Value,
+) {
+    if keys.is_empty() {
+        return;
+    }
+    if keys.len() == 1 {
+        map.insert(keys[0].to_string(), value);
+        return;
+    }
+    let entry = map
+        .entry(keys[0].to_string())
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    if let serde_json::Value::Object(nested) = entry {
+        insert_nested(nested, &keys[1..], value);
     }
 }

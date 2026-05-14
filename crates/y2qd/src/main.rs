@@ -31,6 +31,7 @@
 use std::sync::Arc;
 
 use actix_web::{App, HttpServer, middleware::from_fn, web};
+use clap::Parser;
 use metrics_exporter_prometheus::Matcher;
 use tracing_actix_web::TracingLogger;
 use tracing_subscriber::EnvFilter;
@@ -41,6 +42,7 @@ use y2q_core::{AnyStorage, FilesystemStorage};
 #[cfg(all(target_os = "linux", feature = "uring"))]
 use y2q_core::{UringStorage, storage::uring::UringConfig};
 
+mod cli;
 mod config;
 mod error;
 mod handlers;
@@ -85,14 +87,16 @@ struct ApiDoc;
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
+    let cli = cli::Cli::parse();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
 
-    let cfg =
-        config::Config::load().expect("failed to load config (config.toml or Y2QD_* env vars)");
+    let cfg = config::Config::load(&cli)
+        .expect("failed to load config (config.toml, Y2QD_* env vars, or --set)");
 
     tracing::info!(host = %cfg.server.host, port = cfg.server.port, "starting y2qd");
 
