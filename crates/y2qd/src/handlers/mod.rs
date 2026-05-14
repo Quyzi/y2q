@@ -4,6 +4,8 @@
 //! first path segment and `tail` captures everything after it, including any
 //! embedded `/` characters. Listing routes (`/` and `/{bucket}/`) are
 //! registered first so the greedy tail pattern does not shadow them.
+//! Admin routes live under `/api/v1/` and are also registered before the
+//! greedy tail pattern.
 
 use actix_web::web;
 
@@ -27,12 +29,12 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
     cfg.service(web::resource("/").route(web::get().to(list_buckets::handle)));
     cfg.service(web::resource("/{bucket}/").route(web::get().to(list_objects::handle)));
     cfg.service(
-        web::resource("/_admin/rebuild")
+        web::resource("/api/v1/rebuild")
             .route(web::post().to(rebuild::start))
             .route(web::get().to(rebuild::status)),
     );
     cfg.service(
-        web::resource("/_admin/locks")
+        web::resource("/api/v1/locks")
             .route(web::get().to(locks::list))
             .route(web::delete().to(locks::clear)),
     );

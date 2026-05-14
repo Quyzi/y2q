@@ -112,10 +112,14 @@ impl FilesystemStorage {
 
 /// Validate that `bucket` is a safe directory name.
 ///
+/// Reserved bucket names that conflict with the `/api/v1/*` admin namespace.
+const RESERVED_BUCKETS: &[&str] = &["api"];
+
 /// Buckets must be non-empty and contain only alphanumeric characters, `-`, or
 /// `_`. Path separators and `..` components are rejected to prevent escaping
-/// the storage root.
+/// the storage root. Names in `RESERVED_BUCKETS` are rejected case-insensitively.
 fn validate_bucket(bucket: &str) -> Result<(), Error> {
+    let lower = bucket.to_ascii_lowercase();
     if bucket.is_empty()
         || bucket.contains('/')
         || bucket.contains('\\')
@@ -123,6 +127,7 @@ fn validate_bucket(bucket: &str) -> Result<(), Error> {
         || !bucket
             .chars()
             .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+        || RESERVED_BUCKETS.contains(&lower.as_str())
     {
         return Err(Error::InvalidBucket {
             bucket: bucket.to_owned(),
