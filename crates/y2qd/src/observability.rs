@@ -89,7 +89,7 @@ pub fn describe_metrics() {
 }
 
 /// Matcher suffix used to apply [`PAYLOAD_BUCKETS_BYTES`] to both payload
-/// histograms via `PrometheusBuilder::set_buckets_for_metric`.
+/// histograms via [`DashboardInput`].
 pub const PAYLOAD_METRIC_SUFFIX: &str = "_payload_bytes";
 
 /// Actix-web middleware that records request and response counters plus
