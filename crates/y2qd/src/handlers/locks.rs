@@ -1,4 +1,4 @@
-//! `GET /_admin/locks` and `DELETE /_admin/locks` — find and clear stale
+//! `GET /api/v1/locks` and `DELETE /api/v1/locks` — find and clear stale
 //! `.lock` sidecar files left behind by abruptly-killed PUTs.
 //!
 //! Both endpoints require an `older_than` query parameter. Accepted forms:
@@ -12,7 +12,7 @@
 //!
 //! Cleaning a stale lock does not touch the metadata index. If the
 //! partial PUT also corrupted the object file, run
-//! `POST /_admin/rebuild` afterward.
+//! `POST /api/v1/rebuild` afterward.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -24,7 +24,7 @@ use y2q_core::{AnyStorage, Error as CoreError, StaleLock, StorageExt};
 
 use crate::error::{AppError, ErrorBody};
 
-/// Query parameters for `GET` and `DELETE` on `/_admin/locks`.
+/// Query parameters for `GET` and `DELETE` on `/api/v1/locks`.
 #[derive(Debug, Deserialize, IntoParams)]
 pub struct LocksQuery {
     /// Required cutoff: either a relative duration (`1h`, `30m`, `45s`,
@@ -32,7 +32,7 @@ pub struct LocksQuery {
     pub older_than: String,
 }
 
-/// One stale lock returned by `GET /_admin/locks`.
+/// One stale lock returned by `GET /api/v1/locks`.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct StaleLockEntry {
     /// Bucket directory the lock lives under.
@@ -47,7 +47,7 @@ pub struct StaleLockEntry {
     pub age_seconds: u64,
 }
 
-/// JSON body returned by `DELETE /_admin/locks`.
+/// JSON body returned by `DELETE /api/v1/locks`.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ClearStaleLocksResponse {
     /// Number of `.lock` files successfully unlinked.
@@ -58,7 +58,7 @@ pub struct ClearStaleLocksResponse {
 #[utoipa::path(
     get,
     operation_id = "list_stale_locks",
-    path = "/_admin/locks",
+    path = "/api/v1/locks",
     params(LocksQuery),
     responses(
         (status = 200, description = "Stale locks (dry-run)", body = [StaleLockEntry], content_type = "application/json"),
@@ -82,7 +82,7 @@ pub async fn list(
 #[utoipa::path(
     delete,
     operation_id = "clear_stale_locks",
-    path = "/_admin/locks",
+    path = "/api/v1/locks",
     params(LocksQuery),
     responses(
         (status = 200, description = "Stale locks cleared", body = ClearStaleLocksResponse, content_type = "application/json"),

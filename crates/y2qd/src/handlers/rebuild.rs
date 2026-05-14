@@ -1,4 +1,4 @@
-//! `POST /_admin/rebuild` and `GET /_admin/rebuild` — kick off and poll a
+//! `POST /api/v1/rebuild` and `GET /api/v1/rebuild` — kick off and poll a
 //! secondary-index rebuild.
 //!
 //! Rebuild is fire-and-forget. `POST` returns 202 once the background task is
@@ -14,7 +14,7 @@ use y2q_core::{CacheRebuildStatus, AnyStorage, StorageExt};
 
 use crate::error::{AppError, ErrorBody};
 
-/// JSON body for `GET /_admin/rebuild`.
+/// JSON body for `GET /api/v1/rebuild`.
 ///
 /// `state` is one of `idle`, `running`, `completed`, or `failed`. `percent` is
 /// present when `state == "running"`. `reason` is present when
@@ -58,7 +58,7 @@ impl From<CacheRebuildStatus> for RebuildStatusResponse {
     }
 }
 
-/// Body returned by `POST /_admin/rebuild` when a rebuild is successfully
+/// Body returned by `POST /api/v1/rebuild` when a rebuild is successfully
 /// kicked off.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct RebuildStartResponse {
@@ -70,7 +70,7 @@ pub struct RebuildStartResponse {
 #[utoipa::path(
     post,
     operation_id = "start_rebuild",
-    path = "/_admin/rebuild",
+    path = "/api/v1/rebuild",
     responses(
         (status = 202, description = "Rebuild started", body = RebuildStartResponse, content_type = "application/json"),
         (status = 409, description = "Rebuild already in progress", body = ErrorBody, content_type = "application/json"),
@@ -87,7 +87,7 @@ pub async fn start(storage: web::Data<Arc<AnyStorage>>) -> Result<HttpResponse, 
 #[utoipa::path(
     get,
     operation_id = "rebuild_status",
-    path = "/_admin/rebuild",
+    path = "/api/v1/rebuild",
     responses(
         (status = 200, description = "Current rebuild state", body = RebuildStatusResponse, content_type = "application/json"),
         (status = 500, description = "Internal error", body = ErrorBody, content_type = "application/json"),
