@@ -62,6 +62,8 @@ pub(crate) mod observability;
         handlers::list_objects::handle,
         handlers::rebuild::start,
         handlers::rebuild::status,
+        handlers::locks::list,
+        handlers::locks::clear,
     ),
     components(schemas(
         error::ErrorBody,
@@ -70,11 +72,13 @@ pub(crate) mod observability;
         handlers::list_objects::MetadataView,
         handlers::rebuild::RebuildStartResponse,
         handlers::rebuild::RebuildStatusResponse,
+        handlers::locks::StaleLockEntry,
+        handlers::locks::ClearStaleLocksResponse,
     )),
     tags(
         (name = "objects", description = "Object storage — read, write, and delete objects addressed by bucket/key"),
         (name = "listing", description = "Enumerate buckets and the objects within them"),
-        (name = "admin", description = "Administrative operations — secondary-index rebuild"),
+        (name = "admin", description = "Administrative operations — secondary-index rebuild, stale-lock cleanup"),
     ),
 )]
 struct ApiDoc;

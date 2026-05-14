@@ -13,6 +13,7 @@ pub(crate) mod head;
 pub(crate) mod labels;
 pub(crate) mod list_buckets;
 pub(crate) mod list_objects;
+pub(crate) mod locks;
 pub(crate) mod metrics;
 pub(crate) mod put;
 pub(crate) mod rebuild;
@@ -29,6 +30,11 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         web::resource("/_admin/rebuild")
             .route(web::post().to(rebuild::start))
             .route(web::get().to(rebuild::status)),
+    );
+    cfg.service(
+        web::resource("/_admin/locks")
+            .route(web::get().to(locks::list))
+            .route(web::delete().to(locks::clear)),
     );
 
     cfg.service(
