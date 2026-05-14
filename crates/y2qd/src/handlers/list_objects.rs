@@ -7,7 +7,7 @@ use std::sync::Arc;
 use actix_web::{HttpResponse, web};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
-use y2q_core::{FilesystemStorage, ListOptions, Listing, MAX_LIST_LIMIT, Metadata};
+use y2q_core::{AnyStorage, ListOptions, Listing, MAX_LIST_LIMIT, Metadata};
 
 use crate::error::{AppError, ErrorBody};
 
@@ -103,7 +103,7 @@ pub struct ListObjectsResponse {
 pub async fn handle(
     path: web::Path<String>,
     query: web::Query<ListQuery>,
-    storage: web::Data<Arc<FilesystemStorage>>,
+    storage: web::Data<Arc<AnyStorage>>,
 ) -> Result<HttpResponse, AppError> {
     let bucket = path.into_inner();
     let q = query.into_inner();

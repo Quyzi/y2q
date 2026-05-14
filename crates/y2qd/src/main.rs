@@ -36,7 +36,10 @@ use tracing_actix_web::TracingLogger;
 use tracing_subscriber::EnvFilter;
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
-use y2q_core::FilesystemStorage;
+use y2q_core::{AnyStorage, FilesystemStorage};
+
+#[cfg(all(target_os = "linux", feature = "uring"))]
+use y2q_core::{UringStorage, storage::uring::UringConfig};
 
 mod config;
 mod error;
@@ -111,21 +114,23 @@ async fn main() -> std::io::Result<()> {
         .index_path
         .clone()
         .unwrap_or_else(|| format!("{}/_y2q_index.redb", cfg.storage.base_path));
-    let storage = match cfg.storage.backend {
-        config::StorageBackend::Filesystem => Arc::new(
+    let storage: Arc<AnyStorage> = Arc::new(match cfg.storage.backend {
+        config::StorageBackend::Filesystem => AnyStorage::Filesystem(
             FilesystemStorage::new(&cfg.storage.base_path, &index_path)
                 .map_err(|e| std::io::Error::other(format!("storage init: {e}")))?,
         ),
+        #[cfg(all(target_os = "linux", feature = "uring"))]
+        config::StorageBackend::Uring => AnyStorage::Uring(
+            UringStorage::new(&cfg.storage.base_path, &index_path, UringConfig::default())
+                .map_err(|e| std::io::Error::other(format!("storage init: {e}")))?,
+        ),
+        #[cfg(not(all(target_os = "linux", feature = "uring")))]
         config::StorageBackend::Uring => {
-            // The uring backend is currently a stub. Once its trait impls
-            // are real, this branch will construct a `UringStorage` and the
-            // handlers will be made generic over `Storage + Listing + StorageExt`.
             return Err(std::io::Error::other(
-                "storage backend `uring` is not yet implemented; \
-                 set storage.backend = \"filesystem\" or unset it",
+                "storage.backend = \"uring\" requires building with --features y2q-core/uring on Linux",
             ));
         }
-    };
+    });
     let storage_data = web::Data::new(storage);
     let label_limits = web::Data::new(config::LabelLimits::from(&cfg.storage));
     let openapi = ApiDoc::openapi();

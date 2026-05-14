@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, ops::Deref, path::PathBuf, time::SystemTime};
 
 pub mod storage;
+pub use storage::any::AnyStorage;
 pub use storage::filesystem::FilesystemStorage;
 pub use storage::index::MetadataIndex;
 
@@ -67,6 +68,30 @@ pub struct Metadata {
     pub labels: BTreeMap<String, String>,
 }
 
+/// Durability guarantee a PUT should provide before returning success.
+///
+/// Default is [`SyncLevel::Durable`]: every successful PUT must survive a
+/// power loss. Callers willing to trade durability for throughput can pass
+/// [`SyncLevel::BestEffort`] per request.
+///
+/// Backend support:
+/// - [`UringStorage`](crate::storage::uring::UringStorage) (Linux): honoured.
+///   `Durable` issues `fdatasync` on the object file plus `fsync` on the
+///   parent directory after `rename`; `BestEffort` skips both.
+/// - [`FilesystemStorage`]: currently best-effort regardless of this field.
+///   The field is informational on that backend; it may be honoured in a
+///   later change without affecting callers.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SyncLevel {
+    /// `fdatasync` on the object file + parent directory `fsync` before
+    /// returning. Crash-safe — the object is on stable storage.
+    #[default]
+    Durable,
+    /// No fsync. The kernel will flush eventually; an unclean shutdown can
+    /// lose a recently-PUT object even though the API returned success.
+    BestEffort,
+}
+
 /// Options passed to [`Storage::put`].
 ///
 /// Extensible: future fields (content-type, TTL, preconditions) can be added
@@ -75,6 +100,8 @@ pub struct Metadata {
 pub struct PutOptions {
     /// User-supplied labels to attach to the object.
     pub labels: BTreeMap<String, String>,
+    /// Durability guarantee required before the PUT returns success.
+    pub sync: SyncLevel,
 }
 
 /// Default page size when [`ListOptions::limit`] is `None` or `Some(0)`.

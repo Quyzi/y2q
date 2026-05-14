@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use actix_web::http::header;
 use actix_web::{HttpRequest, HttpResponse, web};
-use y2q_core::{FilesystemStorage, Storage};
+use y2q_core::{AnyStorage, Storage};
 
 use crate::error::{AppError, ErrorBody};
 
@@ -39,7 +39,7 @@ use crate::error::{AppError, ErrorBody};
 pub async fn handle(
     path: web::Path<(String, String)>,
     req: HttpRequest,
-    storage: web::Data<Arc<FilesystemStorage>>,
+    storage: web::Data<Arc<AnyStorage>>,
 ) -> Result<HttpResponse, AppError> {
     let (bucket, key) = path.into_inner();
 

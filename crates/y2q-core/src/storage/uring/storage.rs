@@ -252,6 +252,7 @@ impl Storage for UringStorage {
             payload: payload.into_inner(),
             labels: options.labels,
             large_object_bytes: self.config.large_object_bytes,
+            sync: options.sync,
             reply,
         };
         let (is_overwrite, metadata) = self.dispatch(op, bucket, key, "put", reply_rx).await?;
@@ -603,7 +604,15 @@ mod tests {
         let mut labels = BTreeMap::new();
         labels.insert("env".to_owned(), "prod".to_owned());
         storage
-            .put("b", "k", payload(&body), PutOptions { labels })
+            .put(
+                "b",
+                "k",
+                payload(&body),
+                PutOptions {
+                    labels,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         let meta = storage.describe("b", "k").await.unwrap();
