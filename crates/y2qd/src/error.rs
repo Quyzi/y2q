@@ -25,11 +25,12 @@ pub struct ErrorBody {
 /// | `InvalidLabelValue`     | 400         |
 /// | `LabelNameTooLong`      | 400         |
 /// | `LabelValueTooLong`     | 400         |
-/// | `TooManyLabels`         | 400         |
-/// | `Locked`                | 409         |
-/// | `RebuildAlreadyRunning` | 409         |
-/// | `Index`                 | 500         |
-/// | `InternalError`         | 500         |
+/// | `TooManyLabels`             | 400         |
+/// | `InvalidStaleLockThreshold` | 400         |
+/// | `Locked`                    | 409         |
+/// | `RebuildAlreadyRunning`     | 409         |
+/// | `Index`                     | 500         |
+/// | `InternalError`             | 500         |
 #[derive(Debug)]
 pub struct AppError(pub CoreError);
 
@@ -55,7 +56,8 @@ impl ResponseError for AppError {
             | CoreError::InvalidLabelValue { .. }
             | CoreError::LabelNameTooLong { .. }
             | CoreError::LabelValueTooLong { .. }
-            | CoreError::TooManyLabels { .. } => StatusCode::BAD_REQUEST,
+            | CoreError::TooManyLabels { .. }
+            | CoreError::InvalidStaleLockThreshold { .. } => StatusCode::BAD_REQUEST,
             CoreError::Locked { .. } | CoreError::RebuildAlreadyRunning => StatusCode::CONFLICT,
             CoreError::Index { .. } | CoreError::InternalError { .. } => {
                 StatusCode::INTERNAL_SERVER_ERROR

@@ -14,9 +14,12 @@ use std::{
 use bytes::Bytes;
 use uuid::Uuid;
 
+use std::time::SystemTime;
+
 use crate::{
     CacheRebuildStatus, DEFAULT_LIST_LIMIT, Error, ListOptions, ListPage, Listing, MAX_LIST_LIMIT,
-    Metadata, MetadataIndex, Object, PutOptions, Storage, StorageExt,
+    Metadata, MetadataIndex, Object, PutOptions, StaleLock, Storage, StorageExt,
+    storage::locks::{clear_stale_locks_under, list_stale_locks_under},
 };
 
 use super::{ops::UringOp, runtime::WorkerPool};
@@ -375,6 +378,28 @@ impl StorageExt for UringStorage {
 
     async fn rebuild_progress(&self) -> Result<CacheRebuildStatus, Error> {
         Ok(self.rebuild_state.lock().await.clone())
+    }
+
+    async fn list_stale_locks(&self, older_than: SystemTime) -> Result<Vec<StaleLock>, Error> {
+        list_stale_locks_under(&self.base_path, older_than)
+            .await
+            .map_err(|e| Error::InternalError {
+                bucket: String::new(),
+                key: String::new(),
+                operation: "list_stale_locks".to_owned(),
+                message: e.to_string(),
+            })
+    }
+
+    async fn clear_stale_locks(&self, older_than: SystemTime) -> Result<u64, Error> {
+        clear_stale_locks_under(&self.base_path, older_than)
+            .await
+            .map_err(|e| Error::InternalError {
+                bucket: String::new(),
+                key: String::new(),
+                operation: "clear_stale_locks".to_owned(),
+                message: e.to_string(),
+            })
     }
 }
 

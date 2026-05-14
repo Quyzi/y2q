@@ -7,12 +7,13 @@
 //! and pass it to handlers as `web::Data<Arc<AnyStorage>>`.
 
 use core::range::RangeInclusive;
+use std::time::SystemTime;
 
 use bytes::Bytes;
 
 use crate::{
     CacheRebuildStatus, Error, FilesystemStorage, ListOptions, ListPage, Listing, Metadata,
-    Object, PutOptions, Storage, StorageExt,
+    Object, PutOptions, StaleLock, Storage, StorageExt,
 };
 
 #[cfg(all(target_os = "linux", feature = "uring"))]
@@ -116,6 +117,22 @@ impl StorageExt for AnyStorage {
             Self::Filesystem(s) => s.rebuild_progress().await,
             #[cfg(all(target_os = "linux", feature = "uring"))]
             Self::Uring(s) => s.rebuild_progress().await,
+        }
+    }
+
+    async fn list_stale_locks(&self, older_than: SystemTime) -> Result<Vec<StaleLock>, Error> {
+        match self {
+            Self::Filesystem(s) => s.list_stale_locks(older_than).await,
+            #[cfg(all(target_os = "linux", feature = "uring"))]
+            Self::Uring(s) => s.list_stale_locks(older_than).await,
+        }
+    }
+
+    async fn clear_stale_locks(&self, older_than: SystemTime) -> Result<u64, Error> {
+        match self {
+            Self::Filesystem(s) => s.clear_stale_locks(older_than).await,
+            #[cfg(all(target_os = "linux", feature = "uring"))]
+            Self::Uring(s) => s.clear_stale_locks(older_than).await,
         }
     }
 }

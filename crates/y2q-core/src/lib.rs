@@ -7,6 +7,7 @@ pub mod storage;
 pub use storage::any::AnyStorage;
 pub use storage::filesystem::FilesystemStorage;
 pub use storage::index::MetadataIndex;
+pub use storage::locks::StaleLock;
 
 #[cfg(all(target_os = "linux", feature = "uring"))]
 pub use storage::uring::UringStorage;
@@ -197,6 +198,15 @@ pub enum Error {
     /// A cache rebuild was requested while one is already in progress.
     #[error("rebuild already in progress")]
     RebuildAlreadyRunning,
+
+    /// The `older_than` parameter passed to the stale-lock admin endpoint
+    /// was neither a valid duration (`1h`, `30m`, ...) nor a Unix-seconds
+    /// timestamp.
+    #[error("invalid stale-lock threshold: {value}")]
+    InvalidStaleLockThreshold {
+        /// The raw value the caller supplied.
+        value: String,
+    },
 }
 
 /// Async interface for object storage backends.
@@ -300,4 +310,23 @@ pub trait StorageExt: Storage {
 
     /// Return the current state of the background rebuild.
     async fn rebuild_progress(&self) -> Result<CacheRebuildStatus, Error>;
+
+    /// Enumerate `.lock` sidecar files whose recorded acquisition time is
+    /// strictly earlier than `older_than`.
+    ///
+    /// Locks are only released by their owning process under normal
+    /// shutdown; a `SIGKILL` (or kernel panic) mid-PUT leaves the file
+    /// behind and future writes to that key fail with [`Error::Locked`].
+    /// This call is the "dry-run" counterpart to
+    /// [`StorageExt::clear_stale_locks`].
+    async fn list_stale_locks(&self, older_than: SystemTime) -> Result<Vec<StaleLock>, Error>;
+
+    /// Delete every `.lock` sidecar older than `older_than`. Returns the
+    /// number of files successfully removed.
+    ///
+    /// `ENOENT` on the unlink is treated as success — another worker may
+    /// have legitimately released the lock between the scan and the
+    /// unlink. The scan / unlink pair is not atomic across the tree; see
+    /// [`storage::locks`] for race semantics.
+    async fn clear_stale_locks(&self, older_than: SystemTime) -> Result<u64, Error>;
 }
