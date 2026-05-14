@@ -82,6 +82,19 @@ pub(super) enum UringOp {
         key: String,
         reply: oneshot::Sender<Result<Metadata, Error>>,
     },
+    /// Read the on-disk metadata for an object given its file path, without
+    /// resolving a `(bucket, key)` first. Used by [`rebuild_cache`] to
+    /// repopulate the secondary index from the source-of-truth `.obj` files.
+    ///
+    /// Unlike [`Describe`], no `.lock` check is performed: rebuild is allowed
+    /// to read concurrently with PUTs because `.obj` files are always whole
+    /// (writes happen to `.tmp` then rename).
+    ///
+    /// [`rebuild_cache`]: crate::StorageExt::rebuild_cache
+    ReadObjectMeta {
+        path: PathBuf,
+        reply: oneshot::Sender<Result<Metadata, Error>>,
+    },
 }
 
 /// Dispatch one op to its handler. Called from the worker's recv loop.
@@ -150,6 +163,9 @@ pub(super) async fn handle(op: UringOp) {
             reply,
         } => {
             let _ = reply.send(do_describe(obj_path, lock_path, bucket, key).await);
+        }
+        UringOp::ReadObjectMeta { path, reply } => {
+            let _ = reply.send(do_read_object_meta(path).await);
         }
     }
 }
@@ -315,6 +331,43 @@ async fn do_describe(
     let meta = read_meta_blob(&file, &header, &bucket, &key, "describe").await;
     let _ = file.close().await;
     meta
+}
+
+/// Read just the metadata for the `.obj` file at `path` — no lock check, no
+/// bucket/key validation. Used by the rebuild walker, which has thousands
+/// of paths to process and identifies each object by the metadata embedded
+/// in the file itself.
+async fn do_read_object_meta(path: PathBuf) -> Result<Metadata, Error> {
+    let make_err = |msg: String| Error::InternalError {
+        bucket: String::new(),
+        key: String::new(),
+        operation: "rebuild".to_owned(),
+        message: format!("{}: {}", path.display(), msg),
+    };
+
+    let file = File::open(&path)
+        .await
+        .map_err(|e| make_err(format!("open: {e}")))?;
+    let buf = vec![0u8; HEADER_SIZE];
+    let (res, buf) = file.read_exact_at(buf, 0).await;
+    if let Err(e) = res {
+        let _ = file.close().await;
+        return Err(make_err(format!("read header: {e}")));
+    }
+    let header_bytes: [u8; HEADER_SIZE] =
+        buf.as_slice().try_into().expect("HEADER_SIZE buffer");
+    let header = match Header::decode(&header_bytes) {
+        Ok(h) => h,
+        Err(e) => {
+            let _ = file.close().await;
+            return Err(make_err(format!("decode header: {e}")));
+        }
+    };
+    let meta_buf = vec![0u8; header.meta_len as usize];
+    let (res, meta_buf) = file.read_exact_at(meta_buf, header.meta_offset()).await;
+    let _ = file.close().await;
+    res.map_err(|e| make_err(format!("read meta: {e}")))?;
+    serde_json::from_slice(&meta_buf).map_err(|e| make_err(format!("decode meta: {e}")))
 }
 
 async fn do_get(
