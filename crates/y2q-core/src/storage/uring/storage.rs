@@ -6,7 +6,10 @@
 //! All real I/O lives in [`super::ops`] inside the uring runtime.
 
 use core::range::RangeInclusive;
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use bytes::Bytes;
 use uuid::Uuid;
@@ -36,10 +39,11 @@ const Y2Q_NAMESPACE: Uuid = Uuid::from_bytes([
 pub struct UringStorage {
     base_path: PathBuf,
     index: Arc<MetadataIndex>,
-    #[allow(dead_code)] // wired in subsequent steps (rebuild_cache)
     rebuild_state: Arc<tokio::sync::Mutex<CacheRebuildStatus>>,
     config: UringConfig,
-    pool: WorkerPool,
+    /// `Arc` so a spawned rebuild task can share dispatch without making
+    /// `WorkerPool` cloneable (the `JoinHandle`s aren't).
+    pool: Arc<WorkerPool>,
 }
 
 /// Tunables for [`UringStorage`].
@@ -98,7 +102,7 @@ impl UringStorage {
             })?;
         }
         let index = MetadataIndex::open(index_path)?;
-        let pool = WorkerPool::spawn(&config);
+        let pool = Arc::new(WorkerPool::spawn(&config));
         Ok(Self {
             base_path,
             index: Arc::new(index),
@@ -333,13 +337,186 @@ impl Listing for UringStorage {
 }
 
 impl StorageExt for UringStorage {
+    /// Spawn a background task that rebuilds the secondary index from the
+    /// on-disk `.obj` files.
+    ///
+    /// Returns [`Error::RebuildAlreadyRunning`] if a rebuild is already in
+    /// flight. Otherwise the task is scheduled on the actix-side tokio
+    /// runtime; it dispatches per-file metadata reads to the uring worker
+    /// pool in batches of [`REBUILD_BATCH_SIZE`] so I/O stays parallel.
+    /// Progress is observable via [`Self::rebuild_progress`].
     async fn rebuild_cache(&self) -> Result<(), Error> {
-        todo!("UringStorage::rebuild_cache")
+        {
+            let mut state = self.rebuild_state.lock().await;
+            if matches!(*state, CacheRebuildStatus::Running(_)) {
+                return Err(Error::RebuildAlreadyRunning);
+            }
+            *state = CacheRebuildStatus::Running(0);
+        }
+
+        let base_path = self.base_path.clone();
+        let index = self.index.clone();
+        let state = self.rebuild_state.clone();
+        let pool = Arc::clone(&self.pool);
+        tokio::spawn(async move {
+            let result = run_rebuild(base_path, index, state.clone(), pool).await;
+            let mut s = state.lock().await;
+            *s = match result {
+                Ok(()) => CacheRebuildStatus::Completed,
+                Err(msg) => {
+                    tracing::error!(error = %msg, "uring cache rebuild failed");
+                    CacheRebuildStatus::Failed(msg)
+                }
+            };
+        });
+        Ok(())
     }
 
     async fn rebuild_progress(&self) -> Result<CacheRebuildStatus, Error> {
-        todo!("UringStorage::rebuild_progress")
+        Ok(self.rebuild_state.lock().await.clone())
     }
+}
+
+/// Number of read-meta ops the rebuild walker dispatches in a single batch.
+///
+/// Submitted in flight together, then awaited together before the next
+/// batch starts. With N workers, throughput is bounded by the slowest in
+/// the batch but the worst-case memory overhead stays at
+/// `BATCH_SIZE * sizeof(oneshot pair)` regardless of total object count.
+const REBUILD_BATCH_SIZE: usize = 64;
+
+/// Walk every `.obj` file under `base_path`, dispatch a read-meta op for
+/// each, upsert the decoded metadata into `index`, then drop any index rows
+/// whose object is no longer on disk. Updates `state` with `Running(pct)`
+/// periodically; the caller transitions to `Completed` after this returns.
+async fn run_rebuild(
+    base_path: PathBuf,
+    index: Arc<MetadataIndex>,
+    state: Arc<tokio::sync::Mutex<CacheRebuildStatus>>,
+    pool: Arc<WorkerPool>,
+) -> Result<(), String> {
+    let obj_paths = collect_obj_files(&base_path)
+        .await
+        .map_err(|e| format!("enumerate .obj files: {e}"))?;
+    let total = obj_paths.len();
+    let report_every = (total / 100).max(1);
+
+    let mut seen: std::collections::HashSet<(String, String)> =
+        std::collections::HashSet::with_capacity(total);
+
+    let mut path_iter = obj_paths.into_iter();
+    let mut processed = 0;
+    loop {
+        // Submit a batch of read-meta ops to the worker pool.
+        let mut receivers = Vec::with_capacity(REBUILD_BATCH_SIZE);
+        for _ in 0..REBUILD_BATCH_SIZE {
+            let Some(path) = path_iter.next() else { break };
+            let (reply, reply_rx) = tokio::sync::oneshot::channel();
+            let sender = pool.dispatch_for_path(&path).clone();
+            let op = UringOp::ReadObjectMeta { path, reply };
+            if let Err(e) = sender.send(op).await {
+                return Err(format!("worker pool closed mid-rebuild: {e}"));
+            }
+            receivers.push(reply_rx);
+        }
+        if receivers.is_empty() {
+            break;
+        }
+
+        // Drain the batch in submission order. Workers process concurrently
+        // across the pool, so by the time we await later receivers their
+        // results may already be in flight.
+        for rx in receivers {
+            match rx.await {
+                Ok(Ok(meta)) => {
+                    seen.insert((meta.bucket.clone(), meta.key.clone()));
+                    if let Err(e) = index.upsert(&meta).await {
+                        tracing::warn!(
+                            bucket = %meta.bucket,
+                            key = %meta.key,
+                            error = %e,
+                            "rebuild: index upsert failed; continuing"
+                        );
+                    }
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!(error = %e, "rebuild: read meta failed; skipping");
+                }
+                Err(_) => {
+                    tracing::warn!("rebuild: worker dropped reply; skipping");
+                }
+            }
+            processed += 1;
+            if processed % report_every == 0 && total > 0 {
+                let pct = ((processed * 100 / total) as u8).min(99);
+                *state.lock().await = CacheRebuildStatus::Running(pct);
+            }
+        }
+    }
+
+    // Drop index rows whose `.obj` file is no longer on disk.
+    let all_keys = index
+        .list_all_keys()
+        .await
+        .map_err(|e| format!("list index keys: {e}"))?;
+    for (bucket, key) in all_keys {
+        if !seen.contains(&(bucket.clone(), key.clone()))
+            && let Err(e) = index.remove(&bucket, &key).await
+        {
+            tracing::warn!(
+                bucket = %bucket,
+                key = %key,
+                error = %e,
+                "rebuild: stale index row removal failed; continuing"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Recursively gather every `*.obj` file under
+/// `base_path/<bucket>/<xx>/<yy>/`.
+///
+/// Bucket directories whose name fails [`validate_bucket`] are skipped,
+/// which excludes reserved files like `_y2q_index.redb` and any leftover
+/// `.tmp` files at unexpected nesting levels.
+async fn collect_obj_files(base_path: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let mut out = Vec::new();
+    let mut buckets = tokio::fs::read_dir(base_path).await?;
+    while let Some(b_entry) = buckets.next_entry().await? {
+        if !b_entry.file_type().await?.is_dir() {
+            continue;
+        }
+        let bucket_name = match b_entry.file_name().into_string() {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        if validate_bucket(&bucket_name).is_err() {
+            continue;
+        }
+        let bucket_path = b_entry.path();
+        let mut l1 = tokio::fs::read_dir(&bucket_path).await?;
+        while let Some(l1_entry) = l1.next_entry().await? {
+            if !l1_entry.file_type().await?.is_dir() {
+                continue;
+            }
+            let mut l2 = tokio::fs::read_dir(l1_entry.path()).await?;
+            while let Some(l2_entry) = l2.next_entry().await? {
+                if !l2_entry.file_type().await?.is_dir() {
+                    continue;
+                }
+                let mut files = tokio::fs::read_dir(l2_entry.path()).await?;
+                while let Some(f) = files.next_entry().await? {
+                    let p = f.path();
+                    if p.extension().is_some_and(|e| e == "obj") {
+                        out.push(p);
+                    }
+                }
+            }
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -652,6 +829,176 @@ mod tests {
             0,
             "small object should not have the O_DIRECT flag"
         );
+    }
+
+    /// Pagination across prefix + after + limit must behave the same as on
+    /// FilesystemStorage — both backends share `MetadataIndex::scan_objects`.
+    /// This test is a smoke-test for parity rather than testing the index
+    /// itself.
+    #[tokio::test]
+    async fn list_objects_paginates_with_prefix_and_after() {
+        let dir = TempDir::new().unwrap();
+        let storage = make_storage(&dir, 1);
+        for key in ["a/1", "a/2", "a/3", "b/1", "b/2"] {
+            storage
+                .put("bkt", key, payload(b"x"), PutOptions::default())
+                .await
+                .unwrap();
+        }
+
+        let page = storage
+            .list_objects(
+                "bkt",
+                ListOptions {
+                    prefix: Some("a/".to_owned()),
+                    after: None,
+                    limit: Some(2),
+                },
+            )
+            .await
+            .unwrap();
+        let keys: Vec<_> = page.items.iter().map(|m| m.key.clone()).collect();
+        assert_eq!(keys, vec!["a/1".to_owned(), "a/2".to_owned()]);
+        assert_eq!(page.next.as_deref(), Some("a/2"));
+
+        let page2 = storage
+            .list_objects(
+                "bkt",
+                ListOptions {
+                    prefix: Some("a/".to_owned()),
+                    after: page.next,
+                    limit: Some(10),
+                },
+            )
+            .await
+            .unwrap();
+        let keys2: Vec<_> = page2.items.iter().map(|m| m.key.clone()).collect();
+        assert_eq!(keys2, vec!["a/3".to_owned()]);
+        assert!(page2.next.is_none());
+    }
+
+    /// Wait for the spawned rebuild task to reach a terminal state.
+    /// Polls progress; bails out (panics) if it stays running too long.
+    async fn wait_for_rebuild(storage: &UringStorage) -> super::CacheRebuildStatus {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let s = storage.rebuild_progress().await.unwrap();
+            if matches!(
+                s,
+                super::CacheRebuildStatus::Completed | super::CacheRebuildStatus::Failed(_)
+            ) {
+                return s;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("rebuild did not complete within 5s; last status: {s:?}");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    /// `rebuild_cache` must repopulate the secondary index from `.obj`
+    /// files on disk after the index has been wiped, so a corrupted /
+    /// missing redb is fully recoverable from the source-of-truth files.
+    #[tokio::test]
+    async fn rebuild_repopulates_index_after_wipe() {
+        let dir = TempDir::new().unwrap();
+        let storage = make_storage(&dir, 2);
+        for (k, v) in [("alpha", &b"a"[..]), ("beta", &b"bb"[..]), ("gamma", &b"ccc"[..])] {
+            storage
+                .put("b", k, payload(v), PutOptions::default())
+                .await
+                .unwrap();
+        }
+        // Drop the storage so the redb file is closed cleanly, then wipe it
+        // and reopen. The .obj files on disk remain untouched.
+        let base = storage.base_path.clone();
+        drop(storage);
+        let index_path = base.join("idx.redb");
+        std::fs::remove_file(&index_path).unwrap();
+
+        let storage = UringStorage::new(
+            &base,
+            &index_path,
+            UringConfig {
+                workers: 2,
+                ..UringConfig::default()
+            },
+        )
+        .unwrap();
+        // Index is empty right now.
+        let page = storage.list_objects("b", ListOptions::default()).await.unwrap();
+        assert!(page.items.is_empty());
+
+        storage.rebuild_cache().await.unwrap();
+        let final_state = wait_for_rebuild(&storage).await;
+        assert!(matches!(final_state, super::CacheRebuildStatus::Completed));
+
+        let page = storage.list_objects("b", ListOptions::default()).await.unwrap();
+        let keys: Vec<_> = page.items.iter().map(|m| m.key.clone()).collect();
+        assert_eq!(
+            keys,
+            vec!["alpha".to_owned(), "beta".to_owned(), "gamma".to_owned()]
+        );
+    }
+
+    /// If a `.obj` file is removed out-of-band, `rebuild_cache` must drop
+    /// the corresponding index row so subsequent listings stay consistent.
+    #[tokio::test]
+    async fn rebuild_drops_stale_index_entries() {
+        let dir = TempDir::new().unwrap();
+        let storage = make_storage(&dir, 1);
+        storage
+            .put("b", "ghost", payload(b"boo"), PutOptions::default())
+            .await
+            .unwrap();
+        storage
+            .put("b", "real", payload(b"yes"), PutOptions::default())
+            .await
+            .unwrap();
+
+        // Yank the ghost's .obj file but leave the index entry.
+        let ghost_path = storage.obj_path("b", "ghost");
+        std::fs::remove_file(&ghost_path).unwrap();
+
+        storage.rebuild_cache().await.unwrap();
+        assert!(matches!(
+            wait_for_rebuild(&storage).await,
+            super::CacheRebuildStatus::Completed
+        ));
+
+        let page = storage.list_objects("b", ListOptions::default()).await.unwrap();
+        let keys: Vec<_> = page.items.iter().map(|m| m.key.clone()).collect();
+        assert_eq!(keys, vec!["real".to_owned()]);
+    }
+
+    /// A second `rebuild_cache` call while one is in flight must return
+    /// `Error::RebuildAlreadyRunning` rather than starting a parallel
+    /// rebuild that races with the first one over the index.
+    #[tokio::test]
+    async fn rebuild_rejects_concurrent_invocations() {
+        let dir = TempDir::new().unwrap();
+        let storage = make_storage(&dir, 1);
+        // Seed enough objects that the rebuild takes long enough to overlap
+        // with our second call.
+        for i in 0..32 {
+            storage
+                .put(
+                    "b",
+                    &format!("k{i}"),
+                    payload(b"x"),
+                    PutOptions::default(),
+                )
+                .await
+                .unwrap();
+        }
+
+        storage.rebuild_cache().await.unwrap();
+        // Immediately try again — the first one is still going.
+        match storage.rebuild_cache().await {
+            Err(Error::RebuildAlreadyRunning) => { /* expected */ }
+            other => panic!("expected RebuildAlreadyRunning, got {other:?}"),
+        }
+        let _ = wait_for_rebuild(&storage).await;
     }
 
     /// Regression guard for the dispatch logic: a payload that exceeds the

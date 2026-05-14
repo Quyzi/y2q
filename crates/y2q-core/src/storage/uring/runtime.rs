@@ -18,6 +18,7 @@
 use std::{
     collections::hash_map::DefaultHasher,
     hash::{Hash, Hasher},
+    path::Path,
     sync::Mutex,
     thread::JoinHandle,
 };
@@ -69,6 +70,15 @@ impl WorkerPool {
         let mut h = DefaultHasher::new();
         bucket.hash(&mut h);
         key.hash(&mut h);
+        let idx = (h.finish() as usize) % self.senders.len();
+        &self.senders[idx]
+    }
+
+    /// Pick a worker by hashing `path`. Used by the rebuild walker, which
+    /// has paths but not yet the corresponding `(bucket, key)` pair.
+    pub fn dispatch_for_path(&self, path: &Path) -> &Sender<UringOp> {
+        let mut h = DefaultHasher::new();
+        path.hash(&mut h);
         let idx = (h.finish() as usize) % self.senders.len();
         &self.senders[idx]
     }
