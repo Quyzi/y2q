@@ -33,4 +33,9 @@ default = []
 uring = ["dep:tokio-uring", "dep:aligned-vec", "dep:async-channel", "dep:crc32fast", "dep:libc"]
 
 [dev-dependencies]
-tempfile = { workspace = true }
+criterion = { workspace = true }
+tempfile  = { workspace = true }
+
+[[bench]]
+name    = "storage"
+harness = false
