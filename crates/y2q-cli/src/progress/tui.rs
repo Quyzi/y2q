@@ -4,7 +4,6 @@ use std::io::Write;
 use crossterm::{
     cursor, execute,
     style::{Color, Print, SetForegroundColor},
-    terminal::{Clear, ClearType},
 };
 
 use crate::output::fmt_bytes;
@@ -23,6 +22,9 @@ impl TuiProgressReporter {
 
     fn render(&self, bytes_done: u64, speed_bps: u64) {
         let mut stderr = std::io::stderr();
+        // Clamp output to one terminal row so MoveToColumn(0) is always sufficient.
+        let term_width =
+            crossterm::terminal::size().map(|(w, _)| w as usize).unwrap_or(80).max(20);
 
         let bar_width: usize = 30;
         let filled = if let Some(total) = self.total {
@@ -30,13 +32,12 @@ impl TuiProgressReporter {
         } else {
             0
         };
-        let bar: String = format!(
-            "[{}{}]",
-            "█".repeat(filled),
-            "░".repeat(bar_width - filled)
-        );
+        let bar: String = format!("[{}{}]", "█".repeat(filled), "░".repeat(bar_width - filled));
 
-        let pct = self.total.map(|t| format!(" {:3}%", bytes_done * 100 / t.max(1))).unwrap_or_default();
+        let pct = self
+            .total
+            .map(|t| format!(" {:3}%", bytes_done * 100 / t.max(1)))
+            .unwrap_or_default();
         let done_str = fmt_bytes(bytes_done);
         let speed_str = fmt_bytes(speed_bps);
 
@@ -53,14 +54,36 @@ impl TuiProgressReporter {
             })
             .collect();
 
+        let label_part = format!("{}: ", self.label);
+        let progress_part = format!("{bar}{pct}  {done_str}  {speed_str}/s  {sparkline}");
+
+        // Truncate visible chars to fit in one row, then pad the remainder with
+        // spaces so any previously printed longer line is fully overwritten.
+        let label_vis = label_part.chars().count();
+        let progress_vis = progress_part.chars().count();
+        let total_vis = label_vis + progress_vis;
+
+        let (label_out, progress_out) = if total_vis > term_width {
+            let lv = label_vis.min(term_width);
+            let pv = term_width.saturating_sub(lv);
+            (
+                label_part.chars().take(lv).collect::<String>(),
+                progress_part.chars().take(pv).collect::<String>(),
+            )
+        } else {
+            (label_part, progress_part)
+        };
+
+        let vis_out = label_out.chars().count() + progress_out.chars().count();
+        let padding = " ".repeat(term_width.saturating_sub(vis_out));
+
         let _ = execute!(
             stderr,
             cursor::MoveToColumn(0),
-            Clear(ClearType::CurrentLine),
             SetForegroundColor(Color::Cyan),
-            Print(format!("{}: ", self.label)),
+            Print(&label_out),
             SetForegroundColor(Color::Reset),
-            Print(format!("{bar}{pct}  {done_str}  {speed_str}/s  {sparkline}")),
+            Print(format!("{progress_out}{padding}")),
         );
         let _ = stderr.flush();
     }
@@ -70,7 +93,15 @@ impl ProgressReporter for TuiProgressReporter {
     fn start(&mut self, label: &str, total_bytes: Option<u64>) {
         self.label = label.to_owned();
         self.total = total_bytes;
-        eprint!("\r{label}  starting...");
+        let mut stderr = std::io::stderr();
+        let _ = execute!(
+            stderr,
+            SetForegroundColor(Color::Cyan),
+            Print(format!("{label}: ")),
+            SetForegroundColor(Color::Reset),
+            Print("starting..."),
+        );
+        let _ = stderr.flush();
     }
 
     fn update(&mut self, bytes_done: u64, speed_bps: u64) {
