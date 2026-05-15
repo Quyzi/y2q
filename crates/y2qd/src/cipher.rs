@@ -63,18 +63,24 @@ pub fn is_encrypted_envelope(bytes: &[u8]) -> bool {
 /// Consumes chunks from `stream` (an `actix_web::web::Payload`), feeds them
 /// through AES-256-GCM 1 MiB chunks, and writes each encrypted chunk to
 /// `file`. Returns the file handle (for the caller to pass to
-/// [`StreamingPutGuard::commit`]), plus the plaintext metrics and cipher
+/// [`AnyStreamingPutGuard::commit`]), plus the plaintext metrics and cipher
 /// metadata for the metadata sidecar.
+///
+/// `write_offset` is the byte offset within `file` at which the v2 envelope
+/// starts. Pass the value returned by
+/// [`AnyStorage::begin_streaming_put`]: `0` for the filesystem backend, `64`
+/// for the uring backend.
 pub async fn stream_encrypt_for_put(
     keystore: &DecryptedKeystore,
     mut stream: actix_web::web::Payload,
     file: tokio::fs::File,
     bucket: &str,
     key: &str,
+    write_offset: u64,
 ) -> Result<(tokio::fs::File, PlaintextMetrics, CipherMetadata), AppError> {
     use futures::StreamExt;
 
-    let mut session = envelope::EncryptSession::new(file, &keystore.public.public_key)
+    let mut session = envelope::EncryptSession::new(file, &keystore.public.public_key, write_offset)
         .await
         .map_err(|_| AppError(y2q_core::Error::EncryptionFailed {
             bucket: bucket.to_owned(),
