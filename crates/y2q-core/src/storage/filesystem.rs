@@ -11,8 +11,9 @@ use sha2::Digest;
 use uuid::Uuid;
 
 use crate::{
-    CacheRebuildStatus, DEFAULT_LIST_LIMIT, Error, ListOptions, ListPage, Listing, MAX_LIST_LIMIT,
-    Metadata, MetadataIndex, Object, PutOptions, StaleLock, Storage, StorageExt,
+    CacheRebuildStatus, CipherMetadata, DEFAULT_LIST_LIMIT, Error, ListOptions, ListPage, Listing,
+    MAX_LIST_LIMIT, Metadata, MetadataIndex, Object, PlaintextMetrics, PutOptions, StaleLock,
+    Storage, StorageExt,
     crypto::{decrypt_meta, encrypt_meta},
     storage::locks::{clear_stale_locks_under, list_stale_locks_under},
 };
@@ -298,6 +299,175 @@ async fn read_created_timestamp(meta_path: &Path, mek: Option<&[u8; 32]>) -> Opt
         .await
         .ok()
         .map(|m| m.created)
+}
+
+/// RAII guard returned by [`FilesystemStorage::begin_streaming_put`].
+///
+/// Holds the `.lock` file and tmp-file path for the duration of a streaming
+/// PUT. Call [`commit`] (passing back the file handle) when encryption is
+/// done; otherwise [`Drop`] removes the tmp file and releases the lock.
+pub struct StreamingPutGuard {
+    tmp_path: PathBuf,
+    data_path: PathBuf,
+    meta_path: PathBuf,
+    _lock: LockGuard,
+    bucket: String,
+    key: String,
+    is_overwrite: bool,
+    created: u64,
+    now: u64,
+    index: Arc<MetadataIndex>,
+    mek: Option<[u8; 32]>,
+}
+
+impl StreamingPutGuard {
+    /// Flush and close `file`, rename the tmp file into place, write the
+    /// metadata sidecar, and update the index. Returns `true` if overwrite.
+    pub async fn commit(
+        self,
+        file: tokio::fs::File,
+        options: PutOptions,
+        plaintext_metrics: PlaintextMetrics,
+        cipher_metadata: CipherMetadata,
+    ) -> Result<bool, Error> {
+        use tokio::io::AsyncWriteExt;
+        let mut file = file;
+        file.flush().await.map_err(|e| Error::InternalError {
+            bucket: self.bucket.clone(),
+            key: self.key.clone(),
+            operation: "put".to_owned(),
+            message: format!("flush: {e}"),
+        })?;
+        drop(file);
+
+        tokio::fs::rename(&self.tmp_path, &self.data_path)
+            .await
+            .map_err(|e| Error::InternalError {
+                bucket: self.bucket.clone(),
+                key: self.key.clone(),
+                operation: "put".to_owned(),
+                message: format!("rename: {e}"),
+            })?;
+
+        let metadata = Metadata {
+            created: self.created,
+            modified: self.now,
+            size: plaintext_metrics.size,
+            checksum_md5: plaintext_metrics.checksum_md5_b64,
+            checksum_sha256: plaintext_metrics.checksum_sha256_b64,
+            bucket: self.bucket.clone(),
+            key: self.key.clone(),
+            disk_path: self.data_path.clone(),
+            url_path: format!("{}/{}", self.bucket, self.key),
+            labels: options.labels,
+            cipher_size: Some(cipher_metadata.cipher_size),
+            cipher_sha256: Some(cipher_metadata.cipher_sha256_b64),
+            kem_alg: Some(cipher_metadata.kem_alg),
+            aead_alg: Some(cipher_metadata.aead_alg),
+            envelope_version: Some(cipher_metadata.envelope_version),
+        };
+
+        let encoded = encode_metadata(&metadata, self.mek.as_ref()).map_err(|e| Error::InternalError {
+            bucket: self.bucket.clone(),
+            key: self.key.clone(),
+            operation: "put".to_owned(),
+            message: format!("encode metadata: {e}"),
+        })?;
+        tokio::fs::write(&self.meta_path, &encoded)
+            .await
+            .map_err(|e| Error::InternalError {
+                bucket: self.bucket.clone(),
+                key: self.key.clone(),
+                operation: "put".to_owned(),
+                message: format!("write meta: {e}"),
+            })?;
+
+        if let Err(e) = self.index.upsert(&metadata).await {
+            tracing::warn!(
+                bucket = self.bucket,
+                key = self.key,
+                error = %e,
+                "metadata index upsert failed; sidecar is authoritative"
+            );
+        }
+
+        Ok(self.is_overwrite)
+    }
+}
+
+impl Drop for StreamingPutGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.tmp_path);
+    }
+}
+
+impl FilesystemStorage {
+    /// Begin a streaming PUT: validate inputs, create the directory, acquire the
+    /// lock, and open the tmp file for writing. Returns a [`StreamingPutGuard`]
+    /// plus the open tmp file. The caller writes encrypted bytes to the file
+    /// and then calls [`StreamingPutGuard::commit`] (passing the file back) to
+    /// rename it into place.
+    pub async fn begin_streaming_put(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<(StreamingPutGuard, tokio::fs::File), Error> {
+        validate_bucket(bucket)?;
+        validate_key(key)?;
+
+        let data_path = self.key_path(bucket, key);
+        let meta_path = data_path.with_extension("meta");
+        let lock_path = data_path.with_extension("lock");
+        let tmp_path = data_path.with_extension("tmp");
+
+        if let Some(parent) = data_path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| Error::InternalError {
+                    bucket: bucket.to_owned(),
+                    key: key.to_owned(),
+                    operation: "put".to_owned(),
+                    message: format!("create dirs: {e}"),
+                })?;
+        }
+
+        let lock = LockGuard::acquire(lock_path, bucket, key).await?;
+        let is_overwrite = tokio::fs::try_exists(&data_path).await.unwrap_or(false);
+        let now = now_nanos();
+        let created = if is_overwrite {
+            read_created_timestamp(&meta_path, self.mek.as_ref()).await.unwrap_or(now)
+        } else {
+            now
+        };
+
+        let file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp_path)
+            .await
+            .map_err(|e| Error::InternalError {
+                bucket: bucket.to_owned(),
+                key: key.to_owned(),
+                operation: "put".to_owned(),
+                message: format!("open tmp: {e}"),
+            })?;
+
+        let guard = StreamingPutGuard {
+            tmp_path,
+            data_path,
+            meta_path,
+            _lock: lock,
+            bucket: bucket.to_owned(),
+            key: key.to_owned(),
+            is_overwrite,
+            created,
+            now,
+            index: self.index.clone(),
+            mek: self.mek,
+        };
+        Ok((guard, file))
+    }
 }
 
 impl Storage for FilesystemStorage {

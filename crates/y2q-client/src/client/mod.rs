@@ -24,9 +24,7 @@ impl Y2qClient {
     pub fn new(config: ClientConfig) -> Result<Self, ClientError> {
         let base_url = Url::parse(&config.base_url)
             .map_err(|e| ClientError::BadRequest { message: format!("invalid server URL: {e}") })?;
-        let inner = reqwest::ClientBuilder::new()
-            .timeout(std::time::Duration::from_secs(30))
-            .build()?;
+        let inner = reqwest::ClientBuilder::new().build()?;
         Ok(Self { inner, base_url, token: config.token })
     }
 

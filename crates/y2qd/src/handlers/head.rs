@@ -61,6 +61,7 @@ pub async fn handle(
     let mut builder = HttpResponse::Ok();
     builder
         .insert_header(("Content-Length", meta.size.to_string()))
+        .insert_header(("X-Y2Q-Size", meta.size.to_string()))
         .insert_header(("Content-Type", "application/octet-stream"))
         .insert_header(("X-Y2Q-Created", meta.created.to_string()))
         .insert_header(("X-Y2Q-Modified", meta.modified.to_string()))

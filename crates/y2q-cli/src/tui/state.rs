@@ -49,6 +49,8 @@ impl AdminTab {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InputAction {
     CreateBucket { alias: String },
+    AddUserUsername { alias: String },
+    AddUserPassword { alias: String, username: String },
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -59,4 +61,6 @@ pub enum Mode {
     Admin(AdminTab),
     Error(String),
     Input { prompt: String, value: String, action: InputAction },
+    /// Object stat popup — pre-formatted lines ready to render.
+    ObjectStat { path: String, lines: Vec<String> },
 }

@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use actix_web::{HttpRequest, HttpResponse, web};
-use y2q_core::{AnyStorage, Object, PutOptions, Storage, SyncLevel};
+use y2q_core::{AnyStorage, PutOptions, SyncLevel};
 
 use crate::auth::Authenticated;
 use crate::cipher;
@@ -55,7 +55,7 @@ use crate::handlers::labels::extract_labels;
 pub async fn handle(
     path: web::Path<(String, String)>,
     req: HttpRequest,
-    body: web::Bytes,
+    payload: web::Payload,
     storage: web::Data<Arc<AnyStorage>>,
     limits: web::Data<LabelLimits>,
     auth: Authenticated,
@@ -64,19 +64,20 @@ pub async fn handle(
     let labels = extract_labels(&req, limits.get_ref())?;
     let sync = parse_sync_header(&req)?;
 
-    let encrypted = cipher::encrypt_for_put(&auth.keystore, &bucket, &key, &body)?;
-    let payload = Object::new(encrypted.envelope);
-    let was_overwrite = storage
-        .put(
-            &bucket,
-            &key,
-            payload,
-            PutOptions {
-                labels,
-                sync,
-                plaintext_metrics: Some(encrypted.plaintext_metrics),
-                cipher_metadata: Some(encrypted.cipher_metadata),
-            },
+    let (guard, file) = storage
+        .begin_streaming_put(&bucket, &key)
+        .await
+        .map_err(AppError::from)?;
+
+    let (file, plaintext_metrics, cipher_metadata) =
+        cipher::stream_encrypt_for_put(&auth.keystore, payload, file, &bucket, &key).await?;
+
+    let was_overwrite = guard
+        .commit(
+            file,
+            PutOptions { labels, sync, ..Default::default() },
+            plaintext_metrics,
+            cipher_metadata,
         )
         .await
         .map_err(AppError::from)?;

@@ -1,5 +1,5 @@
 use crossterm::event::{KeyEvent, MouseEvent};
-use y2q_client::{MetadataView, StaleLockEntry, UserView};
+use y2q_client::{MetadataView, ObjectHead, StaleLockEntry, UserView};
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -21,6 +21,8 @@ pub enum Event {
     RebuildStatus { alias: String, state: String, percent: Option<u8>, reason: Option<String> },
     UsersLoaded { alias: String, users: Vec<UserView> },
     LocksLoaded { alias: String, locks: Vec<StaleLockEntry> },
+    /// HEAD result for the object-stat popup.
+    ObjectStatFetched { path: String, result: Result<ObjectHead, String> },
     Quit,
 }
 

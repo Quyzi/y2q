@@ -45,6 +45,13 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         && matches!(app.remote.level, RemoteLevel::Buckets { .. });
 
     let bindings: &[(&str, &str)] = match &app.mode {
+        Mode::Admin(AdminTab::Users) => &[
+            ("Tab", "tab"),
+            ("↑↓/jk", "nav"),
+            ("n", "add user"),
+            ("d", "del"),
+            ("q/Esc", "close"),
+        ],
         Mode::Admin(_) => &[
             ("Tab", "tab"),
             ("↑↓/jk", "nav"),
@@ -96,6 +103,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         }
         Mode::Error(e) => render_error_popup(frame, area, &e),
         Mode::Input { prompt, value, .. } => render_input_dialog(frame, area, &prompt, &value),
+        Mode::ObjectStat { lines, .. } => render_object_stat_popup(frame, area, &lines),
         _ => {}
     }
 }
@@ -379,6 +387,27 @@ fn render_input_dialog(frame: &mut Frame, area: Rect, prompt: &str, value: &str)
         Paragraph::new(text).block(block).alignment(Alignment::Left),
         popup,
     );
+}
+
+fn render_object_stat_popup(frame: &mut Frame, area: Rect, lines: &[String]) {
+    let content_w = lines.iter().map(|l| l.len()).max().unwrap_or(20) as u16;
+    let w = (content_w + 4).max(40).min(area.width.saturating_sub(4));
+    let h = ((lines.len() as u16) + 4).min(area.height.saturating_sub(4));
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    let popup = Rect { x, y, width: w, height: h };
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .title(" Object Info ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+    let mut text: Vec<Line> = lines.iter().map(|l| Line::from(Span::raw(l.as_str()))).collect();
+    text.push(Line::from(""));
+    text.push(Line::from(Span::styled(
+        "[any key] dismiss",
+        Style::default().fg(Color::DarkGray),
+    )));
+    frame.render_widget(Paragraph::new(text).block(block), popup);
 }
 
 fn render_error_popup(frame: &mut Frame, area: Rect, message: &str) {
