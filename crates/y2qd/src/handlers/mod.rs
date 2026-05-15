@@ -4,8 +4,8 @@
 //! first path segment and `tail` captures everything after it, including any
 //! embedded `/` characters. Listing routes (`/` and `/{bucket}/`) are
 //! registered first so the greedy tail pattern does not shadow them.
-//! Admin routes live under `/api/v1/` and are also registered before the
-//! greedy tail pattern.
+//! Admin and auth routes live under `/api/v1/` and are also registered before
+//! the greedy tail pattern.
 
 use actix_web::web;
 
@@ -19,12 +19,39 @@ pub(crate) mod locks;
 pub(crate) mod put;
 pub(crate) mod rebuild;
 
-// Re-exported so the ApiDoc derive in main.rs can reference these by a stable
-// crate-relative path without exposing the submodule structure publicly.
-/// Register all object-store routes on `cfg`.
+use crate::auth::handlers as auth_handlers;
+
+/// Register all object-store + auth routes on `cfg`.
 ///
 /// Intended to be passed directly to [`actix_web::App::configure`].
 pub fn configure(cfg: &mut web::ServiceConfig) {
+    // Auth and user-management endpoints. Registered before the greedy
+    // /{bucket}/{tail}* pattern so they aren't shadowed.
+    cfg.service(
+        web::resource("/api/v1/auth/login").route(web::post().to(auth_handlers::login)),
+    );
+    cfg.service(
+        web::resource("/api/v1/auth/refresh").route(web::post().to(auth_handlers::refresh)),
+    );
+    cfg.service(
+        web::resource("/api/v1/auth/logout").route(web::post().to(auth_handlers::logout)),
+    );
+    cfg.service(
+        web::resource("/api/v1/auth/password")
+            .route(web::post().to(auth_handlers::change_password)),
+    );
+    cfg.service(
+        web::resource("/api/v1/users/add").route(web::put().to(auth_handlers::add_user)),
+    );
+    cfg.service(
+        web::resource("/api/v1/users").route(web::get().to(auth_handlers::list_users)),
+    );
+    cfg.service(
+        web::resource("/api/v1/users/{user}")
+            .route(web::delete().to(auth_handlers::delete_user)),
+    );
+
+    // Object store + admin endpoints.
     cfg.service(web::resource("/").route(web::get().to(list_buckets::handle)));
     cfg.service(web::resource("/{bucket}/").route(web::get().to(list_objects::handle)));
     cfg.service(

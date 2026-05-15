@@ -19,10 +19,18 @@ pub struct Config {
     pub server: ServerConfig,
     /// Object storage settings.
     pub storage: StorageConfig,
+    /// Cryptography (keystore + KDF) settings.
+    pub crypto: CryptoConfig,
+    /// User authentication / session settings.
+    pub auth: AuthConfig,
 }
 
 fn default_max_body_bytes() -> usize {
     256 * 1024 * 1024 // 256 MiB
+}
+
+fn default_unauthenticated_metrics() -> bool {
+    false
 }
 
 /// HTTP listener settings.
@@ -36,6 +44,109 @@ pub struct ServerConfig {
     /// Override via `config.toml` or `Y2QD_SERVER__MAX_BODY_BYTES`.
     #[serde(default = "default_max_body_bytes")]
     pub max_body_bytes: usize,
+    /// When `true`, the metrics dashboard, Prometheus scrape endpoint, and
+    /// Swagger UI are reachable without a session token. Defaults to `false`,
+    /// which makes all three require Bearer auth like every other route.
+    #[serde(default = "default_unauthenticated_metrics")]
+    pub unauthenticated_metrics: bool,
+}
+
+/// Argon2id parameters for newly-added user records.
+#[derive(Debug, Deserialize, Clone)]
+pub struct Argon2Config {
+    #[serde(default = "default_argon2_m_cost_kib")]
+    pub m_cost_kib: u32,
+    #[serde(default = "default_argon2_t_cost")]
+    pub t_cost: u32,
+    #[serde(default = "default_argon2_p_cost")]
+    pub p_cost: u32,
+}
+
+fn default_argon2_m_cost_kib() -> u32 {
+    65_536
+}
+fn default_argon2_t_cost() -> u32 {
+    3
+}
+fn default_argon2_p_cost() -> u32 {
+    4
+}
+
+impl Default for Argon2Config {
+    fn default() -> Self {
+        Self {
+            m_cost_kib: default_argon2_m_cost_kib(),
+            t_cost: default_argon2_t_cost(),
+            p_cost: default_argon2_p_cost(),
+        }
+    }
+}
+
+/// Keystore + KDF settings.
+#[derive(Debug, Deserialize)]
+pub struct CryptoConfig {
+    /// Directory holding `pubkey.json`, `users.redb`, and the daemon-wide
+    /// `.lock` file. Required — no default. Should NOT live under
+    /// `storage.base_path`, so a `cp -r` of the storage tree doesn't
+    /// accidentally copy or strand authentication state.
+    pub keystore_dir: String,
+    /// Argon2id parameters for new user records.
+    #[serde(default)]
+    pub argon2: Argon2Config,
+}
+
+fn default_session_ttl_seconds() -> u64 {
+    3600
+}
+fn default_max_session_ttl_seconds() -> u64 {
+    86_400
+}
+fn default_session_sweep_interval_seconds() -> u64 {
+    300
+}
+fn default_min_login_response_ms() -> u64 {
+    250
+}
+fn default_max_failed_logins() -> u32 {
+    10
+}
+fn default_lockout_seconds() -> u64 {
+    900
+}
+fn default_keystore_idle_drop_seconds() -> u64 {
+    0
+}
+
+/// User authentication / session settings.
+#[derive(Debug, Deserialize, Clone)]
+pub struct AuthConfig {
+    /// Default token lifetime when `ttl_seconds` is omitted on `POST /api/v1/auth/login`.
+    #[serde(default = "default_session_ttl_seconds")]
+    pub default_ttl_seconds: u64,
+    /// Hard ceiling. Logins requesting `ttl_seconds > max_ttl_seconds` are
+    /// rejected with 400.
+    #[serde(default = "default_max_session_ttl_seconds")]
+    pub max_ttl_seconds: u64,
+    /// How often the background sweeper purges expired sessions from memory.
+    #[serde(default = "default_session_sweep_interval_seconds")]
+    pub session_sweep_interval_seconds: u64,
+    /// Minimum delay (ms) before a failed-login response is sent. Argon2id
+    /// dominates this already; the floor smooths out timing differences
+    /// between known and unknown usernames.
+    #[serde(default = "default_min_login_response_ms")]
+    pub min_login_response_ms: u64,
+    /// After this many consecutive failed logins for a username, lock the
+    /// account for `lockout_seconds`. `0` disables lockout.
+    #[serde(default = "default_max_failed_logins")]
+    pub max_failed_logins: u32,
+    /// Lockout duration (seconds) after `max_failed_logins` is exceeded.
+    #[serde(default = "default_lockout_seconds")]
+    pub lockout_seconds: u64,
+    /// Drop the in-memory decrypted SK this many seconds after the last
+    /// session expires. `0` = drop immediately. Set higher to forgive brief
+    /// gaps between sessions; lower to bound the SK exposure window.
+    #[serde(default = "default_keystore_idle_drop_seconds")]
+    pub keystore_idle_drop_seconds: u64,
 }
 
 fn default_max_labels() -> usize {
