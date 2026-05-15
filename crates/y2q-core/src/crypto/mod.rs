@@ -69,7 +69,12 @@ pub enum CryptoError {
 
     /// `pubkey.json` exists but could not be parsed.
     #[error("keystore corrupt at {path}: {reason}")]
-    KeystoreCorrupt { path: String, reason: String },
+    KeystoreCorrupt {
+        /// Filesystem path of the corrupt keystore.
+        path: String,
+        /// Short description of the corruption detected.
+        reason: String,
+    },
 
     /// User-store (redb) operation failed.
     #[error("user store: {0}")]

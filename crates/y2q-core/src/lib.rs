@@ -1,9 +1,17 @@
+//! Core library for the y2q post-quantum secure object store.
+//!
+//! Provides the [`Storage`], [`Listing`], and [`StorageExt`] traits, concrete
+//! backends ([`FilesystemStorage`], [`UringStorage`] on Linux), the
+//! [`MetadataIndex`], and the [`crypto`] layer (ML-KEM-768 + AES-256-GCM
+//! envelope format, Argon2id key wrapping, and the user-store database).
+
 use bytes::Bytes;
 use core::range::RangeInclusive;
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, ops::Deref, path::PathBuf, time::SystemTime};
 
 pub mod crypto;
+/// Storage backends (filesystem and io_uring), metadata index, and lock management.
 pub mod storage;
 pub use storage::any::AnyStorage;
 pub use storage::filesystem::FilesystemStorage;
@@ -143,8 +151,11 @@ pub struct PutOptions {
 /// compute from the (encrypted) bytes it sees.
 #[derive(Debug, Clone)]
 pub struct PlaintextMetrics {
+    /// Plaintext size in bytes.
     pub size: u64,
+    /// Full 16-byte MD5 of the plaintext, standard base64 (24 chars).
     pub checksum_md5_b64: String,
+    /// Full 32-byte SHA-256 of the plaintext, standard base64 (44 chars).
     pub checksum_sha256_b64: String,
 }
 
@@ -154,10 +165,15 @@ pub struct PlaintextMetrics {
 /// integrity-scan codepath.
 #[derive(Debug, Clone)]
 pub struct CipherMetadata {
+    /// Total on-disk envelope size in bytes.
     pub cipher_size: u64,
+    /// SHA-256 of the on-disk envelope, standard base64 (44 chars).
     pub cipher_sha256_b64: String,
+    /// Symbolic KEM algorithm name, e.g. `"ml-kem-768"`.
     pub kem_alg: String,
+    /// Symbolic AEAD algorithm name, e.g. `"aes-256-gcm"`.
     pub aead_alg: String,
+    /// Envelope format version number.
     pub envelope_version: u16,
 }
 
@@ -197,20 +213,33 @@ pub enum Error {
     /// The bucket name is empty, contains disallowed characters, or would escape
     /// the storage root (e.g. `..` components).
     #[error("invalid bucket: {bucket}")]
-    InvalidBucket { bucket: String },
+    InvalidBucket {
+        /// The rejected bucket name.
+        bucket: String,
+    },
 
     /// The key is empty, contains null bytes, or exceeds the maximum length.
     #[error("invalid key: {key}")]
-    InvalidKey { key: String },
+    InvalidKey {
+        /// The rejected key.
+        key: String,
+    },
 
     /// No object exists at the given `bucket`/`key` address.
     #[error("not found: {bucket}/{key}")]
-    NotFound { bucket: String, key: String },
+    NotFound {
+        /// Bucket component of the address.
+        bucket: String,
+        /// Key component of the address.
+        key: String,
+    },
 
     /// The object is currently being written to; `since` is when the lock was acquired.
     #[error("object {bucket}/{key} is locked since {since:?}")]
     Locked {
+        /// Bucket component of the locked address.
         bucket: String,
+        /// Key component of the locked address.
         key: String,
         /// Wall-clock time when the write lock was acquired.
         since: SystemTime,
@@ -219,35 +248,56 @@ pub enum Error {
     /// A label name collides with a reserved system metadata name
     /// (`created`, `modified`, `checksum-md5`, `checksum-sha256`).
     #[error("reserved label: {name}")]
-    ReservedLabel { name: String },
+    ReservedLabel {
+        /// The reserved label name that was rejected.
+        name: String,
+    },
 
     /// A label value was not valid UTF-8.
     #[error("invalid label value (not UTF-8): {name}")]
-    InvalidLabelValue { name: String },
+    InvalidLabelValue {
+        /// Name of the label whose value was invalid.
+        name: String,
+    },
 
     /// A label name exceeded the configured maximum byte length.
     #[error("label name too long: {name}")]
-    LabelNameTooLong { name: String },
+    LabelNameTooLong {
+        /// The oversized label name.
+        name: String,
+    },
 
     /// A label value exceeded the configured maximum byte length.
     #[error("label value too long: {name}")]
-    LabelValueTooLong { name: String },
+    LabelValueTooLong {
+        /// Name of the label whose value was too long.
+        name: String,
+    },
 
     /// More labels were supplied than the configured maximum.
     #[error("too many labels: {count}")]
-    TooManyLabels { count: usize },
+    TooManyLabels {
+        /// Number of labels that were supplied.
+        count: usize,
+    },
 
     /// The secondary metadata index returned an error.
     #[error("index error: {message}")]
-    Index { message: String },
+    Index {
+        /// Error detail from the index layer.
+        message: String,
+    },
 
     /// An unexpected I/O or internal error occurred during `operation`.
     #[error("internal error in {operation} on {bucket}/{key}: {message}")]
     InternalError {
+        /// Bucket component of the address being operated on.
         bucket: String,
+        /// Key component of the address being operated on.
         key: String,
         /// Name of the operation that failed (e.g. `"get"`, `"put"`).
         operation: String,
+        /// Human-readable error detail.
         message: String,
     },
 
@@ -267,40 +317,67 @@ pub enum Error {
     /// `pubkey.json` is missing — the daemon cannot serve traffic until
     /// first-run setup completes.
     #[error("keystore not found at {path}")]
-    KeystoreNotFound { path: String },
+    KeystoreNotFound {
+        /// Filesystem path where the keystore was expected.
+        path: String,
+    },
 
     /// `pubkey.json` exists but is unparseable, has a wrong-size key, or
     /// fingerprint mismatches.
     #[error("keystore corrupt at {path}: {reason}")]
-    KeystoreCorrupt { path: String, reason: String },
+    KeystoreCorrupt {
+        /// Filesystem path of the corrupt keystore.
+        path: String,
+        /// Short description of the corruption detected.
+        reason: String,
+    },
 
     /// Argon2id key derivation failed (typically a bad parameter triple).
     #[error("kdf failure: {reason}")]
-    KdfFailed { reason: String },
+    KdfFailed {
+        /// Short description of the KDF failure.
+        reason: String,
+    },
 
     /// Encrypting an object body failed for an unexpected reason.
     #[error("encryption failed for {bucket}/{key}")]
-    EncryptionFailed { bucket: String, key: String },
+    EncryptionFailed {
+        /// Bucket component of the address being encrypted.
+        bucket: String,
+        /// Key component of the address being encrypted.
+        key: String,
+    },
 
     /// Decrypting an object body failed — bad ciphertext, wrong key, or
     /// AAD mismatch. The HTTP layer must NEVER include the underlying
     /// reason in the response body to avoid side-channel leaks about disk
     /// state.
     #[error("decryption failed for {bucket}/{key}")]
-    DecryptionFailed { bucket: String, key: String },
+    DecryptionFailed {
+        /// Bucket component of the address being decrypted.
+        bucket: String,
+        /// Key component of the address being decrypted.
+        key: String,
+    },
 
     /// On-disk envelope header (magic / algorithm tags / lengths) failed
     /// validation.
     #[error("envelope malformed for {bucket}/{key}: {reason}")]
     EnvelopeMalformed {
+        /// Bucket component of the address with the malformed envelope.
         bucket: String,
+        /// Key component of the address with the malformed envelope.
         key: String,
+        /// Short description of what failed validation.
         reason: String,
     },
 
     /// Envelope advertises a `format_ver` newer than this build supports.
     #[error("unsupported envelope version: {version}")]
-    UnsupportedEnvelopeVersion { version: u16 },
+    UnsupportedEnvelopeVersion {
+        /// The version number found in the envelope header.
+        version: u16,
+    },
 
     /// Range read attempted against an encrypted object — the on-disk
     /// envelope is whole-object AEAD, so partial reads aren't possible.
