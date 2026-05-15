@@ -13,6 +13,7 @@ use uuid::Uuid;
 use crate::{
     CacheRebuildStatus, DEFAULT_LIST_LIMIT, Error, ListOptions, ListPage, Listing, MAX_LIST_LIMIT,
     Metadata, MetadataIndex, Object, PutOptions, StaleLock, Storage, StorageExt,
+    crypto::{decrypt_meta, encrypt_meta},
     storage::locks::{clear_stale_locks_under, list_stale_locks_under},
 };
 
@@ -49,6 +50,7 @@ pub struct FilesystemStorage {
     base_path: PathBuf,
     index: Arc<MetadataIndex>,
     rebuild_state: Arc<tokio::sync::Mutex<CacheRebuildStatus>>,
+    mek: Option<[u8; 32]>,
 }
 
 impl FilesystemStorage {
@@ -86,12 +88,20 @@ impl FilesystemStorage {
             base_path,
             index: Arc::new(index),
             rebuild_state: Arc::new(tokio::sync::Mutex::new(CacheRebuildStatus::Idle)),
+            mek: None,
         })
     }
 
     /// Access the underlying metadata index, e.g. for `lookup_by_label`.
     pub fn index(&self) -> &MetadataIndex {
         &self.index
+    }
+
+    /// Set the Metadata Encryption Key. All subsequent metadata writes will be
+    /// encrypted; reads transparently decrypt or pass through legacy plaintext.
+    pub fn with_mek(mut self, mek: [u8; 32]) -> Self {
+        self.mek = Some(mek);
+        self
     }
 
     /// Derive the canonical filesystem path for `(bucket, key)`.
@@ -149,16 +159,28 @@ fn validate_key(key: &str) -> Result<(), Error> {
     Ok(())
 }
 
-/// Encode `metadata` as pretty-printed JSON for the on-disk sidecar.
-fn encode_metadata(meta: &Metadata) -> Result<Vec<u8>, std::io::Error> {
-    serde_json::to_vec_pretty(meta)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+/// Encode `metadata` as JSON, optionally encrypting with `mek`.
+fn encode_metadata(meta: &Metadata, mek: Option<&[u8; 32]>) -> Result<Vec<u8>, std::io::Error> {
+    let json = serde_json::to_vec_pretty(meta)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    if let Some(mek) = mek {
+        encrypt_meta(mek, &json)
+            .map_err(|e| std::io::Error::other(e.to_string()))
+    } else {
+        Ok(json)
+    }
 }
 
-/// Read and parse the JSON metadata sidecar at `path`.
-async fn read_metadata_sidecar(path: &Path) -> Result<Metadata, std::io::Error> {
+/// Read and parse the metadata sidecar at `path`, decrypting if the MEK is set.
+async fn read_metadata_sidecar(path: &Path, mek: Option<&[u8; 32]>) -> Result<Metadata, std::io::Error> {
     let bytes = tokio::fs::read(path).await?;
-    serde_json::from_slice(&bytes)
+    let json = if let Some(mek) = mek {
+        decrypt_meta(mek, &bytes)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?
+    } else {
+        bytes
+    };
+    serde_json::from_slice(&json)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
 
@@ -269,8 +291,8 @@ async fn check_not_locked(lock_path: &Path, bucket: &str, key: &str) -> Result<(
 /// Read the `created` timestamp from an existing JSON metadata sidecar.
 ///
 /// Returns `None` if the file does not exist or cannot be parsed.
-async fn read_created_timestamp(meta_path: &Path) -> Option<u64> {
-    read_metadata_sidecar(meta_path)
+async fn read_created_timestamp(meta_path: &Path, mek: Option<&[u8; 32]>) -> Option<u64> {
+    read_metadata_sidecar(meta_path, mek)
         .await
         .ok()
         .map(|m| m.created)
@@ -377,7 +399,7 @@ impl Storage for FilesystemStorage {
         let data: &[u8] = &payload;
         let now = now_nanos();
         let created = if is_overwrite {
-            read_created_timestamp(&meta_path).await.unwrap_or(now)
+            read_created_timestamp(&meta_path, self.mek.as_ref()).await.unwrap_or(now)
         } else {
             now
         };
@@ -439,7 +461,7 @@ impl Storage for FilesystemStorage {
                 message: e.to_string(),
             })?;
 
-        let encoded = encode_metadata(&metadata).map_err(|e| Error::InternalError {
+        let encoded = encode_metadata(&metadata, self.mek.as_ref()).map_err(|e| Error::InternalError {
             bucket: bucket.to_owned(),
             key: key.to_owned(),
             operation: "put".to_owned(),
@@ -526,7 +548,7 @@ impl Storage for FilesystemStorage {
             });
         }
 
-        read_metadata_sidecar(&meta_path)
+        read_metadata_sidecar(&meta_path, self.mek.as_ref())
             .await
             .map_err(|e| Error::InternalError {
                 bucket: bucket.to_owned(),
@@ -582,8 +604,9 @@ impl StorageExt for FilesystemStorage {
         let base_path = self.base_path.clone();
         let index = self.index.clone();
         let state = self.rebuild_state.clone();
+        let mek = self.mek;
         tokio::spawn(async move {
-            let result = run_rebuild(base_path, index, state.clone()).await;
+            let result = run_rebuild(base_path, index, state.clone(), mek).await;
             let mut s = state.lock().await;
             *s = match result {
                 Ok(()) => CacheRebuildStatus::Completed,
@@ -632,6 +655,7 @@ async fn run_rebuild(
     base_path: PathBuf,
     index: Arc<MetadataIndex>,
     state: Arc<tokio::sync::Mutex<CacheRebuildStatus>>,
+    mek: Option<[u8; 32]>,
 ) -> Result<(), String> {
     let sidecars = collect_sidecars(&base_path)
         .await
@@ -643,7 +667,7 @@ async fn run_rebuild(
     let report_every = (total / 100).max(1);
 
     for (i, path) in sidecars.into_iter().enumerate() {
-        match read_metadata_sidecar(&path).await {
+        match read_metadata_sidecar(&path, mek.as_ref()).await {
             Ok(meta) => {
                 if let Err(e) = index.upsert(&meta).await {
                     tracing::warn!(

@@ -50,7 +50,7 @@ pub struct UringStorage {
 }
 
 /// Tunables for [`UringStorage`].
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct UringConfig {
     /// Number of dedicated tokio-uring worker threads. Defaults to the number
     /// of logical CPUs.
@@ -58,6 +58,20 @@ pub struct UringConfig {
     /// Object size at or above which writes switch to the `O_DIRECT` path
     /// with aligned buffers. Below this, buffered uring writes are used.
     pub large_object_bytes: u64,
+    /// Metadata Encryption Key. When set, all metadata blobs are encrypted
+    /// with AES-256-GCM on write and decrypted on read. Legacy plaintext
+    /// metadata is read transparently for backward compatibility.
+    pub mek: Option<[u8; 32]>,
+}
+
+impl std::fmt::Debug for UringConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UringConfig")
+            .field("workers", &self.workers)
+            .field("large_object_bytes", &self.large_object_bytes)
+            .field("mek", &self.mek.map(|_| "[redacted]"))
+            .finish()
+    }
 }
 
 impl Default for UringConfig {
@@ -67,6 +81,7 @@ impl Default for UringConfig {
                 .map(|n| n.get())
                 .unwrap_or(4),
             large_object_bytes: 4 * 1024 * 1024,
+            mek: None,
         }
     }
 }
@@ -113,6 +128,13 @@ impl UringStorage {
             config,
             pool,
         })
+    }
+
+    /// Set the Metadata Encryption Key. All subsequent metadata writes will be
+    /// encrypted; reads transparently decrypt or pass through legacy plaintext.
+    pub fn with_mek(mut self, mek: [u8; 32]) -> Self {
+        self.config.mek = Some(mek);
+        self
     }
 
     /// Access the underlying metadata index, e.g. for `lookup_by_label`.
@@ -271,6 +293,7 @@ impl Storage for UringStorage {
             crypto,
             large_object_bytes: self.config.large_object_bytes,
             sync: options.sync,
+            mek: self.config.mek,
             reply,
         };
         let (is_overwrite, metadata) = self.dispatch(op, bucket, key, "put", reply_rx).await?;
@@ -326,6 +349,7 @@ impl Storage for UringStorage {
             lock_path,
             bucket: bucket.to_owned(),
             key: key.to_owned(),
+            mek: self.config.mek,
             reply,
         };
         self.dispatch(op, bucket, key, "describe", reply_rx).await
@@ -377,8 +401,9 @@ impl StorageExt for UringStorage {
         let index = self.index.clone();
         let state = self.rebuild_state.clone();
         let pool = Arc::clone(&self.pool);
+        let mek = self.config.mek;
         tokio::spawn(async move {
-            let result = run_rebuild(base_path, index, state.clone(), pool).await;
+            let result = run_rebuild(base_path, index, state.clone(), pool, mek).await;
             let mut s = state.lock().await;
             *s = match result {
                 Ok(()) => CacheRebuildStatus::Completed,
@@ -435,6 +460,7 @@ async fn run_rebuild(
     index: Arc<MetadataIndex>,
     state: Arc<tokio::sync::Mutex<CacheRebuildStatus>>,
     pool: Arc<WorkerPool>,
+    mek: Option<[u8; 32]>,
 ) -> Result<(), String> {
     let obj_paths = collect_obj_files(&base_path)
         .await
@@ -454,7 +480,7 @@ async fn run_rebuild(
             let Some(path) = path_iter.next() else { break };
             let (reply, reply_rx) = tokio::sync::oneshot::channel();
             let sender = pool.dispatch_for_path(&path).clone();
-            let op = UringOp::ReadObjectMeta { path, reply };
+            let op = UringOp::ReadObjectMeta { path, mek, reply };
             if let Err(e) = sender.send(op).await {
                 return Err(format!("worker pool closed mid-rebuild: {e}"));
             }

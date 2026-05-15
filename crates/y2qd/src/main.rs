@@ -64,7 +64,7 @@ use tracing_actix_web::TracingLogger;
 use tracing_subscriber::EnvFilter;
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
-use y2q_core::crypto::{Argon2Params, keystore as keystore_mod};
+use y2q_core::crypto::{Argon2Params, derive_mek, keystore as keystore_mod};
 use y2q_core::{AnyStorage, FilesystemStorage};
 
 #[cfg(all(target_os = "linux", feature = "uring"))]
@@ -209,6 +209,8 @@ async fn main() -> std::io::Result<()> {
         "deployment public-key fingerprint"
     );
 
+    let mek = derive_mek(&public_keystore.public_key);
+
     let auth_state = web::Data::new(AuthState::new(
         public_keystore,
         user_store,
@@ -240,11 +242,12 @@ async fn main() -> std::io::Result<()> {
     let storage: Arc<AnyStorage> = Arc::new(match cfg.storage.backend {
         config::StorageBackend::Filesystem => AnyStorage::Filesystem(
             FilesystemStorage::new(&cfg.storage.base_path, &index_path)
-                .map_err(|e| std::io::Error::other(format!("storage init: {e}")))?,
+                .map_err(|e| std::io::Error::other(format!("storage init: {e}")))?
+                .with_mek(mek),
         ),
         #[cfg(all(target_os = "linux", feature = "uring"))]
         config::StorageBackend::Uring => AnyStorage::Uring(
-            UringStorage::new(&cfg.storage.base_path, &index_path, UringConfig::default())
+            UringStorage::new(&cfg.storage.base_path, &index_path, UringConfig { mek: Some(mek), ..UringConfig::default() })
                 .map_err(|e| std::io::Error::other(format!("storage init: {e}")))?,
         ),
         #[cfg(not(all(target_os = "linux", feature = "uring")))]

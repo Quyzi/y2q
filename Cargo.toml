@@ -2,6 +2,8 @@
 members = [
     "crates/y2q-core",
     "crates/y2qd",
+    "crates/y2q-client",
+    "crates/y2q-cli",
 ]
 resolver = "2"
 
@@ -41,6 +43,17 @@ tracing                     = "0.1.44"
 tracing-actix-web           = "0.7"
 tracing-subscriber          = { version = "0.3", features = ["env-filter"] }
 uuid                        = { version = "1", features = ["v5"] }
-clap                        = { version = "4", features = ["derive"] }
+clap                        = { version = "4", features = ["derive", "env"] }
 tempfile                    = "3"
 zeroize                     = { version = "1", features = ["derive"] }
+chrono                      = "0.4"
+crossterm                   = { version = "0.28", features = ["event-stream"] }
+directories                 = "5"
+futures                     = "0.3"
+indexmap                    = { version = "2", features = ["serde"] }
+ratatui                     = { version = "0.29", features = ["crossterm"] }
+reqwest                     = { version = "0.12", features = ["json", "stream", "rustls-tls"], default-features = false }
+rpassword                   = "7"
+throbber-widgets-tui        = "0.8"
+tokio-util                  = { version = "0.7", features = ["io"] }
+toml                        = "0.8"
