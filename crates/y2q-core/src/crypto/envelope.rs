@@ -287,6 +287,12 @@ const V2_AAD_LEN: usize = 20; // up to and including nonce_base
 /// Feed plaintext in arbitrary-sized chunks via [`feed`]; call [`finish`] when
 /// done to flush the last chunk and patch the `plaintext_len` field in the
 /// header. The file is returned so the caller can close or rename it.
+///
+/// `write_offset` is the byte offset within the file at which the v2 envelope
+/// starts. Pass `0` when the envelope occupies the whole file (filesystem
+/// backend). Pass `64` when a 64-byte container header precedes the envelope
+/// (uring backend — the caller pre-writes a placeholder header before creating
+/// the session).
 pub struct EncryptSession {
     file: tokio::fs::File,
     cipher: Aes256Gcm,
@@ -297,17 +303,22 @@ pub struct EncryptSession {
     /// First 20 bytes of the fixed header (magic … nonce_base), used as AAD.
     aad: [u8; V2_AAD_LEN],
     bytes_written: u64,
+    /// Byte offset within the file at which the v2 envelope begins.
+    write_offset: u64,
 }
 
 impl EncryptSession {
     /// Create a new encrypt session for a v2 envelope.
     ///
     /// Writes the 32-byte fixed header (with `plaintext_len = 0`) and the
-    /// 1088-byte KEM ciphertext to `file`. The caller should have created
-    /// `file` as an empty tmp file immediately before calling this.
+    /// 1088-byte KEM ciphertext to `file`, starting at the current file
+    /// position (which must equal `write_offset`). Pass `write_offset = 0`
+    /// when the envelope is the entire file; pass a non-zero value when a
+    /// container header precedes it.
     pub async fn new(
         mut file: tokio::fs::File,
         pk_bytes: &[u8],
+        write_offset: u64,
     ) -> Result<Self, CryptoError> {
         let pk = mlkem768::PublicKey::from_bytes(pk_bytes)
             .map_err(|_| CryptoError::KemDecode("public key"))?;
@@ -350,6 +361,7 @@ impl EncryptSession {
             plaintext_total: 0,
             aad,
             bytes_written,
+            write_offset,
         })
     }
 
@@ -376,9 +388,9 @@ impl EncryptSession {
         }
         let cipher_size = self.bytes_written;
 
-        // Patch plaintext_len at offset 20 in the file.
+        // Patch plaintext_len at its position within the v2 envelope.
         self.file
-            .seek(std::io::SeekFrom::Start(V2_PLAINTEXT_LEN_OFFSET))
+            .seek(std::io::SeekFrom::Start(self.write_offset + V2_PLAINTEXT_LEN_OFFSET))
             .await
             .map_err(|_| CryptoError::Aead("seek plaintext_len"))?;
         self.file
@@ -602,7 +614,7 @@ mod tests {
         let (pk, sk) = mlkem768::keypair();
         let pt = b"hello chunked world";
         let file = tempfile_v2().await;
-        let mut session = EncryptSession::new(file, pk.as_bytes()).await.unwrap();
+        let mut session = EncryptSession::new(file, pk.as_bytes(), 0).await.unwrap();
         session.feed(pt).await.unwrap();
         let (file, info) = session.finish().await.unwrap();
         assert_eq!(info.envelope_version, 2);
@@ -616,7 +628,7 @@ mod tests {
     async fn v2_roundtrip_empty() {
         let (pk, sk) = mlkem768::keypair();
         let file = tempfile_v2().await;
-        let session = EncryptSession::new(file, pk.as_bytes()).await.unwrap();
+        let session = EncryptSession::new(file, pk.as_bytes(), 0).await.unwrap();
         let (file, _) = session.finish().await.unwrap();
         let env = read_file(file).await;
         let recovered = decrypt(sk.as_bytes(), &env).unwrap();
@@ -629,7 +641,7 @@ mod tests {
         // 2.5 MiB — spans three chunks
         let pt = vec![0xAB_u8; 5 * (1 << 20) / 2];
         let file = tempfile_v2().await;
-        let mut session = EncryptSession::new(file, pk.as_bytes()).await.unwrap();
+        let mut session = EncryptSession::new(file, pk.as_bytes(), 0).await.unwrap();
         // Feed in small slices to exercise partial-chunk buffering.
         for chunk in pt.chunks(65536) {
             session.feed(chunk).await.unwrap();
@@ -648,7 +660,7 @@ mod tests {
     async fn v2_tamper_breaks_decrypt() {
         let (pk, sk) = mlkem768::keypair();
         let file = tempfile_v2().await;
-        let mut session = EncryptSession::new(file, pk.as_bytes()).await.unwrap();
+        let mut session = EncryptSession::new(file, pk.as_bytes(), 0).await.unwrap();
         session.feed(b"some payload").await.unwrap();
         let (file, _) = session.finish().await.unwrap();
         let mut env = read_file(file).await;

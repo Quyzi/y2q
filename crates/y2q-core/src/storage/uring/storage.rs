@@ -22,7 +22,7 @@ use crate::{
     storage::locks::{clear_stale_locks_under, list_stale_locks_under},
 };
 
-use super::{ops::UringOp, runtime::WorkerPool};
+use super::{ops::UringOp, runtime::WorkerPool, streaming::UringStreamingPutGuard};
 
 /// UUID v5 namespace used to derive deterministic filenames from object keys.
 ///
@@ -190,6 +190,165 @@ impl UringStorage {
             message: "uring worker dropped reply".to_owned(),
         })?
     }
+}
+
+impl UringStorage {
+    /// Begin a streaming PUT for `bucket`/`key`.
+    ///
+    /// Acquires the object write-lock, opens a tmp file, writes a 64-byte
+    /// placeholder `.obj` header, and returns the guard + file. The caller
+    /// passes the file to an [`crate::crypto::envelope::EncryptSession`]
+    /// (with `write_offset = STREAMING_DATA_OFFSET`) to stream-encrypt the
+    /// body, then calls [`UringStreamingPutGuard::commit`] to finalise and
+    /// rename the object.
+    pub async fn begin_streaming_put(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<(UringStreamingPutGuard, tokio::fs::File), Error> {
+        validate_bucket(bucket)?;
+        validate_key(key)?;
+
+        let obj_path = self.obj_path(bucket, key);
+        let tmp_path = obj_path.with_extension("tmp");
+        let lock_path = obj_path.with_extension("lock");
+
+        if let Some(parent) = obj_path.parent() {
+            tokio::fs::create_dir_all(parent).await.map_err(|e| Error::InternalError {
+                bucket: bucket.to_owned(),
+                key: key.to_owned(),
+                operation: "begin_streaming_put".to_owned(),
+                message: format!("mkdir: {e}"),
+            })?;
+        }
+
+        // Detect overwrite before acquiring the lock (ReadObjectMeta skips
+        // the lock check, so it's safe to call concurrently with readers).
+        let (is_overwrite, prior_created) = match tokio::fs::metadata(&obj_path).await {
+            Ok(_) => {
+                let (reply, reply_rx) = tokio::sync::oneshot::channel();
+                let op = UringOp::ReadObjectMeta {
+                    path: obj_path.clone(),
+                    mek: self.config.mek,
+                    reply,
+                };
+                self.pool
+                    .dispatch_for_key(bucket, key)
+                    .send(op)
+                    .await
+                    .map_err(|_| Error::InternalError {
+                        bucket: bucket.to_owned(),
+                        key: key.to_owned(),
+                        operation: "begin_streaming_put".to_owned(),
+                        message: "worker pool closed".to_owned(),
+                    })?;
+                let prior_created = match reply_rx.await {
+                    Ok(Ok(meta)) => Some(meta.created),
+                    _ => None,
+                };
+                (true, prior_created)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (false, None),
+            Err(e) => {
+                return Err(Error::InternalError {
+                    bucket: bucket.to_owned(),
+                    key: key.to_owned(),
+                    operation: "begin_streaming_put".to_owned(),
+                    message: format!("stat existing: {e}"),
+                });
+            }
+        };
+
+        // Acquire lock synchronously. Using std::fs so we don't need a uring
+        // worker dispatch for the lock-file creation.
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+        {
+            Ok(mut f) => {
+                use std::io::Write as _;
+                let stamp = now_nanos_sync().to_le_bytes();
+                let _ = f.write_all(&stamp);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let since = read_lock_since_sync(&lock_path);
+                return Err(Error::Locked {
+                    bucket: bucket.to_owned(),
+                    key: key.to_owned(),
+                    since,
+                });
+            }
+            Err(e) => {
+                return Err(Error::InternalError {
+                    bucket: bucket.to_owned(),
+                    key: key.to_owned(),
+                    operation: "begin_streaming_put".to_owned(),
+                    message: format!("acquire lock: {e}"),
+                });
+            }
+        }
+
+        // Open the tmp file and write a placeholder `.obj` header so the
+        // EncryptSession starts writing at data_offset (= HEADER_SIZE = 64).
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .read(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp_path)
+            .await
+            .map_err(|e| Error::InternalError {
+                bucket: bucket.to_owned(),
+                key: key.to_owned(),
+                operation: "begin_streaming_put".to_owned(),
+                message: format!("open tmp: {e}"),
+            })?;
+
+        use tokio::io::AsyncWriteExt as _;
+        let placeholder = [0u8; super::format::HEADER_SIZE];
+        file.write_all(&placeholder).await.map_err(|e| Error::InternalError {
+            bucket: bucket.to_owned(),
+            key: key.to_owned(),
+            operation: "begin_streaming_put".to_owned(),
+            message: format!("write placeholder header: {e}"),
+        })?;
+
+        let guard = UringStreamingPutGuard::new(
+            tmp_path,
+            obj_path,
+            lock_path,
+            bucket.to_owned(),
+            key.to_owned(),
+            is_overwrite,
+            prior_created,
+            self.config.mek,
+            self.index.clone(),
+        );
+
+        Ok((guard, file))
+    }
+}
+
+fn now_nanos_sync() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64
+}
+
+fn read_lock_since_sync(path: &std::path::Path) -> std::time::SystemTime {
+    std::fs::read(path)
+        .ok()
+        .and_then(|b| {
+            b.get(..8)
+                .and_then(|s| <[u8; 8]>::try_from(s).ok())
+                .map(|arr| {
+                    std::time::UNIX_EPOCH
+                        + std::time::Duration::from_nanos(u64::from_le_bytes(arr))
+                })
+        })
+        .unwrap_or(std::time::UNIX_EPOCH)
 }
 
 /// Reserved bucket names that conflict with the `/api/v1/*` admin namespace.
@@ -624,6 +783,7 @@ mod tests {
             UringConfig {
                 workers,
                 large_object_bytes,
+                ..UringConfig::default()
             },
         )
         .unwrap()

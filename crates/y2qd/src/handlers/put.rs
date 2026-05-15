@@ -64,13 +64,13 @@ pub async fn handle(
     let labels = extract_labels(&req, limits.get_ref())?;
     let sync = parse_sync_header(&req)?;
 
-    let (guard, file) = storage
+    let (guard, file, write_offset) = storage
         .begin_streaming_put(&bucket, &key)
         .await
         .map_err(AppError::from)?;
 
     let (file, plaintext_metrics, cipher_metadata) =
-        cipher::stream_encrypt_for_put(&auth.keystore, payload, file, &bucket, &key).await?;
+        cipher::stream_encrypt_for_put(&auth.keystore, payload, file, &bucket, &key, write_offset).await?;
 
     let was_overwrite = guard
         .commit(

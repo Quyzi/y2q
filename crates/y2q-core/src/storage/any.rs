@@ -12,12 +12,15 @@ use std::time::SystemTime;
 use bytes::Bytes;
 
 use crate::{
-    CacheRebuildStatus, Error, FilesystemStorage, ListOptions, ListPage, Listing, Metadata,
-    Object, PutOptions, StaleLock, Storage, StorageExt, StreamingPutGuard,
+    CacheRebuildStatus, CipherMetadata, Error, FilesystemStorage, ListOptions, ListPage, Listing,
+    Metadata, Object, PlaintextMetrics, PutOptions, StaleLock, Storage, StorageExt,
+    StreamingPutGuard,
 };
 
 #[cfg(all(target_os = "linux", feature = "uring"))]
 use crate::UringStorage;
+#[cfg(all(target_os = "linux", feature = "uring"))]
+use crate::storage::uring::{UringStreamingPutGuard, URING_STREAMING_WRITE_OFFSET};
 
 /// One of the available storage backends, selected at startup.
 ///
@@ -103,25 +106,61 @@ impl Listing for AnyStorage {
     }
 }
 
+/// Backend-erased streaming PUT guard returned by
+/// [`AnyStorage::begin_streaming_put`].
+///
+/// Call [`commit`] after feeding all data through the encrypt session.
+pub enum AnyStreamingPutGuard {
+    /// Guard backed by [`FilesystemStorage`].
+    Filesystem(StreamingPutGuard),
+    /// Guard backed by [`UringStorage`] (Linux + `uring` feature only).
+    #[cfg(all(target_os = "linux", feature = "uring"))]
+    Uring(UringStreamingPutGuard),
+}
+
+impl AnyStreamingPutGuard {
+    /// Finalise the streaming PUT. See the backend-specific guard types for
+    /// full semantics; both rename the tmp file atomically into place and
+    /// update the secondary metadata index.
+    pub async fn commit(
+        self,
+        file: tokio::fs::File,
+        options: PutOptions,
+        plaintext_metrics: PlaintextMetrics,
+        cipher_metadata: CipherMetadata,
+    ) -> Result<bool, Error> {
+        match self {
+            Self::Filesystem(g) => g.commit(file, options, plaintext_metrics, cipher_metadata).await,
+            #[cfg(all(target_os = "linux", feature = "uring"))]
+            Self::Uring(g) => g.commit(file, options, plaintext_metrics, cipher_metadata).await,
+        }
+    }
+}
+
 impl AnyStorage {
     /// Begin a streaming PUT, acquiring the object lock and opening the tmp
-    /// file. See [`FilesystemStorage::begin_streaming_put`] for full semantics.
+    /// file. Returns the guard, the open tmp file, and a `write_offset` that
+    /// must be passed to
+    /// [`crate::crypto::envelope::EncryptSession::new`].
+    ///
+    /// `write_offset` is `0` for the filesystem backend (the v2 envelope
+    /// fills the whole file) and `64` for the uring backend (where a 64-byte
+    /// `.obj` header precedes the envelope). Passing it to `EncryptSession`
+    /// ensures `finish()` seeks to the right position to patch `plaintext_len`.
     pub async fn begin_streaming_put(
         &self,
         bucket: &str,
         key: &str,
-    ) -> Result<(StreamingPutGuard, tokio::fs::File), Error> {
+    ) -> Result<(AnyStreamingPutGuard, tokio::fs::File, u64), Error> {
         match self {
-            Self::Filesystem(s) => s.begin_streaming_put(bucket, key).await,
+            Self::Filesystem(s) => {
+                let (g, f) = s.begin_streaming_put(bucket, key).await?;
+                Ok((AnyStreamingPutGuard::Filesystem(g), f, 0))
+            }
             #[cfg(all(target_os = "linux", feature = "uring"))]
-            Self::Uring(_) => {
-                // io_uring backend doesn't support streaming PUT yet.
-                Err(Error::InternalError {
-                    bucket: bucket.to_owned(),
-                    key: key.to_owned(),
-                    operation: "begin_streaming_put".to_owned(),
-                    message: "uring backend does not support streaming PUT".to_owned(),
-                })
+            Self::Uring(s) => {
+                let (g, f) = s.begin_streaming_put(bucket, key).await?;
+                Ok((AnyStreamingPutGuard::Uring(g), f, URING_STREAMING_WRITE_OFFSET))
             }
         }
     }
