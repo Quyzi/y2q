@@ -99,7 +99,9 @@ impl FilesystemStorage {
 
     /// Set the Metadata Encryption Key. All subsequent metadata writes will be
     /// encrypted; reads transparently decrypt or pass through legacy plaintext.
+    /// Also enables encrypted key blinding on the metadata index.
     pub fn with_mek(mut self, mek: [u8; 32]) -> Self {
+        self.index.set_mek(mek);
         self.mek = Some(mek);
         self
     }

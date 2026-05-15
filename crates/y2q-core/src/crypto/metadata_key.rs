@@ -15,16 +15,43 @@
 //! compatibility.
 
 use aes_gcm::{Aes256Gcm, KeyInit, aead::Aead};
+use hmac::{Hmac, Mac};
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 
 use super::CryptoError;
 
+type HmacSha256 = Hmac<Sha256>;
+
 const DERIVATION_LABEL: &[u8] = b"y2q-metadata-encryption-key-v1";
+const INDEX_KEY_LABEL: &[u8] = b"y2q-index-key-v1";
 const VERSION_BYTE: u8 = 0x01;
 const NONCE_LEN: usize = 12;
 /// Minimum blob size for an encrypted blob: version + nonce + GCM tag.
 const MIN_ENCRYPTED_LEN: usize = 1 + NONCE_LEN + 16;
+
+/// HMAC-SHA256 keyed PRF: `HMAC(key, data) → [u8; 32]`.
+///
+/// Used both to derive sub-keys and to blind index key fields.
+pub fn prf(key: &[u8; 32], data: &[u8]) -> [u8; 32] {
+    let mut mac = <HmacSha256 as KeyInit>::new_from_slice(key).expect("HMAC accepts any key size");
+    mac.update(data);
+    let out = mac.finalize().into_bytes();
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&out);
+    arr
+}
+
+/// Derive the Index Key (IK) from the MEK.
+///
+/// `IK = HMAC-SHA256(MEK, "y2q-index-key-v1")`
+///
+/// IK is used exclusively for HMAC-blinding redb index keys; the MEK is used
+/// for AES-256-GCM value encryption. Keeping them separate ensures that
+/// compromise of one operation does not directly expose the other.
+pub fn derive_index_key(mek: &[u8; 32]) -> [u8; 32] {
+    prf(mek, INDEX_KEY_LABEL)
+}
 
 /// Derive the Metadata Encryption Key from the raw bytes of the deployment
 /// public key.

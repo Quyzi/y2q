@@ -18,6 +18,7 @@ crc32fast                   = "1.4"
 criterion                   = { version = "0.5", features = ["async_tokio"] }
 dashmap                     = "6"
 fs2                         = "0.4"
+hmac                        = "0.12"
 hkdf                        = "0.12"
 libc                        = "0.2"
 utoipa                      = "5"

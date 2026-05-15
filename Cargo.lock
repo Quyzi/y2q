@@ -4636,6 +4636,7 @@ dependencies = [
  "criterion",
  "fs2",
  "hkdf",
+ "hmac",
  "libc",
  "md-5",
  "pqcrypto",
