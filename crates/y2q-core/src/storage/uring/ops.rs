@@ -25,7 +25,7 @@ use sha2::Digest;
 use tokio::sync::oneshot;
 use tokio_uring::fs::{File, OpenOptions};
 
-use crate::{Error, Metadata, Object, SyncLevel};
+use crate::{Error, Metadata, Object, SyncLevel, crypto::{decrypt_meta, encrypt_meta}};
 
 use super::{
     buffer::{AlignedBuf, DIRECT_IO_ALIGN, DIRECT_IO_CHUNK},
@@ -77,6 +77,9 @@ pub(super) enum UringOp {
         large_object_bytes: u64,
         /// Whether to fdatasync + fsync the parent dir before returning.
         sync: SyncLevel,
+        /// Metadata Encryption Key. When set, the metadata JSON blob is
+        /// encrypted before being written to the `.obj` file.
+        mek: Option<[u8; 32]>,
         reply: oneshot::Sender<Result<(bool, Metadata), Error>>,
     },
     /// Read the object, then unlink it. Returns the deleted bytes.
@@ -93,6 +96,8 @@ pub(super) enum UringOp {
         lock_path: PathBuf,
         bucket: String,
         key: String,
+        /// Metadata Encryption Key for decrypting the embedded metadata blob.
+        mek: Option<[u8; 32]>,
         reply: oneshot::Sender<Result<Metadata, Error>>,
     },
     /// Read the on-disk metadata for an object given its file path, without
@@ -106,6 +111,8 @@ pub(super) enum UringOp {
     /// [`rebuild_cache`]: crate::StorageExt::rebuild_cache
     ReadObjectMeta {
         path: PathBuf,
+        /// Metadata Encryption Key for decrypting the embedded metadata blob.
+        mek: Option<[u8; 32]>,
         reply: oneshot::Sender<Result<Metadata, Error>>,
     },
 }
@@ -144,6 +151,7 @@ pub(super) async fn handle(op: UringOp) {
             crypto,
             large_object_bytes,
             sync,
+            mek,
             reply,
         } => {
             let (plaintext_metrics, cipher_metadata) = match crypto {
@@ -164,6 +172,7 @@ pub(super) async fn handle(op: UringOp) {
                     cipher_metadata,
                     large_object_bytes,
                     sync,
+                    mek,
                 )
                 .await,
             );
@@ -182,12 +191,13 @@ pub(super) async fn handle(op: UringOp) {
             lock_path,
             bucket,
             key,
+            mek,
             reply,
         } => {
-            let _ = reply.send(do_describe(obj_path, lock_path, bucket, key).await);
+            let _ = reply.send(do_describe(obj_path, lock_path, bucket, key, mek).await);
         }
-        UringOp::ReadObjectMeta { path, reply } => {
-            let _ = reply.send(do_read_object_meta(path).await);
+        UringOp::ReadObjectMeta { path, mek, reply } => {
+            let _ = reply.send(do_read_object_meta(path, mek).await);
         }
     }
 }
@@ -325,18 +335,25 @@ async fn open_and_read_header(
 }
 
 /// Read the metadata blob from an already-opened object, given its decoded
-/// header.
+/// header. Decrypts with `mek` if the blob carries the 0x01 version prefix.
 async fn read_meta_blob(
     file: &File,
     header: &Header,
     bucket: &str,
     key: &str,
     op_name: &str,
+    mek: Option<&[u8; 32]>,
 ) -> Result<Metadata, Error> {
     let buf = vec![0u8; header.meta_len as usize];
     let (res, buf) = file.read_exact_at(buf, header.meta_offset()).await;
     res.map_err(|e| internal(bucket, key, op_name, format!("read meta: {e}")))?;
-    serde_json::from_slice(&buf)
+    let json = if let Some(mek) = mek {
+        decrypt_meta(mek, &buf)
+            .map_err(|e| internal(bucket, key, op_name, format!("decrypt meta: {e}")))?
+    } else {
+        buf
+    };
+    serde_json::from_slice(&json)
         .map_err(|e| internal(bucket, key, op_name, format!("decode meta: {e}")))
 }
 
@@ -347,10 +364,11 @@ async fn do_describe(
     lock_path: PathBuf,
     bucket: String,
     key: String,
+    mek: Option<[u8; 32]>,
 ) -> Result<Metadata, Error> {
     check_not_locked(&lock_path, &bucket, &key).await?;
     let (file, header) = open_and_read_header(&obj_path, &bucket, &key, "describe").await?;
-    let meta = read_meta_blob(&file, &header, &bucket, &key, "describe").await;
+    let meta = read_meta_blob(&file, &header, &bucket, &key, "describe", mek.as_ref()).await;
     let _ = file.close().await;
     meta
 }
@@ -359,7 +377,7 @@ async fn do_describe(
 /// bucket/key validation. Used by the rebuild walker, which has thousands
 /// of paths to process and identifies each object by the metadata embedded
 /// in the file itself.
-async fn do_read_object_meta(path: PathBuf) -> Result<Metadata, Error> {
+async fn do_read_object_meta(path: PathBuf, mek: Option<[u8; 32]>) -> Result<Metadata, Error> {
     let make_err = |msg: String| Error::InternalError {
         bucket: String::new(),
         key: String::new(),
@@ -389,7 +407,12 @@ async fn do_read_object_meta(path: PathBuf) -> Result<Metadata, Error> {
     let (res, meta_buf) = file.read_exact_at(meta_buf, header.meta_offset()).await;
     let _ = file.close().await;
     res.map_err(|e| make_err(format!("read meta: {e}")))?;
-    serde_json::from_slice(&meta_buf).map_err(|e| make_err(format!("decode meta: {e}")))
+    let json = if let Some(ref mek) = mek {
+        decrypt_meta(mek, &meta_buf).map_err(|e| make_err(format!("decrypt meta: {e}")))?
+    } else {
+        meta_buf
+    };
+    serde_json::from_slice(&json).map_err(|e| make_err(format!("decode meta: {e}")))
 }
 
 async fn do_get(
@@ -470,6 +493,7 @@ async fn do_put(
     cipher_metadata: Option<crate::CipherMetadata>,
     large_object_bytes: u64,
     sync: SyncLevel,
+    mek: Option<[u8; 32]>,
 ) -> Result<(bool, Metadata), Error> {
     if let Some(parent) = obj_path.parent() {
         std::fs::create_dir_all(parent)
@@ -482,7 +506,7 @@ async fn do_put(
     // gives us its prior `created` timestamp for preservation.
     let (is_overwrite, prior_created) = match File::open(&obj_path).await {
         Ok(file) => {
-            let prior = read_existing_created(&file).await;
+            let prior = read_existing_created(&file, mek.as_ref()).await;
             let _ = file.close().await;
             (true, prior)
         }
@@ -546,8 +570,14 @@ async fn do_put(
         envelope_version,
     };
 
-    let meta_bytes = serde_json::to_vec(&metadata)
+    let meta_json = serde_json::to_vec(&metadata)
         .map_err(|e| internal(&bucket, &key, "put", format!("encode meta: {e}")))?;
+    let meta_bytes = if let Some(ref mek) = mek {
+        encrypt_meta(mek, &meta_json)
+            .map_err(|e| internal(&bucket, &key, "put", format!("encrypt meta: {e}")))?
+    } else {
+        meta_json
+    };
 
     let use_direct = large_object_bytes > 0 && payload.len() as u64 >= large_object_bytes;
     if use_direct {
@@ -807,7 +837,7 @@ async fn finalize_rename_and_dir_fsync(
 /// Read the `created` timestamp from an existing object by parsing its
 /// header + metadata blob. Returns `None` if anything is unreadable; the
 /// caller falls back to "now" in that case.
-async fn read_existing_created(file: &File) -> Option<u64> {
+async fn read_existing_created(file: &File, mek: Option<&[u8; 32]>) -> Option<u64> {
     let buf = vec![0u8; HEADER_SIZE];
     let (res, buf) = file.read_exact_at(buf, 0).await;
     res.ok()?;
@@ -816,6 +846,11 @@ async fn read_existing_created(file: &File) -> Option<u64> {
     let meta_buf = vec![0u8; header.meta_len as usize];
     let (res, meta_buf) = file.read_exact_at(meta_buf, header.meta_offset()).await;
     res.ok()?;
-    let m: Metadata = serde_json::from_slice(&meta_buf).ok()?;
+    let json = if let Some(mek) = mek {
+        decrypt_meta(mek, &meta_buf).ok()?
+    } else {
+        meta_buf
+    };
+    let m: Metadata = serde_json::from_slice(&json).ok()?;
     Some(m.created)
 }
