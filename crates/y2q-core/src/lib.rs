@@ -14,7 +14,7 @@ pub mod crypto;
 /// Storage backends (filesystem and io_uring), metadata index, and lock management.
 pub mod storage;
 pub use storage::any::AnyStorage;
-pub use storage::filesystem::FilesystemStorage;
+pub use storage::filesystem::{FilesystemStorage, StreamingPutGuard};
 pub use storage::index::MetadataIndex;
 pub use storage::locks::StaleLock;
 

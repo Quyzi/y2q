@@ -13,7 +13,7 @@ use bytes::Bytes;
 
 use crate::{
     CacheRebuildStatus, Error, FilesystemStorage, ListOptions, ListPage, Listing, Metadata,
-    Object, PutOptions, StaleLock, Storage, StorageExt,
+    Object, PutOptions, StaleLock, Storage, StorageExt, StreamingPutGuard,
 };
 
 #[cfg(all(target_os = "linux", feature = "uring"))]
@@ -99,6 +99,30 @@ impl Listing for AnyStorage {
             Self::Filesystem(s) => s.list_objects(bucket, options).await,
             #[cfg(all(target_os = "linux", feature = "uring"))]
             Self::Uring(s) => s.list_objects(bucket, options).await,
+        }
+    }
+}
+
+impl AnyStorage {
+    /// Begin a streaming PUT, acquiring the object lock and opening the tmp
+    /// file. See [`FilesystemStorage::begin_streaming_put`] for full semantics.
+    pub async fn begin_streaming_put(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<(StreamingPutGuard, tokio::fs::File), Error> {
+        match self {
+            Self::Filesystem(s) => s.begin_streaming_put(bucket, key).await,
+            #[cfg(all(target_os = "linux", feature = "uring"))]
+            Self::Uring(_) => {
+                // io_uring backend doesn't support streaming PUT yet.
+                Err(Error::InternalError {
+                    bucket: bucket.to_owned(),
+                    key: key.to_owned(),
+                    operation: "begin_streaming_put".to_owned(),
+                    message: "uring backend does not support streaming PUT".to_owned(),
+                })
+            }
         }
     }
 }

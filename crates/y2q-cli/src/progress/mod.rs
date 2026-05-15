@@ -72,7 +72,7 @@ impl Default for SpeedMeter {
 /// Wraps a tokio AsyncRead to count bytes and report progress.
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use tokio::io::{AsyncRead, ReadBuf};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 pub struct CountingReader<R> {
     inner: R,
@@ -113,5 +113,50 @@ impl<R: AsyncRead + Unpin> AsyncRead for CountingReader<R> {
 impl<R> Drop for CountingReader<R> {
     fn drop(&mut self) {
         self.reporter.finish(self.bytes_done);
+    }
+}
+
+/// Wraps a tokio AsyncWrite to count bytes written and report progress.
+pub struct CountingWriter<W> {
+    inner: W,
+    bytes_done: u64,
+    speed: SpeedMeter,
+    reporter: Box<dyn ProgressReporter>,
+}
+
+impl<W> CountingWriter<W> {
+    pub fn new(inner: W, reporter: Box<dyn ProgressReporter>) -> Self {
+        Self { inner, bytes_done: 0, speed: SpeedMeter::new(), reporter }
+    }
+}
+
+impl<W: AsyncWrite + Unpin> AsyncWrite for CountingWriter<W> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        let poll = Pin::new(&mut this.inner).poll_write(cx, buf);
+        if let Poll::Ready(Ok(n)) = &poll {
+            let n = *n as u64;
+            if n > 0 {
+                this.bytes_done += n;
+                if let Some(speed) = this.speed.record(n) {
+                    this.reporter.update(this.bytes_done, speed);
+                }
+            }
+        }
+        poll
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        this.reporter.finish(this.bytes_done);
+        Pin::new(&mut this.inner).poll_shutdown(cx)
     }
 }

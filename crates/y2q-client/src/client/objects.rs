@@ -101,7 +101,9 @@ impl Y2qClient {
         }
 
         Ok(ObjectHead {
-            size: hdr_u64(headers, "content-length").unwrap_or(0),
+            size: hdr_u64(headers, "x-y2q-size")
+                .or_else(|| hdr_u64(headers, "content-length"))
+                .unwrap_or(0),
             created: hdr_u64(headers, "x-y2q-created").unwrap_or(0),
             modified: hdr_u64(headers, "x-y2q-modified").unwrap_or(0),
             checksum_md5: hdr(headers, "x-y2q-checksum-md5").unwrap_or_default(),

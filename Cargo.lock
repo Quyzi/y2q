@@ -4666,6 +4666,7 @@ dependencies = [
  "clap",
  "dashmap",
  "figment",
+ "futures",
  "md-5",
  "metrics",
  "metrics-exporter-prometheus",
