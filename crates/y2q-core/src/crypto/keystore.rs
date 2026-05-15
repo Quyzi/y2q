@@ -30,13 +30,18 @@ use super::CryptoError;
 
 /// Standard filenames within the keystore directory.
 pub struct KeystoreFiles {
+    /// Root directory path (the `keystore_dir` from config).
     pub root: PathBuf,
+    /// Path to `pubkey.json` (the deployment public key, non-secret).
     pub pubkey: PathBuf,
+    /// Path to `users.redb` (the user-records database).
     pub users: PathBuf,
+    /// Path to `.lock` (POSIX advisory exclusive lock held by the daemon).
     pub lock: PathBuf,
 }
 
 impl KeystoreFiles {
+    /// Build all standard paths rooted at `dir`.
     pub fn new(dir: impl Into<PathBuf>) -> Self {
         let root: PathBuf = dir.into();
         Self {

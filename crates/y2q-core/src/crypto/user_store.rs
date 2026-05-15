@@ -37,8 +37,11 @@ pub struct UserRecord {
 /// Public-safe summary surfaced by `GET /api/v1/users`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserSummary {
+    /// Login name, case-sensitive.
     pub username: String,
+    /// Nanoseconds since Unix epoch when the account was created.
     pub created_at: u64,
+    /// Nanoseconds since Unix epoch of the last successful login, or `None` if never.
     pub last_login: Option<u64>,
 }
 
