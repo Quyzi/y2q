@@ -7,6 +7,7 @@ use serde::Serialize;
 use utoipa::ToSchema;
 use y2q_core::{AnyStorage, Listing};
 
+use crate::auth::Authenticated;
 use crate::error::{AppError, ErrorBody};
 
 /// Response body for `GET /`.
@@ -23,11 +24,16 @@ pub struct ListBucketsResponse {
     path = "/",
     responses(
         (status = 200, description = "Sorted list of bucket names", body = ListBucketsResponse, content_type = "application/json"),
+        (status = 401, description = "Authentication required", body = ErrorBody, content_type = "application/json"),
         (status = 500, description = "Internal error", body = ErrorBody, content_type = "application/json"),
     ),
+    security(("bearer" = [])),
     tag = "listing",
 )]
-pub async fn handle(storage: web::Data<Arc<AnyStorage>>) -> Result<HttpResponse, AppError> {
+pub async fn handle(
+    storage: web::Data<Arc<AnyStorage>>,
+    _auth: Authenticated,
+) -> Result<HttpResponse, AppError> {
     let buckets = storage.list_buckets().await.map_err(AppError::from)?;
     Ok(HttpResponse::Ok().json(ListBucketsResponse { buckets }))
 }

@@ -32,6 +32,13 @@ use super::{
     format::{self, HEADER_SIZE, Header},
 };
 
+/// Bundle of encryption-side fields handed to a PUT worker, boxed so that
+/// adding them to [`UringOp::Put`] doesn't blow up the enum variant size.
+pub(super) struct PutCryptoFields {
+    pub plaintext_metrics: crate::PlaintextMetrics,
+    pub cipher_metadata: crate::CipherMetadata,
+}
+
 /// One unit of work submitted to a uring worker.
 pub(super) enum UringOp {
     /// Read the full object payload.
@@ -61,6 +68,10 @@ pub(super) enum UringOp {
         url_path: String,
         payload: Bytes,
         labels: BTreeMap<String, String>,
+        /// Encryption-side fields supplied by the daemon when it has
+        /// already encrypted the body before this PUT. Boxed to keep the
+        /// enum variant size in check (clippy::large_enum_variant).
+        crypto: Option<Box<PutCryptoFields>>,
         /// Threshold at or above which the worker uses the `O_DIRECT` path.
         /// `0` disables the threshold (always buffered).
         large_object_bytes: u64,
@@ -130,10 +141,15 @@ pub(super) async fn handle(op: UringOp) {
             url_path,
             payload,
             labels,
+            crypto,
             large_object_bytes,
             sync,
             reply,
         } => {
+            let (plaintext_metrics, cipher_metadata) = match crypto {
+                Some(b) => (Some(b.plaintext_metrics), Some(b.cipher_metadata)),
+                None => (None, None),
+            };
             let _ = reply.send(
                 do_put(
                     obj_path,
@@ -144,6 +160,8 @@ pub(super) async fn handle(op: UringOp) {
                     url_path,
                     payload,
                     labels,
+                    plaintext_metrics,
+                    cipher_metadata,
                     large_object_bytes,
                     sync,
                 )
@@ -448,6 +466,8 @@ async fn do_put(
     url_path: String,
     payload: Bytes,
     labels: BTreeMap<String, String>,
+    plaintext_metrics: Option<crate::PlaintextMetrics>,
+    cipher_metadata: Option<crate::CipherMetadata>,
     large_object_bytes: u64,
     sync: SyncLevel,
 ) -> Result<(bool, Metadata), Error> {
@@ -470,26 +490,48 @@ async fn do_put(
         Err(e) => return Err(internal(&bucket, &key, "put", format!("stat existing: {e}"))),
     };
 
-    // Stream the checksums chunk-by-chunk. Memory is the same as a single
-    // hash call (the payload is already resident here), but the streaming
-    // shape mirrors how the O_DIRECT path consumes the buffer in chunks.
-    const HASH_CHUNK: usize = 1024 * 1024;
-    let mut md5_hasher = md5::Md5::new();
-    let mut sha_hasher = sha2::Sha256::new();
-    for chunk in payload.chunks(HASH_CHUNK) {
-        md5_hasher.update(chunk);
-        sha_hasher.update(chunk);
-    }
-    let b64 = base64::engine::general_purpose::STANDARD;
-    let checksum_md5 = b64.encode(md5_hasher.finalize());
-    let checksum_sha256 = b64.encode(sha_hasher.finalize());
+    // When the daemon supplied plaintext-derived size + checksums, persist
+    // those instead of values computed from the (possibly encrypted) bytes
+    // we're about to write to disk.
+    let (size, checksum_md5, checksum_sha256) = match plaintext_metrics {
+        Some(p) => (p.size, p.checksum_md5_b64, p.checksum_sha256_b64),
+        None => {
+            // Stream the checksums chunk-by-chunk. Memory is the same as a
+            // single hash call (the payload is already resident here), but
+            // the streaming shape mirrors how the O_DIRECT path consumes
+            // the buffer in chunks.
+            const HASH_CHUNK: usize = 1024 * 1024;
+            let mut md5_hasher = md5::Md5::new();
+            let mut sha_hasher = sha2::Sha256::new();
+            for chunk in payload.chunks(HASH_CHUNK) {
+                md5_hasher.update(chunk);
+                sha_hasher.update(chunk);
+            }
+            let b64 = base64::engine::general_purpose::STANDARD;
+            (
+                payload.len() as u64,
+                b64.encode(md5_hasher.finalize()),
+                b64.encode(sha_hasher.finalize()),
+            )
+        }
+    };
+    let (cipher_size, cipher_sha256, kem_alg, aead_alg, envelope_version) = match cipher_metadata {
+        Some(c) => (
+            Some(c.cipher_size),
+            Some(c.cipher_sha256_b64),
+            Some(c.kem_alg),
+            Some(c.aead_alg),
+            Some(c.envelope_version),
+        ),
+        None => (None, None, None, None, None),
+    };
 
     let now = now_nanos();
     let created = prior_created.unwrap_or(now);
     let mut metadata = Metadata {
         created,
         modified: now,
-        size: payload.len() as u64,
+        size,
         checksum_md5,
         checksum_sha256,
         bucket: bucket.clone(),
@@ -497,6 +539,11 @@ async fn do_put(
         disk_path: obj_path.clone(),
         url_path,
         labels,
+        cipher_size,
+        cipher_sha256,
+        kem_alg,
+        aead_alg,
+        envelope_version,
     };
 
     let meta_bytes = serde_json::to_vec(&metadata)

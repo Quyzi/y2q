@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 use y2q_core::{AnyStorage, Error as CoreError, StaleLock, StorageExt};
 
+use crate::auth::Authenticated;
 use crate::error::{AppError, ErrorBody};
 
 /// Query parameters for `GET` and `DELETE` on `/api/v1/locks`.
@@ -63,13 +64,16 @@ pub struct ClearStaleLocksResponse {
     responses(
         (status = 200, description = "Stale locks (dry-run)", body = [StaleLockEntry], content_type = "application/json"),
         (status = 400, description = "Missing or malformed `older_than`", body = ErrorBody, content_type = "application/json"),
+        (status = 401, description = "Authentication required", body = ErrorBody, content_type = "application/json"),
         (status = 500, description = "Internal error", body = ErrorBody, content_type = "application/json"),
     ),
+    security(("bearer" = [])),
     tag = "admin",
 )]
 pub async fn list(
     storage: web::Data<Arc<AnyStorage>>,
     query: web::Query<LocksQuery>,
+    _auth: Authenticated,
 ) -> Result<HttpResponse, AppError> {
     let now = SystemTime::now();
     let cutoff = parse_older_than(&query.older_than, now)?;
@@ -87,13 +91,16 @@ pub async fn list(
     responses(
         (status = 200, description = "Stale locks cleared", body = ClearStaleLocksResponse, content_type = "application/json"),
         (status = 400, description = "Missing or malformed `older_than`", body = ErrorBody, content_type = "application/json"),
+        (status = 401, description = "Authentication required", body = ErrorBody, content_type = "application/json"),
         (status = 500, description = "Internal error", body = ErrorBody, content_type = "application/json"),
     ),
+    security(("bearer" = [])),
     tag = "admin",
 )]
 pub async fn clear(
     storage: web::Data<Arc<AnyStorage>>,
     query: web::Query<LocksQuery>,
+    _auth: Authenticated,
 ) -> Result<HttpResponse, AppError> {
     let now = SystemTime::now();
     let cutoff = parse_older_than(&query.older_than, now)?;

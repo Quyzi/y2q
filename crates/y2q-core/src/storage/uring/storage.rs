@@ -252,6 +252,13 @@ impl Storage for UringStorage {
         let lock_path = obj_path.with_extension("lock");
         let tmp_path = obj_path.with_extension("tmp");
         let (reply, reply_rx) = tokio::sync::oneshot::channel();
+        let crypto = match (options.plaintext_metrics, options.cipher_metadata) {
+            (Some(p), Some(c)) => Some(Box::new(crate::storage::uring::ops::PutCryptoFields {
+                plaintext_metrics: p,
+                cipher_metadata: c,
+            })),
+            _ => None,
+        };
         let op = UringOp::Put {
             obj_path,
             tmp_path,
@@ -261,6 +268,7 @@ impl Storage for UringStorage {
             url_path: format!("{bucket}/{key}"),
             payload: payload.into_inner(),
             labels: options.labels,
+            crypto,
             large_object_bytes: self.config.large_object_bytes,
             sync: options.sync,
             reply,

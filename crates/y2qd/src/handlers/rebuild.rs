@@ -12,6 +12,7 @@ use serde::Serialize;
 use utoipa::ToSchema;
 use y2q_core::{CacheRebuildStatus, AnyStorage, StorageExt};
 
+use crate::auth::Authenticated;
 use crate::error::{AppError, ErrorBody};
 
 /// JSON body for `GET /api/v1/rebuild`.
@@ -73,12 +74,17 @@ pub struct RebuildStartResponse {
     path = "/api/v1/rebuild",
     responses(
         (status = 202, description = "Rebuild started", body = RebuildStartResponse, content_type = "application/json"),
+        (status = 401, description = "Authentication required", body = ErrorBody, content_type = "application/json"),
         (status = 409, description = "Rebuild already in progress", body = ErrorBody, content_type = "application/json"),
         (status = 500, description = "Internal error", body = ErrorBody, content_type = "application/json"),
     ),
+    security(("bearer" = [])),
     tag = "admin",
 )]
-pub async fn start(storage: web::Data<Arc<AnyStorage>>) -> Result<HttpResponse, AppError> {
+pub async fn start(
+    storage: web::Data<Arc<AnyStorage>>,
+    _auth: Authenticated,
+) -> Result<HttpResponse, AppError> {
     storage.rebuild_cache().await.map_err(AppError::from)?;
     Ok(HttpResponse::Accepted().json(RebuildStartResponse { status: "running" }))
 }
@@ -90,11 +96,16 @@ pub async fn start(storage: web::Data<Arc<AnyStorage>>) -> Result<HttpResponse, 
     path = "/api/v1/rebuild",
     responses(
         (status = 200, description = "Current rebuild state", body = RebuildStatusResponse, content_type = "application/json"),
+        (status = 401, description = "Authentication required", body = ErrorBody, content_type = "application/json"),
         (status = 500, description = "Internal error", body = ErrorBody, content_type = "application/json"),
     ),
+    security(("bearer" = [])),
     tag = "admin",
 )]
-pub async fn status(storage: web::Data<Arc<AnyStorage>>) -> Result<HttpResponse, AppError> {
+pub async fn status(
+    storage: web::Data<Arc<AnyStorage>>,
+    _auth: Authenticated,
+) -> Result<HttpResponse, AppError> {
     let s = storage.rebuild_progress().await.map_err(AppError::from)?;
     Ok(HttpResponse::Ok().json(RebuildStatusResponse::from(s)))
 }

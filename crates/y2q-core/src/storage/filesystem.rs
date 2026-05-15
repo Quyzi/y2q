@@ -382,11 +382,32 @@ impl Storage for FilesystemStorage {
             now
         };
 
-        let (checksum_md5, checksum_sha256) = compute_checksums(data);
+        // When the daemon has already encrypted the body, it supplies the
+        // plaintext-derived size and checksums via `plaintext_metrics` so we
+        // store the values users expect to see — not values computed from the
+        // (encrypted) bytes we're about to write.
+        let (size, checksum_md5, checksum_sha256) = match &options.plaintext_metrics {
+            Some(p) => (p.size, p.checksum_md5_b64.clone(), p.checksum_sha256_b64.clone()),
+            None => {
+                let (md5, sha) = compute_checksums(data);
+                (data.len() as u64, md5, sha)
+            }
+        };
+        let (cipher_size, cipher_sha256, kem_alg, aead_alg, envelope_version) =
+            match &options.cipher_metadata {
+                Some(c) => (
+                    Some(c.cipher_size),
+                    Some(c.cipher_sha256_b64.clone()),
+                    Some(c.kem_alg.clone()),
+                    Some(c.aead_alg.clone()),
+                    Some(c.envelope_version),
+                ),
+                None => (None, None, None, None, None),
+            };
         let metadata = Metadata {
             created,
             modified: now,
-            size: data.len() as u64,
+            size,
             checksum_md5,
             checksum_sha256,
             bucket: bucket.to_owned(),
@@ -394,6 +415,11 @@ impl Storage for FilesystemStorage {
             disk_path: data_path.clone(),
             url_path: format!("{bucket}/{key}"),
             labels: options.labels,
+            cipher_size,
+            cipher_sha256,
+            kem_alg,
+            aead_alg,
+            envelope_version,
         };
 
         tokio::fs::write(&tmp_path, data)

@@ -3,6 +3,7 @@ use core::range::RangeInclusive;
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, ops::Deref, path::PathBuf, time::SystemTime};
 
+pub mod crypto;
 pub mod storage;
 pub use storage::any::AnyStorage;
 pub use storage::filesystem::FilesystemStorage;
@@ -67,6 +68,28 @@ pub struct Metadata {
     /// Names are stored lowercased.
     #[serde(default)]
     pub labels: BTreeMap<String, String>,
+    /// Total bytes on disk for the encrypted envelope, when encryption is
+    /// enabled. `None` for legacy plaintext objects written before the
+    /// crypto layer was wired in.
+    #[serde(default)]
+    pub cipher_size: Option<u64>,
+    /// Standard-base64 SHA-256 of the on-disk envelope bytes (cheap to
+    /// recompute without the secret key — useful for `rebuild_cache`
+    /// integrity scans). `None` for legacy plaintext objects.
+    #[serde(default)]
+    pub cipher_sha256: Option<String>,
+    /// Symbolic KEM algorithm name (e.g. `"ml-kem-768"`) when the object is
+    /// encrypted; `None` for legacy plaintext objects.
+    #[serde(default)]
+    pub kem_alg: Option<String>,
+    /// Symbolic AEAD algorithm name (e.g. `"aes-256-gcm"`) when the object is
+    /// encrypted; `None` for legacy plaintext objects.
+    #[serde(default)]
+    pub aead_alg: Option<String>,
+    /// Envelope format version when the object is encrypted; `None` for
+    /// legacy plaintext objects.
+    #[serde(default)]
+    pub envelope_version: Option<u16>,
 }
 
 /// Durability guarantee a PUT should provide before returning success.
@@ -103,6 +126,39 @@ pub struct PutOptions {
     pub labels: BTreeMap<String, String>,
     /// Durability guarantee required before the PUT returns success.
     pub sync: SyncLevel,
+    /// When the daemon performs encryption ahead of the backend, the
+    /// plaintext metrics that should be persisted instead of the values the
+    /// backend would otherwise compute from the (encrypted) payload bytes.
+    pub plaintext_metrics: Option<PlaintextMetrics>,
+    /// When the daemon performs encryption ahead of the backend, the
+    /// ciphertext-side fields the backend should attach to the metadata
+    /// sidecar (cipher_size, kem/aead alg, envelope_version, cipher_sha256).
+    pub cipher_metadata: Option<CipherMetadata>,
+}
+
+/// Plaintext-derived size and checksums supplied by the daemon when it has
+/// encrypted the body before handing it to the backend. The backend should
+/// store these values in [`Metadata::size`], [`Metadata::checksum_md5`], and
+/// [`Metadata::checksum_sha256`] in place of values it would otherwise
+/// compute from the (encrypted) bytes it sees.
+#[derive(Debug, Clone)]
+pub struct PlaintextMetrics {
+    pub size: u64,
+    pub checksum_md5_b64: String,
+    pub checksum_sha256_b64: String,
+}
+
+/// Ciphertext-side metadata fields supplied by the daemon for the backend to
+/// attach to the metadata sidecar. These never change the bytes the backend
+/// writes — they're informational fields for `HEAD` responses and the
+/// integrity-scan codepath.
+#[derive(Debug, Clone)]
+pub struct CipherMetadata {
+    pub cipher_size: u64,
+    pub cipher_sha256_b64: String,
+    pub kem_alg: String,
+    pub aead_alg: String,
+    pub envelope_version: u16,
 }
 
 /// Default page size when [`ListOptions::limit`] is `None` or `Some(0)`.
@@ -207,6 +263,49 @@ pub enum Error {
         /// The raw value the caller supplied.
         value: String,
     },
+
+    /// `pubkey.json` is missing — the daemon cannot serve traffic until
+    /// first-run setup completes.
+    #[error("keystore not found at {path}")]
+    KeystoreNotFound { path: String },
+
+    /// `pubkey.json` exists but is unparseable, has a wrong-size key, or
+    /// fingerprint mismatches.
+    #[error("keystore corrupt at {path}: {reason}")]
+    KeystoreCorrupt { path: String, reason: String },
+
+    /// Argon2id key derivation failed (typically a bad parameter triple).
+    #[error("kdf failure: {reason}")]
+    KdfFailed { reason: String },
+
+    /// Encrypting an object body failed for an unexpected reason.
+    #[error("encryption failed for {bucket}/{key}")]
+    EncryptionFailed { bucket: String, key: String },
+
+    /// Decrypting an object body failed — bad ciphertext, wrong key, or
+    /// AAD mismatch. The HTTP layer must NEVER include the underlying
+    /// reason in the response body to avoid side-channel leaks about disk
+    /// state.
+    #[error("decryption failed for {bucket}/{key}")]
+    DecryptionFailed { bucket: String, key: String },
+
+    /// On-disk envelope header (magic / algorithm tags / lengths) failed
+    /// validation.
+    #[error("envelope malformed for {bucket}/{key}: {reason}")]
+    EnvelopeMalformed {
+        bucket: String,
+        key: String,
+        reason: String,
+    },
+
+    /// Envelope advertises a `format_ver` newer than this build supports.
+    #[error("unsupported envelope version: {version}")]
+    UnsupportedEnvelopeVersion { version: u16 },
+
+    /// Range read attempted against an encrypted object — the on-disk
+    /// envelope is whole-object AEAD, so partial reads aren't possible.
+    #[error("range reads are not supported on encrypted objects")]
+    RangeReadOnEncrypted,
 }
 
 /// Async interface for object storage backends.

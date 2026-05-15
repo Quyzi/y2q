@@ -5,14 +5,17 @@ use std::sync::Arc;
 use actix_web::{HttpRequest, HttpResponse, web};
 use y2q_core::{AnyStorage, Object, PutOptions, Storage, SyncLevel};
 
+use crate::auth::Authenticated;
+use crate::cipher;
 use crate::config::LabelLimits;
 use crate::error::{AppError, ErrorBody};
 use crate::handlers::labels::extract_labels;
 
 /// Write or overwrite a stored object.
 ///
-/// The raw request body is stored as a new object at `bucket`/`key`.
-/// Writes are atomic: readers see either the old object or the new one.
+/// The raw request body is encrypted under the deployment public key and the
+/// resulting envelope is stored at `bucket`/`key`. Writes are atomic: readers
+/// see either the old object or the new one. Requires a valid Bearer token.
 ///
 /// Any request header matching `X-Y2Q-<label>` (case-insensitive) is captured
 /// as a custom label and persisted with the object. The label name is
@@ -42,9 +45,11 @@ use crate::handlers::labels::extract_labels;
         (status = 201, description = "Object created"),
         (status = 200, description = "Object replaced (key already existed)"),
         (status = 400, description = "Invalid bucket, key, or label", body = ErrorBody, content_type = "application/json"),
+        (status = 401, description = "Authentication required", body = ErrorBody, content_type = "application/json"),
         (status = 409, description = "Object is locked (write in progress)", body = ErrorBody, content_type = "application/json"),
         (status = 500, description = "Internal error", body = ErrorBody, content_type = "application/json"),
     ),
+    security(("bearer" = [])),
     tag = "objects",
 )]
 pub async fn handle(
@@ -53,13 +58,26 @@ pub async fn handle(
     body: web::Bytes,
     storage: web::Data<Arc<AnyStorage>>,
     limits: web::Data<LabelLimits>,
+    auth: Authenticated,
 ) -> Result<HttpResponse, AppError> {
     let (bucket, key) = path.into_inner();
     let labels = extract_labels(&req, limits.get_ref())?;
     let sync = parse_sync_header(&req)?;
-    let payload = Object::new(body);
+
+    let encrypted = cipher::encrypt_for_put(&auth.keystore, &bucket, &key, &body)?;
+    let payload = Object::new(encrypted.envelope);
     let was_overwrite = storage
-        .put(&bucket, &key, payload, PutOptions { labels, sync })
+        .put(
+            &bucket,
+            &key,
+            payload,
+            PutOptions {
+                labels,
+                sync,
+                plaintext_metrics: Some(encrypted.plaintext_metrics),
+                cipher_metadata: Some(encrypted.cipher_metadata),
+            },
+        )
         .await
         .map_err(AppError::from)?;
 

@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use y2q_core::{AnyStorage, ListOptions, Listing, MAX_LIST_LIMIT, Metadata};
 
+use crate::auth::Authenticated;
 use crate::error::{AppError, ErrorBody};
 
 /// Query-string parameters for `GET /{bucket}/`.
@@ -48,6 +49,21 @@ pub struct MetadataView {
     pub url_path: String,
     /// User-supplied labels attached to the object.
     pub labels: BTreeMap<String, String>,
+    /// Total bytes on disk (encrypted envelope), if encryption is enabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cipher_size: Option<u64>,
+    /// Standard-base64 SHA-256 of the on-disk envelope bytes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cipher_sha256: Option<String>,
+    /// Symbolic KEM algorithm name (e.g. `"ml-kem-768"`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kem_alg: Option<String>,
+    /// Symbolic AEAD algorithm name (e.g. `"aes-256-gcm"`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aead_alg: Option<String>,
+    /// Envelope format version.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub envelope_version: Option<u16>,
 }
 
 impl From<Metadata> for MetadataView {
@@ -63,6 +79,11 @@ impl From<Metadata> for MetadataView {
             disk_path: m.disk_path.to_string_lossy().into_owned(),
             url_path: m.url_path,
             labels: m.labels,
+            cipher_size: m.cipher_size,
+            cipher_sha256: m.cipher_sha256,
+            kem_alg: m.kem_alg,
+            aead_alg: m.aead_alg,
+            envelope_version: m.envelope_version,
         }
     }
 }
@@ -96,14 +117,17 @@ pub struct ListObjectsResponse {
     responses(
         (status = 200, description = "Sorted page of object metadata", body = ListObjectsResponse, content_type = "application/json"),
         (status = 400, description = "Invalid bucket", body = ErrorBody, content_type = "application/json"),
+        (status = 401, description = "Authentication required", body = ErrorBody, content_type = "application/json"),
         (status = 500, description = "Internal error", body = ErrorBody, content_type = "application/json"),
     ),
+    security(("bearer" = [])),
     tag = "listing",
 )]
 pub async fn handle(
     path: web::Path<String>,
     query: web::Query<ListQuery>,
     storage: web::Data<Arc<AnyStorage>>,
+    _auth: Authenticated,
 ) -> Result<HttpResponse, AppError> {
     let bucket = path.into_inner();
     let q = query.into_inner();
