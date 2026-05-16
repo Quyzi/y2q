@@ -105,6 +105,8 @@ pub struct ListBucketsResponse {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct TraceEvent {
+    #[serde(default)]
+    pub request_id: String,
     pub timestamp_ns: u64,
     pub method: String,
     pub path: String,

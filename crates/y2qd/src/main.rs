@@ -62,6 +62,9 @@ use metrics_exporter_prometheus::Matcher;
 use metrics_rs_dashboard_actix::{DashboardInput, create_metrics_actx_scope};
 use tracing_actix_web::TracingLogger;
 use tracing_subscriber::EnvFilter;
+
+use crate::config::LogFormat;
+use crate::span::Y2qRootSpanBuilder;
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 use y2q_core::crypto::{Argon2Params, derive_mek, keystore as keystore_mod};
@@ -77,6 +80,8 @@ mod config;
 mod error;
 mod handlers;
 pub(crate) mod observability;
+mod request_id;
+mod span;
 mod trace;
 
 use crate::auth::AuthState;
@@ -161,14 +166,23 @@ impl utoipa::Modify for SecurityAddon {
 async fn main() -> std::io::Result<()> {
     let cli = cli::Cli::parse();
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
-
     let cfg = config::Config::load(&cli)
         .expect("failed to load config (config.toml, Y2QD_* env vars, or --set)");
+
+    // RUST_LOG takes precedence; fall back to the config-file filter.
+    let log_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        EnvFilter::new(format!("{},metrics_rs_dashboard_actix=warn", cfg.observability.log_filter))
+    });
+
+    match cfg.observability.log_format {
+        LogFormat::Text => tracing_subscriber::fmt()
+            .with_env_filter(log_filter)
+            .init(),
+        LogFormat::Json => tracing_subscriber::fmt()
+            .json()
+            .with_env_filter(log_filter)
+            .init(),
+    }
 
     tracing::info!(host = %cfg.server.host, port = cfg.server.port, "starting y2qd");
 
@@ -302,6 +316,10 @@ async fn main() -> std::io::Result<()> {
                     Matcher::Full(observability::DURATION_METRIC_NAME.to_string()),
                     observability::DURATION_BUCKETS_MILLIS,
                 ),
+                (
+                    Matcher::Suffix(observability::STORAGE_DURATION_METRIC_SUFFIX.to_string()),
+                    observability::STORAGE_DURATION_BUCKETS_MILLIS,
+                ),
             ],
         };
         let dashboard_scope = create_metrics_actx_scope(&dashboard_input)
@@ -311,7 +329,8 @@ async fn main() -> std::io::Result<()> {
         observability::describe_metrics();
 
         let mut app = App::new()
-            .wrap(TracingLogger::default())
+            .wrap(from_fn(request_id::request_id_middleware))
+            .wrap(TracingLogger::<Y2qRootSpanBuilder>::new())
             .wrap(from_fn(observability::metrics_middleware))
             .wrap(from_fn(trace::trace_middleware))
             .app_data(trace_hub.clone())

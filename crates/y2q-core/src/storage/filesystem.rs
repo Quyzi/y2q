@@ -2,7 +2,7 @@ use core::range::RangeInclusive;
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use base64::Engine;
@@ -202,6 +202,20 @@ fn now_nanos() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos() as u64
+}
+
+fn record_storage_op<T, E>(op: &'static str, result: &Result<T, E>, elapsed_ms: f64) {
+    let result_label = if result.is_ok() { "ok" } else { "err" };
+    metrics::counter!(
+        "y2qd_storage_ops_total",
+        "op" => op, "backend" => "filesystem", "result" => result_label
+    )
+    .increment(1);
+    metrics::histogram!(
+        "y2qd_storage_op_duration_milliseconds",
+        "op" => op, "backend" => "filesystem"
+    )
+    .record(elapsed_ms);
 }
 
 /// RAII guard that holds a write lock on an object for the duration of a
@@ -472,25 +486,31 @@ impl FilesystemStorage {
 
 impl Storage for FilesystemStorage {
     async fn get(&self, bucket: &str, key: &str) -> Result<Object, Error> {
-        validate_bucket(bucket)?;
-        validate_key(key)?;
+        let started = Instant::now();
+        let result = async {
+            validate_bucket(bucket)?;
+            validate_key(key)?;
 
-        let data_path = self.key_path(bucket, key);
-        check_not_locked(&data_path.with_extension("lock"), bucket, key).await?;
+            let data_path = self.key_path(bucket, key);
+            check_not_locked(&data_path.with_extension("lock"), bucket, key).await?;
 
-        match tokio::fs::read(&data_path).await {
-            Ok(bytes) => Ok(Object::new(Bytes::from(bytes))),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(Error::NotFound {
-                bucket: bucket.to_owned(),
-                key: key.to_owned(),
-            }),
-            Err(e) => Err(Error::InternalError {
-                bucket: bucket.to_owned(),
-                key: key.to_owned(),
-                operation: "get".to_owned(),
-                message: e.to_string(),
-            }),
+            match tokio::fs::read(&data_path).await {
+                Ok(bytes) => Ok(Object::new(Bytes::from(bytes))),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(Error::NotFound {
+                    bucket: bucket.to_owned(),
+                    key: key.to_owned(),
+                }),
+                Err(e) => Err(Error::InternalError {
+                    bucket: bucket.to_owned(),
+                    key: key.to_owned(),
+                    operation: "get".to_owned(),
+                    message: e.to_string(),
+                }),
+            }
         }
+        .await;
+        record_storage_op("get", &result, started.elapsed().as_secs_f64() * 1_000.0);
+        result
     }
 
     async fn get_range(
@@ -544,17 +564,81 @@ impl Storage for FilesystemStorage {
         payload: Object,
         options: PutOptions,
     ) -> Result<bool, Error> {
-        validate_bucket(bucket)?;
-        validate_key(key)?;
-        let _ = &options.sync; // documented above; honoured by UringStorage
+        let started = Instant::now();
+        let result = async {
+            validate_bucket(bucket)?;
+            validate_key(key)?;
+            let _ = &options.sync; // documented above; honoured by UringStorage
 
-        let data_path = self.key_path(bucket, key);
-        let meta_path = data_path.with_extension("meta");
-        let lock_path = data_path.with_extension("lock");
-        let tmp_path = data_path.with_extension("tmp");
+            let data_path = self.key_path(bucket, key);
+            let meta_path = data_path.with_extension("meta");
+            let lock_path = data_path.with_extension("lock");
+            let tmp_path = data_path.with_extension("tmp");
 
-        if let Some(parent) = data_path.parent() {
-            tokio::fs::create_dir_all(parent)
+            if let Some(parent) = data_path.parent() {
+                tokio::fs::create_dir_all(parent)
+                    .await
+                    .map_err(|e| Error::InternalError {
+                        bucket: bucket.to_owned(),
+                        key: key.to_owned(),
+                        operation: "put".to_owned(),
+                        message: e.to_string(),
+                    })?;
+            }
+
+            let _guard = LockGuard::acquire(lock_path, bucket, key).await?;
+
+            let is_overwrite = tokio::fs::try_exists(&data_path).await.unwrap_or(false);
+
+            let data: &[u8] = &payload;
+            let now = now_nanos();
+            let created = if is_overwrite {
+                read_created_timestamp(&meta_path, self.mek.as_ref()).await.unwrap_or(now)
+            } else {
+                now
+            };
+
+            // When the daemon has already encrypted the body, it supplies the
+            // plaintext-derived size and checksums via `plaintext_metrics` so we
+            // store the values users expect to see — not values computed from the
+            // (encrypted) bytes we're about to write.
+            let (size, checksum_md5, checksum_sha256) = match &options.plaintext_metrics {
+                Some(p) => (p.size, p.checksum_md5_b64.clone(), p.checksum_sha256_b64.clone()),
+                None => {
+                    let (md5, sha) = compute_checksums(data);
+                    (data.len() as u64, md5, sha)
+                }
+            };
+            let (cipher_size, cipher_sha256, kem_alg, aead_alg, envelope_version) =
+                match &options.cipher_metadata {
+                    Some(c) => (
+                        Some(c.cipher_size),
+                        Some(c.cipher_sha256_b64.clone()),
+                        Some(c.kem_alg.clone()),
+                        Some(c.aead_alg.clone()),
+                        Some(c.envelope_version),
+                    ),
+                    None => (None, None, None, None, None),
+                };
+            let metadata = Metadata {
+                created,
+                modified: now,
+                size,
+                checksum_md5,
+                checksum_sha256,
+                bucket: bucket.to_owned(),
+                key: key.to_owned(),
+                disk_path: data_path.clone(),
+                url_path: format!("{bucket}/{key}"),
+                labels: options.labels,
+                cipher_size,
+                cipher_sha256,
+                kem_alg,
+                aead_alg,
+                envelope_version,
+            };
+
+            tokio::fs::write(&tmp_path, data)
                 .await
                 .map_err(|e| Error::InternalError {
                     bucket: bucket.to_owned(),
@@ -562,172 +646,126 @@ impl Storage for FilesystemStorage {
                     operation: "put".to_owned(),
                     message: e.to_string(),
                 })?;
-        }
+            tokio::fs::rename(&tmp_path, &data_path)
+                .await
+                .map_err(|e| Error::InternalError {
+                    bucket: bucket.to_owned(),
+                    key: key.to_owned(),
+                    operation: "put".to_owned(),
+                    message: e.to_string(),
+                })?;
 
-        let _guard = LockGuard::acquire(lock_path, bucket, key).await?;
+            let encoded = encode_metadata(&metadata, self.mek.as_ref()).map_err(|e| Error::InternalError {
+                bucket: bucket.to_owned(),
+                key: key.to_owned(),
+                operation: "put".to_owned(),
+                message: e.to_string(),
+            })?;
+            tokio::fs::write(&meta_path, &encoded)
+                .await
+                .map_err(|e| Error::InternalError {
+                    bucket: bucket.to_owned(),
+                    key: key.to_owned(),
+                    operation: "put".to_owned(),
+                    message: e.to_string(),
+                })?;
 
-        let is_overwrite = tokio::fs::try_exists(&data_path).await.unwrap_or(false);
-
-        let data: &[u8] = &payload;
-        let now = now_nanos();
-        let created = if is_overwrite {
-            read_created_timestamp(&meta_path, self.mek.as_ref()).await.unwrap_or(now)
-        } else {
-            now
-        };
-
-        // When the daemon has already encrypted the body, it supplies the
-        // plaintext-derived size and checksums via `plaintext_metrics` so we
-        // store the values users expect to see — not values computed from the
-        // (encrypted) bytes we're about to write.
-        let (size, checksum_md5, checksum_sha256) = match &options.plaintext_metrics {
-            Some(p) => (p.size, p.checksum_md5_b64.clone(), p.checksum_sha256_b64.clone()),
-            None => {
-                let (md5, sha) = compute_checksums(data);
-                (data.len() as u64, md5, sha)
+            if let Err(e) = self.index.upsert(&metadata).await {
+                tracing::warn!(
+                    bucket = bucket,
+                    key = key,
+                    error = %e,
+                    "metadata index upsert failed; sidecar is authoritative"
+                );
             }
-        };
-        let (cipher_size, cipher_sha256, kem_alg, aead_alg, envelope_version) =
-            match &options.cipher_metadata {
-                Some(c) => (
-                    Some(c.cipher_size),
-                    Some(c.cipher_sha256_b64.clone()),
-                    Some(c.kem_alg.clone()),
-                    Some(c.aead_alg.clone()),
-                    Some(c.envelope_version),
-                ),
-                None => (None, None, None, None, None),
-            };
-        let metadata = Metadata {
-            created,
-            modified: now,
-            size,
-            checksum_md5,
-            checksum_sha256,
-            bucket: bucket.to_owned(),
-            key: key.to_owned(),
-            disk_path: data_path.clone(),
-            url_path: format!("{bucket}/{key}"),
-            labels: options.labels,
-            cipher_size,
-            cipher_sha256,
-            kem_alg,
-            aead_alg,
-            envelope_version,
-        };
 
-        tokio::fs::write(&tmp_path, data)
-            .await
-            .map_err(|e| Error::InternalError {
-                bucket: bucket.to_owned(),
-                key: key.to_owned(),
-                operation: "put".to_owned(),
-                message: e.to_string(),
-            })?;
-        tokio::fs::rename(&tmp_path, &data_path)
-            .await
-            .map_err(|e| Error::InternalError {
-                bucket: bucket.to_owned(),
-                key: key.to_owned(),
-                operation: "put".to_owned(),
-                message: e.to_string(),
-            })?;
-
-        let encoded = encode_metadata(&metadata, self.mek.as_ref()).map_err(|e| Error::InternalError {
-            bucket: bucket.to_owned(),
-            key: key.to_owned(),
-            operation: "put".to_owned(),
-            message: e.to_string(),
-        })?;
-        tokio::fs::write(&meta_path, &encoded)
-            .await
-            .map_err(|e| Error::InternalError {
-                bucket: bucket.to_owned(),
-                key: key.to_owned(),
-                operation: "put".to_owned(),
-                message: e.to_string(),
-            })?;
-
-        if let Err(e) = self.index.upsert(&metadata).await {
-            tracing::warn!(
-                bucket = bucket,
-                key = key,
-                error = %e,
-                "metadata index upsert failed; sidecar is authoritative"
-            );
+            Ok(is_overwrite)
         }
-
-        Ok(is_overwrite)
+        .await;
+        record_storage_op("put", &result, started.elapsed().as_secs_f64() * 1_000.0);
+        result
     }
 
     async fn delete(&self, bucket: &str, key: &str) -> Result<Object, Error> {
-        validate_bucket(bucket)?;
-        validate_key(key)?;
+        let started = Instant::now();
+        let result = async {
+            validate_bucket(bucket)?;
+            validate_key(key)?;
 
-        let data_path = self.key_path(bucket, key);
-        let lock_path = data_path.with_extension("lock");
-        let meta_path = data_path.with_extension("meta");
+            let data_path = self.key_path(bucket, key);
+            let lock_path = data_path.with_extension("lock");
+            let meta_path = data_path.with_extension("meta");
 
-        check_not_locked(&lock_path, bucket, key).await?;
+            check_not_locked(&lock_path, bucket, key).await?;
 
-        let data = match tokio::fs::read(&data_path).await {
-            Ok(b) => b,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let data = match tokio::fs::read(&data_path).await {
+                Ok(b) => b,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(Error::NotFound {
+                        bucket: bucket.to_owned(),
+                        key: key.to_owned(),
+                    });
+                }
+                Err(e) => {
+                    return Err(Error::InternalError {
+                        bucket: bucket.to_owned(),
+                        key: key.to_owned(),
+                        operation: "delete".to_owned(),
+                        message: e.to_string(),
+                    });
+                }
+            };
+
+            tokio::fs::remove_file(&data_path).await.ok();
+            tokio::fs::remove_file(&meta_path).await.ok();
+
+            if let Err(e) = self.index.remove(bucket, key).await {
+                tracing::warn!(
+                    bucket = bucket,
+                    key = key,
+                    error = %e,
+                    "metadata index remove failed; sidecar is authoritative"
+                );
+            }
+
+            Ok(Object::new(Bytes::from(data)))
+        }
+        .await;
+        record_storage_op("delete", &result, started.elapsed().as_secs_f64() * 1_000.0);
+        result
+    }
+
+    async fn describe(&self, bucket: &str, key: &str) -> Result<Metadata, Error> {
+        let started = Instant::now();
+        let result = async {
+            validate_bucket(bucket)?;
+            validate_key(key)?;
+
+            let data_path = self.key_path(bucket, key);
+            let lock_path = data_path.with_extension("lock");
+            let meta_path = data_path.with_extension("meta");
+
+            check_not_locked(&lock_path, bucket, key).await?;
+
+            if !tokio::fs::try_exists(&data_path).await.unwrap_or(false) {
                 return Err(Error::NotFound {
                     bucket: bucket.to_owned(),
                     key: key.to_owned(),
                 });
             }
-            Err(e) => {
-                return Err(Error::InternalError {
+
+            read_metadata_sidecar(&meta_path, self.mek.as_ref())
+                .await
+                .map_err(|e| Error::InternalError {
                     bucket: bucket.to_owned(),
                     key: key.to_owned(),
-                    operation: "delete".to_owned(),
+                    operation: "describe".to_owned(),
                     message: e.to_string(),
-                });
-            }
-        };
-
-        tokio::fs::remove_file(&data_path).await.ok();
-        tokio::fs::remove_file(&meta_path).await.ok();
-
-        if let Err(e) = self.index.remove(bucket, key).await {
-            tracing::warn!(
-                bucket = bucket,
-                key = key,
-                error = %e,
-                "metadata index remove failed; sidecar is authoritative"
-            );
+                })
         }
-
-        Ok(Object::new(Bytes::from(data)))
-    }
-
-    async fn describe(&self, bucket: &str, key: &str) -> Result<Metadata, Error> {
-        validate_bucket(bucket)?;
-        validate_key(key)?;
-
-        let data_path = self.key_path(bucket, key);
-        let lock_path = data_path.with_extension("lock");
-        let meta_path = data_path.with_extension("meta");
-
-        check_not_locked(&lock_path, bucket, key).await?;
-
-        if !tokio::fs::try_exists(&data_path).await.unwrap_or(false) {
-            return Err(Error::NotFound {
-                bucket: bucket.to_owned(),
-                key: key.to_owned(),
-            });
-        }
-
-        read_metadata_sidecar(&meta_path, self.mek.as_ref())
-            .await
-            .map_err(|e| Error::InternalError {
-                bucket: bucket.to_owned(),
-                key: key.to_owned(),
-                operation: "describe".to_owned(),
-                message: e.to_string(),
-            })
+        .await;
+        record_storage_op("describe", &result, started.elapsed().as_secs_f64() * 1_000.0);
+        result
     }
 }
 

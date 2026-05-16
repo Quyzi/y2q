@@ -42,8 +42,8 @@ tokio                       = { version = "1.52.3", features = ["full"] }
 tokio-uring                 = "0.5"
 tracing                     = "0.1.44"
 tracing-actix-web           = "0.7"
-tracing-subscriber          = { version = "0.3", features = ["env-filter"] }
-uuid                        = { version = "1", features = ["v5"] }
+tracing-subscriber          = { version = "0.3", features = ["env-filter", "json"] }
+uuid                        = { version = "1", features = ["v4", "v5"] }
 clap                        = { version = "4", features = ["derive", "env"] }
 tempfile                    = "3"
 zeroize                     = { version = "1", features = ["derive"] }

@@ -36,6 +36,13 @@ const METRIC_RESPONSE_PAYLOAD: &str = "y2qd_response_payload_bytes";
 /// Public so the Prometheus recorder can target it via `Matcher::Full`.
 pub const DURATION_METRIC_NAME: &str = "y2qd_request_duration_milliseconds";
 
+/// Public metric names for storage operations — used in `y2q-core` and
+/// here for Prometheus descriptor registration.
+pub const STORAGE_OPS_TOTAL: &str = "y2qd_storage_ops_total";
+pub const STORAGE_OP_DURATION: &str = "y2qd_storage_op_duration_milliseconds";
+pub const AUTH_LOGINS_TOTAL: &str = "y2qd_auth_logins_total";
+pub const SESSIONS_ACTIVE: &str = "y2qd_sessions_active";
+
 /// Bucket boundaries for both payload-size histograms, in bytes.
 /// Spans small JSON bodies (~256 B) through the default 256 MiB upload cap.
 pub const PAYLOAD_BUCKETS_BYTES: &[f64] = &[
@@ -57,6 +64,16 @@ pub const PAYLOAD_BUCKETS_BYTES: &[f64] = &[
 pub const DURATION_BUCKETS_MILLIS: &[f64] = &[
     0.5, 1.0, 2.5, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1_000.0, 2_500.0, 5_000.0, 10_000.0,
 ];
+
+/// Bucket boundaries for storage-operation duration histograms, in milliseconds.
+/// Spans fast metadata lookups (~0.1 ms) through large-object I/O (~5 s).
+pub const STORAGE_DURATION_BUCKETS_MILLIS: &[f64] = &[
+    0.1, 0.5, 1.0, 5.0, 10.0, 50.0, 100.0, 500.0, 1_000.0, 5_000.0,
+];
+
+/// Matcher suffix used to apply [`STORAGE_DURATION_BUCKETS_MILLIS`] to the
+/// storage operation duration histogram via [`DashboardInput`].
+pub const STORAGE_DURATION_METRIC_SUFFIX: &str = "storage_op_duration_milliseconds";
 
 /// Register HELP text for every metric emitted by [`metrics_middleware`].
 ///
@@ -85,6 +102,23 @@ pub fn describe_metrics() {
         DURATION_METRIC_NAME,
         Unit::Milliseconds,
         "Wall-clock time spent serving a request, in milliseconds"
+    );
+    describe_counter!(
+        STORAGE_OPS_TOTAL,
+        "Storage operations completed, labelled by op, backend, and result (ok/err)"
+    );
+    describe_histogram!(
+        STORAGE_OP_DURATION,
+        Unit::Milliseconds,
+        "Wall-clock time spent in storage operations, in milliseconds"
+    );
+    describe_counter!(
+        AUTH_LOGINS_TOTAL,
+        "Login attempts, labelled by result (success/wrong_password/not_found/locked)"
+    );
+    metrics::describe_gauge!(
+        SESSIONS_ACTIVE,
+        "Number of active (non-expired) sessions currently held in memory"
     );
 }
 
