@@ -33,6 +33,70 @@ fn default_unauthenticated_metrics() -> bool {
     false
 }
 
+fn default_backlog() -> u32 {
+    1024
+}
+fn default_max_connections() -> usize {
+    25_000
+}
+fn default_keep_alive_secs() -> u64 {
+    5
+}
+fn default_client_request_timeout_secs() -> u64 {
+    5
+}
+fn default_client_disconnect_timeout_secs() -> u64 {
+    1
+}
+fn default_shutdown_timeout_secs() -> u64 {
+    30
+}
+
+/// Actix `HttpServer` tuning knobs.
+///
+/// The entire `[server.actix]` section is optional; omitting it leaves actix's
+/// compiled-in defaults in effect.
+#[derive(Debug, Deserialize)]
+pub struct ActixConfig {
+    /// Worker thread count. `None` (omit the key) uses the number of logical CPUs.
+    pub workers: Option<usize>,
+    /// TCP listen backlog depth. Default: 1024.
+    #[serde(default = "default_backlog")]
+    pub backlog: u32,
+    /// Maximum concurrent connections per worker thread. Default: 25 000.
+    #[serde(default = "default_max_connections")]
+    pub max_connections: usize,
+    /// Keep-alive idle timeout in seconds. `0` disables keep-alive entirely. Default: 5.
+    #[serde(default = "default_keep_alive_secs")]
+    pub keep_alive_secs: u64,
+    /// Time to wait for the first request bytes after a connection is accepted,
+    /// in seconds. Default: 5.
+    #[serde(default = "default_client_request_timeout_secs")]
+    pub client_request_timeout_secs: u64,
+    /// Time to wait for the client to close the connection after the final
+    /// response has been sent, in seconds. Default: 1.
+    #[serde(default = "default_client_disconnect_timeout_secs")]
+    pub client_disconnect_timeout_secs: u64,
+    /// Graceful shutdown window in seconds — in-flight requests have this long
+    /// to complete before the process exits. Default: 30.
+    #[serde(default = "default_shutdown_timeout_secs")]
+    pub shutdown_timeout_secs: u64,
+}
+
+impl Default for ActixConfig {
+    fn default() -> Self {
+        Self {
+            workers: None,
+            backlog: default_backlog(),
+            max_connections: default_max_connections(),
+            keep_alive_secs: default_keep_alive_secs(),
+            client_request_timeout_secs: default_client_request_timeout_secs(),
+            client_disconnect_timeout_secs: default_client_disconnect_timeout_secs(),
+            shutdown_timeout_secs: default_shutdown_timeout_secs(),
+        }
+    }
+}
+
 /// HTTP listener settings.
 #[derive(Debug, Deserialize)]
 pub struct ServerConfig {
@@ -49,6 +113,9 @@ pub struct ServerConfig {
     /// which makes all three require Bearer auth like every other route.
     #[serde(default = "default_unauthenticated_metrics")]
     pub unauthenticated_metrics: bool,
+    /// Actix `HttpServer` tuning knobs.
+    #[serde(default)]
+    pub actix: ActixConfig,
 }
 
 /// Argon2id parameters for newly-added user records.

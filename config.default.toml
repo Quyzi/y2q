@@ -1,0 +1,121 @@
+# config.default.toml — reference showing every knob and its default.
+#
+# Copy this file to config.toml and fill in the fields marked "required".
+# Fields without a default have no compiled-in fallback and must be set.
+#
+# Override any value at runtime without editing the file:
+#   Environment variable:  Y2QD_SECTION__KEY=value   (double-underscore for nesting)
+#   Command-line:          y2qd --set section.key=value
+
+# ---------------------------------------------------------------------------
+# [server] — HTTP listener
+# ---------------------------------------------------------------------------
+[server]
+host             = "127.0.0.1"  # required — IP address to bind
+port             = 8080         # required — TCP port
+
+# Maximum request body size accepted for PUT uploads.
+max_body_bytes = 268435456  # 256 MiB
+
+# When true, the metrics dashboard (/metrics/dashboard), Prometheus scrape
+# endpoint (/metrics/prometheus), and Swagger UI (/swagger-ui/) are reachable
+# without a Bearer token. Keep false in production.
+unauthenticated_metrics = false
+
+# ---------------------------------------------------------------------------
+# [server.actix] — actix HttpServer tuning knobs
+#
+# The entire section is optional. Omitting it leaves actix's own defaults.
+# ---------------------------------------------------------------------------
+[server.actix]
+
+# Number of worker threads. Comment out (or remove) to use the number of
+# logical CPUs reported by the OS.
+# workers = 4
+
+# TCP listen backlog — depth of the kernel's accept queue.
+backlog = 1024
+
+# Maximum concurrent connections handled per worker thread.
+max_connections = 25000
+
+# Keep-alive idle timeout in seconds. Set to 0 to disable keep-alive.
+keep_alive_secs = 5
+
+# How long to wait for the first request bytes after accepting a connection,
+# in seconds. Connections that stay silent longer are closed.
+client_request_timeout_secs = 5
+
+# How long to wait for the client to close its side of the connection after
+# the final response has been sent, in seconds.
+client_disconnect_timeout_secs = 1
+
+# Graceful shutdown window in seconds. In-flight requests have this long to
+# complete after a SIGTERM before the process exits.
+shutdown_timeout_secs = 30
+
+# ---------------------------------------------------------------------------
+# [storage] — object storage backend
+# ---------------------------------------------------------------------------
+[storage]
+
+# Storage backend implementation.
+#   "filesystem"  — portable tokio::fs backend (default)
+#   "uring"       — Linux io_uring fast path (requires --features uring, kernel ≥ 5.6)
+backend = "filesystem"
+
+# Root directory for stored objects. Created on first write if absent.
+base_path = "/var/lib/y2q/data"  # required
+
+# Path to the redb metadata index. Defaults to <base_path>/_y2q_index.redb.
+# index_path = "/var/lib/y2q/data/_y2q_index.redb"
+
+# Limits on X-Y2Q-<label> custom headers accepted on PUT requests.
+max_labels            = 32    # maximum number of label headers per request
+max_label_name_bytes  = 64    # maximum byte length of a label name
+max_label_value_bytes = 1024  # maximum byte length of a label value
+
+# ---------------------------------------------------------------------------
+# [crypto] — keystore and key-derivation settings
+# ---------------------------------------------------------------------------
+[crypto]
+
+# Directory holding pubkey.json, users.redb, and the daemon-wide lock file.
+# Must NOT be located under storage.base_path — keep keys and data separate.
+keystore_dir = "/var/lib/y2q/keys"  # required
+
+[crypto.argon2]
+# Argon2id parameters used when hashing passwords for new user records.
+m_cost_kib = 65536  # memory cost — 64 MiB
+t_cost     = 3      # time cost (iterations)
+p_cost     = 4      # parallelism (lanes)
+
+# ---------------------------------------------------------------------------
+# [auth] — session and account-lockout policy
+# ---------------------------------------------------------------------------
+[auth]
+
+# Default session lifetime when the login request omits ttl_seconds.
+default_ttl_seconds = 3600  # 1 hour
+
+# Hard ceiling. Login requests specifying ttl_seconds above this are rejected.
+max_ttl_seconds = 86400  # 24 hours
+
+# How often the background task sweeps expired sessions from memory.
+session_sweep_interval_seconds = 300  # 5 minutes
+
+# Minimum delay before a failed-login response is returned, in milliseconds.
+# Argon2id already dominates this; the floor smooths timing differences
+# between known and unknown usernames.
+min_login_response_ms = 250
+
+# Consecutive failed logins before the account is locked. 0 disables lockout.
+max_failed_logins = 10
+
+# How long an account stays locked after exceeding max_failed_logins.
+lockout_seconds = 900  # 15 minutes
+
+# Drop the in-memory decrypted secret key this many seconds after the last
+# session expires. 0 drops it immediately. Raise this value to tolerate brief
+# gaps between sessions without requiring a keystore unlock each time.
+keystore_idle_drop_seconds = 0
