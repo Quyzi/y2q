@@ -56,7 +56,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use actix_web::{App, HttpServer, middleware::from_fn, web};
+use actix_web::{App, HttpServer, http::KeepAlive, middleware::from_fn, web};
 use clap::Parser;
 use metrics_exporter_prometheus::Matcher;
 use metrics_rs_dashboard_actix::{DashboardInput, create_metrics_actx_scope};
@@ -273,7 +273,21 @@ async fn main() -> std::io::Result<()> {
              set [server] unauthenticated_metrics = true to enable them"
         );
     }
-    HttpServer::new(move || {
+
+    // Extract actix knobs before the move closure captures `cfg`.
+    let actix_workers = cfg.server.actix.workers;
+    let actix_backlog = cfg.server.actix.backlog;
+    let actix_max_connections = cfg.server.actix.max_connections;
+    let actix_keep_alive = if cfg.server.actix.keep_alive_secs == 0 {
+        KeepAlive::Disabled
+    } else {
+        KeepAlive::Timeout(Duration::from_secs(cfg.server.actix.keep_alive_secs))
+    };
+    let actix_req_timeout = Duration::from_secs(cfg.server.actix.client_request_timeout_secs);
+    let actix_disc_timeout = Duration::from_secs(cfg.server.actix.client_disconnect_timeout_secs);
+    let actix_shutdown = cfg.server.actix.shutdown_timeout_secs;
+
+    let mut server = HttpServer::new(move || {
         // The dashboard crate installs its own Prometheus recorder on first
         // call (once per process via once_cell). Custom histogram buckets are
         // threaded through DashboardInput so the recorder is configured
@@ -320,10 +334,21 @@ async fn main() -> std::io::Result<()> {
                 .service(dashboard_scope);
         }
         app.configure(handlers::configure)
-    })
-    .bind((cfg.server.host.as_str(), cfg.server.port))?
-    .run()
-    .await
+    });
+
+    if let Some(w) = actix_workers {
+        server = server.workers(w);
+    }
+    server
+        .backlog(actix_backlog)
+        .max_connections(actix_max_connections)
+        .keep_alive(actix_keep_alive)
+        .client_request_timeout(actix_req_timeout)
+        .client_disconnect_timeout(actix_disc_timeout)
+        .shutdown_timeout(actix_shutdown)
+        .bind((cfg.server.host.as_str(), cfg.server.port))?
+        .run()
+        .await
 }
 
 /// Print the first-run root password to stdout exactly once.
