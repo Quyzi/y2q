@@ -65,6 +65,144 @@ CLI flags:
 | `--config <path>` | `config.toml` | Path to configuration file |
 | `--set KEY=VALUE` | — | Override a config value, e.g. `--set server.port=9090` |
 
+## CLI (`y2q`)
+
+Build the client:
+
+```sh
+cargo build --release -p y2q-cli
+```
+
+### Setup
+
+Add a server profile and log in:
+
+```sh
+y2q config add prod https://y2qd.example
+y2q login prod --user alice
+```
+
+Profiles and cached tokens are stored in `~/.config/y2q/config.toml` and `~/.local/share/y2q/tokens.toml`.
+
+### Copying files
+
+Upload a single file:
+
+```sh
+y2q cp report.pdf prod/documents/reports/q1.pdf
+```
+
+Upload from stdin:
+
+```sh
+tar czf - /etc | y2q cp - prod/backups/etc.tar.gz
+```
+
+Download to a file or stdout:
+
+```sh
+y2q cp prod/documents/reports/q1.pdf ./q1.pdf
+y2q cat prod/documents/reports/q1.pdf | less
+```
+
+**Recursive directory upload** — preserves the local directory tree as remote key paths:
+
+```sh
+y2q cp -r ./photos prod/media/photos/
+```
+
+**Glob patterns** — shell-quote the pattern to prevent local shell expansion when you want y2q to expand it:
+
+```sh
+y2q cp '*.log' prod/logs/host1/
+y2q cp -r './2024/**' prod/archive/2024/   # -r recurses into matched directories
+```
+
+Attach custom labels to an upload:
+
+```sh
+y2q cp notes.txt prod/docs/notes.txt --label project=y2q --label env=prod
+```
+
+Control durability:
+
+```sh
+y2q cp big.bin prod/data/big.bin --sync best-effort   # skip fsync for speed
+```
+
+### Listing and metadata
+
+```sh
+y2q ls prod/                    # list buckets
+y2q ls prod/documents/          # list objects in bucket
+y2q ls prod/documents/reports/  # list by prefix
+y2q ls prod/documents/ --all    # auto-paginate
+y2q stat prod/documents/reports/q1.pdf
+```
+
+### Deleting objects
+
+Delete a single object:
+
+```sh
+y2q rm prod/documents/old.txt
+```
+
+Delete multiple objects matching a glob — prompts for confirmation before deleting:
+
+```sh
+y2q rm 'prod/logs/host1/*.log'
+y2q rm 'prod/logs/host1/*.log' --force   # -f skips the prompt
+```
+
+### Admin
+
+```sh
+y2q admin user add prod bob
+y2q admin user ls prod
+y2q admin user rm prod bob
+
+y2q admin rebuild start prod
+y2q admin rebuild status prod
+
+y2q admin locks ls prod --older-than 30m
+y2q admin locks clear prod --older-than 30m
+```
+
+### Shell completions
+
+Print a completion script to stdout and install it:
+
+```sh
+# fish
+y2q completions fish > ~/.config/fish/completions/y2q.fish
+
+# zsh
+y2q completions zsh > "${fpath[1]}/_y2q"
+
+# bash
+y2q completions bash > /etc/bash_completion.d/y2q
+```
+
+Supported shells: `bash`, `zsh`, `fish`, `powershell`, `elvish`.
+
+### TUI
+
+Launch the interactive file explorer (also the default when no subcommand is given):
+
+```sh
+y2q tui
+y2q         # same
+```
+
+### Global flags
+
+| Flag | Short | Env | Effect |
+|---|---|---|---|
+| `--json` | `-j` | `Y2Q_OUTPUT` | Output as JSON |
+| `--verbose` | `-v` | — | Increase log verbosity (repeatable) |
+| `--config <path>` | — | — | Override config file location |
+
 ## Configuration
 
 ```toml
