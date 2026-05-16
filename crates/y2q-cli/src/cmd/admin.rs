@@ -1,9 +1,10 @@
+use futures::StreamExt;
 use y2q_client::{ClientConfig, Y2qClient};
 
 use crate::cli::{LocksCmd, RebuildCmd};
 use crate::config::{CliConfig, default_config_path, default_tokens_path};
 use crate::error::CliError;
-use crate::output::{OutputMode, print_json, print_table};
+use crate::output::{OutputMode, fmt_bytes, print_json, print_table};
 use crate::token::TokenStore;
 
 pub async fn rebuild(cmd: RebuildCmd, mode: OutputMode) -> Result<(), CliError> {
@@ -79,6 +80,49 @@ pub async fn locks(cmd: LocksCmd, mode: OutputMode) -> Result<(), CliError> {
         }
     }
     Ok(())
+}
+
+pub async fn trace(alias: &str, errors_only: bool) -> Result<(), CliError> {
+    let client = make_client(alias).await?;
+    let mut stream = client.connect_trace().await?;
+    eprintln!("Streaming trace from `{alias}` — Ctrl-C to stop");
+    while let Some(event) = stream.next().await {
+        if errors_only && event.status < 400 {
+            continue;
+        }
+        let ts = format_trace_ts(event.timestamp_ns);
+        let (color, reset) = ansi_status(event.status);
+        let rb = event.req_bytes.map(fmt_bytes).unwrap_or_else(|| "—".into());
+        let db = event.resp_bytes.map(fmt_bytes).unwrap_or_else(|| "—".into());
+        println!(
+            "{ts}  {m:<7}  {p:<40}  {color}{s:>3}{reset}  {lat:>8.1}ms  {rb:>9}\u{2191}  {db:>9}\u{2193}",
+            m = event.method,
+            p = event.path,
+            s = event.status,
+            lat = event.latency_ms,
+        );
+    }
+    Ok(())
+}
+
+fn format_trace_ts(ns: u64) -> String {
+    use chrono::{DateTime, Utc};
+    DateTime::<Utc>::from_timestamp_nanos(ns as i64)
+        .format("%H:%M:%S%.3f")
+        .to_string()
+}
+
+fn ansi_status(status: u16) -> (&'static str, &'static str) {
+    use std::io::IsTerminal;
+    if !std::io::stdout().is_terminal() {
+        return ("", "");
+    }
+    match status {
+        200..=299 => ("\x1b[32m", "\x1b[0m"),
+        300..=399 => ("\x1b[36m", "\x1b[0m"),
+        400..=499 => ("\x1b[33m", "\x1b[0m"),
+        _ => ("\x1b[31m", "\x1b[0m"),
+    }
 }
 
 async fn make_client(alias: &str) -> Result<Y2qClient, CliError> {

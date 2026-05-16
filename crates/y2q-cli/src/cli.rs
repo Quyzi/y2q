@@ -126,6 +126,13 @@ pub enum AdminCmd {
         #[command(subcommand)]
         cmd: LocksCmd,
     },
+    /// Stream live request/response trace from a server (like mc admin trace)
+    Trace {
+        alias: String,
+        /// Show only requests with status 400 or above
+        #[arg(long, short = 'e')]
+        errors: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]

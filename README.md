@@ -169,6 +169,30 @@ y2q admin locks ls prod --older-than 30m
 y2q admin locks clear prod --older-than 30m
 ```
 
+### Live trace
+
+Stream every request hitting the server in real time, similar to `mc admin trace`:
+
+```sh
+y2q admin trace prod
+```
+
+Each line shows timestamp, method, path, HTTP status (colour-coded), latency, and payload sizes:
+
+```
+12:34:56.123  PUT      /bucket/key                               200    42.1ms      1.2 KiB↑    4.0 KiB↓
+12:34:57.001  GET      /bucket/other/path                        200     1.2ms          —↑      3.4 KiB↓
+12:34:58.400  DELETE   /bucket/missing                           404     0.8ms          —↑          —↓
+```
+
+Filter to errors only:
+
+```sh
+y2q admin trace prod --errors
+```
+
+Press Ctrl-C to disconnect. The server continues running with zero overhead when no trace client is connected.
+
 ### Shell completions
 
 Print a completion script to stdout and install it:
