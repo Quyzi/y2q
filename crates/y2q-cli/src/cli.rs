@@ -1,4 +1,5 @@
 use clap::{Parser, Subcommand};
+use clap_complete::Shell;
 
 #[derive(Parser, Debug)]
 #[command(name = "y2q", about = "Post-quantum secure object storage CLI")]
@@ -46,7 +47,7 @@ pub enum Commands {
         #[arg(long)]
         new: Option<String>,
     },
-    /// Copy a file between local and remote storage
+    /// Copy files between local and remote storage
     Cp {
         src: String,
         dst: String,
@@ -54,9 +55,15 @@ pub enum Commands {
         label: Vec<String>,
         #[arg(long, value_name = "durable|best-effort")]
         sync: Option<String>,
+        #[arg(long, short = 'r', help = "Recursively upload a directory")]
+        recursive: bool,
     },
-    /// Delete a remote object
-    Rm { path: String },
+    /// Delete a remote object (supports glob patterns in key, e.g. alias/bucket/logs/*.log)
+    Rm {
+        path: String,
+        #[arg(long, short = 'f', help = "Skip confirmation when deleting multiple objects")]
+        force: bool,
+    },
     /// Show metadata for a remote object
     Stat { path: String },
     /// Stream a remote object to stdout
@@ -78,6 +85,13 @@ pub enum Commands {
     },
     /// Launch the interactive TUI file explorer
     Tui,
+    /// Print a shell completion script to stdout
+    ///
+    /// Example: y2q completions fish > ~/.config/fish/completions/y2q.fish
+    Completions {
+        #[arg(value_name = "SHELL")]
+        shell: Shell,
+    },
 }
 
 #[derive(Subcommand, Debug)]

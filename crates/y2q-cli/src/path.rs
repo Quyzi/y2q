@@ -40,7 +40,8 @@ pub enum CpEndpoint {
 
 impl CpEndpoint {
     pub fn parse(s: &str) -> Self {
-        if s == "-" || !s.contains('/') {
+        // Glob chars or stdin → always local
+        if s == "-" || !s.contains('/') || s.contains(['*', '?', '[']) {
             return Self::Local(s.to_owned());
         }
         match RemotePath::parse(s) {

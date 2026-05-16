@@ -61,11 +61,15 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         Some(Commands::Ls { path, limit, after, all }) => {
             cmd::listing::run(path, limit, after, all, mode).await
         }
-        Some(Commands::Rm { path }) => cmd::objects::rm(path, mode).await,
+        Some(Commands::Rm { path, force }) => cmd::objects::rm(path, force, mode).await,
         Some(Commands::Stat { path }) => cmd::objects::stat(path, mode).await,
         Some(Commands::Cat { path }) => cmd::objects::cat(path).await,
-        Some(Commands::Cp { src, dst, label, sync }) => {
-            cmd::cp::run(src, dst, label, sync, mode).await
+        Some(Commands::Cp { src, dst, label, sync, recursive }) => {
+            cmd::cp::run(src, dst, label, sync, recursive, mode).await
+        }
+        Some(Commands::Completions { shell }) => {
+            cmd::completions::run(shell);
+            Ok(())
         }
         Some(Commands::Admin { cmd }) => match cmd {
             AdminCmd::User { cmd } => cmd::users::run(cmd, mode).await,
