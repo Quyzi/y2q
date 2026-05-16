@@ -22,6 +22,7 @@ sha2            = { workspace = true }
 subtle          = { workspace = true }
 thiserror       = { workspace = true }
 tokio           = { workspace = true }
+metrics         = { workspace = true }
 tracing         = { workspace = true }
 uuid            = { workspace = true }
 zeroize         = { workspace = true }

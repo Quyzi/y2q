@@ -23,6 +23,48 @@ pub struct Config {
     pub crypto: CryptoConfig,
     /// User authentication / session settings.
     pub auth: AuthConfig,
+    /// Logging and metrics settings.
+    #[serde(default)]
+    pub observability: ObservabilityConfig,
+}
+
+/// Log output format.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum LogFormat {
+    /// Human-readable text output. Default.
+    #[default]
+    Text,
+    /// Structured JSON output, one object per log line. Suited for log
+    /// aggregators (Loki, Elasticsearch, etc.).
+    Json,
+}
+
+/// Logging and metrics settings.
+#[derive(Debug, Deserialize)]
+pub struct ObservabilityConfig {
+    /// Tracing filter directive in `RUST_LOG` syntax, e.g. `"info"` or
+    /// `"y2qd=debug,actix_web=info"`. The `RUST_LOG` environment variable
+    /// takes precedence over this value when set.
+    #[serde(default = "default_log_filter")]
+    pub log_filter: String,
+    /// Log output format. Default: `"text"`. Set to `"json"` for structured
+    /// output consumed by log aggregators.
+    #[serde(default)]
+    pub log_format: LogFormat,
+}
+
+fn default_log_filter() -> String {
+    "info".to_string()
+}
+
+impl Default for ObservabilityConfig {
+    fn default() -> Self {
+        Self {
+            log_filter: default_log_filter(),
+            log_format: LogFormat::Text,
+        }
+    }
 }
 
 fn default_max_body_bytes() -> usize {

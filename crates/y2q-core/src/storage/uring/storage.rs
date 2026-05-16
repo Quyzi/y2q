@@ -14,7 +14,7 @@ use std::{
 use bytes::Bytes;
 use uuid::Uuid;
 
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 
 use crate::{
     CacheRebuildStatus, DEFAULT_LIST_LIMIT, Error, ListOptions, ListPage, Listing, MAX_LIST_LIMIT,
@@ -386,10 +386,25 @@ fn validate_key(key: &str) -> Result<(), Error> {
     Ok(())
 }
 
+fn record_storage_op<T, E>(op: &'static str, result: &Result<T, E>, elapsed_ms: f64) {
+    let result_label = if result.is_ok() { "ok" } else { "err" };
+    metrics::counter!(
+        "y2qd_storage_ops_total",
+        "op" => op, "backend" => "uring", "result" => result_label
+    )
+    .increment(1);
+    metrics::histogram!(
+        "y2qd_storage_op_duration_milliseconds",
+        "op" => op, "backend" => "uring"
+    )
+    .record(elapsed_ms);
+}
+
 impl Storage for UringStorage {
     async fn get(&self, bucket: &str, key: &str) -> Result<Object, Error> {
         validate_bucket(bucket)?;
         validate_key(key)?;
+        let started = Instant::now();
         let obj_path = self.obj_path(bucket, key);
         let lock_path = obj_path.with_extension("lock");
         let (reply, reply_rx) = tokio::sync::oneshot::channel();
@@ -400,7 +415,9 @@ impl Storage for UringStorage {
             key: key.to_owned(),
             reply,
         };
-        self.dispatch(op, bucket, key, "get", reply_rx).await
+        let result = self.dispatch(op, bucket, key, "get", reply_rx).await;
+        record_storage_op("get", &result, started.elapsed().as_secs_f64() * 1_000.0);
+        result
     }
 
     async fn get_range(
@@ -434,6 +451,7 @@ impl Storage for UringStorage {
     ) -> Result<bool, Error> {
         validate_bucket(bucket)?;
         validate_key(key)?;
+        let started = Instant::now();
         let obj_path = self.obj_path(bucket, key);
         let lock_path = obj_path.with_extension("lock");
         let tmp_path = obj_path.with_extension("tmp");
@@ -460,7 +478,10 @@ impl Storage for UringStorage {
             mek: self.config.mek,
             reply,
         };
-        let (is_overwrite, metadata) = self.dispatch(op, bucket, key, "put", reply_rx).await?;
+        let dispatch_result = self.dispatch(op, bucket, key, "put", reply_rx).await;
+        let result = dispatch_result.map(|(is_overwrite, metadata)| (is_overwrite, metadata));
+        record_storage_op("put", &result, started.elapsed().as_secs_f64() * 1_000.0);
+        let (is_overwrite, metadata) = result?;
 
         // Mirror FilesystemStorage: the on-disk record is authoritative, so a
         // failed index upsert is logged but not surfaced — the index can be
@@ -479,6 +500,7 @@ impl Storage for UringStorage {
     async fn delete(&self, bucket: &str, key: &str) -> Result<Object, Error> {
         validate_bucket(bucket)?;
         validate_key(key)?;
+        let started = Instant::now();
         let obj_path = self.obj_path(bucket, key);
         let lock_path = obj_path.with_extension("lock");
         let (reply, reply_rx) = tokio::sync::oneshot::channel();
@@ -489,7 +511,9 @@ impl Storage for UringStorage {
             key: key.to_owned(),
             reply,
         };
-        let obj = self.dispatch(op, bucket, key, "delete", reply_rx).await?;
+        let result = self.dispatch(op, bucket, key, "delete", reply_rx).await;
+        record_storage_op("delete", &result, started.elapsed().as_secs_f64() * 1_000.0);
+        let obj = result?;
 
         if let Err(e) = self.index.remove(bucket, key).await {
             tracing::warn!(
@@ -505,6 +529,7 @@ impl Storage for UringStorage {
     async fn describe(&self, bucket: &str, key: &str) -> Result<Metadata, Error> {
         validate_bucket(bucket)?;
         validate_key(key)?;
+        let started = Instant::now();
         let obj_path = self.obj_path(bucket, key);
         let lock_path = obj_path.with_extension("lock");
         let (reply, reply_rx) = tokio::sync::oneshot::channel();
@@ -516,7 +541,9 @@ impl Storage for UringStorage {
             mek: self.config.mek,
             reply,
         };
-        self.dispatch(op, bucket, key, "describe", reply_rx).await
+        let result = self.dispatch(op, bucket, key, "describe", reply_rx).await;
+        record_storage_op("describe", &result, started.elapsed().as_secs_f64() * 1_000.0);
+        result
     }
 }
 

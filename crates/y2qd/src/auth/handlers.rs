@@ -18,6 +18,17 @@ use super::state::AuthState;
 use super::users::validate as validate_username;
 use super::Authenticated;
 
+fn record_login(result_label: &'static str, session_count: Option<usize>) {
+    metrics::counter!(
+        crate::observability::AUTH_LOGINS_TOTAL,
+        "result" => result_label
+    )
+    .increment(1);
+    if let Some(n) = session_count {
+        metrics::gauge!(crate::observability::SESSIONS_ACTIVE).set(n as f64);
+    }
+}
+
 /// `POST /api/v1/auth/login` request body.
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct LoginRequest {
@@ -108,6 +119,7 @@ pub async fn login(
     {
         let mut attempts = state.login_attempts.lock().unwrap();
         if let Err(until) = attempts.check_lockout(&username) {
+            record_login("locked", None);
             return Err(AuthError::LockedOut {
                 until: SystemTime::now() + until.saturating_duration_since(std::time::Instant::now()),
             });
@@ -128,6 +140,7 @@ pub async fn login(
         .get(&username)
         .map_err(|e| AuthError::Backend(e.to_string()))?;
 
+    let not_found = record.is_none();
     let result = match record {
         Some(rec) => attempt_unwrap(rec, password.clone()).await,
         None => Err(AuthError::InvalidCredentials),
@@ -146,6 +159,7 @@ pub async fn login(
                 expires_at,
             };
             let token = state.sessions.insert(info);
+            record_login("success", Some(state.sessions.len()));
 
             // Update last_login + reset failure counter.
             let mut updated = rec.clone();
@@ -168,6 +182,8 @@ pub async fn login(
             }))
         }
         Err(e) => {
+            let result_label = if not_found { "not_found" } else { "wrong_password" };
+            record_login(result_label, None);
             state.login_attempts.lock().unwrap().record_failure(
                 &username,
                 state.config.max_failed_logins,

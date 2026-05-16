@@ -119,3 +119,18 @@ lockout_seconds = 900  # 15 minutes
 # session expires. 0 drops it immediately. Raise this value to tolerate brief
 # gaps between sessions without requiring a keystore unlock each time.
 keystore_idle_drop_seconds = 0
+
+# ── Observability ─────────────────────────────────────────────────────────────
+[observability]
+
+# Logging filter directive, in RUST_LOG syntax. Controls which crates and
+# modules emit log output and at what level.
+# Examples: "info", "y2qd=debug,actix_web=info"
+# The RUST_LOG environment variable takes precedence over this value when set.
+log_filter = "info"
+
+# Log output format.
+# "text" — human-readable coloured output (default).
+# "json" — structured JSON, one object per line; suited for log aggregators
+#          such as Grafana Loki, Elasticsearch, or Datadog.
+log_format = "text"

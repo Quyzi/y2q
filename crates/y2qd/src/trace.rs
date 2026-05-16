@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use actix_web::{
-    Error, HttpResponse,
+    Error, HttpMessage, HttpResponse,
     body::MessageBody,
     dev::{ServiceRequest, ServiceResponse},
     http::header,
@@ -14,9 +14,11 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
 use crate::auth::Authenticated;
+use crate::request_id::RequestIdExt;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TraceEvent {
+    pub request_id: String,
     pub timestamp_ns: u64,
     pub method: String,
     pub path: String,
@@ -61,6 +63,11 @@ pub async fn trace_middleware<B: MessageBody>(
     let method = req.method().as_str().to_owned();
     let path = req.uri().path().to_owned();
     let remote_addr = req.peer_addr().map(|a| a.to_string());
+    let request_id = req
+        .extensions()
+        .get::<RequestIdExt>()
+        .map(|r| r.0.clone())
+        .unwrap_or_default();
     let started = Instant::now();
 
     let res = next.call(req).await?;
@@ -76,6 +83,7 @@ pub async fn trace_middleware<B: MessageBody>(
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0);
         hub.publish(TraceEvent {
+            request_id,
             timestamp_ns,
             method,
             path,
