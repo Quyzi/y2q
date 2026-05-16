@@ -1,0 +1,12 @@
+[package]
+name = "y2q-config"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+thiserror   = { workspace = true }
+serde       = { workspace = true }
+toml        = { workspace = true }
+zeroize     = { workspace = true }
+indexmap    = { workspace = true }
+directories = { workspace = true }

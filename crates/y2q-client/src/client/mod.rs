@@ -15,6 +15,7 @@ pub struct ClientConfig {
     pub token: Option<Zeroizing<String>>,
 }
 
+#[derive(Clone)]
 pub struct Y2qClient {
     pub(crate) inner: reqwest::Client,
     pub(crate) base_url: Url,
@@ -32,6 +33,14 @@ impl Y2qClient {
     pub fn with_token(mut self, token: impl Into<String>) -> Self {
         self.token = Some(Zeroizing::new(token.into()));
         self
+    }
+
+    pub fn set_token(&mut self, token: impl Into<String>) {
+        self.token = Some(Zeroizing::new(token.into()));
+    }
+
+    pub fn inner_client(&self) -> &reqwest::Client {
+        &self.inner
     }
 
     pub(crate) fn url(&self, path: &str) -> Url {
