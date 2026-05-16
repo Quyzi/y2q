@@ -77,8 +77,10 @@ mod config;
 mod error;
 mod handlers;
 pub(crate) mod observability;
+mod trace;
 
 use crate::auth::AuthState;
+use crate::trace::TraceHub;
 
 #[derive(OpenApi)]
 #[openapi(
@@ -261,6 +263,8 @@ async fn main() -> std::io::Result<()> {
     let label_limits = web::Data::new(config::LabelLimits::from(&cfg.storage));
     let openapi = ApiDoc::openapi();
 
+    let trace_hub = web::Data::new(Arc::new(TraceHub::new()));
+
     let max_body_bytes = cfg.server.max_body_bytes;
     let expose_unauthed = cfg.server.unauthenticated_metrics;
     if !expose_unauthed {
@@ -295,6 +299,8 @@ async fn main() -> std::io::Result<()> {
         let mut app = App::new()
             .wrap(TracingLogger::default())
             .wrap(from_fn(observability::metrics_middleware))
+            .wrap(from_fn(trace::trace_middleware))
+            .app_data(trace_hub.clone())
             .app_data(storage_data.clone())
             .app_data(label_limits.clone())
             .app_data(auth_state.clone())

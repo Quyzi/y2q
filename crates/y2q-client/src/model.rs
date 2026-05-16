@@ -101,6 +101,20 @@ pub struct ListBucketsResponse {
     pub buckets: Vec<String>,
 }
 
+// ── Trace ─────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TraceEvent {
+    pub timestamp_ns: u64,
+    pub method: String,
+    pub path: String,
+    pub status: u16,
+    pub latency_ms: f64,
+    pub req_bytes: Option<u64>,
+    pub resp_bytes: Option<u64>,
+    pub remote_addr: Option<String>,
+}
+
 // ── Admin ─────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize)]

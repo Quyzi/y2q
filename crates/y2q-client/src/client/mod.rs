@@ -2,6 +2,7 @@ mod admin;
 mod auth;
 mod listing;
 mod objects;
+mod trace;
 mod users;
 
 use reqwest::{RequestBuilder, Response, Url};

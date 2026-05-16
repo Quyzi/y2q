@@ -75,6 +75,7 @@ async fn run(cli: Cli) -> Result<(), CliError> {
             AdminCmd::User { cmd } => cmd::users::run(cmd, mode).await,
             AdminCmd::Rebuild { cmd } => cmd::admin::rebuild(cmd, mode).await,
             AdminCmd::Locks { cmd } => cmd::admin::locks(cmd, mode).await,
+            AdminCmd::Trace { alias, errors } => cmd::admin::trace(&alias, errors).await,
         },
     }
 }
