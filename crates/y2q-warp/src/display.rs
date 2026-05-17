@@ -39,10 +39,12 @@ struct AppState {
     aggregates: HashMap<OpKind, Aggregate>,
     throughput_history: VecDeque<u64>,
     ops_history: HashMap<OpKind, VecDeque<u64>>,
-    errors_per_sec: HashMap<OpKind, f64>,
+    errors_4xx_per_sec: HashMap<OpKind, f64>,
+    errors_5xx_per_sec: HashMap<OpKind, f64>,
     prev_bytes: u64,
     prev_ops: HashMap<OpKind, u64>,
-    prev_errors: HashMap<OpKind, u64>,
+    prev_errors_4xx: HashMap<OpKind, u64>,
+    prev_errors_5xx: HashMap<OpKind, u64>,
     last_sample: Instant,
     bench_start: Option<Instant>,
 }
@@ -54,10 +56,12 @@ impl AppState {
             aggregates: HashMap::new(),
             throughput_history: VecDeque::with_capacity(HISTORY_CAP + 1),
             ops_history: HashMap::new(),
-            errors_per_sec: HashMap::new(),
+            errors_4xx_per_sec: HashMap::new(),
+            errors_5xx_per_sec: HashMap::new(),
             prev_bytes: 0,
             prev_ops: HashMap::new(),
-            prev_errors: HashMap::new(),
+            prev_errors_4xx: HashMap::new(),
+            prev_errors_5xx: HashMap::new(),
             last_sample: Instant::now(),
             bench_start: None,
         }
@@ -109,10 +113,15 @@ impl AppState {
             );
             self.prev_ops.insert(op, agg.n_ops);
 
-            let prev_err = *self.prev_errors.get(&op).unwrap_or(&0);
-            let err_delta = agg.n_errors.saturating_sub(prev_err);
-            self.errors_per_sec.insert(op, err_delta as f64 / dt_s);
-            self.prev_errors.insert(op, agg.n_errors);
+            let prev_4xx = *self.prev_errors_4xx.get(&op).unwrap_or(&0);
+            let delta_4xx = agg.n_errors_4xx.saturating_sub(prev_4xx);
+            self.errors_4xx_per_sec.insert(op, delta_4xx as f64 / dt_s);
+            self.prev_errors_4xx.insert(op, agg.n_errors_4xx);
+
+            let prev_5xx = *self.prev_errors_5xx.get(&op).unwrap_or(&0);
+            let delta_5xx = agg.n_errors_5xx.saturating_sub(prev_5xx);
+            self.errors_5xx_per_sec.insert(op, delta_5xx as f64 / dt_s);
+            self.prev_errors_5xx.insert(op, agg.n_errors_5xx);
         }
 
         self.last_sample = Instant::now();
@@ -302,8 +311,8 @@ fn render_running(
         Constraint::Length(table_height), // stats table
         Constraint::Min(3),               // throughput sparkline
     ];
-    if !op_kinds.is_empty() {
-        constraints.push(Constraint::Length(4)); // per-op ops/s sparklines
+    for _ in op_kinds {
+        constraints.push(Constraint::Length(3)); // one row per op's ops/s sparkline
     }
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -335,8 +344,8 @@ fn render_running(
         [
             "Op",
             "Ops",
-            "Errors",
-            "Err/s",
+            "4xx/s",
+            "5xx/s",
             "Throughput",
             "Ops/s",
             "P50",
@@ -358,21 +367,27 @@ fn render_running(
         .iter()
         .map(|kind| {
             let agg = &state.aggregates[kind];
-            let errs_s = state.errors_per_sec.get(kind).copied().unwrap_or(0.0);
+            let e4 = state.errors_4xx_per_sec.get(kind).copied().unwrap_or(0.0);
+            let e5 = state.errors_5xx_per_sec.get(kind).copied().unwrap_or(0.0);
             Row::new([
                 Cell::from(kind.as_str()),
                 Cell::from(format!("{:>8}", agg.n_ops)),
-                Cell::from(format!("{:>8}", agg.n_errors)).style(if agg.n_errors > 0 {
-                    Style::default().fg(Color::Red)
-                } else {
-                    Style::default().fg(Color::Green)
-                }),
-                Cell::from(if errs_s > 0.0 {
-                    format!("{:>5.1}", errs_s)
+                Cell::from(if e4 > 0.0 {
+                    format!("{:>5.1}", e4)
                 } else {
                     format!("{:>5}", "0")
                 })
-                .style(if errs_s > 0.0 {
+                .style(if e4 > 0.0 {
+                    Style::default().fg(Color::Yellow)
+                } else {
+                    Style::default()
+                }),
+                Cell::from(if e5 > 0.0 {
+                    format!("{:>5.1}", e5)
+                } else {
+                    format!("{:>5}", "0")
+                })
+                .style(if e5 > 0.0 {
                     Style::default().fg(Color::Red)
                 } else {
                     Style::default()
@@ -392,7 +407,7 @@ fn render_running(
         [
             Constraint::Length(8),
             Constraint::Length(9),
-            Constraint::Length(9),
+            Constraint::Length(6),
             Constraint::Length(6),
             Constraint::Length(16),
             Constraint::Length(8),
@@ -422,35 +437,35 @@ fn render_running(
         .style(Style::default().fg(Color::Green));
     f.render_widget(tp_spark, tp_area);
 
-    // --- Per-op ops/s sparklines (horizontal row) ---
-    if !op_kinds.is_empty() && chunks.len() > 3 {
-        let ops_area = chunks[3];
-        let n = op_kinds.len();
-        let op_areas = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints(vec![Constraint::Fill(1); n])
-            .split(ops_area);
-
-        for (i, &op) in op_kinds.iter().enumerate() {
-            let area = op_areas[i];
-            let hist = state
-                .ops_history
-                .get(&op)
-                .map(|h| rjust(h, area.width as usize))
-                .unwrap_or_else(|| vec![0u64; area.width as usize]);
-            let peak = hist.iter().copied().max().unwrap_or(0);
-            let spark = Sparkline::default()
-                .block(
-                    Block::default()
-                        .title(format!(" {} ops/s  peak {} ", op.as_str(), peak))
-                        .title_style(Style::default().fg(Color::Cyan))
-                        .borders(Borders::TOP)
-                        .border_style(Style::default().fg(Color::DarkGray)),
-                )
-                .data(&hist)
-                .style(Style::default().fg(Color::Yellow));
-            f.render_widget(spark, area);
+    // --- Per-op ops/s sparklines (one row each, stacked vertically) ---
+    for (i, &op) in op_kinds.iter().enumerate() {
+        let chunk_idx = 3 + i;
+        if chunk_idx >= chunks.len() {
+            break;
         }
+        let area = chunks[chunk_idx];
+        let history = state.ops_history.get(&op);
+        let current = history.and_then(|h| h.back().copied()).unwrap_or(0);
+        let hist = history
+            .map(|h| rjust(h, area.width as usize))
+            .unwrap_or_else(|| vec![0u64; area.width as usize]);
+        let peak = hist.iter().copied().max().unwrap_or(0);
+        let spark = Sparkline::default()
+            .block(
+                Block::default()
+                    .title(format!(
+                        " {} ops/s  now {}  peak {} ",
+                        op.as_str(),
+                        current,
+                        peak
+                    ))
+                    .title_style(Style::default().fg(Color::Cyan))
+                    .borders(Borders::TOP)
+                    .border_style(Style::default().fg(Color::DarkGray)),
+            )
+            .data(&hist)
+            .style(Style::default().fg(Color::Yellow));
+        f.render_widget(spark, area);
     }
 }
 
