@@ -46,7 +46,7 @@ fn open_index() -> (MetadataIndex, TempDir) {
 fn populate(rt: &Runtime, idx: &MetadataIndex, bucket: &str, n: usize) {
     for i in 0..n {
         let key = format!("key-{i:08}");
-        rt.block_on(idx.upsert(&make_meta(bucket, &key))).unwrap();
+        rt.block_on(idx.upsert(&make_meta(bucket, &key), y2q_core::SyncLevel::Durable)).unwrap();
     }
 }
 
@@ -66,7 +66,7 @@ fn bench_upsert(c: &mut Criterion) {
                 let idx = idx.clone();
                 let i = seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let key = format!("key-{i:08}");
-                async move { idx.upsert(&make_meta("bench", &key)).await.unwrap() }
+                async move { idx.upsert(&make_meta("bench", &key), y2q_core::SyncLevel::Durable).await.unwrap() }
             });
         });
     }
