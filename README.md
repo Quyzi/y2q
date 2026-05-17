@@ -13,7 +13,7 @@ Post-quantum secure object storage. `y2qd` is a REST daemon that encrypts every 
 
 ## Features
 
-- **Post-quantum encryption at rest** — each object is encapsulated against an ML-KEM-768 public key; content is encrypted with AES-256-GCM
+- **Post-quantum encryption at rest** — each object is encapsulated against an ML-KEM-768 public key; content and metadata is encrypted with AES-256-GCM
 - **Argon2id-protected secret key** — the ML-KEM private key is never stored in plaintext; it is wrapped under each user's password and only held in memory during an active session
 - **Token-based session auth** — Bearer tokens with configurable TTL, per-account lockout after repeated failures
 - **Dual storage backends** — portable filesystem backend (all platforms); optional Linux io_uring fast path (kernel ≥ 5.6)

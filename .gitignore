@@ -1,3 +1,4 @@
 /target
 /.superpowers
 config.toml
+*.csv.zst
