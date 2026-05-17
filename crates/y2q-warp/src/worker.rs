@@ -40,7 +40,7 @@ pub async fn run_worker(
             client.set_token(tok.as_str());
         }
 
-        let record = execute_op(
+        let Some(record) = execute_op(
             &config,
             &client,
             &raw_http,
@@ -49,7 +49,11 @@ pub async fn run_worker(
             pool.as_deref(),
             &mut rng,
         )
-        .await;
+        .await else {
+            // Pool was empty for this op kind; yield and retry.
+            tokio::task::yield_now().await;
+            continue;
+        };
 
         if tx.send(record).await.is_err() {
             break;
@@ -65,12 +69,12 @@ async fn execute_op(
     put_seq: &AtomicU64,
     pool: Option<&ObjectPool>,
     rng: &mut impl Rng,
-) -> OpRecord {
+) -> Option<OpRecord> {
     let op = pick_op(&config.workload.op, config.workload.mixed_weights.as_ref(), rng);
     let bucket = &config.bucket;
     let run_id = &config.workload.run_id;
 
-    match op {
+    Some(match op {
         OpKind::Put => {
             let seq = put_seq.fetch_add(1, Ordering::Relaxed);
             let key = format!("warp/{run_id}/{seq:08}");
@@ -87,9 +91,9 @@ async fn execute_op(
             let key = match pool {
                 Some(p) => match p.pick_for_get().await {
                     Some(k) => k,
-                    None => return dummy_skip_record(op, run_id),
+                    None => return None,
                 },
-                None => return dummy_skip_record(op, run_id),
+                None => return None,
             };
             let token = token_rx.borrow().clone();
             get::get_op(raw_http, &config.base_url, token.as_str(), bucket, &key, run_id).await
@@ -98,9 +102,9 @@ async fn execute_op(
             let key = match pool {
                 Some(p) => match p.take_for_delete().await {
                     Some(k) => k,
-                    None => return dummy_skip_record(op, run_id),
+                    None => return None,
                 },
-                None => return dummy_skip_record(op, run_id),
+                None => return None,
             };
             let rec = delete::delete_op(client, bucket, &key, run_id).await;
             if rec.error.is_some() {
@@ -114,14 +118,14 @@ async fn execute_op(
             let key = match pool {
                 Some(p) => match p.pick_for_get().await {
                     Some(k) => k,
-                    None => return dummy_skip_record(op, run_id),
+                    None => return None,
                 },
-                None => return dummy_skip_record(op, run_id),
+                None => return None,
             };
             stat::stat_op(client, bucket, &key, run_id).await
         }
         OpKind::List => list::list_op(client, bucket, run_id).await,
-    }
+    })
 }
 
 fn pick_op(op: &OpKind, weights: Option<&MixedWeights>, rng: &mut impl Rng) -> OpKind {
@@ -136,17 +140,3 @@ fn pick_op(op: &OpKind, weights: Option<&MixedWeights>, rng: &mut impl Rng) -> O
     *op
 }
 
-fn dummy_skip_record(op: OpKind, run_id: &str) -> OpRecord {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let ns = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64;
-    OpRecord {
-        run_id: run_id.to_owned(),
-        op: op.as_str().to_owned(),
-        start_ns: ns,
-        end_ns: ns,
-        first_byte_ns: None,
-        bytes: 0,
-        key: String::new(),
-        error: Some("pool empty".to_owned()),
-    }
-}

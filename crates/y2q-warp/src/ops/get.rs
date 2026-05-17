@@ -19,7 +19,7 @@ pub async fn get_op(
     run_id: &str,
 ) -> OpRecord {
     let start_ns = wall_ns();
-    let url = format!("{base_url}{bucket}/{key}");
+    let url = format!("{}/{bucket}/{key}", base_url.trim_end_matches('/'));
 
     let result = client.get(&url).bearer_auth(token).send().await;
 
