@@ -87,6 +87,24 @@ mod trace;
 use crate::auth::AuthState;
 use crate::trace::TraceHub;
 
+struct IgnoreBrokenPipe<W>(W);
+
+impl<W: std::io::Write> std::io::Write for IgnoreBrokenPipe<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self.0.write(buf) {
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(buf.len()),
+            other => other,
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self.0.flush() {
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+            other => other,
+        }
+    }
+}
+
 #[derive(OpenApi)]
 #[openapi(
     info(
@@ -177,10 +195,12 @@ async fn main() -> std::io::Result<()> {
     match cfg.observability.log_format {
         LogFormat::Text => tracing_subscriber::fmt()
             .with_env_filter(log_filter)
+            .with_writer(|| IgnoreBrokenPipe(std::io::stdout()))
             .init(),
         LogFormat::Json => tracing_subscriber::fmt()
             .json()
             .with_env_filter(log_filter)
+            .with_writer(|| IgnoreBrokenPipe(std::io::stdout()))
             .init(),
     }
 

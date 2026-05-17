@@ -11,10 +11,8 @@ mod prepare;
 mod recorder;
 mod worker;
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
-use std::time::Instant;
 
 use clap::Parser;
 use tokio::sync::{mpsc, watch};
@@ -25,6 +23,7 @@ use zeroize::Zeroizing;
 use auth::{build_client, resolve_token, spawn_refresh_task};
 use cli::{Cli, Commands, WorkloadArgs};
 use config::{MixedWeights, ObjSize, RunConfig, WorkloadConfig, parse_size};
+use display::DisplayMsg;
 use error::WarpError;
 use generator::ObjectPool;
 use ops::OpKind;
@@ -60,7 +59,7 @@ async fn run(cli: Cli) -> Result<(), WarpError> {
                 args.obj_size_max.as_deref(),
             )?;
             let run_id = Uuid::new_v4().to_string();
-            prepare(&client, &args.bucket, &run_id, args.objects, &obj_size, 8).await?;
+            prepare(&client, &args.bucket, &run_id, args.objects, &obj_size, 8, None).await?;
             println!("run_id: {run_id}");
             Ok(())
         }
@@ -129,7 +128,11 @@ async fn bench(
     )?;
 
     let run_id = Uuid::new_v4().to_string();
-    let op_label = if mixed_weights.is_some() { "mixed".to_owned() } else { op.as_str().to_lowercase() };
+    let op_label = if mixed_weights.is_some() {
+        "mixed".to_owned()
+    } else {
+        op.as_str().to_lowercase()
+    };
     let output = args.output.unwrap_or_else(|| {
         let ts = chrono::Local::now().format("%Y%m%d-%H%M%S");
         std::path::PathBuf::from(format!("warp-{op_label}-{ts}.csv.zst"))
@@ -138,26 +141,51 @@ async fn bench(
     let needs_pool = matches!(op, OpKind::Get | OpKind::Delete | OpKind::Stat)
         || mixed_weights.is_some();
 
-    // Prepare phase
+    // Display channel and task start before prepare so seeding appears in TUI.
+    let (disp_tx, disp_rx) = mpsc::channel::<DisplayMsg>(32);
+    let display_op = op;
+    let mut display_task =
+        tokio::spawn(display::run_display(disp_rx, display_op, duration));
+
+    // Prepare phase — progress messages go through the TUI.
     let pool = if needs_pool {
-        eprintln!("preparing {} objects...", args.objects);
-        let keys = prepare(
+        let progress_tx = disp_tx.clone();
+        let result = prepare(
             &client,
             &args.bucket,
             &run_id,
             args.objects,
             &obj_size,
             args.concurrent,
+            Some(progress_tx),
         )
-        .await?;
-        Some(ObjectPool::new(run_id.clone(), keys, args.objects))
+        .await;
+        match result {
+            Ok(keys) => Some(ObjectPool::new(run_id.clone(), keys, args.objects)),
+            Err(e) => {
+                drop(disp_tx);
+                let _ = display_task.await;
+                return Err(e);
+            }
+        }
     } else {
         None
     };
 
-    // Token watch channel — workers read this to get the current bearer token for raw HTTP GETs
+    // If the user quit during prepare, stop here.
+    if display_task.is_finished() {
+        return Ok(());
+    }
+
+    // Token watch channel — workers read this to get the current bearer token for raw HTTP GETs.
     let (tok_tx, tok_rx) = watch::channel::<Zeroizing<String>>(initial_token);
-    spawn_refresh_task(client.clone(), alias.to_owned(), profile.username.clone(), expires_at, tok_tx);
+    spawn_refresh_task(
+        client.clone(),
+        alias.to_owned(),
+        profile.username.clone(),
+        expires_at,
+        tok_tx,
+    );
 
     let workload = WorkloadConfig {
         op,
@@ -177,22 +205,13 @@ async fn bench(
         workload,
     });
 
-    // Channels
     let (rec_tx, rec_rx) = mpsc::channel::<metrics::OpRecord>(8192);
-    let (agg_tx, agg_rx) = mpsc::channel::<HashMap<OpKind, metrics::Aggregate>>(4);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-    // Recorder task
-    let recorder = Recorder::new(rec_rx, agg_tx, &output)?;
+    // Recorder owns disp_tx; dropping it at end signals the display to finish.
+    let recorder = Recorder::new(rec_rx, disp_tx, &output)?;
     let recorder_handle = tokio::spawn(recorder.run());
 
-    // Display task (show mixed as generic "MIXED" header using Put as sentinel kind)
-    let display_op = op;
-    let display_start = Instant::now();
-    let display_handle =
-        tokio::spawn(display::run_display(agg_rx, display_op, duration, display_start));
-
-    // Worker tasks
     let raw_http = client.inner_client().clone();
     let put_seq = Arc::new(AtomicU64::new(args.objects as u64));
 
@@ -208,23 +227,25 @@ async fn bench(
         let pl = pool.clone();
         worker_handles.push(tokio::spawn(worker::run_worker(cfg, wc, rh, tr, tx, sd, ps, pl)));
     }
-    // Drop the original sender — recorder exits when all worker senders are dropped
     drop(rec_tx);
 
-    // Run for the requested duration, then signal shutdown
-    tokio::time::sleep(duration).await;
+    // Run until duration elapses or user quits the TUI.
+    tokio::select! {
+        _ = tokio::time::sleep(duration) => {}
+        _ = &mut display_task => {}
+    }
     let _ = shutdown_tx.send(true);
 
     for h in worker_handles {
         let _ = h.await;
     }
+    // Recorder drop closes disp_tx → display sees channel close → exits cleanly.
     recorder_handle.await.ok();
-    display_handle.await.ok();
+    display_task.await.ok();
 
     eprintln!("\nresults written to {}", output.display());
     analyze::run_analyze(&[output.as_path()], None, 0, None)?;
 
-    // Teardown
     if !args.no_cleanup && needs_pool {
         let prefix = format!("warp/{run_id}/");
         cleanup(&client, &args.bucket, &prefix, args.concurrent).await?;

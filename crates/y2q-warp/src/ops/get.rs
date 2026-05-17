@@ -41,6 +41,8 @@ pub async fn get_op(
 
     if !resp.status().is_success() {
         let status = resp.status();
+        // Drain the body so reqwest can reuse the connection; don't record bytes on error.
+        let _ = resp.bytes().await;
         return OpRecord {
             run_id: run_id.to_owned(),
             op: "GET".to_owned(),
