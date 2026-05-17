@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use tokio::sync::mpsc::UnboundedSender;
 use y2q_client::{ClientConfig, ListOptions, Y2qClient};
@@ -100,6 +101,9 @@ impl App {
                         entry.speed_samples.pop_front();
                     }
                     entry.speed_samples.push_back(speed_bps);
+                    if entry.started_at.is_none() {
+                        entry.started_at = Some(Instant::now());
+                    }
                     entry.status = TransferStatus::Running;
                 }
                 Action::None
@@ -108,8 +112,17 @@ impl App {
                 if let Some(entry) = self.transfers.iter_mut().find(|e| e.id == id) {
                     entry.status = match result {
                         Ok(n) => {
+                            let elapsed = entry
+                                .started_at
+                                .map(|t| t.elapsed())
+                                .unwrap_or_default();
+                            let avg_bps = if elapsed.as_secs_f64() > 0.0 {
+                                (n as f64 / elapsed.as_secs_f64()) as u64
+                            } else {
+                                entry.speed_samples.back().copied().unwrap_or(0)
+                            };
                             entry.bytes_done = n;
-                            TransferStatus::Done
+                            TransferStatus::Done { bytes: n, elapsed, avg_bps }
                         }
                         Err(e) => TransferStatus::Failed(e),
                     };
