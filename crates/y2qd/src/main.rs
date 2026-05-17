@@ -288,11 +288,7 @@ async fn main() -> std::io::Result<()> {
             FilesystemStorage::new(&cfg.storage.base_path, &index_path)
                 .map_err(|e| std::io::Error::other(format!("storage init: {e}")))?
                 .with_mek(mek)
-                .with_dirty_channel(
-                    dirty_tx,
-                    flush_notify.clone(),
-                    cfg.storage.sync_flush_limit,
-                ),
+                .with_dirty_channel(dirty_tx, flush_notify.clone(), cfg.storage.sync_flush_limit),
         ),
         #[cfg(all(target_os = "linux", feature = "uring"))]
         config::StorageBackend::Uring => AnyStorage::Uring(

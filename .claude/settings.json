@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//home/digbick/Documents/code/y2qd/src/**)"
+    ]
+  }
+}

@@ -112,17 +112,18 @@ impl App {
                 if let Some(entry) = self.transfers.iter_mut().find(|e| e.id == id) {
                     entry.status = match result {
                         Ok(n) => {
-                            let elapsed = entry
-                                .started_at
-                                .map(|t| t.elapsed())
-                                .unwrap_or_default();
+                            let elapsed = entry.started_at.map(|t| t.elapsed()).unwrap_or_default();
                             let avg_bps = if elapsed.as_secs_f64() > 0.0 {
                                 (n as f64 / elapsed.as_secs_f64()) as u64
                             } else {
                                 entry.speed_samples.back().copied().unwrap_or(0)
                             };
                             entry.bytes_done = n;
-                            TransferStatus::Done { bytes: n, elapsed, avg_bps }
+                            TransferStatus::Done {
+                                bytes: n,
+                                elapsed,
+                                avg_bps,
+                            }
                         }
                         Err(e) => TransferStatus::Failed(e),
                     };

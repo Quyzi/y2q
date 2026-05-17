@@ -15,13 +15,20 @@ pub fn render(frame: &mut Frame, area: Rect, message: &str) {
     let dialog_h = 5u16;
     let x = area.x + (area.width.saturating_sub(dialog_w)) / 2;
     let y = area.y + (area.height.saturating_sub(dialog_h)) / 2;
-    let dialog_area = Rect { x, y, width: dialog_w, height: dialog_h };
+    let dialog_area = Rect {
+        x,
+        y,
+        width: dialog_w,
+        height: dialog_h,
+    };
 
     frame.render_widget(Clear, dialog_area);
     let block = Block::default()
         .title(Span::styled(
             " ⚠ CONFIRM ",
-            Style::default().fg(NEON_YELLOW).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(NEON_YELLOW)
+                .add_modifier(Modifier::BOLD),
         ))
         .borders(Borders::ALL)
         .border_type(BorderType::Double)

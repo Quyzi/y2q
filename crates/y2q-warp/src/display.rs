@@ -36,13 +36,21 @@ const PARTICLES: &[(usize, char)] = &[(1, '·'), (3, '∘'), (5, '·'), (8, '⋅
 /// Build colored particle-animated bar spans (no brackets).
 /// `bar_w` — inner character width.
 /// `frame` — animation counter (e.g. elapsed secs, done-count/10, etc.)
-fn particle_bar_spans(bar_w: usize, ratio: f64, frame: usize, fill_color: Color) -> Vec<Span<'static>> {
+fn particle_bar_spans(
+    bar_w: usize,
+    ratio: f64,
+    frame: usize,
+    fill_color: Color,
+) -> Vec<Span<'static>> {
     let fill = ((ratio * bar_w as f64) as usize).min(bar_w);
     let remaining = bar_w.saturating_sub(fill);
     let mut spans = Vec::with_capacity(4);
 
     if fill > 1 {
-        spans.push(Span::styled("█".repeat(fill - 1), Style::default().fg(fill_color)));
+        spans.push(Span::styled(
+            "█".repeat(fill - 1),
+            Style::default().fg(fill_color),
+        ));
     }
     if fill > 0 {
         spans.push(Span::styled(
@@ -74,15 +82,15 @@ fn render_particle_bar(
     label: &str,
 ) {
     let label_w = label.chars().count() as u16;
-    let bar_w = area
-        .width
-        .saturating_sub(label_w)
-        .saturating_sub(2) as usize; // subtract [ ]
+    let bar_w = area.width.saturating_sub(label_w).saturating_sub(2) as usize; // subtract [ ]
 
     let mut spans = vec![Span::styled("[", Style::default().fg(DIM_BORDER))];
     spans.extend(particle_bar_spans(bar_w, ratio, frame, fill_color));
     spans.push(Span::styled("]", Style::default().fg(DIM_BORDER)));
-    spans.push(Span::styled(label.to_owned(), Style::default().fg(NEON_GREEN)));
+    spans.push(Span::styled(
+        label.to_owned(),
+        Style::default().fg(NEON_GREEN),
+    ));
 
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
@@ -346,20 +354,19 @@ fn render_prepare(f: &mut Frame, area: Rect, done: u32, total: u32) {
         .split(area);
 
     let title = Paragraph::new(Line::from(vec![
-        Span::styled("SEEDING  ", Style::default().fg(NEON_YELLOW).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "SEEDING  ",
+            Style::default()
+                .fg(NEON_YELLOW)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled(
             format!("{done}"),
             Style::default().fg(NEON_CYAN).add_modifier(Modifier::BOLD),
         ),
         Span::styled(" / ", Style::default().fg(DIM_TEXT)),
-        Span::styled(
-            format!("{total}"),
-            Style::default().fg(NEON_CYAN),
-        ),
-        Span::styled(
-            format!("  {pct}%"),
-            Style::default().fg(NEON_GREEN),
-        ),
+        Span::styled(format!("{total}"), Style::default().fg(NEON_CYAN)),
+        Span::styled(format!("  {pct}%"), Style::default().fg(NEON_GREEN)),
     ]));
     f.render_widget(title, chunks[0]);
 
@@ -411,14 +418,24 @@ fn render_running(
 
     // ── Stats table ──────────────────────────────────────────────────────────
     let header = Row::new(
-        ["Op", "Ops", "4xx/s", "5xx/s", "Throughput", "Ops/s", "P50", "P90", "P99"]
-            .map(|h| {
-                Cell::from(h).style(
-                    Style::default()
-                        .fg(NEON_YELLOW)
-                        .add_modifier(Modifier::BOLD),
-                )
-            }),
+        [
+            "Op",
+            "Ops",
+            "4xx/s",
+            "5xx/s",
+            "Throughput",
+            "Ops/s",
+            "P50",
+            "P90",
+            "P99",
+        ]
+        .map(|h| {
+            Cell::from(h).style(
+                Style::default()
+                    .fg(NEON_YELLOW)
+                    .add_modifier(Modifier::BOLD),
+            )
+        }),
     )
     .height(1)
     .bottom_margin(1);
@@ -431,15 +448,16 @@ fn render_running(
             let e5 = state.errors_5xx_per_sec.get(kind).copied().unwrap_or(0.0);
             Row::new([
                 Cell::from(kind.as_str()).style(Style::default().fg(NEON_CYAN)),
-                Cell::from(format!("{:>8}", agg.n_ops))
-                    .style(Style::default().fg(NORMAL_TEXT)),
+                Cell::from(format!("{:>8}", agg.n_ops)).style(Style::default().fg(NORMAL_TEXT)),
                 Cell::from(if e4 > 0.0 {
                     format!("{:>5.1}", e4)
                 } else {
                     format!("{:>5}", "0")
                 })
                 .style(if e4 > 0.0 {
-                    Style::default().fg(NEON_YELLOW).add_modifier(Modifier::BOLD)
+                    Style::default()
+                        .fg(NEON_YELLOW)
+                        .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(DIM_TEXT)
                 }),
@@ -502,10 +520,7 @@ fn render_running(
                         Style::default().fg(NEON_GREEN).add_modifier(Modifier::BOLD),
                     ),
                     Span::styled("  peak ", Style::default().fg(DIM_TEXT)),
-                    Span::styled(
-                        format!("{tp_peak} "),
-                        Style::default().fg(NEON_YELLOW),
-                    ),
+                    Span::styled(format!("{tp_peak} "), Style::default().fg(NEON_YELLOW)),
                 ]))
                 .borders(Borders::TOP)
                 .border_style(Style::default().fg(DIM_BORDER)),
@@ -544,10 +559,7 @@ fn render_running(
                             Style::default().fg(color).add_modifier(Modifier::BOLD),
                         ),
                         Span::styled("  peak ", Style::default().fg(DIM_TEXT)),
-                        Span::styled(
-                            format!("{peak} "),
-                            Style::default().fg(NEON_YELLOW),
-                        ),
+                        Span::styled(format!("{peak} "), Style::default().fg(NEON_YELLOW)),
                     ]))
                     .borders(Borders::TOP)
                     .border_style(Style::default().fg(DIM_BORDER)),
@@ -563,7 +575,10 @@ fn render_statusbar(f: &mut Frame, area: Rect) {
         Span::styled(" // ", Style::default().fg(DIM_TEXT)),
         Span::styled(
             " q ",
-            Style::default().fg(NEON_CYAN).bg(DIM_BORDER).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(NEON_CYAN)
+                .bg(DIM_BORDER)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::styled(" quit", Style::default().fg(NORMAL_TEXT)),
     ]));

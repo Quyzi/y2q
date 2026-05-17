@@ -113,9 +113,15 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 fn render_header(frame: &mut Frame, area: Rect) {
     let spans = vec![
         Span::styled(" // ", Style::default().fg(DIM_TEXT)),
-        Span::styled("Y2Q", Style::default().fg(NEON_PINK).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "Y2Q",
+            Style::default().fg(NEON_PINK).add_modifier(Modifier::BOLD),
+        ),
         Span::styled(" // ", Style::default().fg(DIM_TEXT)),
-        Span::styled("POST-QUANTUM SECURE STORAGE", Style::default().fg(NEON_CYAN)),
+        Span::styled(
+            "POST-QUANTUM SECURE STORAGE",
+            Style::default().fg(NEON_CYAN),
+        ),
         Span::styled("  //  ", Style::default().fg(DIM_TEXT)),
         Span::styled("KYBER-1024", Style::default().fg(NEON_PURPLE)),
         Span::styled(" + ", Style::default().fg(DIM_TEXT)),
@@ -137,7 +143,10 @@ fn render_panes(frame: &mut Frame, area: Rect, app: &mut App) {
 fn focused_block(title: String, focused: bool) -> Block<'static> {
     if focused {
         Block::default()
-            .title(Span::styled(title, Style::default().fg(NEON_PINK).add_modifier(Modifier::BOLD)))
+            .title(Span::styled(
+                title,
+                Style::default().fg(NEON_PINK).add_modifier(Modifier::BOLD),
+            ))
             .borders(Borders::ALL)
             .border_type(BorderType::Double)
             .border_style(Style::default().fg(NEON_PINK))
@@ -317,7 +326,10 @@ fn render_rebuild_tab(frame: &mut Frame, area: Rect, app: &App) {
 fn render_locks_tab(frame: &mut Frame, area: Rect, app: &App) {
     if app.locks.loading {
         frame.render_widget(
-            Paragraph::new(Span::styled("Loading locks…", Style::default().fg(NEON_CYAN))),
+            Paragraph::new(Span::styled(
+                "Loading locks…",
+                Style::default().fg(NEON_CYAN),
+            )),
             area,
         );
         return;
@@ -358,7 +370,10 @@ fn render_locks_tab(frame: &mut Frame, area: Rect, app: &App) {
 fn render_users_tab(frame: &mut Frame, area: Rect, app: &App) {
     if app.users_view.loading {
         frame.render_widget(
-            Paragraph::new(Span::styled("Loading users…", Style::default().fg(NEON_CYAN))),
+            Paragraph::new(Span::styled(
+                "Loading users…",
+                Style::default().fg(NEON_CYAN),
+            )),
             area,
         );
         return;
@@ -393,7 +408,12 @@ fn render_input_dialog(frame: &mut Frame, area: Rect, prompt: &str, value: &str)
     let h = 5u16;
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let y = area.y + (area.height.saturating_sub(h)) / 2;
-    let popup = Rect { x, y, width: w, height: h };
+    let popup = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
     frame.render_widget(Clear, popup);
     let block = Block::default()
         .title(Span::styled(
@@ -424,12 +444,19 @@ fn render_object_stat_popup(frame: &mut Frame, area: Rect, lines: &[String]) {
     let h = ((lines.len() as u16) + 4).min(area.height.saturating_sub(4));
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let y = area.y + (area.height.saturating_sub(h)) / 2;
-    let popup = Rect { x, y, width: w, height: h };
+    let popup = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
     frame.render_widget(Clear, popup);
     let block = Block::default()
         .title(Span::styled(
             " ◆ OBJECT INFO ◆ ",
-            Style::default().fg(NEON_PURPLE).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(NEON_PURPLE)
+                .add_modifier(Modifier::BOLD),
         ))
         .borders(Borders::ALL)
         .border_type(BorderType::Double)
@@ -453,7 +480,12 @@ fn render_error_popup(frame: &mut Frame, area: Rect, message: &str) {
     let h = 5u16;
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let y = area.y + (area.height.saturating_sub(h)) / 2;
-    let popup = Rect { x, y, width: w, height: h };
+    let popup = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
     frame.render_widget(Clear, popup);
     let block = Block::default()
         .title(Span::styled(
