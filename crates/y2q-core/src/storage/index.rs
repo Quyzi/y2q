@@ -35,10 +35,10 @@
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
-use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinition};
 
 use crate::{
-    Error, ListPage, Metadata,
+    Error, ListPage, Metadata, SyncLevel,
     crypto::{decrypt_meta, encrypt_meta, metadata_key::derive_index_key, metadata_key::prf},
 };
 
@@ -99,7 +99,7 @@ impl MetadataIndex {
     /// If a prior row exists, its label entries are removed before the new
     /// ones are written so that a label that has been deleted in `m` no
     /// longer appears in `lookup_by_label`.
-    pub async fn upsert(&self, m: &Metadata) -> Result<(), Error> {
+    pub async fn upsert(&self, m: &Metadata, sync: SyncLevel) -> Result<(), Error> {
         let db = self.db.clone();
         let raw_json = serde_json::to_vec(m).map_err(|e| Error::Index {
             message: format!("serialize metadata: {e}"),
@@ -127,7 +127,10 @@ impl MetadataIndex {
                 None => encode_object_key(&bucket, &key),
             };
 
-            let txn = db.begin_write().map_err(map_redb)?;
+            let mut txn = db.begin_write().map_err(map_redb)?;
+            if sync != SyncLevel::Durable {
+                let _ = txn.set_durability(Durability::None);
+            }
             {
                 let mut objects = txn.open_table(OBJECTS).map_err(map_redb)?;
                 let mut labels = txn.open_table(LABELS).map_err(map_redb)?;

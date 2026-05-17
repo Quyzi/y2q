@@ -220,13 +220,13 @@ impl UringStreamingPutGuard {
 
         if options.sync == SyncLevel::Durable {
             if let Some(parent) = self.obj_path.parent()
-                && let Ok(dir) = std::fs::File::open(parent)
+                && let Ok(dir) = tokio::fs::File::open(parent).await
             {
-                let _ = dir.sync_all();
+                let _ = dir.sync_all().await;
             }
         }
 
-        if let Err(e) = self.index.upsert(&metadata).await {
+        if let Err(e) = self.index.upsert(&metadata, options.sync).await {
             tracing::warn!(
                 bucket = %bucket,
                 key = %key,
