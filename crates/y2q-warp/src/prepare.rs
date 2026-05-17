@@ -1,10 +1,12 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
+use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use y2q_client::{ListOptions, Y2qClient};
 
 use crate::config::ObjSize;
+use crate::display::DisplayMsg;
 use crate::error::WarpError;
 use crate::generator::BoundedRepeatReader;
 
@@ -15,9 +17,11 @@ pub async fn prepare(
     objects: u32,
     obj_size: &ObjSize,
     concurrent: usize,
+    progress_tx: Option<mpsc::Sender<DisplayMsg>>,
 ) -> Result<Vec<String>, WarpError> {
     let sem = Arc::new(tokio::sync::Semaphore::new(concurrent.min(64)));
     let prepared = Arc::new(AtomicU32::new(0));
+    let progress_tx = Arc::new(progress_tx);
     let mut tasks: JoinSet<Result<String, String>> = JoinSet::new();
     let mut rng = rand::thread_rng();
 
@@ -28,6 +32,7 @@ pub async fn prepare(
         let bucket = bucket.to_owned();
         let sem = sem.clone();
         let prepared = prepared.clone();
+        let progress_tx = progress_tx.clone();
         let key_clone = key.clone();
 
         tasks.spawn(async move {
@@ -39,7 +44,9 @@ pub async fn prepare(
                 .await
                 .map_err(|e| e.to_string())?;
             let done = prepared.fetch_add(1, Ordering::Relaxed) + 1;
-            if done % 100 == 0 || done == objects {
+            if let Some(ref tx) = *progress_tx {
+                let _ = tx.try_send(DisplayMsg::Preparing { done, total: objects });
+            } else if done % 100 == 0 || done == objects {
                 eprintln!("  prepared {done}/{objects} objects");
             }
             Ok(key_clone)
@@ -55,7 +62,9 @@ pub async fn prepare(
         }
     }
 
-    eprintln!("prepare complete: {} objects in bucket {bucket}", keys.len());
+    if progress_tx.is_none() {
+        eprintln!("prepare complete: {} objects in bucket {bucket}", keys.len());
+    }
     Ok(keys)
 }
 

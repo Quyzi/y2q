@@ -4,14 +4,15 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 
-use crate::metrics::{Aggregate, OpHistograms, OpRecord, Segment};
+use crate::display::DisplayMsg;
+use crate::metrics::{OpHistograms, OpRecord, Segment};
 use crate::ops::OpKind;
 
 const SEGMENT_NS: u64 = 1_000_000_000;
 
 pub struct Recorder {
     rx: mpsc::Receiver<OpRecord>,
-    agg_tx: mpsc::Sender<HashMap<OpKind, Aggregate>>,
+    agg_tx: mpsc::Sender<DisplayMsg>,
     csv_writer: Option<csv::Writer<Box<dyn std::io::Write + Send>>>,
     histograms: HashMap<OpKind, OpHistograms>,
     segment_buckets: HashMap<(OpKind, u64), (u64, u64, u64)>,
@@ -22,7 +23,7 @@ pub struct Recorder {
 impl Recorder {
     pub fn new(
         rx: mpsc::Receiver<OpRecord>,
-        agg_tx: mpsc::Sender<HashMap<OpKind, Aggregate>>,
+        agg_tx: mpsc::Sender<DisplayMsg>,
         output_path: &Path,
     ) -> Result<Self, crate::error::WarpError> {
         let file = std::fs::File::create(output_path)?;
@@ -91,7 +92,7 @@ impl Recorder {
                 map.insert(*op, agg);
             }
         }
-        let _ = self.agg_tx.try_send(map);
+        let _ = self.agg_tx.try_send(DisplayMsg::Running(map));
     }
 
     #[allow(dead_code)]
