@@ -49,3 +49,11 @@ tempfile  = { workspace = true }
 [[bench]]
 name    = "storage"
 harness = false
+
+[[bench]]
+name    = "crypto"
+harness = false
+
+[[bench]]
+name    = "index"
+harness = false
