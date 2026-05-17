@@ -75,6 +75,23 @@ max_labels            = 32    # maximum number of label headers per request
 max_label_name_bytes  = 64    # maximum byte length of a label name
 max_label_value_bytes = 1024  # maximum byte length of a label value
 
+# Background fsync interval for best-effort PUTs (seconds). The daemon
+# fsyncs all pending dirty objects at this cadence. Minimum: 1. Default: 5.
+sync_flush_interval_secs = 5
+
+# Queue depth that triggers an immediate fsync pass before the timer fires.
+# When this many best-effort PUTs are pending flush, the flusher wakes early.
+# Entries are never dropped — this is a watermark, not a hard cap. Default: 64.
+sync_flush_limit = 64
+
+# Default durability for PUT requests that omit the X-Y2Q-Sync header.
+#   "durable"      — fdatasync on the object file + fsync on the parent directory
+#                    before returning success. Crash-safe. (default)
+#   "best-effort"  — no fsync. Higher throughput; an unclean shutdown can lose
+#                    a recently-PUT object even though the API returned success.
+# Per-request override: X-Y2Q-Sync: best-effort  (or: durable)
+default_sync = "durable"
+
 # ---------------------------------------------------------------------------
 # [crypto] — keystore and key-derivation settings
 # ---------------------------------------------------------------------------

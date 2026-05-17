@@ -21,6 +21,13 @@ pub use storage::locks::StaleLock;
 #[cfg(all(target_os = "linux", feature = "uring"))]
 pub use storage::uring::UringStorage;
 
+/// Payload sent on the dirty-write channel after a best-effort PUT commit.
+/// The background flusher drains these and fsyncs each path.
+pub struct DirtyEntry {
+    pub obj_path: PathBuf,
+    pub parent_dir: PathBuf,
+}
+
 /// A stored binary object. Wraps [`bytes::Bytes`] for cheap cloning and slicing.
 #[derive(Debug)]
 pub struct Object(Bytes);
@@ -112,7 +119,8 @@ pub struct Metadata {
 ///   parent directory after `rename`; `BestEffort` skips both.
 /// - [`FilesystemStorage`]: honoured. Same semantics as the uring backend:
 ///   `Durable` issues `fdatasync` + parent dir `fsync`; `BestEffort` skips both.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum SyncLevel {
     /// `fdatasync` on the object file + parent directory `fsync` before
     /// returning. Crash-safe — the object is on stable storage.

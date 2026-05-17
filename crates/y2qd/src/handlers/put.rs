@@ -58,11 +58,12 @@ pub async fn handle(
     payload: web::Payload,
     storage: web::Data<Arc<AnyStorage>>,
     limits: web::Data<LabelLimits>,
+    default_sync: web::Data<SyncLevel>,
     auth: Authenticated,
 ) -> Result<HttpResponse, AppError> {
     let (bucket, key) = path.into_inner();
     let labels = extract_labels(&req, limits.get_ref())?;
-    let sync = parse_sync_header(&req)?;
+    let sync = parse_sync_header(&req, *default_sync.get_ref())?;
 
     let (guard, file, write_offset) = storage
         .begin_streaming_put(&bucket, &key)
@@ -96,12 +97,11 @@ pub async fn handle(
 
 /// Parse the optional `X-Y2Q-Sync` request header into a [`SyncLevel`].
 ///
-/// Accepts `durable` (default; same as omitting the header) or `best-effort`.
-/// Any other value returns a 400 via the existing `InvalidLabelValue` shape
-/// since `sync` lives in the same header namespace as user labels.
-fn parse_sync_header(req: &HttpRequest) -> Result<SyncLevel, AppError> {
+/// Falls back to `default` when the header is absent. Accepts `durable` or
+/// `best-effort`. Any other value returns 400.
+fn parse_sync_header(req: &HttpRequest, default: SyncLevel) -> Result<SyncLevel, AppError> {
     let Some(raw) = req.headers().get("x-y2q-sync") else {
-        return Ok(SyncLevel::default());
+        return Ok(default);
     };
     let value = raw.to_str().map_err(|_| {
         AppError(y2q_core::Error::InvalidLabelValue {

@@ -11,6 +11,7 @@ use figment::{
     providers::{Env, Format, Serialized, Toml},
 };
 use serde::Deserialize;
+use y2q_core::SyncLevel;
 
 /// Top-level daemon configuration.
 #[derive(Debug, Deserialize)]
@@ -270,6 +271,14 @@ fn default_max_label_value_bytes() -> usize {
     1024
 }
 
+fn default_sync_flush_interval_secs() -> u64 {
+    5
+}
+
+fn default_sync_flush_limit() -> usize {
+    64
+}
+
 /// Selected storage backend implementation.
 ///
 /// Maps to the on-disk format and I/O strategy used at runtime. Set via
@@ -312,6 +321,18 @@ pub struct StorageConfig {
     /// Maximum byte length of a single label value. Defaults to 1024.
     #[serde(default = "default_max_label_value_bytes")]
     pub max_label_value_bytes: usize,
+    /// Seconds between background fsync passes for best-effort PUTs. Default: 5.
+    #[serde(default = "default_sync_flush_interval_secs")]
+    pub sync_flush_interval_secs: u64,
+    /// Queue depth that triggers an immediate fsync pass before the timer fires.
+    /// Default: 64.
+    #[serde(default = "default_sync_flush_limit")]
+    pub sync_flush_limit: usize,
+    /// Default durability for PUT requests that omit the `X-Y2Q-Sync` header.
+    /// `"durable"` (default) — fdatasync + parent dir fsync before returning.
+    /// `"best-effort"` — no fsync; higher throughput, not crash-safe.
+    #[serde(default)]
+    pub default_sync: SyncLevel,
 }
 
 /// Per-request limits on `X-Y2Q-<label>` headers, registered as actix

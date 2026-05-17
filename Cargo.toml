@@ -19,6 +19,7 @@ base64                      = "0.22"
 crc32fast                   = "1.4"
 criterion                   = { version = "0.5", features = ["async_tokio"] }
 dashmap                     = "6"
+flume                       = "0.12"
 fs2                         = "0.4"
 hmac                        = "0.12"
 hkdf                        = "0.12"
