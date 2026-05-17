@@ -13,6 +13,7 @@ hmac            = { workspace = true }
 hkdf            = { workspace = true }
 md-5            = { workspace = true }
 pqcrypto        = { workspace = true }
+ring            = { workspace = true }
 pqcrypto-traits = { workspace = true }
 rand            = { workspace = true }
 redb            = { workspace = true }
