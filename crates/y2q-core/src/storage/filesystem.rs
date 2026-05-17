@@ -8,14 +8,18 @@ use std::{
 use base64::Engine;
 use bytes::Bytes;
 use sha2::Digest;
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use uuid::Uuid;
 
 use crate::{
     CacheRebuildStatus, CipherMetadata, DEFAULT_LIST_LIMIT, Error, ListOptions, ListPage, Listing,
     MAX_LIST_LIMIT, Metadata, MetadataIndex, Object, PlaintextMetrics, PutOptions, StaleLock,
-    Storage, StorageExt,
+    Storage, StorageExt, SyncLevel,
     crypto::{decrypt_meta, encrypt_meta},
-    storage::locks::{clear_stale_locks_under, list_stale_locks_under},
+    storage::{
+        format::{self, Header, HEADER_SIZE},
+        locks::{clear_stale_locks_under, list_stale_locks_under},
+    },
 };
 
 /// UUID v5 namespace used to derive deterministic filenames from object keys.
@@ -24,7 +28,8 @@ use crate::{
 /// chosen as a stable, well-known constant so the same key always maps to the
 /// same filename regardless of which process or host computes it.
 const Y2Q_NAMESPACE: Uuid = Uuid::from_bytes([
-    0x6b, 0xa7, 0xb8, 0x11, 0x9d, 0xad, 0x11, 0xd1, 0x80, 0xb4, 0x00, 0xc0, 0x4f, 0xd4, 0x30, 0xc8,
+    0x6b, 0xa7, 0xb8, 0x11, 0x9d, 0xad, 0x11, 0xd1, 0x80, 0xb4, 0x00, 0xc0, 0x4f, 0xd4, 0x30,
+    0xc8,
 ]);
 
 /// A [`Storage`] backend that persists objects on a local filesystem.
@@ -33,20 +38,19 @@ const Y2Q_NAMESPACE: Uuid = Uuid::from_bytes([
 /// `base_path`:
 ///
 /// ```text
-/// <base_path>/<bucket>/<xx>/<yy>/<uuid>        — object data
-/// <base_path>/<bucket>/<xx>/<yy>/<uuid>.meta   — JSON metadata sidecar
+/// <base_path>/<bucket>/<xx>/<yy>/<uuid>.obj    — single-file object record
 /// <base_path>/<bucket>/<xx>/<yy>/<uuid>.lock   — ephemeral write-lock file
 /// ```
 ///
-/// where `<xx>` and `<yy>` are the first two hex-character pairs of a UUID v5
-/// derived from the object key, and `<uuid>` is the full UUID. The sharding
-/// keeps directory entry counts manageable on filesystems with per-directory
-/// limits (e.g. ext3 without `dir_index`).
+/// Each `.obj` file uses the shared [`crate::storage::format`] layout:
+/// `[header 64 B | data N B | meta M B | trailer 64 B]`. This is identical
+/// to the format written by [`crate::UringStorage`], so files are
+/// cross-compatible between backends.
 ///
 /// A secondary [`MetadataIndex`] (redb-backed) is kept in sync on every
-/// `put` / `delete`. The on-disk sidecar is the source of truth: index
-/// failures are logged but do not fail the operation, since the index can be
-/// rebuilt from a sidecar scan.
+/// `put` / `delete`. The on-disk `.obj` record is the source of truth:
+/// index failures are logged but do not fail the operation, and the index
+/// can be rebuilt from an `.obj` scan.
 pub struct FilesystemStorage {
     base_path: PathBuf,
     index: Arc<MetadataIndex>,
@@ -57,10 +61,6 @@ pub struct FilesystemStorage {
 impl FilesystemStorage {
     /// Create a new `FilesystemStorage` rooted at `base_path`, with a
     /// secondary metadata index file at `index_path`.
-    ///
-    /// `base_path` is created if it does not yet exist, then canonicalized so
-    /// that `Metadata::disk_path` is consistently absolute. The parent of
-    /// `index_path` is also created on demand.
     pub fn new(base_path: impl Into<PathBuf>, index_path: impl AsRef<Path>) -> Result<Self, Error> {
         let base_path = base_path.into();
         std::fs::create_dir_all(&base_path).map_err(|e| Error::InternalError {
@@ -107,30 +107,28 @@ impl FilesystemStorage {
         self
     }
 
-    /// Derive the canonical filesystem path for `(bucket, key)`.
+    /// Canonical on-disk path for the single-file object record of
+    /// `(bucket, key)`: `<base>/<bucket>/<xx>/<yy>/<uuid>.obj`.
     ///
-    /// The path is deterministic: the same inputs always produce the same path.
-    /// Callers can append extensions (`.meta`, `.lock`, `.tmp`) to get the
-    /// paths of related sidecar files.
-    fn key_path(&self, bucket: &str, key: &str) -> PathBuf {
+    /// Matches the path scheme used by [`crate::UringStorage`] so both
+    /// backends can read each other's files when sharing a `base_path`.
+    pub fn key_path(&self, bucket: &str, key: &str) -> PathBuf {
         let id = Uuid::new_v5(&Y2Q_NAMESPACE, key.as_bytes());
         let s = id.hyphenated().to_string();
-        self.base_path
+        let mut p = self
+            .base_path
             .join(bucket)
             .join(&s[0..2])
             .join(&s[2..4])
-            .join(&s)
+            .join(&s);
+        p.set_extension("obj");
+        p
     }
 }
 
-/// Validate that `bucket` is a safe directory name.
-///
 /// Reserved bucket names that conflict with the `/api/v1/*` admin namespace.
 const RESERVED_BUCKETS: &[&str] = &["api"];
 
-/// Buckets must be non-empty and contain only alphanumeric characters, `-`, or
-/// `_`. Path separators and `..` components are rejected to prevent escaping
-/// the storage root. Names in `RESERVED_BUCKETS` are rejected case-insensitively.
 fn validate_bucket(bucket: &str) -> Result<(), Error> {
     let lower = bucket.to_ascii_lowercase();
     if bucket.is_empty()
@@ -149,9 +147,6 @@ fn validate_bucket(bucket: &str) -> Result<(), Error> {
     Ok(())
 }
 
-/// Validate that `key` is a legal object key.
-///
-/// Keys must be non-empty, free of null bytes, and at most 1 024 bytes long.
 fn validate_key(key: &str) -> Result<(), Error> {
     const MAX_KEY_LEN: usize = 1024;
     if key.is_empty() || key.contains('\0') || key.len() > MAX_KEY_LEN {
@@ -162,33 +157,6 @@ fn validate_key(key: &str) -> Result<(), Error> {
     Ok(())
 }
 
-/// Encode `metadata` as JSON, optionally encrypting with `mek`.
-fn encode_metadata(meta: &Metadata, mek: Option<&[u8; 32]>) -> Result<Vec<u8>, std::io::Error> {
-    let json = serde_json::to_vec_pretty(meta)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    if let Some(mek) = mek {
-        encrypt_meta(mek, &json)
-            .map_err(|e| std::io::Error::other(e.to_string()))
-    } else {
-        Ok(json)
-    }
-}
-
-/// Read and parse the metadata sidecar at `path`, decrypting if the MEK is set.
-async fn read_metadata_sidecar(path: &Path, mek: Option<&[u8; 32]>) -> Result<Metadata, std::io::Error> {
-    let bytes = tokio::fs::read(path).await?;
-    let json = if let Some(mek) = mek {
-        decrypt_meta(mek, &bytes)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?
-    } else {
-        bytes
-    };
-    serde_json::from_slice(&json)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
-}
-
-/// Compute the MD5 and SHA-256 checksums of `data`, returning each as the full
-/// digest encoded with standard base64 (RFC 4648 §4, padded).
 fn compute_checksums(data: &[u8]) -> (String, String) {
     let md5_digest = md5::Md5::digest(data);
     let sha256_digest = sha2::Sha256::digest(data);
@@ -196,7 +164,6 @@ fn compute_checksums(data: &[u8]) -> (String, String) {
     (engine.encode(md5_digest), engine.encode(sha256_digest))
 }
 
-/// Return the current time as nanoseconds since the Unix epoch.
 fn now_nanos() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -221,26 +188,18 @@ fn record_storage_op<T, E>(op: &'static str, result: &Result<T, E>, elapsed_ms: 
 /// RAII guard that holds a write lock on an object for the duration of a
 /// [`Storage::put`] operation.
 ///
-/// The lock is represented by a `.lock` sidecar file created with `O_EXCL`
-/// (via [`tokio::fs::OpenOptions::create_new`]), which is atomic on Linux.
-/// The file contains the lock acquisition time as a little-endian `u64` of
-/// nanoseconds since the Unix epoch, so callers can report how long the lock
-/// has been held.
+/// The lock is a `.lock` sidecar file created with `O_EXCL`. The file
+/// contains the lock acquisition time as a little-endian `u64` of nanoseconds
+/// since the Unix epoch so callers can report how long the lock has been held.
 ///
-/// The lock file is removed synchronously in [`Drop`] to ensure it is always
-/// cleaned up, even if the future holding the guard is cancelled.
+/// The lock file is removed synchronously in [`Drop`] so it is always cleaned
+/// up even if the future holding the guard is cancelled.
 struct LockGuard {
     path: PathBuf,
 }
 
 impl LockGuard {
-    /// Attempt to acquire the lock at `path`.
-    ///
-    /// Returns `Ok(guard)` on success. Returns [`Error::Locked`] if the lock
-    /// file already exists, or [`Error::InternalError`] for any other I/O failure.
     async fn acquire(path: PathBuf, bucket: &str, key: &str) -> Result<Self, Error> {
-        use tokio::io::AsyncWriteExt;
-
         let result = tokio::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -276,9 +235,6 @@ impl Drop for LockGuard {
     }
 }
 
-/// Read the lock acquisition timestamp from `path`.
-///
-/// Falls back to [`SystemTime::now`] if the file cannot be read or is too short.
 async fn read_lock_timestamp(path: &Path) -> SystemTime {
     if let Ok(bytes) = tokio::fs::read(path).await
         && bytes.len() >= 8
@@ -289,10 +245,6 @@ async fn read_lock_timestamp(path: &Path) -> SystemTime {
     SystemTime::now()
 }
 
-/// Return [`Error::Locked`] if a `.lock` file exists at `lock_path`.
-///
-/// Called by read operations (`get`, `get_range`, `describe`, `delete`) before
-/// any I/O so they never observe a partially-written object.
 async fn check_not_locked(lock_path: &Path, bucket: &str, key: &str) -> Result<(), Error> {
     if tokio::fs::try_exists(lock_path).await.unwrap_or(false) {
         let since = read_lock_timestamp(lock_path).await;
@@ -305,14 +257,30 @@ async fn check_not_locked(lock_path: &Path, bucket: &str, key: &str) -> Result<(
     Ok(())
 }
 
-/// Read the `created` timestamp from an existing JSON metadata sidecar.
-///
-/// Returns `None` if the file does not exist or cannot be parsed.
-async fn read_created_timestamp(meta_path: &Path, mek: Option<&[u8; 32]>) -> Option<u64> {
-    read_metadata_sidecar(meta_path, mek)
-        .await
-        .ok()
-        .map(|m| m.created)
+/// Read and decode the metadata embedded in a `.obj` file at `path`.
+async fn read_obj_metadata(path: &Path, mek: Option<&[u8; 32]>) -> Result<Metadata, std::io::Error> {
+    let mut file = tokio::fs::File::open(path).await?;
+    let mut header_buf = [0u8; HEADER_SIZE];
+    file.read_exact(&mut header_buf).await?;
+    let header = Header::decode(&header_buf)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+    file.seek(std::io::SeekFrom::Start(header.meta_offset())).await?;
+    let mut meta_buf = vec![0u8; header.meta_len as usize];
+    file.read_exact(&mut meta_buf).await?;
+    let json = if let Some(mek) = mek {
+        decrypt_meta(mek, &meta_buf)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?
+    } else {
+        meta_buf
+    };
+    serde_json::from_slice(&json)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
+/// Read the `created` timestamp from an existing `.obj` file, returning `None`
+/// if the file cannot be read or parsed.
+async fn read_obj_created(path: &Path, mek: Option<&[u8; 32]>) -> Option<u64> {
+    read_obj_metadata(path, mek).await.ok().map(|m| m.created)
 }
 
 /// RAII guard returned by [`FilesystemStorage::begin_streaming_put`].
@@ -322,86 +290,142 @@ async fn read_created_timestamp(meta_path: &Path, mek: Option<&[u8; 32]>) -> Opt
 /// done; otherwise [`Drop`] removes the tmp file and releases the lock.
 pub struct StreamingPutGuard {
     tmp_path: PathBuf,
-    data_path: PathBuf,
-    meta_path: PathBuf,
+    obj_path: PathBuf,
     _lock: LockGuard,
     bucket: String,
     key: String,
     is_overwrite: bool,
-    created: u64,
-    now: u64,
+    prior_created: Option<u64>,
     index: Arc<MetadataIndex>,
     mek: Option<[u8; 32]>,
 }
 
 impl StreamingPutGuard {
-    /// Flush and close `file`, rename the tmp file into place, write the
-    /// metadata sidecar, and update the index. Returns `true` if overwrite.
+    /// Flush and close `file`, write the metadata blob and trailer, overwrite
+    /// the placeholder header at offset 0 with the real header, optionally
+    /// fdatasync, rename the tmp file atomically into place, and update the
+    /// secondary index. Returns `true` if this was an overwrite.
     pub async fn commit(
         self,
-        file: tokio::fs::File,
+        mut file: tokio::fs::File,
         options: PutOptions,
         plaintext_metrics: PlaintextMetrics,
         cipher_metadata: CipherMetadata,
     ) -> Result<bool, Error> {
-        use tokio::io::AsyncWriteExt;
-        let mut file = file;
-        file.flush().await.map_err(|e| Error::InternalError {
-            bucket: self.bucket.clone(),
-            key: self.key.clone(),
-            operation: "put".to_owned(),
-            message: format!("flush: {e}"),
-        })?;
-        drop(file);
-
-        tokio::fs::rename(&self.tmp_path, &self.data_path)
-            .await
-            .map_err(|e| Error::InternalError {
-                bucket: self.bucket.clone(),
-                key: self.key.clone(),
-                operation: "put".to_owned(),
-                message: format!("rename: {e}"),
-            })?;
+        let bucket = self.bucket.as_str();
+        let key = self.key.as_str();
+        let cipher_size = cipher_metadata.cipher_size;
+        let now = now_nanos();
+        let created = self.prior_created.unwrap_or(now);
 
         let metadata = Metadata {
-            created: self.created,
-            modified: self.now,
+            created,
+            modified: now,
             size: plaintext_metrics.size,
             checksum_md5: plaintext_metrics.checksum_md5_b64,
             checksum_sha256: plaintext_metrics.checksum_sha256_b64,
-            bucket: self.bucket.clone(),
-            key: self.key.clone(),
-            disk_path: self.data_path.clone(),
-            url_path: format!("{}/{}", self.bucket, self.key),
+            bucket: bucket.to_owned(),
+            key: key.to_owned(),
+            disk_path: self.obj_path.clone(),
+            url_path: format!("{bucket}/{key}"),
             labels: options.labels,
-            cipher_size: Some(cipher_metadata.cipher_size),
+            cipher_size: Some(cipher_size),
             cipher_sha256: Some(cipher_metadata.cipher_sha256_b64),
             kem_alg: Some(cipher_metadata.kem_alg),
             aead_alg: Some(cipher_metadata.aead_alg),
             envelope_version: Some(cipher_metadata.envelope_version),
         };
 
-        let encoded = encode_metadata(&metadata, self.mek.as_ref()).map_err(|e| Error::InternalError {
-            bucket: self.bucket.clone(),
-            key: self.key.clone(),
+        let meta_json = serde_json::to_vec(&metadata).map_err(|e| Error::InternalError {
+            bucket: bucket.to_owned(),
+            key: key.to_owned(),
             operation: "put".to_owned(),
-            message: format!("encode metadata: {e}"),
+            message: format!("encode meta: {e}"),
         })?;
-        tokio::fs::write(&self.meta_path, &encoded)
+        let meta_bytes = if let Some(ref mek) = self.mek {
+            encrypt_meta(mek, &meta_json).map_err(|e| Error::InternalError {
+                bucket: bucket.to_owned(),
+                key: key.to_owned(),
+                operation: "put".to_owned(),
+                message: format!("encrypt meta: {e}"),
+            })?
+        } else {
+            meta_json
+        };
+
+        let mut flags = 0u16;
+        if options.sync == SyncLevel::Durable {
+            flags |= format::flags::DURABLE;
+        }
+        let header = Header {
+            data_len: cipher_size,
+            meta_len: meta_bytes.len() as u32,
+            data_offset: Header::MIN_DATA_OFFSET,
+            flags,
+            version: format::VERSION,
+        };
+
+        // File is at EOF after EncryptSession. Append meta then trailer.
+        file.write_all(&meta_bytes).await.map_err(|e| Error::InternalError {
+            bucket: bucket.to_owned(),
+            key: key.to_owned(),
+            operation: "put".to_owned(),
+            message: format!("write meta: {e}"),
+        })?;
+        file.write_all(&header.encode()).await.map_err(|e| Error::InternalError {
+            bucket: bucket.to_owned(),
+            key: key.to_owned(),
+            operation: "put".to_owned(),
+            message: format!("write trailer: {e}"),
+        })?;
+
+        // Overwrite the placeholder header at offset 0 with the real one.
+        file.seek(std::io::SeekFrom::Start(0)).await.map_err(|e| Error::InternalError {
+            bucket: bucket.to_owned(),
+            key: key.to_owned(),
+            operation: "put".to_owned(),
+            message: format!("seek to header: {e}"),
+        })?;
+        file.write_all(&header.encode()).await.map_err(|e| Error::InternalError {
+            bucket: bucket.to_owned(),
+            key: key.to_owned(),
+            operation: "put".to_owned(),
+            message: format!("write header: {e}"),
+        })?;
+
+        if options.sync == SyncLevel::Durable {
+            file.sync_data().await.map_err(|e| Error::InternalError {
+                bucket: bucket.to_owned(),
+                key: key.to_owned(),
+                operation: "put".to_owned(),
+                message: format!("fdatasync: {e}"),
+            })?;
+        }
+        drop(file);
+
+        tokio::fs::rename(&self.tmp_path, &self.obj_path)
             .await
             .map_err(|e| Error::InternalError {
-                bucket: self.bucket.clone(),
-                key: self.key.clone(),
+                bucket: bucket.to_owned(),
+                key: key.to_owned(),
                 operation: "put".to_owned(),
-                message: format!("write meta: {e}"),
+                message: format!("rename: {e}"),
             })?;
+
+        if options.sync == SyncLevel::Durable {
+            if let Some(parent) = self.obj_path.parent()
+                && let Ok(dir) = std::fs::File::open(parent)
+            {
+                let _ = dir.sync_all();
+            }
+        }
 
         if let Err(e) = self.index.upsert(&metadata).await {
             tracing::warn!(
-                bucket = self.bucket,
-                key = self.key,
+                bucket = bucket,
+                key = key,
                 error = %e,
-                "metadata index upsert failed; sidecar is authoritative"
+                "metadata index upsert failed; on-disk record is authoritative"
             );
         }
 
@@ -417,10 +441,10 @@ impl Drop for StreamingPutGuard {
 
 impl FilesystemStorage {
     /// Begin a streaming PUT: validate inputs, create the directory, acquire the
-    /// lock, and open the tmp file for writing. Returns a [`StreamingPutGuard`]
-    /// plus the open tmp file. The caller writes encrypted bytes to the file
-    /// and then calls [`StreamingPutGuard::commit`] (passing the file back) to
-    /// rename it into place.
+    /// lock, open the tmp file, and write a 64-byte placeholder `.obj` header.
+    /// Returns a [`StreamingPutGuard`] plus the open tmp file. The caller writes
+    /// encrypted bytes to the file (starting at offset 64), then calls
+    /// [`StreamingPutGuard::commit`] to finalise the on-disk record.
     pub async fn begin_streaming_put(
         &self,
         bucket: &str,
@@ -429,33 +453,42 @@ impl FilesystemStorage {
         validate_bucket(bucket)?;
         validate_key(key)?;
 
-        let data_path = self.key_path(bucket, key);
-        let meta_path = data_path.with_extension("meta");
-        let lock_path = data_path.with_extension("lock");
-        let tmp_path = data_path.with_extension("tmp");
+        let obj_path = self.key_path(bucket, key);
+        let tmp_path = obj_path.with_extension("tmp");
+        let lock_path = obj_path.with_extension("lock");
 
-        if let Some(parent) = data_path.parent() {
+        if let Some(parent) = obj_path.parent() {
             tokio::fs::create_dir_all(parent)
                 .await
                 .map_err(|e| Error::InternalError {
                     bucket: bucket.to_owned(),
                     key: key.to_owned(),
-                    operation: "put".to_owned(),
+                    operation: "begin_streaming_put".to_owned(),
                     message: format!("create dirs: {e}"),
                 })?;
         }
 
-        let lock = LockGuard::acquire(lock_path, bucket, key).await?;
-        let is_overwrite = tokio::fs::try_exists(&data_path).await.unwrap_or(false);
-        let now = now_nanos();
-        let created = if is_overwrite {
-            read_created_timestamp(&meta_path, self.mek.as_ref()).await.unwrap_or(now)
-        } else {
-            now
+        let (is_overwrite, prior_created) = match tokio::fs::metadata(&obj_path).await {
+            Ok(_) => {
+                let created = read_obj_created(&obj_path, self.mek.as_ref()).await;
+                (true, created)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (false, None),
+            Err(e) => {
+                return Err(Error::InternalError {
+                    bucket: bucket.to_owned(),
+                    key: key.to_owned(),
+                    operation: "begin_streaming_put".to_owned(),
+                    message: format!("stat existing: {e}"),
+                });
+            }
         };
 
-        let file = tokio::fs::OpenOptions::new()
+        let lock = LockGuard::acquire(lock_path, bucket, key).await?;
+
+        let mut file = tokio::fs::OpenOptions::new()
             .write(true)
+            .read(true)
             .create(true)
             .truncate(true)
             .open(&tmp_path)
@@ -463,22 +496,27 @@ impl FilesystemStorage {
             .map_err(|e| Error::InternalError {
                 bucket: bucket.to_owned(),
                 key: key.to_owned(),
-                operation: "put".to_owned(),
+                operation: "begin_streaming_put".to_owned(),
                 message: format!("open tmp: {e}"),
             })?;
 
+        file.write_all(&[0u8; HEADER_SIZE]).await.map_err(|e| Error::InternalError {
+            bucket: bucket.to_owned(),
+            key: key.to_owned(),
+            operation: "begin_streaming_put".to_owned(),
+            message: format!("write placeholder header: {e}"),
+        })?;
+
         let guard = StreamingPutGuard {
             tmp_path,
-            data_path,
-            meta_path,
+            obj_path,
             _lock: lock,
             bucket: bucket.to_owned(),
             key: key.to_owned(),
             is_overwrite,
-            created,
-            now,
-            index: self.index.clone(),
+            prior_created,
             mek: self.mek,
+            index: self.index.clone(),
         };
         Ok((guard, file))
     }
@@ -491,22 +529,59 @@ impl Storage for FilesystemStorage {
             validate_bucket(bucket)?;
             validate_key(key)?;
 
-            let data_path = self.key_path(bucket, key);
-            check_not_locked(&data_path.with_extension("lock"), bucket, key).await?;
+            let obj_path = self.key_path(bucket, key);
+            check_not_locked(&obj_path.with_extension("lock"), bucket, key).await?;
 
-            match tokio::fs::read(&data_path).await {
-                Ok(bytes) => Ok(Object::new(Bytes::from(bytes))),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(Error::NotFound {
-                    bucket: bucket.to_owned(),
-                    key: key.to_owned(),
-                }),
-                Err(e) => Err(Error::InternalError {
+            let mut file = match tokio::fs::File::open(&obj_path).await {
+                Ok(f) => f,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(Error::NotFound {
+                        bucket: bucket.to_owned(),
+                        key: key.to_owned(),
+                    });
+                }
+                Err(e) => {
+                    return Err(Error::InternalError {
+                        bucket: bucket.to_owned(),
+                        key: key.to_owned(),
+                        operation: "get".to_owned(),
+                        message: e.to_string(),
+                    });
+                }
+            };
+
+            let mut header_buf = [0u8; HEADER_SIZE];
+            file.read_exact(&mut header_buf).await.map_err(|e| Error::InternalError {
+                bucket: bucket.to_owned(),
+                key: key.to_owned(),
+                operation: "get".to_owned(),
+                message: format!("read header: {e}"),
+            })?;
+            let header = Header::decode(&header_buf).map_err(|e| Error::InternalError {
+                bucket: bucket.to_owned(),
+                key: key.to_owned(),
+                operation: "get".to_owned(),
+                message: format!("decode header: {e}"),
+            })?;
+
+            file.seek(std::io::SeekFrom::Start(header.data_offset as u64))
+                .await
+                .map_err(|e| Error::InternalError {
                     bucket: bucket.to_owned(),
                     key: key.to_owned(),
                     operation: "get".to_owned(),
-                    message: e.to_string(),
-                }),
-            }
+                    message: format!("seek data: {e}"),
+                })?;
+
+            let mut data = vec![0u8; header.data_len as usize];
+            file.read_exact(&mut data).await.map_err(|e| Error::InternalError {
+                bucket: bucket.to_owned(),
+                key: key.to_owned(),
+                operation: "get".to_owned(),
+                message: format!("read data: {e}"),
+            })?;
+
+            Ok(Object::new(Bytes::from(data)))
         }
         .await;
         record_storage_op("get", &result, started.elapsed().as_secs_f64() * 1_000.0);
@@ -522,11 +597,11 @@ impl Storage for FilesystemStorage {
         validate_bucket(bucket)?;
         validate_key(key)?;
 
-        let data_path = self.key_path(bucket, key);
-        check_not_locked(&data_path.with_extension("lock"), bucket, key).await?;
+        let obj_path = self.key_path(bucket, key);
+        check_not_locked(&obj_path.with_extension("lock"), bucket, key).await?;
 
-        let data = match tokio::fs::read(&data_path).await {
-            Ok(b) => b,
+        let mut file = match tokio::fs::File::open(&obj_path).await {
+            Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return Err(Error::NotFound {
                     bucket: bucket.to_owned(),
@@ -543,20 +618,48 @@ impl Storage for FilesystemStorage {
             }
         };
 
-        let start = range.start as usize;
-        let end = (range.last as usize).min(data.len().saturating_sub(1));
+        let mut header_buf = [0u8; HEADER_SIZE];
+        file.read_exact(&mut header_buf).await.map_err(|e| Error::InternalError {
+            bucket: bucket.to_owned(),
+            key: key.to_owned(),
+            operation: "get_range".to_owned(),
+            message: format!("read header: {e}"),
+        })?;
+        let header = Header::decode(&header_buf).map_err(|e| Error::InternalError {
+            bucket: bucket.to_owned(),
+            key: key.to_owned(),
+            operation: "get_range".to_owned(),
+            message: format!("decode header: {e}"),
+        })?;
 
-        if start >= data.len() {
+        if header.data_len == 0 || range.start >= header.data_len {
             return Ok(Bytes::new());
         }
-        Ok(Bytes::copy_from_slice(&data[start..=end]))
+
+        let start = range.start;
+        let end_inclusive = range.last.min(header.data_len - 1);
+        let len = (end_inclusive - start + 1) as usize;
+
+        file.seek(std::io::SeekFrom::Start(header.data_offset as u64 + start))
+            .await
+            .map_err(|e| Error::InternalError {
+                bucket: bucket.to_owned(),
+                key: key.to_owned(),
+                operation: "get_range".to_owned(),
+                message: format!("seek: {e}"),
+            })?;
+
+        let mut data = vec![0u8; len];
+        file.read_exact(&mut data).await.map_err(|e| Error::InternalError {
+            bucket: bucket.to_owned(),
+            key: key.to_owned(),
+            operation: "get_range".to_owned(),
+            message: format!("read data: {e}"),
+        })?;
+
+        Ok(Bytes::from(data))
     }
 
-    // NOTE on durability: this backend currently performs best-effort writes
-    // regardless of `options.sync`. The metadata sidecar and object data are
-    // written via `tokio::fs::write` (which does not fsync) and the rename is
-    // atomic but unfenced. A later change may upgrade this backend to honour
-    // `SyncLevel::Durable`; the field is accepted today so the API is stable.
     async fn put(
         &self,
         bucket: &str,
@@ -568,14 +671,12 @@ impl Storage for FilesystemStorage {
         let result = async {
             validate_bucket(bucket)?;
             validate_key(key)?;
-            let _ = &options.sync; // documented above; honoured by UringStorage
 
-            let data_path = self.key_path(bucket, key);
-            let meta_path = data_path.with_extension("meta");
-            let lock_path = data_path.with_extension("lock");
-            let tmp_path = data_path.with_extension("tmp");
+            let obj_path = self.key_path(bucket, key);
+            let tmp_path = obj_path.with_extension("tmp");
+            let lock_path = obj_path.with_extension("lock");
 
-            if let Some(parent) = data_path.parent() {
+            if let Some(parent) = obj_path.parent() {
                 tokio::fs::create_dir_all(parent)
                     .await
                     .map_err(|e| Error::InternalError {
@@ -586,22 +687,28 @@ impl Storage for FilesystemStorage {
                     })?;
             }
 
-            let _guard = LockGuard::acquire(lock_path, bucket, key).await?;
+            let _lock = LockGuard::acquire(lock_path, bucket, key).await?;
 
-            let is_overwrite = tokio::fs::try_exists(&data_path).await.unwrap_or(false);
+            let (is_overwrite, prior_created) = match tokio::fs::metadata(&obj_path).await {
+                Ok(_) => {
+                    let created = read_obj_created(&obj_path, self.mek.as_ref()).await;
+                    (true, created)
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => (false, None),
+                Err(e) => {
+                    return Err(Error::InternalError {
+                        bucket: bucket.to_owned(),
+                        key: key.to_owned(),
+                        operation: "put".to_owned(),
+                        message: format!("stat existing: {e}"),
+                    });
+                }
+            };
 
             let data: &[u8] = &payload;
             let now = now_nanos();
-            let created = if is_overwrite {
-                read_created_timestamp(&meta_path, self.mek.as_ref()).await.unwrap_or(now)
-            } else {
-                now
-            };
+            let created = prior_created.unwrap_or(now);
 
-            // When the daemon has already encrypted the body, it supplies the
-            // plaintext-derived size and checksums via `plaintext_metrics` so we
-            // store the values users expect to see — not values computed from the
-            // (encrypted) bytes we're about to write.
             let (size, checksum_md5, checksum_sha256) = match &options.plaintext_metrics {
                 Some(p) => (p.size, p.checksum_md5_b64.clone(), p.checksum_sha256_b64.clone()),
                 None => {
@@ -620,6 +727,7 @@ impl Storage for FilesystemStorage {
                     ),
                     None => (None, None, None, None, None),
                 };
+
             let metadata = Metadata {
                 created,
                 modified: now,
@@ -628,7 +736,7 @@ impl Storage for FilesystemStorage {
                 checksum_sha256,
                 bucket: bucket.to_owned(),
                 key: key.to_owned(),
-                disk_path: data_path.clone(),
+                disk_path: obj_path.clone(),
                 url_path: format!("{bucket}/{key}"),
                 labels: options.labels,
                 cipher_size,
@@ -638,15 +746,40 @@ impl Storage for FilesystemStorage {
                 envelope_version,
             };
 
-            tokio::fs::write(&tmp_path, data)
-                .await
-                .map_err(|e| Error::InternalError {
+            let meta_json = serde_json::to_vec(&metadata).map_err(|e| Error::InternalError {
+                bucket: bucket.to_owned(),
+                key: key.to_owned(),
+                operation: "put".to_owned(),
+                message: e.to_string(),
+            })?;
+            let meta_bytes = if let Some(mek) = &self.mek {
+                encrypt_meta(mek, &meta_json).map_err(|e| Error::InternalError {
                     bucket: bucket.to_owned(),
                     key: key.to_owned(),
                     operation: "put".to_owned(),
                     message: e.to_string(),
-                })?;
-            tokio::fs::rename(&tmp_path, &data_path)
+                })?
+            } else {
+                meta_json
+            };
+
+            let mut header_flags = 0u16;
+            if options.sync == SyncLevel::Durable {
+                header_flags |= format::flags::DURABLE;
+            }
+            let header = Header {
+                data_len: data.len() as u64,
+                meta_len: meta_bytes.len() as u32,
+                data_offset: Header::MIN_DATA_OFFSET,
+                flags: header_flags,
+                version: format::VERSION,
+            };
+
+            let mut tmp_file = tokio::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&tmp_path)
                 .await
                 .map_err(|e| Error::InternalError {
                     bucket: bucket.to_owned(),
@@ -655,27 +788,64 @@ impl Storage for FilesystemStorage {
                     message: e.to_string(),
                 })?;
 
-            let encoded = encode_metadata(&metadata, self.mek.as_ref()).map_err(|e| Error::InternalError {
+            tmp_file.write_all(&header.encode()).await.map_err(|e| Error::InternalError {
                 bucket: bucket.to_owned(),
                 key: key.to_owned(),
                 operation: "put".to_owned(),
-                message: e.to_string(),
+                message: format!("write header: {e}"),
             })?;
-            tokio::fs::write(&meta_path, &encoded)
+            tmp_file.write_all(data).await.map_err(|e| Error::InternalError {
+                bucket: bucket.to_owned(),
+                key: key.to_owned(),
+                operation: "put".to_owned(),
+                message: format!("write data: {e}"),
+            })?;
+            tmp_file.write_all(&meta_bytes).await.map_err(|e| Error::InternalError {
+                bucket: bucket.to_owned(),
+                key: key.to_owned(),
+                operation: "put".to_owned(),
+                message: format!("write meta: {e}"),
+            })?;
+            tmp_file.write_all(&header.encode()).await.map_err(|e| Error::InternalError {
+                bucket: bucket.to_owned(),
+                key: key.to_owned(),
+                operation: "put".to_owned(),
+                message: format!("write trailer: {e}"),
+            })?;
+
+            if options.sync == SyncLevel::Durable {
+                tmp_file.sync_data().await.map_err(|e| Error::InternalError {
+                    bucket: bucket.to_owned(),
+                    key: key.to_owned(),
+                    operation: "put".to_owned(),
+                    message: format!("fdatasync: {e}"),
+                })?;
+            }
+            drop(tmp_file);
+
+            tokio::fs::rename(&tmp_path, &obj_path)
                 .await
                 .map_err(|e| Error::InternalError {
                     bucket: bucket.to_owned(),
                     key: key.to_owned(),
                     operation: "put".to_owned(),
-                    message: e.to_string(),
+                    message: format!("rename: {e}"),
                 })?;
+
+            if options.sync == SyncLevel::Durable {
+                if let Some(parent) = obj_path.parent()
+                    && let Ok(dir) = std::fs::File::open(parent)
+                {
+                    let _ = dir.sync_all();
+                }
+            }
 
             if let Err(e) = self.index.upsert(&metadata).await {
                 tracing::warn!(
                     bucket = bucket,
                     key = key,
                     error = %e,
-                    "metadata index upsert failed; sidecar is authoritative"
+                    "metadata index upsert failed; on-disk record is authoritative"
                 );
             }
 
@@ -692,14 +862,11 @@ impl Storage for FilesystemStorage {
             validate_bucket(bucket)?;
             validate_key(key)?;
 
-            let data_path = self.key_path(bucket, key);
-            let lock_path = data_path.with_extension("lock");
-            let meta_path = data_path.with_extension("meta");
+            let obj_path = self.key_path(bucket, key);
+            check_not_locked(&obj_path.with_extension("lock"), bucket, key).await?;
 
-            check_not_locked(&lock_path, bucket, key).await?;
-
-            let data = match tokio::fs::read(&data_path).await {
-                Ok(b) => b,
+            let mut file = match tokio::fs::File::open(&obj_path).await {
+                Ok(f) => f,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     return Err(Error::NotFound {
                         bucket: bucket.to_owned(),
@@ -716,15 +883,46 @@ impl Storage for FilesystemStorage {
                 }
             };
 
-            tokio::fs::remove_file(&data_path).await.ok();
-            tokio::fs::remove_file(&meta_path).await.ok();
+            let mut header_buf = [0u8; HEADER_SIZE];
+            file.read_exact(&mut header_buf).await.map_err(|e| Error::InternalError {
+                bucket: bucket.to_owned(),
+                key: key.to_owned(),
+                operation: "delete".to_owned(),
+                message: format!("read header: {e}"),
+            })?;
+            let header = Header::decode(&header_buf).map_err(|e| Error::InternalError {
+                bucket: bucket.to_owned(),
+                key: key.to_owned(),
+                operation: "delete".to_owned(),
+                message: format!("decode header: {e}"),
+            })?;
+
+            file.seek(std::io::SeekFrom::Start(header.data_offset as u64))
+                .await
+                .map_err(|e| Error::InternalError {
+                    bucket: bucket.to_owned(),
+                    key: key.to_owned(),
+                    operation: "delete".to_owned(),
+                    message: format!("seek data: {e}"),
+                })?;
+
+            let mut data = vec![0u8; header.data_len as usize];
+            file.read_exact(&mut data).await.map_err(|e| Error::InternalError {
+                bucket: bucket.to_owned(),
+                key: key.to_owned(),
+                operation: "delete".to_owned(),
+                message: format!("read data: {e}"),
+            })?;
+            drop(file);
+
+            tokio::fs::remove_file(&obj_path).await.ok();
 
             if let Err(e) = self.index.remove(bucket, key).await {
                 tracing::warn!(
                     bucket = bucket,
                     key = key,
                     error = %e,
-                    "metadata index remove failed; sidecar is authoritative"
+                    "metadata index remove failed"
                 );
             }
 
@@ -741,20 +939,17 @@ impl Storage for FilesystemStorage {
             validate_bucket(bucket)?;
             validate_key(key)?;
 
-            let data_path = self.key_path(bucket, key);
-            let lock_path = data_path.with_extension("lock");
-            let meta_path = data_path.with_extension("meta");
+            let obj_path = self.key_path(bucket, key);
+            check_not_locked(&obj_path.with_extension("lock"), bucket, key).await?;
 
-            check_not_locked(&lock_path, bucket, key).await?;
-
-            if !tokio::fs::try_exists(&data_path).await.unwrap_or(false) {
+            if !tokio::fs::try_exists(&obj_path).await.unwrap_or(false) {
                 return Err(Error::NotFound {
                     bucket: bucket.to_owned(),
                     key: key.to_owned(),
                 });
             }
 
-            read_metadata_sidecar(&meta_path, self.mek.as_ref())
+            read_obj_metadata(&obj_path, self.mek.as_ref())
                 .await
                 .map_err(|e| Error::InternalError {
                     bucket: bucket.to_owned(),
@@ -770,12 +965,6 @@ impl Storage for FilesystemStorage {
 }
 
 impl Listing for FilesystemStorage {
-    /// Enumerate every bucket that has at least one object, by reading the
-    /// secondary index. Buckets are returned sorted ascending.
-    ///
-    /// The index is the source of truth here: an empty bucket directory on
-    /// disk (e.g. leftover from a deleted object) does not surface, and any
-    /// bucket present in the index is listed.
     async fn list_buckets(&self) -> Result<Vec<String>, Error> {
         self.index.list_buckets().await
     }
@@ -799,9 +988,6 @@ impl Listing for FilesystemStorage {
 }
 
 impl StorageExt for FilesystemStorage {
-    /// Spawn a background task that reconciles the secondary index against the
-    /// on-disk sidecar tree. Returns [`Error::RebuildAlreadyRunning`] if a
-    /// rebuild is already in progress.
     async fn rebuild_cache(&self) -> Result<(), Error> {
         {
             let mut state = self.rebuild_state.lock().await;
@@ -857,27 +1043,26 @@ impl StorageExt for FilesystemStorage {
     }
 }
 
-/// Walk every `.meta` sidecar under `base_path`, upsert it into `index`, and
-/// then drop any index rows that no longer have a sidecar on disk. Updates
-/// `state` with `Running(pct)` periodically; capped at 99 until the call site
-/// transitions to `Completed`.
+/// Walk every `.obj` file under `base_path/<bucket>/xx/yy/`, read the embedded
+/// metadata, upsert it into `index`, then drop any index rows whose `.obj`
+/// file is gone. Updates `state` with `Running(pct)` periodically.
 async fn run_rebuild(
     base_path: PathBuf,
     index: Arc<MetadataIndex>,
     state: Arc<tokio::sync::Mutex<CacheRebuildStatus>>,
     mek: Option<[u8; 32]>,
 ) -> Result<(), String> {
-    let sidecars = collect_sidecars(&base_path)
+    let obj_files = collect_obj_files(&base_path)
         .await
-        .map_err(|e| format!("enumerate sidecars: {e}"))?;
-    let total = sidecars.len();
+        .map_err(|e| format!("enumerate obj files: {e}"))?;
+    let total = obj_files.len();
 
     let mut seen: std::collections::HashSet<(String, String)> =
         std::collections::HashSet::with_capacity(total);
     let report_every = (total / 100).max(1);
 
-    for (i, path) in sidecars.into_iter().enumerate() {
-        match read_metadata_sidecar(&path, mek.as_ref()).await {
+    for (i, path) in obj_files.into_iter().enumerate() {
+        match read_obj_metadata(&path, mek.as_ref()).await {
             Ok(meta) => {
                 if let Err(e) = index.upsert(&meta).await {
                     tracing::warn!(
@@ -892,7 +1077,7 @@ async fn run_rebuild(
                 tracing::warn!(
                     path = %path.display(),
                     error = %e,
-                    "rebuild: failed to read sidecar; skipping"
+                    "rebuild: failed to read obj metadata; skipping"
                 );
             }
         }
@@ -922,11 +1107,11 @@ async fn run_rebuild(
     Ok(())
 }
 
-/// Recursively gather every `*.meta` path under `base_path/<bucket>/xx/yy/`.
+/// Recursively gather every `*.obj` file under `base_path/<bucket>/xx/yy/`.
 ///
 /// Bucket directories whose name fails [`validate_bucket`] are skipped, which
-/// excludes reserved files like `_y2q_index.redb`.
-async fn collect_sidecars(base_path: &Path) -> std::io::Result<Vec<PathBuf>> {
+/// excludes reserved entries like `_y2q_index.redb`.
+async fn collect_obj_files(base_path: &Path) -> std::io::Result<Vec<PathBuf>> {
     let mut out = Vec::new();
     let mut buckets = tokio::fs::read_dir(base_path).await?;
     while let Some(b_entry) = buckets.next_entry().await? {
@@ -954,7 +1139,7 @@ async fn collect_sidecars(base_path: &Path) -> std::io::Result<Vec<PathBuf>> {
                 let mut files = tokio::fs::read_dir(l2_entry.path()).await?;
                 while let Some(f) = files.next_entry().await? {
                     let p = f.path();
-                    if p.extension().is_some_and(|e| e == "meta") {
+                    if p.extension().is_some_and(|e| e == "obj") {
                         out.push(p);
                     }
                 }
@@ -1039,7 +1224,6 @@ mod tests {
         assert_eq!(meta.url_path, "b/k");
         assert!(meta.labels.is_empty());
         assert!(meta.disk_path.is_absolute());
-        // Base64 MD5 = 24 chars (16 raw + padding), SHA-256 = 44 chars.
         assert_eq!(meta.checksum_md5.len(), 24);
         assert_eq!(meta.checksum_sha256.len(), 44);
     }
@@ -1061,7 +1245,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delete_removes_files() {
+    async fn delete_removes_obj_file() {
         let (s, _dir) = make_storage();
         s.put("b", "k", make_object(b"data"), PutOptions::default())
             .await
@@ -1069,9 +1253,7 @@ mod tests {
         s.delete("b", "k").await.unwrap();
         let err = s.get("b", "k").await.unwrap_err();
         assert!(matches!(err, crate::Error::NotFound { .. }));
-        let data_path = s.key_path("b", "k");
-        assert!(!data_path.exists());
-        assert!(!data_path.with_extension("meta").exists());
+        assert!(!s.key_path("b", "k").exists());
     }
 
     #[tokio::test]
@@ -1239,9 +1421,6 @@ mod tests {
 
     #[tokio::test]
     async fn list_objects_sorted_by_string_key_not_encoded_order() {
-        // Regression: redb's length-prefixed encoding puts shorter encoded
-        // keys first, so "abz" (len 3) would sort before "abcd" (len 4) in
-        // raw redb order. The trait must return string-sorted results.
         let (s, _dir) = make_storage();
         for k in &["abz", "abcd", "aa"] {
             s.put("b", k, make_object(b"x"), PutOptions::default())
@@ -1409,11 +1588,8 @@ mod tests {
             .await
             .unwrap();
 
-        let ghost_data = s.key_path("b", "ghost");
-        tokio::fs::remove_file(&ghost_data).await.unwrap();
-        tokio::fs::remove_file(ghost_data.with_extension("meta"))
-            .await
-            .unwrap();
+        // Remove the ghost's .obj file but leave its index entry.
+        tokio::fs::remove_file(s.key_path("b", "ghost")).await.unwrap();
 
         assert!(
             s.index()
@@ -1482,5 +1658,31 @@ mod tests {
         let err = s.rebuild_cache().await.unwrap_err();
         assert!(matches!(err, crate::Error::RebuildAlreadyRunning));
         let _ = wait_until_done(&s).await;
+    }
+
+    /// Verify that the on-disk file uses the shared `.obj` format by inspecting
+    /// the header magic and data_offset directly.
+    #[tokio::test]
+    async fn put_writes_obj_format_with_correct_header() {
+        use crate::storage::format::{HEADER_SIZE, Header, MAGIC};
+
+        let (s, _dir) = make_storage();
+        let body = b"hello obj";
+        s.put("b", "k", make_object(body), PutOptions::default())
+            .await
+            .unwrap();
+
+        let obj_path = s.key_path("b", "k");
+        assert_eq!(obj_path.extension().and_then(|e| e.to_str()), Some("obj"));
+
+        let bytes = std::fs::read(&obj_path).unwrap();
+        assert!(bytes.len() >= HEADER_SIZE);
+        assert_eq!(&bytes[..4], &MAGIC);
+
+        let header_arr: [u8; HEADER_SIZE] = bytes[..HEADER_SIZE].try_into().unwrap();
+        let header = Header::decode(&header_arr).unwrap();
+        assert_eq!(header.data_len, body.len() as u64);
+        assert_eq!(header.data_offset, Header::MIN_DATA_OFFSET);
+        assert_eq!(&bytes[header.data_offset as usize..header.data_offset as usize + body.len()], body);
     }
 }

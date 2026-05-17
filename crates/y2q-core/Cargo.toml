@@ -16,6 +16,7 @@ pqcrypto        = { workspace = true }
 pqcrypto-traits = { workspace = true }
 rand            = { workspace = true }
 redb            = { workspace = true }
+crc32fast       = { workspace = true }
 serde           = { workspace = true }
 serde_json      = { workspace = true }
 sha2            = { workspace = true }
@@ -32,7 +33,6 @@ zeroize         = { workspace = true }
 tokio-uring   = { workspace = true, optional = true }
 aligned-vec   = { workspace = true, optional = true }
 async-channel = { workspace = true, optional = true }
-crc32fast     = { workspace = true, optional = true }
 libc          = { workspace = true, optional = true }
 
 [features]
@@ -40,7 +40,7 @@ default = []
 # Enables the io_uring-based UringStorage backend. Linux-only at runtime:
 # the module is `#[cfg(target_os = "linux")]`, so on other targets the
 # feature is accepted but contributes nothing.
-uring = ["dep:tokio-uring", "dep:aligned-vec", "dep:async-channel", "dep:crc32fast", "dep:libc"]
+uring = ["dep:tokio-uring", "dep:aligned-vec", "dep:async-channel", "dep:libc"]
 
 [dev-dependencies]
 criterion = { workspace = true }
