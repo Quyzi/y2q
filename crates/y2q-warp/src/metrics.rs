@@ -95,13 +95,13 @@ impl OpHistograms {
 
     pub fn record(&mut self, rec: &OpRecord) {
         self.n_ops += 1;
+        self.first_ns = self.first_ns.min(rec.start_ns);
+        self.last_ns = self.last_ns.max(rec.end_ns);
         if rec.is_error() {
             self.n_errors += 1;
             return;
         }
         self.total_bytes += rec.bytes;
-        self.first_ns = self.first_ns.min(rec.start_ns);
-        self.last_ns = self.last_ns.max(rec.end_ns);
         let _ = self.latency.record(rec.latency_ns().max(1));
         if let Some(ttfb) = rec.ttfb_ns() {
             let _ = self.ttfb.record(ttfb.max(1));

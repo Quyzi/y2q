@@ -4786,6 +4786,7 @@ dependencies = [
  "hdrhistogram",
  "humantime",
  "rand 0.8.6",
+ "ratatui",
  "reqwest",
  "serde",
  "serde_json",
