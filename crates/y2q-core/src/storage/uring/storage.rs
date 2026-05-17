@@ -18,7 +18,7 @@ use std::time::{Instant, SystemTime};
 
 use crate::{
     CacheRebuildStatus, DEFAULT_LIST_LIMIT, Error, ListOptions, ListPage, Listing, MAX_LIST_LIMIT,
-    Metadata, MetadataIndex, Object, PutOptions, StaleLock, Storage, StorageExt,
+    Metadata, MetadataIndex, Object, PutOptions, StaleLock, Storage, StorageExt, SyncLevel,
     storage::locks::{clear_stale_locks_under, list_stale_locks_under},
 };
 
@@ -489,7 +489,7 @@ impl Storage for UringStorage {
         // Mirror FilesystemStorage: the on-disk record is authoritative, so a
         // failed index upsert is logged but not surfaced — the index can be
         // rebuilt from the trailer scan in `rebuild_cache`.
-        if let Err(e) = self.index.upsert(&metadata).await {
+        if let Err(e) = self.index.upsert(&metadata, options.sync).await {
             tracing::warn!(
                 bucket = bucket,
                 key = key,
@@ -695,7 +695,7 @@ async fn run_rebuild(
             match rx.await {
                 Ok(Ok(meta)) => {
                     seen.insert((meta.bucket.clone(), meta.key.clone()));
-                    if let Err(e) = index.upsert(&meta).await {
+                    if let Err(e) = index.upsert(&meta, SyncLevel::Durable).await {
                         tracing::warn!(
                             bucket = %meta.bucket,
                             key = %meta.key,

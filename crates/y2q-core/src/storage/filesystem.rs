@@ -468,7 +468,7 @@ impl StreamingPutGuard {
             }
         }
 
-        if let Err(e) = self.index.upsert(&metadata).await {
+        if let Err(e) = self.index.upsert(&metadata, options.sync).await {
             tracing::warn!(
                 bucket = bucket,
                 key = key,
@@ -933,7 +933,7 @@ impl Storage for FilesystemStorage {
                 }
             }
 
-            if let Err(e) = self.index.upsert(&metadata).await {
+            if let Err(e) = self.index.upsert(&metadata, options.sync).await {
                 tracing::warn!(
                     bucket = bucket,
                     key = key,
@@ -1165,7 +1165,7 @@ async fn run_rebuild(
     for (i, path) in obj_files.into_iter().enumerate() {
         match read_obj_metadata(&path, mek.as_ref()).await {
             Ok(meta) => {
-                if let Err(e) = index.upsert(&meta).await {
+                if let Err(e) = index.upsert(&meta, SyncLevel::Durable).await {
                     tracing::warn!(
                         path = %path.display(),
                         error = %e,
