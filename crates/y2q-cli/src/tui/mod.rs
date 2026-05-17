@@ -4,6 +4,7 @@ mod app;
 mod events;
 mod pane;
 mod state;
+pub mod theme;
 mod ui;
 mod widgets;
 

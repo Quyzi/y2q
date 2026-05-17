@@ -3,11 +3,28 @@ use std::io::Write;
 
 use crossterm::{
     cursor, execute,
-    style::{Color, Print, SetForegroundColor},
+    style::{Color, Print, ResetColor, SetForegroundColor},
 };
 
 use crate::output::fmt_bytes;
 use crate::progress::ProgressReporter;
+
+const NEON_PINK: Color = Color::Rgb { r: 255, g: 20, b: 147 };
+const NEON_CYAN: Color = Color::Rgb { r: 0, g: 255, b: 255 };
+const NEON_GREEN: Color = Color::Rgb { r: 57, g: 255, b: 20 };
+const NEON_YELLOW: Color = Color::Rgb { r: 255, g: 215, b: 0 };
+const NEON_PURPLE: Color = Color::Rgb { r: 188, g: 0, b: 255 };
+const DIM: Color = Color::Rgb { r: 50, g: 50, b: 80 };
+const NORMAL: Color = Color::Rgb { r: 200, g: 210, b: 255 };
+
+/// Particle offsets from fill head (offset, glyph).
+const PARTICLES: &[(usize, &str)] = &[
+    (1, "·"),
+    (3, "∘"),
+    (5, "·"),
+    (8, "⋅"),
+    (11, "·"),
+];
 
 pub struct TuiProgressReporter {
     label: String,
@@ -26,21 +43,21 @@ impl TuiProgressReporter {
 
     fn render(&self, bytes_done: u64, speed_bps: u64) {
         let mut stderr = std::io::stderr();
-        // Clamp output to one terminal row so MoveToColumn(0) is always sufficient.
         let term_width = crossterm::terminal::size()
             .map(|(w, _)| w as usize)
             .unwrap_or(80)
-            .max(20);
+            .max(30);
 
-        let bar_width: usize = 30;
-        let filled = if let Some(total) = self.total {
+        let bar_width: usize = 28;
+        let fill = if let Some(total) = self.total {
             (bytes_done as f64 / total.max(1) as f64 * bar_width as f64) as usize
         } else {
             0
         };
-        let bar: String = format!("[{}{}]", "█".repeat(filled), "░".repeat(bar_width - filled));
+        let remaining = bar_width.saturating_sub(fill);
+        let frame = self.samples.len();
 
-        let pct = self
+        let pct_str = self
             .total
             .map(|t| format!(" {:3}%", bytes_done * 100 / t.max(1)))
             .unwrap_or_default();
@@ -60,37 +77,87 @@ impl TuiProgressReporter {
             })
             .collect();
 
-        let label_part = format!("{}: ", self.label);
-        let progress_part = format!("{bar}{pct}  {done_str}  {speed_str}/s  {sparkline}");
+        // Build particle empty zone
+        let mut empty_chars: Vec<&str> = vec!["░"; remaining];
+        for &(base_off, ch) in PARTICLES {
+            let pos = (base_off + frame / 2) % remaining.max(1);
+            empty_chars[pos] = ch;
+        }
 
-        // Truncate visible chars to fit in one row, then pad the remainder with
-        // spaces so any previously printed longer line is fully overwritten.
-        let label_vis = label_part.chars().count();
-        let progress_vis = progress_part.chars().count();
-        let total_vis = label_vis + progress_vis;
+        let _ = execute!(stderr, cursor::MoveToColumn(0));
 
-        let (label_out, progress_out) = if total_vis > term_width {
-            let lv = label_vis.min(term_width);
-            let pv = term_width.saturating_sub(lv);
-            (
-                label_part.chars().take(lv).collect::<String>(),
-                progress_part.chars().take(pv).collect::<String>(),
-            )
-        } else {
-            (label_part, progress_part)
-        };
-
-        let vis_out = label_out.chars().count() + progress_out.chars().count();
-        let padding = " ".repeat(term_width.saturating_sub(vis_out));
-
+        // Label
         let _ = execute!(
             stderr,
-            cursor::MoveToColumn(0),
-            SetForegroundColor(Color::Cyan),
-            Print(&label_out),
-            SetForegroundColor(Color::Reset),
-            Print(format!("{progress_out}{padding}")),
+            SetForegroundColor(NEON_PINK),
+            Print(format!("{}: ", self.label)),
+            ResetColor,
         );
+
+        // Opening bracket
+        let _ = execute!(stderr, SetForegroundColor(DIM), Print("["), ResetColor);
+
+        // Solid fill
+        if fill > 1 {
+            let _ = execute!(
+                stderr,
+                SetForegroundColor(NEON_CYAN),
+                Print("█".repeat(fill - 1)),
+                ResetColor,
+            );
+        }
+
+        // Leading edge
+        if fill > 0 {
+            let _ = execute!(
+                stderr,
+                SetForegroundColor(NEON_PINK),
+                Print("▶"),
+                ResetColor,
+            );
+        }
+
+        // Particle zone
+        if remaining > 0 {
+            let _ = execute!(stderr, SetForegroundColor(NEON_YELLOW));
+            for ch in &empty_chars {
+                let _ = execute!(stderr, Print(ch));
+            }
+            let _ = execute!(stderr, ResetColor);
+        }
+
+        // Closing bracket + stats
+        let _ = execute!(
+            stderr,
+            SetForegroundColor(DIM),
+            Print("]"),
+            ResetColor,
+            SetForegroundColor(NEON_GREEN),
+            Print(&pct_str),
+            ResetColor,
+            SetForegroundColor(NORMAL),
+            Print(format!("  {done_str}  {speed_str}/s  ")),
+            ResetColor,
+            SetForegroundColor(NEON_PURPLE),
+            Print(&sparkline),
+            ResetColor,
+        );
+
+        // Pad to overwrite any previously-longer line
+        let visible = self.label.chars().count()
+            + 2  // ": "
+            + 2  // "[ "
+            + bar_width
+            + pct_str.chars().count()
+            + 2 + done_str.chars().count()
+            + 2 + speed_str.chars().count()
+            + 3  // "/s  "
+            + sparkline.chars().count();
+        let pad = term_width.saturating_sub(visible);
+        if pad > 0 {
+            let _ = execute!(stderr, Print(" ".repeat(pad)));
+        }
+
         let _ = stderr.flush();
     }
 }
@@ -102,10 +169,12 @@ impl ProgressReporter for TuiProgressReporter {
         let mut stderr = std::io::stderr();
         let _ = execute!(
             stderr,
-            SetForegroundColor(Color::Cyan),
+            SetForegroundColor(NEON_PINK),
             Print(format!("{label}: ")),
-            SetForegroundColor(Color::Reset),
-            Print("starting..."),
+            ResetColor,
+            SetForegroundColor(NEON_CYAN),
+            Print("initialising…"),
+            ResetColor,
         );
         let _ = stderr.flush();
     }
@@ -121,6 +190,14 @@ impl ProgressReporter for TuiProgressReporter {
     fn finish(&mut self, bytes_done: u64) {
         let speed = self.samples.back().copied().unwrap_or(0);
         self.render(bytes_done, speed);
+        let mut stderr = std::io::stderr();
+        let _ = execute!(
+            stderr,
+            Print("  "),
+            SetForegroundColor(NEON_GREEN),
+            Print("✓ done"),
+            ResetColor,
+        );
         eprintln!();
     }
 }

@@ -13,17 +13,85 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Gauge, Paragraph, Row, Sparkline, Table};
+use ratatui::widgets::{Block, BorderType, Borders, Cell, Paragraph, Row, Sparkline, Table};
 use tokio::sync::mpsc;
 
 use crate::metrics::{Aggregate, ns_to_ms_str};
 use crate::ops::OpKind;
 
+// ── Cyberpunk palette ────────────────────────────────────────────────────────
+const NEON_PINK: Color = Color::Rgb(255, 20, 147);
+const NEON_CYAN: Color = Color::Rgb(0, 255, 255);
+const NEON_GREEN: Color = Color::Rgb(57, 255, 20);
+const NEON_YELLOW: Color = Color::Rgb(255, 215, 0);
+const NEON_PURPLE: Color = Color::Rgb(188, 0, 255);
+const ERROR_RED: Color = Color::Rgb(255, 50, 50);
+const DIM_BORDER: Color = Color::Rgb(50, 50, 80);
+const DIM_TEXT: Color = Color::Rgb(90, 90, 130);
+const NORMAL_TEXT: Color = Color::Rgb(200, 210, 255);
+
+// ── Particle bar ─────────────────────────────────────────────────────────────
+const PARTICLES: &[(usize, char)] = &[(1, '·'), (3, '∘'), (5, '·'), (8, '⋅'), (11, '·')];
+
+/// Build colored particle-animated bar spans (no brackets).
+/// `bar_w` — inner character width.
+/// `frame` — animation counter (e.g. elapsed secs, done-count/10, etc.)
+fn particle_bar_spans(bar_w: usize, ratio: f64, frame: usize, fill_color: Color) -> Vec<Span<'static>> {
+    let fill = ((ratio * bar_w as f64) as usize).min(bar_w);
+    let remaining = bar_w.saturating_sub(fill);
+    let mut spans = Vec::with_capacity(4);
+
+    if fill > 1 {
+        spans.push(Span::styled("█".repeat(fill - 1), Style::default().fg(fill_color)));
+    }
+    if fill > 0 {
+        spans.push(Span::styled(
+            "▶",
+            Style::default().fg(NEON_PINK).add_modifier(Modifier::BOLD),
+        ));
+    }
+    if remaining > 0 {
+        let mut empty: Vec<char> = vec!['░'; remaining];
+        for &(base_off, ch) in PARTICLES {
+            let pos = (base_off + frame / 2) % remaining.max(1);
+            empty[pos] = ch;
+        }
+        spans.push(Span::styled(
+            empty.into_iter().collect::<String>(),
+            Style::default().fg(NEON_YELLOW),
+        ));
+    }
+    spans
+}
+
+/// Render a full particle bar row (brackets + bar + label suffix) into `area`.
+fn render_particle_bar(
+    f: &mut Frame,
+    area: Rect,
+    ratio: f64,
+    frame: usize,
+    fill_color: Color,
+    label: &str,
+) {
+    let label_w = label.chars().count() as u16;
+    let bar_w = area
+        .width
+        .saturating_sub(label_w)
+        .saturating_sub(2) as usize; // subtract [ ]
+
+    let mut spans = vec![Span::styled("[", Style::default().fg(DIM_BORDER))];
+    spans.extend(particle_bar_spans(bar_w, ratio, frame, fill_color));
+    spans.push(Span::styled("]", Style::default().fg(DIM_BORDER)));
+    spans.push(Span::styled(label.to_owned(), Style::default().fg(NEON_GREEN)));
+
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+// ── Data / state ─────────────────────────────────────────────────────────────
 const HISTORY_CAP: usize = 256;
 const TICK_MS: u64 = 100;
 const SAMPLE_INTERVAL_MS: u128 = 1_000;
 
-/// Messages sent to the display task from bench orchestration and the recorder.
 pub enum DisplayMsg {
     Preparing { done: u32, total: u32 },
     Running(HashMap<OpKind, Aggregate>),
@@ -139,8 +207,6 @@ fn push_cap(h: &mut VecDeque<u64>, v: u64) {
     h.push_back(v);
 }
 
-/// Right-justify sparkline data into exactly `width` slots.
-/// Pads the left with zeros so the newest sample is always on the right edge.
 fn rjust(data: &VecDeque<u64>, width: usize) -> Vec<u64> {
     if width == 0 {
         return vec![];
@@ -153,7 +219,7 @@ fn rjust(data: &VecDeque<u64>, width: usize) -> Vec<u64> {
         .collect()
 }
 
-/// Run the TUI display loop. Returns `true` if the user quit early with `q`.
+// ── Entry point ───────────────────────────────────────────────────────────────
 pub async fn run_display(
     rx: mpsc::Receiver<DisplayMsg>,
     sentinel_op: OpKind,
@@ -228,17 +294,17 @@ pub async fn run_display(
     user_quit
 }
 
+// ── Render ────────────────────────────────────────────────────────────────────
 fn render(f: &mut Frame, sentinel_op: OpKind, total_duration: Duration, state: &AppState) {
     let area = f.area();
     let outer = Block::default()
-        .title(" y2q-warp ")
-        .title_style(
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )
+        .title(Span::styled(
+            " // Y2Q-WARP // POST-QUANTUM BENCHMARK // ",
+            Style::default().fg(NEON_PINK).add_modifier(Modifier::BOLD),
+        ))
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan));
+        .border_type(BorderType::Double)
+        .border_style(Style::default().fg(NEON_PINK));
     let inner = outer.inner(area);
     f.render_widget(outer, area);
 
@@ -262,11 +328,14 @@ fn render(f: &mut Frame, sentinel_op: OpKind, total_duration: Duration, state: &
 }
 
 fn render_prepare(f: &mut Frame, area: Rect, done: u32, total: u32) {
-    let pct = if total > 0 {
-        ((done as f64 / total as f64) * 100.0).clamp(0.0, 100.0) as u16
+    let ratio = if total > 0 {
+        (done as f64 / total as f64).clamp(0.0, 1.0)
     } else {
-        0
+        0.0
     };
+    let pct = (ratio * 100.0) as u16;
+    let frame = (done / 10) as usize;
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -277,21 +346,24 @@ fn render_prepare(f: &mut Frame, area: Rect, done: u32, total: u32) {
         .split(area);
 
     let title = Paragraph::new(Line::from(vec![
-        Span::styled("Seeding   ", Style::default().fg(Color::Yellow)),
+        Span::styled("SEEDING  ", Style::default().fg(NEON_YELLOW).add_modifier(Modifier::BOLD)),
         Span::styled(
-            format!("{done} / {total}"),
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
+            format!("{done}"),
+            Style::default().fg(NEON_CYAN).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" / ", Style::default().fg(DIM_TEXT)),
+        Span::styled(
+            format!("{total}"),
+            Style::default().fg(NEON_CYAN),
+        ),
+        Span::styled(
+            format!("  {pct}%"),
+            Style::default().fg(NEON_GREEN),
         ),
     ]));
     f.render_widget(title, chunks[0]);
 
-    let gauge = Gauge::default()
-        .gauge_style(Style::default().fg(Color::Yellow).bg(Color::DarkGray))
-        .percent(pct)
-        .label(format!(" {pct}% "));
-    f.render_widget(gauge, chunks[1]);
+    render_particle_bar(f, chunks[1], ratio, frame, NEON_CYAN, "");
 }
 
 fn render_running(
@@ -304,61 +376,49 @@ fn render_running(
 ) {
     let elapsed = state.bench_elapsed().min(total_duration);
     let n_data_rows = op_kinds.len().max(1) as u16;
-    let table_height = n_data_rows + 2; // header row + bottom_margin
+    let table_height = n_data_rows + 2;
 
     let mut constraints = vec![
-        Constraint::Length(1),            // progress gauge
-        Constraint::Length(table_height), // stats table
-        Constraint::Min(3),               // throughput sparkline
+        Constraint::Length(1),
+        Constraint::Length(table_height),
+        Constraint::Min(3),
     ];
     for _ in op_kinds {
-        constraints.push(Constraint::Length(3)); // one row per op's ops/s sparkline
+        constraints.push(Constraint::Length(3));
     }
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints(constraints)
         .split(area);
 
-    // --- Progress gauge ---
+    // ── Time progress bar ────────────────────────────────────────────────────
     let op_label = match op_kinds.len() {
         0 => sentinel_op.as_str().to_owned(),
         1 => op_kinds[0].as_str().to_owned(),
         _ => "MIXED".to_owned(),
     };
-    let pct =
-        ((elapsed.as_secs_f64() / total_duration.as_secs_f64()) * 100.0).clamp(0.0, 100.0) as u16;
-    let gauge = Gauge::default()
-        .gauge_style(Style::default().fg(Color::Green).bg(Color::DarkGray))
-        .percent(pct)
-        .label(format!(
-            " {}   {}s / {}s   {}% ",
-            op_label,
-            elapsed.as_secs(),
-            total_duration.as_secs(),
-            pct,
-        ));
-    f.render_widget(gauge, chunks[0]);
+    let ratio = (elapsed.as_secs_f64() / total_duration.as_secs_f64()).clamp(0.0, 1.0);
+    let pct = (ratio * 100.0) as u16;
+    let frame = elapsed.as_secs() as usize;
+    let label = format!(
+        "  {}  {}s / {}s  {}%",
+        op_label,
+        elapsed.as_secs(),
+        total_duration.as_secs(),
+        pct,
+    );
+    render_particle_bar(f, chunks[0], ratio, frame, NEON_GREEN, &label);
 
-    // --- Stats table ---
+    // ── Stats table ──────────────────────────────────────────────────────────
     let header = Row::new(
-        [
-            "Op",
-            "Ops",
-            "4xx/s",
-            "5xx/s",
-            "Throughput",
-            "Ops/s",
-            "P50",
-            "P90",
-            "P99",
-        ]
-        .map(|h| {
-            Cell::from(h).style(
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            )
-        }),
+        ["Op", "Ops", "4xx/s", "5xx/s", "Throughput", "Ops/s", "P50", "P90", "P99"]
+            .map(|h| {
+                Cell::from(h).style(
+                    Style::default()
+                        .fg(NEON_YELLOW)
+                        .add_modifier(Modifier::BOLD),
+                )
+            }),
     )
     .height(1)
     .bottom_margin(1);
@@ -370,17 +430,18 @@ fn render_running(
             let e4 = state.errors_4xx_per_sec.get(kind).copied().unwrap_or(0.0);
             let e5 = state.errors_5xx_per_sec.get(kind).copied().unwrap_or(0.0);
             Row::new([
-                Cell::from(kind.as_str()),
-                Cell::from(format!("{:>8}", agg.n_ops)),
+                Cell::from(kind.as_str()).style(Style::default().fg(NEON_CYAN)),
+                Cell::from(format!("{:>8}", agg.n_ops))
+                    .style(Style::default().fg(NORMAL_TEXT)),
                 Cell::from(if e4 > 0.0 {
                     format!("{:>5.1}", e4)
                 } else {
                     format!("{:>5}", "0")
                 })
                 .style(if e4 > 0.0 {
-                    Style::default().fg(Color::Yellow)
+                    Style::default().fg(NEON_YELLOW).add_modifier(Modifier::BOLD)
                 } else {
-                    Style::default()
+                    Style::default().fg(DIM_TEXT)
                 }),
                 Cell::from(if e5 > 0.0 {
                     format!("{:>5.1}", e5)
@@ -388,16 +449,20 @@ fn render_running(
                     format!("{:>5}", "0")
                 })
                 .style(if e5 > 0.0 {
-                    Style::default().fg(Color::Red)
+                    Style::default().fg(ERROR_RED).add_modifier(Modifier::BOLD)
                 } else {
-                    Style::default()
+                    Style::default().fg(DIM_TEXT)
                 }),
                 Cell::from(format!("{:>10.1} MiB/s", agg.throughput_mibps))
-                    .style(Style::default().fg(Color::Cyan)),
-                Cell::from(format!("{:>6.0}", agg.ops_per_sec)),
-                Cell::from(format!("{:>7}", ns_to_ms_str(agg.p50_ns))),
-                Cell::from(format!("{:>7}", ns_to_ms_str(agg.p90_ns))),
-                Cell::from(format!("{:>7}", ns_to_ms_str(agg.p99_ns))),
+                    .style(Style::default().fg(NEON_GREEN).add_modifier(Modifier::BOLD)),
+                Cell::from(format!("{:>6.0}", agg.ops_per_sec))
+                    .style(Style::default().fg(NEON_PURPLE)),
+                Cell::from(format!("{:>7}", ns_to_ms_str(agg.p50_ns)))
+                    .style(Style::default().fg(NORMAL_TEXT)),
+                Cell::from(format!("{:>7}", ns_to_ms_str(agg.p90_ns)))
+                    .style(Style::default().fg(NORMAL_TEXT)),
+                Cell::from(format!("{:>7}", ns_to_ms_str(agg.p99_ns)))
+                    .style(Style::default().fg(NORMAL_TEXT)),
             ])
         })
         .collect();
@@ -421,23 +486,37 @@ fn render_running(
     .column_spacing(1);
     f.render_widget(table, chunks[1]);
 
-    // --- Throughput sparkline ---
+    // ── Throughput sparkline ─────────────────────────────────────────────────
     let tp_area = chunks[2];
     let tp_hist = rjust(&state.throughput_history, tp_area.width as usize);
     let tp_peak = tp_hist.iter().copied().max().unwrap_or(0);
+    let tp_cur = state.throughput_history.back().copied().unwrap_or(0);
     let tp_spark = Sparkline::default()
         .block(
             Block::default()
-                .title(format!(" Throughput MiB/s  peak {tp_peak} "))
-                .title_style(Style::default().fg(Color::Cyan))
+                .title(Line::from(vec![
+                    Span::styled(" Throughput MiB/s ", Style::default().fg(NEON_CYAN)),
+                    Span::styled("now ", Style::default().fg(DIM_TEXT)),
+                    Span::styled(
+                        format!("{tp_cur}"),
+                        Style::default().fg(NEON_GREEN).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled("  peak ", Style::default().fg(DIM_TEXT)),
+                    Span::styled(
+                        format!("{tp_peak} "),
+                        Style::default().fg(NEON_YELLOW),
+                    ),
+                ]))
                 .borders(Borders::TOP)
-                .border_style(Style::default().fg(Color::DarkGray)),
+                .border_style(Style::default().fg(DIM_BORDER)),
         )
         .data(&tp_hist)
-        .style(Style::default().fg(Color::Green));
+        .style(Style::default().fg(NEON_GREEN));
     f.render_widget(tp_spark, tp_area);
 
-    // --- Per-op ops/s sparklines (one row each, stacked vertically) ---
+    // ── Per-op ops/s sparklines ───────────────────────────────────────────────
+    // Cycle through neon colors for multiple ops
+    let spark_colors = [NEON_YELLOW, NEON_CYAN, NEON_PURPLE, NEON_GREEN];
     for (i, &op) in op_kinds.iter().enumerate() {
         let chunk_idx = 3 + i;
         if chunk_idx >= chunks.len() {
@@ -450,38 +529,48 @@ fn render_running(
             .map(|h| rjust(h, area.width as usize))
             .unwrap_or_else(|| vec![0u64; area.width as usize]);
         let peak = hist.iter().copied().max().unwrap_or(0);
+        let color = spark_colors[i % spark_colors.len()];
         let spark = Sparkline::default()
             .block(
                 Block::default()
-                    .title(format!(
-                        " {} ops/s  now {}  peak {} ",
-                        op.as_str(),
-                        current,
-                        peak
-                    ))
-                    .title_style(Style::default().fg(Color::Cyan))
+                    .title(Line::from(vec![
+                        Span::styled(
+                            format!(" {} ops/s ", op.as_str()),
+                            Style::default().fg(NEON_CYAN),
+                        ),
+                        Span::styled("now ", Style::default().fg(DIM_TEXT)),
+                        Span::styled(
+                            format!("{current}"),
+                            Style::default().fg(color).add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled("  peak ", Style::default().fg(DIM_TEXT)),
+                        Span::styled(
+                            format!("{peak} "),
+                            Style::default().fg(NEON_YELLOW),
+                        ),
+                    ]))
                     .borders(Borders::TOP)
-                    .border_style(Style::default().fg(Color::DarkGray)),
+                    .border_style(Style::default().fg(DIM_BORDER)),
             )
             .data(&hist)
-            .style(Style::default().fg(Color::Yellow));
+            .style(Style::default().fg(color));
         f.render_widget(spark, area);
     }
 }
 
 fn render_statusbar(f: &mut Frame, area: Rect) {
     let bar = Paragraph::new(Line::from(vec![
+        Span::styled(" // ", Style::default().fg(DIM_TEXT)),
         Span::styled(
-            "  q",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
+            " q ",
+            Style::default().fg(NEON_CYAN).bg(DIM_BORDER).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(" quit", Style::default().fg(Color::DarkGray)),
+        Span::styled(" quit", Style::default().fg(NORMAL_TEXT)),
     ]));
     f.render_widget(bar, area);
 }
 
+// ── Plain fallback (no TTY) ───────────────────────────────────────────────────
 async fn plain_fallback(mut rx: mpsc::Receiver<DisplayMsg>, op: OpKind, total_duration: Duration) {
     let mut interval = tokio::time::interval(Duration::from_millis(500));
     let mut bench_start: Option<Instant> = None;
