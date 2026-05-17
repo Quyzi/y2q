@@ -27,28 +27,19 @@ use crate::auth::handlers as auth_handlers;
 pub fn configure(cfg: &mut web::ServiceConfig) {
     // Auth and user-management endpoints. Registered before the greedy
     // /{bucket}/{tail}* pattern so they aren't shadowed.
-    cfg.service(
-        web::resource("/api/v1/auth/login").route(web::post().to(auth_handlers::login)),
-    );
+    cfg.service(web::resource("/api/v1/auth/login").route(web::post().to(auth_handlers::login)));
     cfg.service(
         web::resource("/api/v1/auth/refresh").route(web::post().to(auth_handlers::refresh)),
     );
-    cfg.service(
-        web::resource("/api/v1/auth/logout").route(web::post().to(auth_handlers::logout)),
-    );
+    cfg.service(web::resource("/api/v1/auth/logout").route(web::post().to(auth_handlers::logout)));
     cfg.service(
         web::resource("/api/v1/auth/password")
             .route(web::post().to(auth_handlers::change_password)),
     );
+    cfg.service(web::resource("/api/v1/users/add").route(web::put().to(auth_handlers::add_user)));
+    cfg.service(web::resource("/api/v1/users").route(web::get().to(auth_handlers::list_users)));
     cfg.service(
-        web::resource("/api/v1/users/add").route(web::put().to(auth_handlers::add_user)),
-    );
-    cfg.service(
-        web::resource("/api/v1/users").route(web::get().to(auth_handlers::list_users)),
-    );
-    cfg.service(
-        web::resource("/api/v1/users/{user}")
-            .route(web::delete().to(auth_handlers::delete_user)),
+        web::resource("/api/v1/users/{user}").route(web::delete().to(auth_handlers::delete_user)),
     );
 
     // Object store + admin endpoints.
@@ -64,9 +55,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             .route(web::get().to(locks::list))
             .route(web::delete().to(locks::clear)),
     );
-    cfg.service(
-        web::resource("/api/v1/trace").route(web::get().to(crate::trace::stream)),
-    );
+    cfg.service(web::resource("/api/v1/trace").route(web::get().to(crate::trace::stream)));
 
     cfg.service(
         web::resource("/{bucket}/{tail}*")

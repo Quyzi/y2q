@@ -24,10 +24,15 @@ pub struct Y2qClient {
 
 impl Y2qClient {
     pub fn new(config: ClientConfig) -> Result<Self, ClientError> {
-        let base_url = Url::parse(&config.base_url)
-            .map_err(|e| ClientError::BadRequest { message: format!("invalid server URL: {e}") })?;
+        let base_url = Url::parse(&config.base_url).map_err(|e| ClientError::BadRequest {
+            message: format!("invalid server URL: {e}"),
+        })?;
         let inner = reqwest::ClientBuilder::new().build()?;
-        Ok(Self { inner, base_url, token: config.token })
+        Ok(Self {
+            inner,
+            base_url,
+            token: config.token,
+        })
     }
 
     pub fn with_token(mut self, token: impl Into<String>) -> Self {
@@ -60,10 +65,7 @@ impl Y2qClient {
             return Ok(resp);
         }
         let message = match resp.json::<serde_json::Value>().await {
-            Ok(v) => v["error"]
-                .as_str()
-                .unwrap_or("unknown error")
-                .to_owned(),
+            Ok(v) => v["error"].as_str().unwrap_or("unknown error").to_owned(),
             Err(_) => status
                 .canonical_reason()
                 .unwrap_or("unknown error")
@@ -74,7 +76,10 @@ impl Y2qClient {
             404 => ClientError::NotFound { message },
             409 => ClientError::Conflict { message },
             400 => ClientError::BadRequest { message },
-            code => ClientError::ServerError { status: code, message },
+            code => ClientError::ServerError {
+                status: code,
+                message,
+            },
         })
     }
 }

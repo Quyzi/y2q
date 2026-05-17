@@ -32,7 +32,10 @@ use recorder::Recorder;
 
 #[tokio::main]
 async fn main() {
-    fmt().with_env_filter(EnvFilter::from_default_env()).with_writer(std::io::stderr).init();
+    fmt()
+        .with_env_filter(EnvFilter::from_default_env())
+        .with_writer(std::io::stderr)
+        .init();
 
     let cli = Cli::parse();
     if let Err(e) = run(cli).await {
@@ -59,7 +62,16 @@ async fn run(cli: Cli) -> Result<(), WarpError> {
                 args.obj_size_max.as_deref(),
             )?;
             let run_id = Uuid::new_v4().to_string();
-            prepare(&client, &args.bucket, &run_id, args.objects, &obj_size, 8, None).await?;
+            prepare(
+                &client,
+                &args.bucket,
+                &run_id,
+                args.objects,
+                &obj_size,
+                8,
+                None,
+            )
+            .await?;
             println!("run_id: {run_id}");
             Ok(())
         }
@@ -138,14 +150,13 @@ async fn bench(
         std::path::PathBuf::from(format!("warp-{op_label}-{ts}.csv.zst"))
     });
 
-    let needs_pool = matches!(op, OpKind::Get | OpKind::Delete | OpKind::Stat)
-        || mixed_weights.is_some();
+    let needs_pool =
+        matches!(op, OpKind::Get | OpKind::Delete | OpKind::Stat) || mixed_weights.is_some();
 
     // Display channel and task start before prepare so seeding appears in TUI.
     let (disp_tx, disp_rx) = mpsc::channel::<DisplayMsg>(32);
     let display_op = op;
-    let mut display_task =
-        tokio::spawn(display::run_display(disp_rx, display_op, duration));
+    let mut display_task = tokio::spawn(display::run_display(disp_rx, display_op, duration));
 
     // Prepare phase — progress messages go through the TUI.
     let pool = if needs_pool {
@@ -225,7 +236,9 @@ async fn bench(
         let sd = shutdown_rx.clone();
         let ps = put_seq.clone();
         let pl = pool.clone();
-        worker_handles.push(tokio::spawn(worker::run_worker(cfg, wc, rh, tr, tx, sd, ps, pl)));
+        worker_handles.push(tokio::spawn(worker::run_worker(
+            cfg, wc, rh, tr, tx, sd, ps, pl,
+        )));
     }
     drop(rec_tx);
 
@@ -260,7 +273,15 @@ async fn init_client(
     alias: &str,
     config_path: &Option<std::path::PathBuf>,
     password: Option<&str>,
-) -> Result<(y2q_config::Profile, y2q_client::Y2qClient, u64, Zeroizing<String>), WarpError> {
+) -> Result<
+    (
+        y2q_config::Profile,
+        y2q_client::Y2qClient,
+        u64,
+        Zeroizing<String>,
+    ),
+    WarpError,
+> {
     let cfg_path = match config_path {
         Some(p) => p.clone(),
         None => y2q_config::default_config_path()?,

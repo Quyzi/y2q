@@ -25,7 +25,10 @@ use sha2::Digest;
 use tokio::sync::oneshot;
 use tokio_uring::fs::{File, OpenOptions};
 
-use crate::{Error, Metadata, Object, SyncLevel, crypto::{decrypt_meta, encrypt_meta}};
+use crate::{
+    Error, Metadata, Object, SyncLevel,
+    crypto::{decrypt_meta, encrypt_meta},
+};
 
 use super::{
     buffer::{AlignedBuf, DIRECT_IO_ALIGN, DIRECT_IO_CHUNK},
@@ -272,11 +275,7 @@ impl Drop for LockGuard {
 ///
 /// Writes the current timestamp into the lock so subsequent
 /// [`Error::Locked`] errors carry useful `since` data.
-async fn acquire_lock(
-    lock_path: PathBuf,
-    bucket: &str,
-    key: &str,
-) -> Result<LockGuard, Error> {
+async fn acquire_lock(lock_path: PathBuf, bucket: &str, key: &str) -> Result<LockGuard, Error> {
     let file = match OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -328,7 +327,12 @@ async fn open_and_read_header(
         Ok(h) => h,
         Err(e) => {
             let _ = file.close().await;
-            return Err(internal(bucket, key, op_name, format!("decode header: {e}")));
+            return Err(internal(
+                bucket,
+                key,
+                op_name,
+                format!("decode header: {e}"),
+            ));
         }
     };
     Ok((file, header))
@@ -394,8 +398,7 @@ async fn do_read_object_meta(path: PathBuf, mek: Option<[u8; 32]>) -> Result<Met
         let _ = file.close().await;
         return Err(make_err(format!("read header: {e}")));
     }
-    let header_bytes: [u8; HEADER_SIZE] =
-        buf.as_slice().try_into().expect("HEADER_SIZE buffer");
+    let header_bytes: [u8; HEADER_SIZE] = buf.as_slice().try_into().expect("HEADER_SIZE buffer");
     let header = match Header::decode(&header_bytes) {
         Ok(h) => h,
         Err(e) => {
@@ -511,7 +514,14 @@ async fn do_put(
             (true, prior)
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => (false, None),
-        Err(e) => return Err(internal(&bucket, &key, "put", format!("stat existing: {e}"))),
+        Err(e) => {
+            return Err(internal(
+                &bucket,
+                &key,
+                "put",
+                format!("stat existing: {e}"),
+            ));
+        }
     };
 
     // When the daemon supplied plaintext-derived size + checksums, persist
@@ -581,8 +591,16 @@ async fn do_put(
 
     let use_direct = large_object_bytes > 0 && payload.len() as u64 >= large_object_bytes;
     if use_direct {
-        match put_via_direct(&obj_path, &tmp_path, &bucket, &key, &payload, &meta_bytes, sync)
-            .await
+        match put_via_direct(
+            &obj_path,
+            &tmp_path,
+            &bucket,
+            &key,
+            &payload,
+            &meta_bytes,
+            sync,
+        )
+        .await
         {
             Ok(true) => return Ok((is_overwrite, metadata)),
             Ok(false) => {
@@ -596,10 +614,21 @@ async fn do_put(
         }
         // Mark the metadata so a future re-PUT (or `rebuild_cache`) can see
         // the fallback happened. Cheap; this branch is rare.
-        metadata.labels.insert("y2q.direct_io".to_owned(), "fallback".to_owned());
+        metadata
+            .labels
+            .insert("y2q.direct_io".to_owned(), "fallback".to_owned());
     }
 
-    put_via_buffered(&obj_path, &tmp_path, &bucket, &key, &payload, &meta_bytes, sync).await?;
+    put_via_buffered(
+        &obj_path,
+        &tmp_path,
+        &bucket,
+        &key,
+        &payload,
+        &meta_bytes,
+        sync,
+    )
+    .await?;
     Ok((is_overwrite, metadata))
 }
 
@@ -702,7 +731,12 @@ async fn put_via_direct(
         Err(e) => {
             let _ = fd_direct.close().await;
             let _ = tokio_uring::fs::remove_file(tmp_path).await;
-            return Err(internal(bucket, key, "put", format!("open buffered fd: {e}")));
+            return Err(internal(
+                bucket,
+                key,
+                "put",
+                format!("open buffered fd: {e}"),
+            ));
         }
     };
 
@@ -763,7 +797,12 @@ async fn put_via_direct(
         let (res, _) = fd_buffered.write_all_at(tail_vec, tail_offset).await;
         if let Err(e) = res {
             cleanup_direct_failure(fd_direct, fd_buffered, tmp_path).await;
-            return Err(internal(bucket, key, "put", format!("write data tail: {e}")));
+            return Err(internal(
+                bucket,
+                key,
+                "put",
+                format!("write data tail: {e}"),
+            ));
         }
     }
 

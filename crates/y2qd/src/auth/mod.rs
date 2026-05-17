@@ -78,9 +78,7 @@ fn parse_bearer(req: &HttpRequest) -> Result<String, AuthError> {
         .ok_or(AuthError::TokenMissing)?;
     let raw = header.to_str().map_err(|_| AuthError::TokenInvalid)?;
     let trimmed = raw.trim();
-    let (scheme, token) = trimmed
-        .split_once(' ')
-        .ok_or(AuthError::TokenInvalid)?;
+    let (scheme, token) = trimmed.split_once(' ').ok_or(AuthError::TokenInvalid)?;
     if !scheme.eq_ignore_ascii_case("Bearer") {
         return Err(AuthError::TokenInvalid);
     }

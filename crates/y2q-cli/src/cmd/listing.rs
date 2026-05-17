@@ -36,9 +36,9 @@ pub async fn run(
         Some(ref p) => {
             let remote = RemotePath::parse(p)?;
             let profile = config.get_profile(&remote.alias)?;
-            let token = store.token_for(&remote.alias).ok_or(CliError::Client(
-                y2q_client::ClientError::Unauthenticated,
-            ))?;
+            let token = store
+                .token_for(&remote.alias)
+                .ok_or(CliError::Client(y2q_client::ClientError::Unauthenticated))?;
             let client = Y2qClient::new(ClientConfig {
                 base_url: profile.url.clone(),
                 token: Some(token),
@@ -57,14 +57,21 @@ pub async fn run(
             } else {
                 let bucket = remote.bucket.as_deref().unwrap();
                 let prefix = remote.key.clone();
-                let opts = ListOptions { prefix, after, limit };
+                let opts = ListOptions {
+                    prefix,
+                    after,
+                    limit,
+                };
 
                 if all {
                     let mut cursor = None;
                     let mut all_items = vec![];
                     loop {
-                        let opts_page =
-                            ListOptions { prefix: opts.prefix.clone(), after: cursor, limit };
+                        let opts_page = ListOptions {
+                            prefix: opts.prefix.clone(),
+                            after: cursor,
+                            limit,
+                        };
                         let page = client.list_objects(bucket, &opts_page).await?;
                         all_items.extend(page.items);
                         cursor = page.next;

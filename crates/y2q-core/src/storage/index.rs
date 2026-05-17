@@ -154,7 +154,9 @@ impl MetadataIndex {
                         Some(ref ik) => encode_label_key_enc(ik, n, v, &bucket, &key),
                         None => encode_label_key(n, v, &bucket, &key),
                     };
-                    labels.insert(lk.as_slice(), [].as_slice()).map_err(map_redb)?;
+                    labels
+                        .insert(lk.as_slice(), [].as_slice())
+                        .map_err(map_redb)?;
                 }
             }
             txn.commit().map_err(map_redb)?;
@@ -350,7 +352,9 @@ impl MetadataIndex {
                     })?;
                     let bucket_hash = &key_bytes[..32];
                     buckets.push(m.bucket);
-                    let Some(next) = next_lex_after(bucket_hash) else { break };
+                    let Some(next) = next_lex_after(bucket_hash) else {
+                        break;
+                    };
                     start = next;
                 } else {
                     // Plaintext: decode bucket name from key bytes.
@@ -625,7 +629,13 @@ fn encode_bucket_prefix_enc(ik: &[u8; 32], bucket: &str) -> [u8; 32] {
 }
 
 /// Label key: four 32-byte HMAC blocks = 128 bytes total.
-fn encode_label_key_enc(ik: &[u8; 32], name: &str, value: &str, bucket: &str, key: &str) -> Vec<u8> {
+fn encode_label_key_enc(
+    ik: &[u8; 32],
+    name: &str,
+    value: &str,
+    bucket: &str,
+    key: &str,
+) -> Vec<u8> {
     let mut out = Vec::with_capacity(128);
     out.extend_from_slice(&field_hmac(ik, b"ln\x00", name));
     out.extend_from_slice(&field_hmac(ik, b"lv\x00", value));

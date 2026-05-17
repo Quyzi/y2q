@@ -68,7 +68,10 @@ impl Recorder {
             _ => return,
         };
 
-        self.histograms.entry(op).or_insert_with(|| OpHistograms::new(op)).record(rec);
+        self.histograms
+            .entry(op)
+            .or_insert_with(|| OpHistograms::new(op))
+            .record(rec);
 
         // Segment accounting
         let window = rec.start_ns / SEGMENT_NS;

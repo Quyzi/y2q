@@ -17,14 +17,20 @@ pub struct TuiProgressReporter {
 
 impl TuiProgressReporter {
     pub fn new() -> Self {
-        Self { label: String::new(), total: None, samples: VecDeque::with_capacity(60) }
+        Self {
+            label: String::new(),
+            total: None,
+            samples: VecDeque::with_capacity(60),
+        }
     }
 
     fn render(&self, bytes_done: u64, speed_bps: u64) {
         let mut stderr = std::io::stderr();
         // Clamp output to one terminal row so MoveToColumn(0) is always sufficient.
-        let term_width =
-            crossterm::terminal::size().map(|(w, _)| w as usize).unwrap_or(80).max(20);
+        let term_width = crossterm::terminal::size()
+            .map(|(w, _)| w as usize)
+            .unwrap_or(80)
+            .max(20);
 
         let bar_width: usize = 30;
         let filled = if let Some(total) = self.total {

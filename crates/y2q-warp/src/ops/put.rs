@@ -7,7 +7,10 @@ use crate::generator::BoundedRepeatReader;
 use crate::metrics::OpRecord;
 
 fn wall_ns() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64
 }
 
 pub async fn put_op(

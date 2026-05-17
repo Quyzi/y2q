@@ -214,12 +214,14 @@ impl UringStorage {
         let lock_path = obj_path.with_extension("lock");
 
         if let Some(parent) = obj_path.parent() {
-            tokio::fs::create_dir_all(parent).await.map_err(|e| Error::InternalError {
-                bucket: bucket.to_owned(),
-                key: key.to_owned(),
-                operation: "begin_streaming_put".to_owned(),
-                message: format!("mkdir: {e}"),
-            })?;
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| Error::InternalError {
+                    bucket: bucket.to_owned(),
+                    key: key.to_owned(),
+                    operation: "begin_streaming_put".to_owned(),
+                    message: format!("mkdir: {e}"),
+                })?;
         }
 
         // Detect overwrite before acquiring the lock (ReadObjectMeta skips
@@ -307,12 +309,14 @@ impl UringStorage {
 
         use tokio::io::AsyncWriteExt as _;
         let placeholder = [0u8; super::format::HEADER_SIZE];
-        file.write_all(&placeholder).await.map_err(|e| Error::InternalError {
-            bucket: bucket.to_owned(),
-            key: key.to_owned(),
-            operation: "begin_streaming_put".to_owned(),
-            message: format!("write placeholder header: {e}"),
-        })?;
+        file.write_all(&placeholder)
+            .await
+            .map_err(|e| Error::InternalError {
+                bucket: bucket.to_owned(),
+                key: key.to_owned(),
+                operation: "begin_streaming_put".to_owned(),
+                message: format!("write placeholder header: {e}"),
+            })?;
 
         let guard = UringStreamingPutGuard::new(
             tmp_path,
@@ -344,8 +348,7 @@ fn read_lock_since_sync(path: &std::path::Path) -> std::time::SystemTime {
             b.get(..8)
                 .and_then(|s| <[u8; 8]>::try_from(s).ok())
                 .map(|arr| {
-                    std::time::UNIX_EPOCH
-                        + std::time::Duration::from_nanos(u64::from_le_bytes(arr))
+                    std::time::UNIX_EPOCH + std::time::Duration::from_nanos(u64::from_le_bytes(arr))
                 })
         })
         .unwrap_or(std::time::UNIX_EPOCH)
@@ -542,7 +545,11 @@ impl Storage for UringStorage {
             reply,
         };
         let result = self.dispatch(op, bucket, key, "describe", reply_rx).await;
-        record_storage_op("describe", &result, started.elapsed().as_secs_f64() * 1_000.0);
+        record_storage_op(
+            "describe",
+            &result,
+            started.elapsed().as_secs_f64() * 1_000.0,
+        );
         result
     }
 }
@@ -918,7 +925,14 @@ mod tests {
             .unwrap();
 
         let slice = storage
-            .get_range("b", "k", RangeInclusive { start: 100, last: 199 })
+            .get_range(
+                "b",
+                "k",
+                RangeInclusive {
+                    start: 100,
+                    last: 199,
+                },
+            )
             .await
             .unwrap();
         assert_eq!(slice.len(), 100);
@@ -926,7 +940,14 @@ mod tests {
 
         // Range past EOF clamps to actual length.
         let tail = storage
-            .get_range("b", "k", RangeInclusive { start: 4000, last: 999_999 })
+            .get_range(
+                "b",
+                "k",
+                RangeInclusive {
+                    start: 4000,
+                    last: 999_999,
+                },
+            )
             .await
             .unwrap();
         assert_eq!(tail.len(), 96);
@@ -934,7 +955,14 @@ mod tests {
 
         // Start past EOF returns empty.
         let empty = storage
-            .get_range("b", "k", RangeInclusive { start: 10_000, last: 20_000 })
+            .get_range(
+                "b",
+                "k",
+                RangeInclusive {
+                    start: 10_000,
+                    last: 20_000,
+                },
+            )
             .await
             .unwrap();
         assert!(empty.is_empty());
@@ -966,7 +994,10 @@ mod tests {
             .put("b", "beta", payload(b"bb"), PutOptions::default())
             .await
             .unwrap();
-        let page = storage.list_objects("b", ListOptions::default()).await.unwrap();
+        let page = storage
+            .list_objects("b", ListOptions::default())
+            .await
+            .unwrap();
         let keys: Vec<_> = page.items.iter().map(|m| m.key.clone()).collect();
         assert_eq!(keys, vec!["alpha".to_owned(), "beta".to_owned()]);
         let buckets = storage.list_buckets().await.unwrap();
@@ -1090,7 +1121,10 @@ mod tests {
             .try_into()
             .unwrap();
         let header = super::super::format::Header::decode(&header_arr).unwrap();
-        assert_eq!(header.data_offset, super::super::format::Header::MIN_DATA_OFFSET);
+        assert_eq!(
+            header.data_offset,
+            super::super::format::Header::MIN_DATA_OFFSET
+        );
         assert_eq!(
             header.flags & super::super::format::flags::WRITTEN_O_DIRECT,
             0,
@@ -1170,7 +1204,11 @@ mod tests {
     async fn rebuild_repopulates_index_after_wipe() {
         let dir = TempDir::new().unwrap();
         let storage = make_storage(&dir, 2);
-        for (k, v) in [("alpha", &b"a"[..]), ("beta", &b"bb"[..]), ("gamma", &b"ccc"[..])] {
+        for (k, v) in [
+            ("alpha", &b"a"[..]),
+            ("beta", &b"bb"[..]),
+            ("gamma", &b"ccc"[..]),
+        ] {
             storage
                 .put("b", k, payload(v), PutOptions::default())
                 .await
@@ -1193,14 +1231,20 @@ mod tests {
         )
         .unwrap();
         // Index is empty right now.
-        let page = storage.list_objects("b", ListOptions::default()).await.unwrap();
+        let page = storage
+            .list_objects("b", ListOptions::default())
+            .await
+            .unwrap();
         assert!(page.items.is_empty());
 
         storage.rebuild_cache().await.unwrap();
         let final_state = wait_for_rebuild(&storage).await;
         assert!(matches!(final_state, super::CacheRebuildStatus::Completed));
 
-        let page = storage.list_objects("b", ListOptions::default()).await.unwrap();
+        let page = storage
+            .list_objects("b", ListOptions::default())
+            .await
+            .unwrap();
         let keys: Vec<_> = page.items.iter().map(|m| m.key.clone()).collect();
         assert_eq!(
             keys,
@@ -1233,7 +1277,10 @@ mod tests {
             super::CacheRebuildStatus::Completed
         ));
 
-        let page = storage.list_objects("b", ListOptions::default()).await.unwrap();
+        let page = storage
+            .list_objects("b", ListOptions::default())
+            .await
+            .unwrap();
         let keys: Vec<_> = page.items.iter().map(|m| m.key.clone()).collect();
         assert_eq!(keys, vec!["real".to_owned()]);
     }
@@ -1249,12 +1296,7 @@ mod tests {
         // with our second call.
         for i in 0..32 {
             storage
-                .put(
-                    "b",
-                    &format!("k{i}"),
-                    payload(b"x"),
-                    PutOptions::default(),
-                )
+                .put("b", &format!("k{i}"), payload(b"x"), PutOptions::default())
                 .await
                 .unwrap();
         }

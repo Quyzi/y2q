@@ -36,7 +36,12 @@ impl LocalPane {
         let cwd = BaseDirs::new()
             .map(|d| d.home_dir().to_owned())
             .unwrap_or_else(|| PathBuf::from("/"));
-        let mut pane = Self { cwd, entries: vec![], selected: 0, scroll: 0 };
+        let mut pane = Self {
+            cwd,
+            entries: vec![],
+            selected: 0,
+            scroll: 0,
+        };
         pane.refresh();
         pane
     }
@@ -78,7 +83,10 @@ impl LocalPane {
             match entry {
                 LocalEntry::Dir(ref name) => {
                     let new_cwd = if name == ".." {
-                        self.cwd.parent().map(|p| p.to_owned()).unwrap_or_else(|| self.cwd.clone())
+                        self.cwd
+                            .parent()
+                            .map(|p| p.to_owned())
+                            .unwrap_or_else(|| self.cwd.clone())
                     } else {
                         self.cwd.join(name)
                     };

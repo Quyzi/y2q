@@ -268,7 +268,12 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let missing = dir.path().join("does-not-exist");
         let now = SystemTime::now();
-        assert!(list_stale_locks_under(&missing, now).await.unwrap().is_empty());
+        assert!(
+            list_stale_locks_under(&missing, now)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(clear_stale_locks_under(&missing, now).await.unwrap(), 0);
     }
 

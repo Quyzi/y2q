@@ -70,7 +70,9 @@ pub fn encrypt_meta(mek: &[u8; 32], json: &[u8]) -> Result<Vec<u8>, CryptoError>
     let mut nonce_bytes = [0u8; NONCE_LEN];
     rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
     let nonce = aes_gcm::Nonce::from_slice(&nonce_bytes);
-    let ct = cipher.encrypt(nonce, json).map_err(|_| CryptoError::Aead("metadata encrypt"))?;
+    let ct = cipher
+        .encrypt(nonce, json)
+        .map_err(|_| CryptoError::Aead("metadata encrypt"))?;
     let mut out = Vec::with_capacity(1 + NONCE_LEN + ct.len());
     out.push(VERSION_BYTE);
     out.extend_from_slice(&nonce_bytes);
@@ -87,10 +89,14 @@ pub fn decrypt_meta(mek: &[u8; 32], blob: &[u8]) -> Result<Vec<u8>, CryptoError>
         return Ok(blob.to_vec());
     }
     if blob.len() < MIN_ENCRYPTED_LEN {
-        return Err(CryptoError::Envelope("metadata blob too short for decryption"));
+        return Err(CryptoError::Envelope(
+            "metadata blob too short for decryption",
+        ));
     }
     let nonce = aes_gcm::Nonce::from_slice(&blob[1..1 + NONCE_LEN]);
     let ct = &blob[1 + NONCE_LEN..];
     let cipher = Aes256Gcm::new(mek.into());
-    cipher.decrypt(nonce, ct).map_err(|_| CryptoError::AuthFailed)
+    cipher
+        .decrypt(nonce, ct)
+        .map_err(|_| CryptoError::AuthFailed)
 }

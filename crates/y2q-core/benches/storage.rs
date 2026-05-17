@@ -80,8 +80,8 @@ fn backends() -> Vec<Backend> {
 
     let fs_dir = scratch_dir();
     let fs_base = fs_dir.path().to_path_buf();
-    let fs = FilesystemStorage::new(&fs_base, fs_base.join("idx.redb"))
-        .expect("init FilesystemStorage");
+    let fs =
+        FilesystemStorage::new(&fs_base, fs_base.join("idx.redb")).expect("init FilesystemStorage");
     out.push(Backend {
         name: "filesystem",
         storage: Arc::new(AnyStorage::Filesystem(fs)),
@@ -136,28 +136,19 @@ fn bench_put(c: &mut Criterion) {
             let body_outer = body.clone();
             let rt_outer = Arc::clone(&rt);
 
-            group.bench_with_input(
-                BenchmarkId::new(backend.name, size),
-                &size,
-                move |b, _| {
-                    b.to_async(&*rt_outer).iter(|| {
-                        let storage = Arc::clone(&storage);
-                        let body = body_outer.clone();
-                        let key = key.clone();
-                        async move {
-                            storage
-                                .put(
-                                    "bench",
-                                    &key,
-                                    Object::new(body),
-                                    PutOptions::default(),
-                                )
-                                .await
-                                .expect("put");
-                        }
-                    });
-                },
-            );
+            group.bench_with_input(BenchmarkId::new(backend.name, size), &size, move |b, _| {
+                b.to_async(&*rt_outer).iter(|| {
+                    let storage = Arc::clone(&storage);
+                    let body = body_outer.clone();
+                    let key = key.clone();
+                    async move {
+                        storage
+                            .put("bench", &key, Object::new(body), PutOptions::default())
+                            .await
+                            .expect("put");
+                    }
+                });
+            });
         }
     }
     group.finish();
@@ -186,19 +177,15 @@ fn bench_get(c: &mut Criterion) {
 
             let storage = Arc::clone(&backend.storage);
             let rt_outer = Arc::clone(&rt);
-            group.bench_with_input(
-                BenchmarkId::new(backend.name, size),
-                &size,
-                move |b, _| {
-                    b.to_async(&*rt_outer).iter(|| {
-                        let storage = Arc::clone(&storage);
-                        let key = key.clone();
-                        async move {
-                            let _ = storage.get("bench", &key).await.expect("get");
-                        }
-                    });
-                },
-            );
+            group.bench_with_input(BenchmarkId::new(backend.name, size), &size, move |b, _| {
+                b.to_async(&*rt_outer).iter(|| {
+                    let storage = Arc::clone(&storage);
+                    let key = key.clone();
+                    async move {
+                        let _ = storage.get("bench", &key).await.expect("get");
+                    }
+                });
+            });
         }
     }
     group.finish();
@@ -242,7 +229,10 @@ fn bench_get_range(c: &mut Criterion) {
                     last: s + (slice_len as u64) - 1,
                 };
                 async move {
-                    let _ = storage.get_range("bench", "rng", r).await.expect("get_range");
+                    let _ = storage
+                        .get_range("bench", "rng", r)
+                        .await
+                        .expect("get_range");
                 }
             });
         });

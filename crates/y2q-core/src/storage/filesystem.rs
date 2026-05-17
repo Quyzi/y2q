@@ -17,7 +17,7 @@ use crate::{
     Storage, StorageExt, SyncLevel,
     crypto::{decrypt_meta, encrypt_meta},
     storage::{
-        format::{self, Header, HEADER_SIZE},
+        format::{self, HEADER_SIZE, Header},
         locks::{clear_stale_locks_under, list_stale_locks_under},
     },
 };
@@ -28,8 +28,7 @@ use crate::{
 /// chosen as a stable, well-known constant so the same key always maps to the
 /// same filename regardless of which process or host computes it.
 const Y2Q_NAMESPACE: Uuid = Uuid::from_bytes([
-    0x6b, 0xa7, 0xb8, 0x11, 0x9d, 0xad, 0x11, 0xd1, 0x80, 0xb4, 0x00, 0xc0, 0x4f, 0xd4, 0x30,
-    0xc8,
+    0x6b, 0xa7, 0xb8, 0x11, 0x9d, 0xad, 0x11, 0xd1, 0x80, 0xb4, 0x00, 0xc0, 0x4f, 0xd4, 0x30, 0xc8,
 ]);
 
 /// A [`Storage`] backend that persists objects on a local filesystem.
@@ -258,13 +257,17 @@ async fn check_not_locked(lock_path: &Path, bucket: &str, key: &str) -> Result<(
 }
 
 /// Read and decode the metadata embedded in a `.obj` file at `path`.
-async fn read_obj_metadata(path: &Path, mek: Option<&[u8; 32]>) -> Result<Metadata, std::io::Error> {
+async fn read_obj_metadata(
+    path: &Path,
+    mek: Option<&[u8; 32]>,
+) -> Result<Metadata, std::io::Error> {
     let mut file = tokio::fs::File::open(path).await?;
     let mut header_buf = [0u8; HEADER_SIZE];
     file.read_exact(&mut header_buf).await?;
     let header = Header::decode(&header_buf)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
-    file.seek(std::io::SeekFrom::Start(header.meta_offset())).await?;
+    file.seek(std::io::SeekFrom::Start(header.meta_offset()))
+        .await?;
     let mut meta_buf = vec![0u8; header.meta_len as usize];
     file.read_exact(&mut meta_buf).await?;
     let json = if let Some(mek) = mek {
@@ -366,32 +369,40 @@ impl StreamingPutGuard {
         };
 
         // File is at EOF after EncryptSession. Append meta then trailer.
-        file.write_all(&meta_bytes).await.map_err(|e| Error::InternalError {
-            bucket: bucket.to_owned(),
-            key: key.to_owned(),
-            operation: "put".to_owned(),
-            message: format!("write meta: {e}"),
-        })?;
-        file.write_all(&header.encode()).await.map_err(|e| Error::InternalError {
-            bucket: bucket.to_owned(),
-            key: key.to_owned(),
-            operation: "put".to_owned(),
-            message: format!("write trailer: {e}"),
-        })?;
+        file.write_all(&meta_bytes)
+            .await
+            .map_err(|e| Error::InternalError {
+                bucket: bucket.to_owned(),
+                key: key.to_owned(),
+                operation: "put".to_owned(),
+                message: format!("write meta: {e}"),
+            })?;
+        file.write_all(&header.encode())
+            .await
+            .map_err(|e| Error::InternalError {
+                bucket: bucket.to_owned(),
+                key: key.to_owned(),
+                operation: "put".to_owned(),
+                message: format!("write trailer: {e}"),
+            })?;
 
         // Overwrite the placeholder header at offset 0 with the real one.
-        file.seek(std::io::SeekFrom::Start(0)).await.map_err(|e| Error::InternalError {
-            bucket: bucket.to_owned(),
-            key: key.to_owned(),
-            operation: "put".to_owned(),
-            message: format!("seek to header: {e}"),
-        })?;
-        file.write_all(&header.encode()).await.map_err(|e| Error::InternalError {
-            bucket: bucket.to_owned(),
-            key: key.to_owned(),
-            operation: "put".to_owned(),
-            message: format!("write header: {e}"),
-        })?;
+        file.seek(std::io::SeekFrom::Start(0))
+            .await
+            .map_err(|e| Error::InternalError {
+                bucket: bucket.to_owned(),
+                key: key.to_owned(),
+                operation: "put".to_owned(),
+                message: format!("seek to header: {e}"),
+            })?;
+        file.write_all(&header.encode())
+            .await
+            .map_err(|e| Error::InternalError {
+                bucket: bucket.to_owned(),
+                key: key.to_owned(),
+                operation: "put".to_owned(),
+                message: format!("write header: {e}"),
+            })?;
 
         if options.sync == SyncLevel::Durable {
             file.sync_data().await.map_err(|e| Error::InternalError {
@@ -500,12 +511,14 @@ impl FilesystemStorage {
                 message: format!("open tmp: {e}"),
             })?;
 
-        file.write_all(&[0u8; HEADER_SIZE]).await.map_err(|e| Error::InternalError {
-            bucket: bucket.to_owned(),
-            key: key.to_owned(),
-            operation: "begin_streaming_put".to_owned(),
-            message: format!("write placeholder header: {e}"),
-        })?;
+        file.write_all(&[0u8; HEADER_SIZE])
+            .await
+            .map_err(|e| Error::InternalError {
+                bucket: bucket.to_owned(),
+                key: key.to_owned(),
+                operation: "begin_streaming_put".to_owned(),
+                message: format!("write placeholder header: {e}"),
+            })?;
 
         let guard = StreamingPutGuard {
             tmp_path,
@@ -551,12 +564,14 @@ impl Storage for FilesystemStorage {
             };
 
             let mut header_buf = [0u8; HEADER_SIZE];
-            file.read_exact(&mut header_buf).await.map_err(|e| Error::InternalError {
-                bucket: bucket.to_owned(),
-                key: key.to_owned(),
-                operation: "get".to_owned(),
-                message: format!("read header: {e}"),
-            })?;
+            file.read_exact(&mut header_buf)
+                .await
+                .map_err(|e| Error::InternalError {
+                    bucket: bucket.to_owned(),
+                    key: key.to_owned(),
+                    operation: "get".to_owned(),
+                    message: format!("read header: {e}"),
+                })?;
             let header = Header::decode(&header_buf).map_err(|e| Error::InternalError {
                 bucket: bucket.to_owned(),
                 key: key.to_owned(),
@@ -574,12 +589,14 @@ impl Storage for FilesystemStorage {
                 })?;
 
             let mut data = vec![0u8; header.data_len as usize];
-            file.read_exact(&mut data).await.map_err(|e| Error::InternalError {
-                bucket: bucket.to_owned(),
-                key: key.to_owned(),
-                operation: "get".to_owned(),
-                message: format!("read data: {e}"),
-            })?;
+            file.read_exact(&mut data)
+                .await
+                .map_err(|e| Error::InternalError {
+                    bucket: bucket.to_owned(),
+                    key: key.to_owned(),
+                    operation: "get".to_owned(),
+                    message: format!("read data: {e}"),
+                })?;
 
             Ok(Object::new(Bytes::from(data)))
         }
@@ -619,12 +636,14 @@ impl Storage for FilesystemStorage {
         };
 
         let mut header_buf = [0u8; HEADER_SIZE];
-        file.read_exact(&mut header_buf).await.map_err(|e| Error::InternalError {
-            bucket: bucket.to_owned(),
-            key: key.to_owned(),
-            operation: "get_range".to_owned(),
-            message: format!("read header: {e}"),
-        })?;
+        file.read_exact(&mut header_buf)
+            .await
+            .map_err(|e| Error::InternalError {
+                bucket: bucket.to_owned(),
+                key: key.to_owned(),
+                operation: "get_range".to_owned(),
+                message: format!("read header: {e}"),
+            })?;
         let header = Header::decode(&header_buf).map_err(|e| Error::InternalError {
             bucket: bucket.to_owned(),
             key: key.to_owned(),
@@ -650,12 +669,14 @@ impl Storage for FilesystemStorage {
             })?;
 
         let mut data = vec![0u8; len];
-        file.read_exact(&mut data).await.map_err(|e| Error::InternalError {
-            bucket: bucket.to_owned(),
-            key: key.to_owned(),
-            operation: "get_range".to_owned(),
-            message: format!("read data: {e}"),
-        })?;
+        file.read_exact(&mut data)
+            .await
+            .map_err(|e| Error::InternalError {
+                bucket: bucket.to_owned(),
+                key: key.to_owned(),
+                operation: "get_range".to_owned(),
+                message: format!("read data: {e}"),
+            })?;
 
         Ok(Bytes::from(data))
     }
@@ -710,7 +731,11 @@ impl Storage for FilesystemStorage {
             let created = prior_created.unwrap_or(now);
 
             let (size, checksum_md5, checksum_sha256) = match &options.plaintext_metrics {
-                Some(p) => (p.size, p.checksum_md5_b64.clone(), p.checksum_sha256_b64.clone()),
+                Some(p) => (
+                    p.size,
+                    p.checksum_md5_b64.clone(),
+                    p.checksum_sha256_b64.clone(),
+                ),
                 None => {
                     let (md5, sha) = compute_checksums(data);
                     (data.len() as u64, md5, sha)
@@ -788,38 +813,53 @@ impl Storage for FilesystemStorage {
                     message: e.to_string(),
                 })?;
 
-            tmp_file.write_all(&header.encode()).await.map_err(|e| Error::InternalError {
-                bucket: bucket.to_owned(),
-                key: key.to_owned(),
-                operation: "put".to_owned(),
-                message: format!("write header: {e}"),
-            })?;
-            tmp_file.write_all(data).await.map_err(|e| Error::InternalError {
-                bucket: bucket.to_owned(),
-                key: key.to_owned(),
-                operation: "put".to_owned(),
-                message: format!("write data: {e}"),
-            })?;
-            tmp_file.write_all(&meta_bytes).await.map_err(|e| Error::InternalError {
-                bucket: bucket.to_owned(),
-                key: key.to_owned(),
-                operation: "put".to_owned(),
-                message: format!("write meta: {e}"),
-            })?;
-            tmp_file.write_all(&header.encode()).await.map_err(|e| Error::InternalError {
-                bucket: bucket.to_owned(),
-                key: key.to_owned(),
-                operation: "put".to_owned(),
-                message: format!("write trailer: {e}"),
-            })?;
-
-            if options.sync == SyncLevel::Durable {
-                tmp_file.sync_data().await.map_err(|e| Error::InternalError {
+            tmp_file
+                .write_all(&header.encode())
+                .await
+                .map_err(|e| Error::InternalError {
                     bucket: bucket.to_owned(),
                     key: key.to_owned(),
                     operation: "put".to_owned(),
-                    message: format!("fdatasync: {e}"),
+                    message: format!("write header: {e}"),
                 })?;
+            tmp_file
+                .write_all(data)
+                .await
+                .map_err(|e| Error::InternalError {
+                    bucket: bucket.to_owned(),
+                    key: key.to_owned(),
+                    operation: "put".to_owned(),
+                    message: format!("write data: {e}"),
+                })?;
+            tmp_file
+                .write_all(&meta_bytes)
+                .await
+                .map_err(|e| Error::InternalError {
+                    bucket: bucket.to_owned(),
+                    key: key.to_owned(),
+                    operation: "put".to_owned(),
+                    message: format!("write meta: {e}"),
+                })?;
+            tmp_file
+                .write_all(&header.encode())
+                .await
+                .map_err(|e| Error::InternalError {
+                    bucket: bucket.to_owned(),
+                    key: key.to_owned(),
+                    operation: "put".to_owned(),
+                    message: format!("write trailer: {e}"),
+                })?;
+
+            if options.sync == SyncLevel::Durable {
+                tmp_file
+                    .sync_data()
+                    .await
+                    .map_err(|e| Error::InternalError {
+                        bucket: bucket.to_owned(),
+                        key: key.to_owned(),
+                        operation: "put".to_owned(),
+                        message: format!("fdatasync: {e}"),
+                    })?;
             }
             drop(tmp_file);
 
@@ -884,12 +924,14 @@ impl Storage for FilesystemStorage {
             };
 
             let mut header_buf = [0u8; HEADER_SIZE];
-            file.read_exact(&mut header_buf).await.map_err(|e| Error::InternalError {
-                bucket: bucket.to_owned(),
-                key: key.to_owned(),
-                operation: "delete".to_owned(),
-                message: format!("read header: {e}"),
-            })?;
+            file.read_exact(&mut header_buf)
+                .await
+                .map_err(|e| Error::InternalError {
+                    bucket: bucket.to_owned(),
+                    key: key.to_owned(),
+                    operation: "delete".to_owned(),
+                    message: format!("read header: {e}"),
+                })?;
             let header = Header::decode(&header_buf).map_err(|e| Error::InternalError {
                 bucket: bucket.to_owned(),
                 key: key.to_owned(),
@@ -907,12 +949,14 @@ impl Storage for FilesystemStorage {
                 })?;
 
             let mut data = vec![0u8; header.data_len as usize];
-            file.read_exact(&mut data).await.map_err(|e| Error::InternalError {
-                bucket: bucket.to_owned(),
-                key: key.to_owned(),
-                operation: "delete".to_owned(),
-                message: format!("read data: {e}"),
-            })?;
+            file.read_exact(&mut data)
+                .await
+                .map_err(|e| Error::InternalError {
+                    bucket: bucket.to_owned(),
+                    key: key.to_owned(),
+                    operation: "delete".to_owned(),
+                    message: format!("read data: {e}"),
+                })?;
             drop(file);
 
             tokio::fs::remove_file(&obj_path).await.ok();
@@ -959,7 +1003,11 @@ impl Storage for FilesystemStorage {
                 })
         }
         .await;
-        record_storage_op("describe", &result, started.elapsed().as_secs_f64() * 1_000.0);
+        record_storage_op(
+            "describe",
+            &result,
+            started.elapsed().as_secs_f64() * 1_000.0,
+        );
         result
     }
 }
@@ -1589,7 +1637,9 @@ mod tests {
             .unwrap();
 
         // Remove the ghost's .obj file but leave its index entry.
-        tokio::fs::remove_file(s.key_path("b", "ghost")).await.unwrap();
+        tokio::fs::remove_file(s.key_path("b", "ghost"))
+            .await
+            .unwrap();
 
         assert!(
             s.index()
@@ -1683,6 +1733,9 @@ mod tests {
         let header = Header::decode(&header_arr).unwrap();
         assert_eq!(header.data_len, body.len() as u64);
         assert_eq!(header.data_offset, Header::MIN_DATA_OFFSET);
-        assert_eq!(&bytes[header.data_offset as usize..header.data_offset as usize + body.len()], body);
+        assert_eq!(
+            &bytes[header.data_offset as usize..header.data_offset as usize + body.len()],
+            body
+        );
     }
 }

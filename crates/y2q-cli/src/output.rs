@@ -9,7 +9,10 @@ pub enum OutputMode {
 }
 
 pub fn print_json<T: Serialize>(value: &T) {
-    println!("{}", serde_json::to_string_pretty(value).unwrap_or_default());
+    println!(
+        "{}",
+        serde_json::to_string_pretty(value).unwrap_or_default()
+    );
 }
 
 /// Format nanosecond timestamp to a local datetime string.

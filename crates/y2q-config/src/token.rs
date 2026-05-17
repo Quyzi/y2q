@@ -41,7 +41,9 @@ pub struct TokenStore {
 impl TokenStore {
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
         if !path.exists() {
-            return Ok(Self { inner: TokenFile::default() });
+            return Ok(Self {
+                inner: TokenFile::default(),
+            });
         }
         check_permissions(path);
         let text = std::fs::read_to_string(path)?;
@@ -54,8 +56,8 @@ impl TokenStore {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let text = toml::to_string_pretty(&self.inner)
-            .map_err(|e| ConfigError::Config(e.to_string()))?;
+        let text =
+            toml::to_string_pretty(&self.inner).map_err(|e| ConfigError::Config(e.to_string()))?;
         atomic_write(path, text.as_bytes())?;
         set_mode_600(path);
         Ok(())
@@ -78,6 +80,7 @@ impl TokenStore {
     }
 
     pub fn token_for(&self, alias: &str) -> Option<Zeroizing<String>> {
-        self.get_valid(alias).map(|e| Zeroizing::new(e.token.clone()))
+        self.get_valid(alias)
+            .map(|e| Zeroizing::new(e.token.clone()))
     }
 }

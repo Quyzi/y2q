@@ -22,11 +22,11 @@ use pqcrypto_traits::kem::{PublicKey as KemPublicKeyTrait, SecretKey as KemSecre
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use super::CryptoError;
 use super::envelope::KEM_ALG_NAME;
 use super::kdf::{Argon2Params, wrap_sk};
 use super::keys::Keystore;
 use super::user_store::{UserRecord, UserStore};
-use super::CryptoError;
 
 /// Standard filenames within the keystore directory.
 pub struct KeystoreFiles {
@@ -90,22 +90,24 @@ pub fn load(dir: &Path) -> Result<(Keystore, UserStore), CryptoError> {
     }
     let raw = fs::read(&files.pubkey)
         .map_err(|e| CryptoError::KeystoreIo(format!("read {}: {e}", files.pubkey.display())))?;
-    let parsed: PubkeyFile = serde_json::from_slice(&raw).map_err(|e| CryptoError::KeystoreCorrupt {
-        path: files.pubkey.display().to_string(),
-        reason: format!("parse: {e}"),
-    })?;
+    let parsed: PubkeyFile =
+        serde_json::from_slice(&raw).map_err(|e| CryptoError::KeystoreCorrupt {
+            path: files.pubkey.display().to_string(),
+            reason: format!("parse: {e}"),
+        })?;
     if parsed.kem_alg != KEM_ALG_NAME {
         return Err(CryptoError::KeystoreCorrupt {
             path: files.pubkey.display().to_string(),
             reason: format!("kem_alg mismatch: {}", parsed.kem_alg),
         });
     }
-    let pk_bytes = STANDARD
-        .decode(&parsed.public_key_b64)
-        .map_err(|e| CryptoError::KeystoreCorrupt {
-            path: files.pubkey.display().to_string(),
-            reason: format!("base64 decode: {e}"),
-        })?;
+    let pk_bytes =
+        STANDARD
+            .decode(&parsed.public_key_b64)
+            .map_err(|e| CryptoError::KeystoreCorrupt {
+                path: files.pubkey.display().to_string(),
+                reason: format!("base64 decode: {e}"),
+            })?;
     if pk_bytes.len() != mlkem768::public_key_bytes() {
         return Err(CryptoError::KeystoreCorrupt {
             path: files.pubkey.display().to_string(),
@@ -269,7 +271,12 @@ mod tests {
     fn first_run_then_load() {
         let dir = tempdir().unwrap();
         let fingerprint = {
-            let outcome = first_run(dir.path(), "root", Argon2Params::with_random_salt(8 * 1024, 1, 1)).unwrap();
+            let outcome = first_run(
+                dir.path(),
+                "root",
+                Argon2Params::with_random_salt(8 * 1024, 1, 1),
+            )
+            .unwrap();
             assert!(!outcome.root_password.is_empty());
             assert_eq!(outcome.keystore.kem_alg, KEM_ALG_NAME);
             assert_eq!(outcome.keystore.fingerprint.len(), 64);
@@ -284,9 +291,18 @@ mod tests {
     #[test]
     fn first_run_refuses_overwrite() {
         let dir = tempdir().unwrap();
-        let _ = first_run(dir.path(), "root", Argon2Params::with_random_salt(8 * 1024, 1, 1)).unwrap();
+        let _ = first_run(
+            dir.path(),
+            "root",
+            Argon2Params::with_random_salt(8 * 1024, 1, 1),
+        )
+        .unwrap();
         assert!(matches!(
-            first_run(dir.path(), "root", Argon2Params::with_random_salt(8 * 1024, 1, 1)),
+            first_run(
+                dir.path(),
+                "root",
+                Argon2Params::with_random_salt(8 * 1024, 1, 1)
+            ),
             Err(CryptoError::KeystoreIo(_))
         ));
     }

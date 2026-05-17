@@ -28,7 +28,11 @@ struct TuiTransferReporter {
 impl ProgressReporter for TuiTransferReporter {
     fn start(&mut self, _: &str, _: Option<u64>) {}
     fn update(&mut self, bytes_done: u64, speed_bps: u64) {
-        let _ = self.tx.send(Event::TransferUpdate { id: self.id, bytes_done, speed_bps });
+        let _ = self.tx.send(Event::TransferUpdate {
+            id: self.id,
+            bytes_done,
+            speed_bps,
+        });
     }
     fn finish(&mut self, _: u64) {}
 }
@@ -85,7 +89,11 @@ impl App {
             }
             Event::Key(key) => self.handle_key(key),
             Event::Resize(_, _) => Action::None,
-            Event::TransferUpdate { id, bytes_done, speed_bps } => {
+            Event::TransferUpdate {
+                id,
+                bytes_done,
+                speed_bps,
+            } => {
                 if let Some(entry) = self.transfers.iter_mut().find(|e| e.id == id) {
                     entry.bytes_done = bytes_done;
                     if entry.speed_samples.len() >= 60 {
@@ -99,13 +107,20 @@ impl App {
             Event::TransferDone { id, result } => {
                 if let Some(entry) = self.transfers.iter_mut().find(|e| e.id == id) {
                     entry.status = match result {
-                        Ok(n) => { entry.bytes_done = n; TransferStatus::Done }
+                        Ok(n) => {
+                            entry.bytes_done = n;
+                            TransferStatus::Done
+                        }
                         Err(e) => TransferStatus::Failed(e),
                     };
                 }
                 Action::None
             }
-            Event::RemoteFetched { alias, path, result } => {
+            Event::RemoteFetched {
+                alias,
+                path,
+                result,
+            } => {
                 self.remote_throbber.stop();
                 match result {
                     RemoteFetchResult::Error(e) => {
@@ -122,8 +137,17 @@ impl App {
                 }
                 Action::None
             }
-            Event::RebuildStatus { state, percent, reason, .. } => {
-                self.rebuild = RebuildView { state, percent, reason };
+            Event::RebuildStatus {
+                state,
+                percent,
+                reason,
+                ..
+            } => {
+                self.rebuild = RebuildView {
+                    state,
+                    percent,
+                    reason,
+                };
                 Action::None
             }
             Event::UsersLoaded { users, .. } => {
@@ -173,13 +197,17 @@ impl App {
     fn handle_key(&mut self, key: crossterm::event::KeyEvent) -> Action {
         use crossterm::event::KeyCode;
 
-        if let Mode::Input { ref value, ref action, .. } = self.mode.clone() {
+        if let Mode::Input {
+            ref value,
+            ref action,
+            ..
+        } = self.mode.clone()
+        {
             return match key.code {
                 KeyCode::Esc => {
                     self.mode = match action {
-                        InputAction::AddUserUsername { .. } | InputAction::AddUserPassword { .. } => {
-                            Mode::Admin(AdminTab::Users)
-                        }
+                        InputAction::AddUserUsername { .. }
+                        | InputAction::AddUserPassword { .. } => Mode::Admin(AdminTab::Users),
                         _ => Mode::Browse,
                     };
                     Action::None
@@ -290,7 +318,9 @@ impl App {
                 }
                 KeyCode::Char('d') => {
                     if matches!(tab, AdminTab::Users) {
-                        if let Some(user) = self.users_view.users.get(self.users_view.selected).cloned() {
+                        if let Some(user) =
+                            self.users_view.users.get(self.users_view.selected).cloned()
+                        {
                             let alias = self.active_alias.clone().unwrap_or_default();
                             self.mode = Mode::Confirm(ConfirmAction::DeleteUser {
                                 alias,
@@ -343,7 +373,9 @@ impl App {
             }
             KeyCode::Backspace | KeyCode::Char('b') => {
                 match self.focused {
-                    FocusedPane::Local => { self.local.enter(); }
+                    FocusedPane::Local => {
+                        self.local.enter();
+                    }
                     FocusedPane::Remote => self.remote.go_back(),
                 }
                 Action::Back
@@ -390,9 +422,19 @@ impl App {
                         }
                         RemoteEntry::Dir(_) => {}
                         RemoteEntry::Object(m) => {
-                            if let RemoteLevel::Objects { ref alias, ref bucket, .. } = self.remote.level.clone() {
+                            if let RemoteLevel::Objects {
+                                ref alias,
+                                ref bucket,
+                                ..
+                            } = self.remote.level.clone()
+                            {
                                 let path = format!("{alias}/{bucket}/{}", m.key);
-                                self.fetch_object_stat(alias.clone(), bucket.clone(), m.key.clone(), path);
+                                self.fetch_object_stat(
+                                    alias.clone(),
+                                    bucket.clone(),
+                                    m.key.clone(),
+                                    path,
+                                );
                             }
                         }
                     }
@@ -407,18 +449,22 @@ impl App {
         let tokens_path = default_tokens_path().unwrap_or_default();
         tokio::spawn(async move {
             let result = async {
-                let profile = config.profiles.get(&alias)
+                let profile = config
+                    .profiles
+                    .get(&alias)
                     .ok_or_else(|| format!("unknown alias `{alias}`"))?;
-                let store = TokenStore::load(&tokens_path)
-                    .map_err(|e| e.to_string())?;
-                let token = store.token_for(&alias)
+                let store = TokenStore::load(&tokens_path).map_err(|e| e.to_string())?;
+                let token = store
+                    .token_for(&alias)
                     .ok_or_else(|| "not authenticated".to_string())?;
                 let client = Y2qClient::new(ClientConfig {
                     base_url: profile.url.clone(),
                     token: Some(token),
-                }).map_err(|e| e.to_string())?;
+                })
+                .map_err(|e| e.to_string())?;
                 client.list_buckets().await.map_err(|e| e.to_string())
-            }.await;
+            }
+            .await;
             let payload = match result {
                 Ok(buckets) => RemoteFetchResult::Buckets(buckets),
                 Err(e) => RemoteFetchResult::Error(e),
@@ -438,25 +484,43 @@ impl App {
         let bucket_clone = bucket.clone();
         tokio::spawn(async move {
             let result = async {
-                let profile = config.profiles.get(&alias)
+                let profile = config
+                    .profiles
+                    .get(&alias)
                     .ok_or_else(|| format!("unknown alias `{alias}`"))?;
-                let store = TokenStore::load(&tokens_path)
-                    .map_err(|e| e.to_string())?;
-                let token = store.token_for(&alias)
+                let store = TokenStore::load(&tokens_path).map_err(|e| e.to_string())?;
+                let token = store
+                    .token_for(&alias)
                     .ok_or_else(|| "not authenticated".to_string())?;
                 let client = Y2qClient::new(ClientConfig {
                     base_url: profile.url.clone(),
                     token: Some(token),
-                }).map_err(|e| e.to_string())?;
-                let opts = ListOptions { prefix: prefix.clone(), after: None, limit: Some(500) };
-                client.list_objects(&bucket, &opts).await.map_err(|e| e.to_string())
-            }.await;
-            let fetch_path = RemoteFetchPath::Objects { bucket: bucket_clone, prefix };
+                })
+                .map_err(|e| e.to_string())?;
+                let opts = ListOptions {
+                    prefix: prefix.clone(),
+                    after: None,
+                    limit: Some(500),
+                };
+                client
+                    .list_objects(&bucket, &opts)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+            .await;
+            let fetch_path = RemoteFetchPath::Objects {
+                bucket: bucket_clone,
+                prefix,
+            };
             let payload = match result {
                 Ok(page) => RemoteFetchResult::Objects(page.items, page.next),
                 Err(e) => RemoteFetchResult::Error(e),
             };
-            let _ = tx.send(Event::RemoteFetched { alias, path: fetch_path, result: payload });
+            let _ = tx.send(Event::RemoteFetched {
+                alias,
+                path: fetch_path,
+                result: payload,
+            });
         });
     }
 
@@ -470,10 +534,16 @@ impl App {
                     Some(p) if !p.ends_with("..") => p,
                     _ => return,
                 };
-                if let RemoteLevel::Objects { ref alias, ref bucket, .. } = self.remote.level.clone() {
+                if let RemoteLevel::Objects {
+                    ref alias,
+                    ref bucket,
+                    ..
+                } = self.remote.level.clone()
+                {
                     let alias = alias.clone();
                     let bucket = bucket.clone();
-                    let key = local_path.file_name()
+                    let key = local_path
+                        .file_name()
                         .map(|n| n.to_string_lossy().into_owned())
                         .unwrap_or_default();
                     let id = TRANSFER_ID.fetch_add(1, Ordering::Relaxed);
@@ -485,23 +555,41 @@ impl App {
                     let tokens_path = default_tokens_path().unwrap_or_default();
                     tokio::spawn(async move {
                         let result = async {
-                            let profile = config.profiles.get(&alias)
+                            let profile = config
+                                .profiles
+                                .get(&alias)
                                 .ok_or_else(|| "unknown alias".to_string())?;
-                            let store = TokenStore::load(&tokens_path).map_err(|e| e.to_string())?;
-                            let token = store.token_for(&alias).ok_or_else(|| "unauthenticated".to_string())?;
+                            let store =
+                                TokenStore::load(&tokens_path).map_err(|e| e.to_string())?;
+                            let token = store
+                                .token_for(&alias)
+                                .ok_or_else(|| "unauthenticated".to_string())?;
                             let client = Y2qClient::new(ClientConfig {
                                 base_url: profile.url.clone(),
                                 token: Some(token),
-                            }).map_err(|e| e.to_string())?;
-                            let file = tokio::fs::File::open(&local_path).await.map_err(|e| e.to_string())?;
+                            })
+                            .map_err(|e| e.to_string())?;
+                            let file = tokio::fs::File::open(&local_path)
+                                .await
+                                .map_err(|e| e.to_string())?;
                             let meta = file.metadata().await.map_err(|e| e.to_string())?;
                             let len = meta.len();
                             let reporter = Box::new(TuiTransferReporter { id, tx: tx.clone() });
                             let reader = CountingReader::new(file, reporter);
-                            client.put_from_reader(&bucket, &key, reader, Some(len), &Default::default(), None)
-                                .await.map_err(|e| e.to_string())?;
+                            client
+                                .put_from_reader(
+                                    &bucket,
+                                    &key,
+                                    reader,
+                                    Some(len),
+                                    &Default::default(),
+                                    None,
+                                )
+                                .await
+                                .map_err(|e| e.to_string())?;
                             Ok::<u64, String>(len)
-                        }.await;
+                        }
+                        .await;
                         let _ = tx.send(Event::TransferDone { id, result });
                     });
                 }
@@ -512,9 +600,7 @@ impl App {
                     let alias = self.active_alias.clone().unwrap_or_default();
                     let bucket = m.bucket.clone();
                     let key = m.key.clone();
-                    let local_dst = self.local.cwd.join(
-                        key.rsplit('/').next().unwrap_or(&key)
-                    );
+                    let local_dst = self.local.cwd.join(key.rsplit('/').next().unwrap_or(&key));
                     let id = TRANSFER_ID.fetch_add(1, Ordering::Relaxed);
                     let label = format!("{alias}/{bucket}/{key} → {}", local_dst.display());
                     let size = Some(m.size);
@@ -524,20 +610,32 @@ impl App {
                     let tokens_path = default_tokens_path().unwrap_or_default();
                     tokio::spawn(async move {
                         let result = async {
-                            let profile = config.profiles.get(&alias)
+                            let profile = config
+                                .profiles
+                                .get(&alias)
                                 .ok_or_else(|| "unknown alias".to_string())?;
-                            let store = TokenStore::load(&tokens_path).map_err(|e| e.to_string())?;
-                            let token = store.token_for(&alias).ok_or_else(|| "unauthenticated".to_string())?;
+                            let store =
+                                TokenStore::load(&tokens_path).map_err(|e| e.to_string())?;
+                            let token = store
+                                .token_for(&alias)
+                                .ok_or_else(|| "unauthenticated".to_string())?;
                             let client = Y2qClient::new(ClientConfig {
                                 base_url: profile.url.clone(),
                                 token: Some(token),
-                            }).map_err(|e| e.to_string())?;
-                            let file = tokio::fs::File::create(&local_dst).await.map_err(|e| e.to_string())?;
+                            })
+                            .map_err(|e| e.to_string())?;
+                            let file = tokio::fs::File::create(&local_dst)
+                                .await
+                                .map_err(|e| e.to_string())?;
                             let reporter = Box::new(TuiTransferReporter { id, tx: tx.clone() });
                             let mut writer = CountingWriter::new(file, reporter);
-                            let n = client.get_to_writer(&bucket, &key, &mut writer).await.map_err(|e| e.to_string())?;
+                            let n = client
+                                .get_to_writer(&bucket, &key, &mut writer)
+                                .await
+                                .map_err(|e| e.to_string())?;
                             Ok::<u64, String>(n)
-                        }.await;
+                        }
+                        .await;
                         let _ = tx.send(Event::TransferDone { id, result });
                     });
                 }
@@ -572,9 +670,11 @@ impl App {
                         let client = Y2qClient::new(ClientConfig {
                             base_url: profile.url.clone(),
                             token: Some(token),
-                        }).ok()?;
+                        })
+                        .ok()?;
                         client.delete(&bucket, &key).await.ok()
-                    }.await;
+                    }
+                    .await;
                 });
             }
             ConfirmAction::DeleteUser { alias, username } => {
@@ -584,20 +684,31 @@ impl App {
                 let alias_clone = alias.clone();
                 tokio::spawn(async move {
                     let result = async {
-                        let profile = config.profiles.get(&alias_clone)
+                        let profile = config
+                            .profiles
+                            .get(&alias_clone)
                             .ok_or_else(|| "unknown alias".to_string())?;
                         let store = TokenStore::load(&tokens_path).map_err(|e| e.to_string())?;
-                        let token = store.token_for(&alias_clone)
+                        let token = store
+                            .token_for(&alias_clone)
                             .ok_or_else(|| "not authenticated".to_string())?;
                         let client = Y2qClient::new(ClientConfig {
                             base_url: profile.url.clone(),
                             token: Some(token),
-                        }).map_err(|e| e.to_string())?;
-                        client.delete_user(&username).await.map_err(|e| e.to_string())?;
+                        })
+                        .map_err(|e| e.to_string())?;
+                        client
+                            .delete_user(&username)
+                            .await
+                            .map_err(|e| e.to_string())?;
                         client.list_users().await.map_err(|e| e.to_string())
-                    }.await;
+                    }
+                    .await;
                     if let Ok(users) = result {
-                        let _ = tx.send(Event::UsersLoaded { alias: alias_clone, users });
+                        let _ = tx.send(Event::UsersLoaded {
+                            alias: alias_clone,
+                            users,
+                        });
                     }
                 });
             }
@@ -612,7 +723,11 @@ impl App {
                 self.remote_throbber.start();
                 self.fetch_buckets(alias);
             }
-            RemoteLevel::Objects { ref alias, ref bucket, ref prefix } => {
+            RemoteLevel::Objects {
+                ref alias,
+                ref bucket,
+                ref prefix,
+            } => {
                 let alias = alias.clone();
                 let bucket = bucket.clone();
                 let prefix = prefix.clone();
@@ -629,16 +744,22 @@ impl App {
         let tokens_path = default_tokens_path().unwrap_or_default();
         tokio::spawn(async move {
             let result = async {
-                let profile = config.profiles.get(&alias)
+                let profile = config
+                    .profiles
+                    .get(&alias)
                     .ok_or_else(|| format!("unknown alias `{alias}`"))?;
                 let store = TokenStore::load(&tokens_path).map_err(|e| e.to_string())?;
-                let token = store.token_for(&alias).ok_or_else(|| "not authenticated".to_string())?;
+                let token = store
+                    .token_for(&alias)
+                    .ok_or_else(|| "not authenticated".to_string())?;
                 let client = Y2qClient::new(ClientConfig {
                     base_url: profile.url.clone(),
                     token: Some(token),
-                }).map_err(|e| e.to_string())?;
+                })
+                .map_err(|e| e.to_string())?;
                 client.head(&bucket, &key).await.map_err(|e| e.to_string())
-            }.await;
+            }
+            .await;
             let _ = tx.send(super::events::Event::ObjectStatFetched { path, result });
         });
     }
@@ -654,16 +775,22 @@ impl App {
         let tokens_path = default_tokens_path().unwrap_or_default();
         tokio::spawn(async move {
             let result = async {
-                let profile = config.profiles.get(&alias)
+                let profile = config
+                    .profiles
+                    .get(&alias)
                     .ok_or_else(|| format!("unknown alias `{alias}`"))?;
                 let store = TokenStore::load(&tokens_path).map_err(|e| e.to_string())?;
-                let token = store.token_for(&alias).ok_or_else(|| "not authenticated".to_string())?;
+                let token = store
+                    .token_for(&alias)
+                    .ok_or_else(|| "not authenticated".to_string())?;
                 let client = Y2qClient::new(ClientConfig {
                     base_url: profile.url.clone(),
                     token: Some(token),
-                }).map_err(|e| e.to_string())?;
+                })
+                .map_err(|e| e.to_string())?;
                 client.list_users().await.map_err(|e| e.to_string())
-            }.await;
+            }
+            .await;
             if let Ok(users) = result {
                 let _ = tx.send(super::events::Event::UsersLoaded { alias, users });
             }
@@ -681,16 +808,22 @@ impl App {
         let tokens_path = default_tokens_path().unwrap_or_default();
         tokio::spawn(async move {
             let result = async {
-                let profile = config.profiles.get(&alias)
+                let profile = config
+                    .profiles
+                    .get(&alias)
                     .ok_or_else(|| format!("unknown alias `{alias}`"))?;
                 let store = TokenStore::load(&tokens_path).map_err(|e| e.to_string())?;
-                let token = store.token_for(&alias).ok_or_else(|| "not authenticated".to_string())?;
+                let token = store
+                    .token_for(&alias)
+                    .ok_or_else(|| "not authenticated".to_string())?;
                 let client = Y2qClient::new(ClientConfig {
                     base_url: profile.url.clone(),
                     token: Some(token),
-                }).map_err(|e| e.to_string())?;
+                })
+                .map_err(|e| e.to_string())?;
                 client.locks_list("5m").await.map_err(|e| e.to_string())
-            }.await;
+            }
+            .await;
             if let Ok(locks) = result {
                 let _ = tx.send(super::events::Event::LocksLoaded { alias, locks });
             }
@@ -712,7 +845,9 @@ impl App {
             self.mode = Mode::Input {
                 prompt: "New bucket name:".into(),
                 value: String::new(),
-                action: InputAction::CreateBucket { alias: alias.clone() },
+                action: InputAction::CreateBucket {
+                    alias: alias.clone(),
+                },
             };
         }
     }
@@ -762,20 +897,31 @@ impl App {
                 let alias_clone = alias.clone();
                 tokio::spawn(async move {
                     let result = async {
-                        let profile = config.profiles.get(&alias_clone)
+                        let profile = config
+                            .profiles
+                            .get(&alias_clone)
                             .ok_or_else(|| "unknown alias".to_string())?;
                         let store = TokenStore::load(&tokens_path).map_err(|e| e.to_string())?;
-                        let token = store.token_for(&alias_clone)
+                        let token = store
+                            .token_for(&alias_clone)
                             .ok_or_else(|| "not authenticated".to_string())?;
                         let client = Y2qClient::new(ClientConfig {
                             base_url: profile.url.clone(),
                             token: Some(token),
-                        }).map_err(|e| e.to_string())?;
-                        client.add_user(&username, &password).await.map_err(|e| e.to_string())?;
+                        })
+                        .map_err(|e| e.to_string())?;
+                        client
+                            .add_user(&username, &password)
+                            .await
+                            .map_err(|e| e.to_string())?;
                         client.list_users().await.map_err(|e| e.to_string())
-                    }.await;
+                    }
+                    .await;
                     if let Ok(users) = result {
-                        let _ = tx.send(super::events::Event::UsersLoaded { alias: alias_clone, users });
+                        let _ = tx.send(super::events::Event::UsersLoaded {
+                            alias: alias_clone,
+                            users,
+                        });
                     }
                 });
                 self.mode = Mode::Admin(AdminTab::Users);

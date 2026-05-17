@@ -49,7 +49,8 @@ pub async fn run_worker(
             pool.as_deref(),
             &mut rng,
         )
-        .await else {
+        .await
+        else {
             // Pool was empty for this op kind; yield and retry.
             tokio::task::yield_now().await;
             continue;
@@ -70,7 +71,11 @@ async fn execute_op(
     pool: Option<&ObjectPool>,
     rng: &mut impl Rng,
 ) -> Option<OpRecord> {
-    let op = pick_op(&config.workload.op, config.workload.mixed_weights.as_ref(), rng);
+    let op = pick_op(
+        &config.workload.op,
+        config.workload.mixed_weights.as_ref(),
+        rng,
+    );
     let bucket = &config.bucket;
     let run_id = &config.workload.run_id;
 
@@ -96,7 +101,15 @@ async fn execute_op(
                 None => return None,
             };
             let token = token_rx.borrow().clone();
-            get::get_op(raw_http, &config.base_url, token.as_str(), bucket, &key, run_id).await
+            get::get_op(
+                raw_http,
+                &config.base_url,
+                token.as_str(),
+                bucket,
+                &key,
+                run_id,
+            )
+            .await
         }
         OpKind::Delete => {
             let key = match pool {
@@ -139,4 +152,3 @@ fn pick_op(op: &OpKind, weights: Option<&MixedWeights>, rng: &mut impl Rng) -> O
     }
     *op
 }
-

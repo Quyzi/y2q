@@ -23,7 +23,7 @@ use crate::{
     crypto::encrypt_meta,
 };
 
-use super::format::{self, Header, HEADER_SIZE};
+use super::format::{self, HEADER_SIZE, Header};
 
 fn now_nanos() -> u64 {
     SystemTime::now()
@@ -163,32 +163,40 @@ impl UringStreamingPutGuard {
         };
 
         // File is at EOF (after v2 envelope). Append meta then trailer.
-        file.write_all(&meta_bytes).await.map_err(|e| Error::InternalError {
-            bucket: bucket.to_owned(),
-            key: key.to_owned(),
-            operation: "put".to_owned(),
-            message: format!("write meta: {e}"),
-        })?;
-        file.write_all(&header.encode()).await.map_err(|e| Error::InternalError {
-            bucket: bucket.to_owned(),
-            key: key.to_owned(),
-            operation: "put".to_owned(),
-            message: format!("write trailer: {e}"),
-        })?;
+        file.write_all(&meta_bytes)
+            .await
+            .map_err(|e| Error::InternalError {
+                bucket: bucket.to_owned(),
+                key: key.to_owned(),
+                operation: "put".to_owned(),
+                message: format!("write meta: {e}"),
+            })?;
+        file.write_all(&header.encode())
+            .await
+            .map_err(|e| Error::InternalError {
+                bucket: bucket.to_owned(),
+                key: key.to_owned(),
+                operation: "put".to_owned(),
+                message: format!("write trailer: {e}"),
+            })?;
 
         // Overwrite the placeholder header at offset 0 with the real one.
-        file.seek(std::io::SeekFrom::Start(0)).await.map_err(|e| Error::InternalError {
-            bucket: bucket.to_owned(),
-            key: key.to_owned(),
-            operation: "put".to_owned(),
-            message: format!("seek to header: {e}"),
-        })?;
-        file.write_all(&header.encode()).await.map_err(|e| Error::InternalError {
-            bucket: bucket.to_owned(),
-            key: key.to_owned(),
-            operation: "put".to_owned(),
-            message: format!("write header: {e}"),
-        })?;
+        file.seek(std::io::SeekFrom::Start(0))
+            .await
+            .map_err(|e| Error::InternalError {
+                bucket: bucket.to_owned(),
+                key: key.to_owned(),
+                operation: "put".to_owned(),
+                message: format!("seek to header: {e}"),
+            })?;
+        file.write_all(&header.encode())
+            .await
+            .map_err(|e| Error::InternalError {
+                bucket: bucket.to_owned(),
+                key: key.to_owned(),
+                operation: "put".to_owned(),
+                message: format!("write header: {e}"),
+            })?;
 
         if options.sync == SyncLevel::Durable {
             file.sync_data().await.map_err(|e| Error::InternalError {
@@ -201,12 +209,14 @@ impl UringStreamingPutGuard {
 
         drop(file);
 
-        tokio::fs::rename(&self.tmp_path, &self.obj_path).await.map_err(|e| Error::InternalError {
-            bucket: bucket.to_owned(),
-            key: key.to_owned(),
-            operation: "put".to_owned(),
-            message: format!("rename: {e}"),
-        })?;
+        tokio::fs::rename(&self.tmp_path, &self.obj_path)
+            .await
+            .map_err(|e| Error::InternalError {
+                bucket: bucket.to_owned(),
+                key: key.to_owned(),
+                operation: "put".to_owned(),
+                message: format!("rename: {e}"),
+            })?;
 
         if options.sync == SyncLevel::Durable {
             if let Some(parent) = self.obj_path.parent()

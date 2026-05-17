@@ -58,8 +58,7 @@ impl CliConfig {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let text =
-            toml::to_string_pretty(self).map_err(|e| ConfigError::Config(e.to_string()))?;
+        let text = toml::to_string_pretty(self).map_err(|e| ConfigError::Config(e.to_string()))?;
         atomic_write(path, text.as_bytes())?;
         set_mode_600(path);
         Ok(())

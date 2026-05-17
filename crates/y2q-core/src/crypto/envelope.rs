@@ -143,8 +143,7 @@ pub fn encrypt(pk_bytes: &[u8], plaintext: &[u8]) -> Result<(Vec<u8>, EnvelopeIn
         )
         .map_err(|_| CryptoError::Aead("encrypt"))?;
 
-    let mut out =
-        Vec::with_capacity(ENVELOPE_HEADER_FIXED_LEN + kem_ct_bytes.len() + ct_buf.len());
+    let mut out = Vec::with_capacity(ENVELOPE_HEADER_FIXED_LEN + kem_ct_bytes.len() + ct_buf.len());
     out.extend_from_slice(&header);
     out.extend_from_slice(kem_ct_bytes);
     out.extend_from_slice(&ct_buf);
@@ -397,7 +396,9 @@ impl EncryptSession {
 
         // Patch plaintext_len at its position within the v2 envelope.
         self.file
-            .seek(std::io::SeekFrom::Start(self.write_offset + V2_PLAINTEXT_LEN_OFFSET))
+            .seek(std::io::SeekFrom::Start(
+                self.write_offset + V2_PLAINTEXT_LEN_OFFSET,
+            ))
             .await
             .map_err(|_| CryptoError::Aead("seek plaintext_len"))?;
         self.file
@@ -525,7 +526,10 @@ fn parse_and_validate_v1_header(env: &[u8]) -> Result<V1Header, CryptoError> {
     let mut nonce = [0u8; 12];
     nonce.copy_from_slice(&env[8..20]);
     let plaintext_len = u64::from_be_bytes(env[20..28].try_into().unwrap());
-    Ok(V1Header { nonce, plaintext_len })
+    Ok(V1Header {
+        nonce,
+        plaintext_len,
+    })
 }
 
 fn derive_content_key(ss: &[u8], kem_ct: &[u8]) -> Result<[u8; 32], CryptoError> {
@@ -693,8 +697,13 @@ mod tests {
     async fn tempfile_v2() -> tokio::fs::File {
         let path = std::env::temp_dir().join(format!("y2q_test_{}.env", rand_u64()));
         tokio::fs::OpenOptions::new()
-            .write(true).read(true).create(true).truncate(true)
-            .open(&path).await.unwrap()
+            .write(true)
+            .read(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .await
+            .unwrap()
     }
 
     async fn read_file(file: tokio::fs::File) -> Vec<u8> {
@@ -717,6 +726,9 @@ mod tests {
 
     fn rand_u64() -> u64 {
         use std::time::{SystemTime, UNIX_EPOCH};
-        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().subsec_nanos() as u64
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos() as u64
     }
 }

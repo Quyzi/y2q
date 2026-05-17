@@ -25,8 +25,9 @@ impl Y2qClient {
             .await?;
         let resp = Self::check_status(resp).await?;
 
-        let byte_stream =
-            resp.bytes_stream().map(|r| r.map_err(std::io::Error::other));
+        let byte_stream = resp
+            .bytes_stream()
+            .map(|r| r.map_err(std::io::Error::other));
         let reader = StreamReader::new(byte_stream);
         let lines = FramedRead::new(reader, LinesCodec::new());
 

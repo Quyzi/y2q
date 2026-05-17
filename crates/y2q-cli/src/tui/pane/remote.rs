@@ -3,8 +3,14 @@ use y2q_client::MetadataView;
 #[derive(Debug, Clone)]
 pub enum RemoteLevel {
     Aliases,
-    Buckets { alias: String },
-    Objects { alias: String, bucket: String, prefix: Option<String> },
+    Buckets {
+        alias: String,
+    },
+    Objects {
+        alias: String,
+        bucket: String,
+        prefix: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -28,10 +34,12 @@ impl RemoteEntry {
         }
     }
 
-
     #[allow(dead_code)]
     pub fn is_dir_like(&self) -> bool {
-        matches!(self, Self::Alias(_) | Self::Bucket(_) | Self::Dir(_) | Self::Back)
+        matches!(
+            self,
+            Self::Alias(_) | Self::Bucket(_) | Self::Dir(_) | Self::Back
+        )
     }
 }
 
@@ -47,8 +55,10 @@ pub struct RemotePane {
 
 impl RemotePane {
     pub fn new(aliases: Vec<String>) -> Self {
-        let entries: Vec<RemoteEntry> =
-            aliases.iter().map(|a| RemoteEntry::Alias(a.clone())).collect();
+        let entries: Vec<RemoteEntry> = aliases
+            .iter()
+            .map(|a| RemoteEntry::Alias(a.clone()))
+            .collect();
         Self {
             level: RemoteLevel::Aliases,
             entries,
@@ -86,12 +96,18 @@ impl RemotePane {
             RemoteLevel::Aliases => {}
             RemoteLevel::Buckets { .. } => {
                 self.level = RemoteLevel::Aliases;
-                self.entries = self.aliases.iter().map(|a| RemoteEntry::Alias(a.clone())).collect();
+                self.entries = self
+                    .aliases
+                    .iter()
+                    .map(|a| RemoteEntry::Alias(a.clone()))
+                    .collect();
                 self.selected = 0;
                 self.scroll = 0;
             }
             RemoteLevel::Objects { alias, .. } => {
-                self.level = RemoteLevel::Buckets { alias: alias.clone() };
+                self.level = RemoteLevel::Buckets {
+                    alias: alias.clone(),
+                };
                 self.entries = vec![RemoteEntry::Back];
                 self.loading = true;
                 self.selected = 0;
@@ -102,7 +118,9 @@ impl RemotePane {
 
     pub fn set_buckets(&mut self, alias: &str, buckets: Vec<String>) {
         self.loading = false;
-        self.level = RemoteLevel::Buckets { alias: alias.to_owned() };
+        self.level = RemoteLevel::Buckets {
+            alias: alias.to_owned(),
+        };
         let mut entries = vec![RemoteEntry::Back];
         entries.extend(buckets.into_iter().map(RemoteEntry::Bucket));
         self.entries = entries;

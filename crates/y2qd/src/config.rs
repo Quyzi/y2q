@@ -360,8 +360,7 @@ impl Config {
             let json_val = coerce_cli_value(val);
             let mut map = serde_json::Map::new();
             insert_nested(&mut map, &parts, json_val);
-            figment =
-                figment.merge(Serialized::globals(serde_json::Value::Object(map)));
+            figment = figment.merge(Serialized::globals(serde_json::Value::Object(map)));
         }
 
         figment.extract().map_err(Box::new)

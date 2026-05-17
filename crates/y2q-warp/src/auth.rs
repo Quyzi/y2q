@@ -9,7 +9,10 @@ use zeroize::Zeroizing;
 use crate::error::WarpError;
 
 fn now_secs() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
 }
 
 /// Resolve the initial token for `alias`:
@@ -39,7 +42,14 @@ pub async fn resolve_token(
     let expires_at = resp.expires_at;
 
     let mut store = TokenStore::load(&tokens_path)?;
-    store.set(alias, TokenEntry { token: resp.token.clone(), expires_at, username: username.to_owned() });
+    store.set(
+        alias,
+        TokenEntry {
+            token: resp.token.clone(),
+            expires_at,
+            username: username.to_owned(),
+        },
+    );
     store.save(&tokens_path)?;
 
     Ok((Zeroizing::new(resp.token), expires_at))

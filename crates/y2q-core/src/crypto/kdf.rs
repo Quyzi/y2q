@@ -241,8 +241,7 @@ mod tests {
         let params = fast_params();
         let wrapped = wrap_sk(b"sk", b"pw", &params).unwrap();
         let json = serde_json::to_string(&(&params, &wrapped)).unwrap();
-        let (params2, wrapped2): (Argon2Params, WrappedSk) =
-            serde_json::from_str(&json).unwrap();
+        let (params2, wrapped2): (Argon2Params, WrappedSk) = serde_json::from_str(&json).unwrap();
         let recovered = unwrap_sk(&wrapped2, b"pw", &params2).unwrap();
         assert_eq!(recovered, b"sk");
     }

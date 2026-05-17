@@ -5,7 +5,10 @@ use futures::StreamExt;
 use crate::metrics::OpRecord;
 
 fn wall_ns() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64
 }
 
 /// GET with TTFB measurement. Bypasses Y2qClient::get_to_writer to intercept

@@ -10,7 +10,7 @@ use std::sync::Arc;
 use actix_web::{HttpResponse, web};
 use serde::Serialize;
 use utoipa::ToSchema;
-use y2q_core::{CacheRebuildStatus, AnyStorage, StorageExt};
+use y2q_core::{AnyStorage, CacheRebuildStatus, StorageExt};
 
 use crate::auth::Authenticated;
 use crate::error::{AppError, ErrorBody};

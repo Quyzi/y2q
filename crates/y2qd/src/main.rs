@@ -189,7 +189,10 @@ async fn main() -> std::io::Result<()> {
 
     // RUST_LOG takes precedence; fall back to the config-file filter.
     let log_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        EnvFilter::new(format!("{},metrics_rs_dashboard_actix=warn", cfg.observability.log_filter))
+        EnvFilter::new(format!(
+            "{},metrics_rs_dashboard_actix=warn",
+            cfg.observability.log_filter
+        ))
     });
 
     match cfg.observability.log_format {
@@ -283,8 +286,15 @@ async fn main() -> std::io::Result<()> {
         ),
         #[cfg(all(target_os = "linux", feature = "uring"))]
         config::StorageBackend::Uring => AnyStorage::Uring(
-            UringStorage::new(&cfg.storage.base_path, &index_path, UringConfig { mek: Some(mek), ..UringConfig::default() })
-                .map_err(|e| std::io::Error::other(format!("storage init: {e}")))?,
+            UringStorage::new(
+                &cfg.storage.base_path,
+                &index_path,
+                UringConfig {
+                    mek: Some(mek),
+                    ..UringConfig::default()
+                },
+            )
+            .map_err(|e| std::io::Error::other(format!("storage init: {e}")))?,
         ),
         #[cfg(not(all(target_os = "linux", feature = "uring")))]
         config::StorageBackend::Uring => {

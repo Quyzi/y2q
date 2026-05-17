@@ -37,7 +37,12 @@ pub struct MixedWeights {
 
 impl Default for MixedWeights {
     fn default() -> Self {
-        Self { get: 45, put: 15, delete: 25, stat: 15 }
+        Self {
+            get: 45,
+            put: 15,
+            delete: 25,
+            stat: 15,
+        }
     }
 }
 
@@ -71,7 +76,10 @@ pub fn parse_size(s: &str) -> Result<u64, String> {
         .find(|c: char| c.is_alphabetic())
         .map(|i| s.split_at(i))
         .unwrap_or((s, ""));
-    let base: u64 = num.trim().parse().map_err(|_| format!("invalid size: {s}"))?;
+    let base: u64 = num
+        .trim()
+        .parse()
+        .map_err(|_| format!("invalid size: {s}"))?;
     let mult = match suffix.to_ascii_uppercase().as_str() {
         "" | "B" => 1,
         "K" | "KB" | "KIB" => 1024,

@@ -96,7 +96,13 @@ fn bench_aes_gcm_encrypt(c: &mut Criterion) {
             let nonce = aes_gcm::Nonce::from_slice(&nonce_bytes);
             b.iter(|| {
                 let ct = cipher
-                    .encrypt(nonce, Payload { msg: black_box(&plaintext), aad })
+                    .encrypt(
+                        nonce,
+                        Payload {
+                            msg: black_box(&plaintext),
+                            aad,
+                        },
+                    )
                     .unwrap();
                 black_box(ct);
             });
@@ -120,7 +126,13 @@ fn bench_aes_gcm_decrypt(c: &mut Criterion) {
         let cipher = Aes256Gcm::new((&key_bytes).into());
         let nonce = aes_gcm::Nonce::from_slice(&nonce_bytes);
         let ciphertext = cipher
-            .encrypt(nonce, Payload { msg: &plaintext, aad })
+            .encrypt(
+                nonce,
+                Payload {
+                    msg: &plaintext,
+                    aad,
+                },
+            )
             .unwrap();
 
         group.bench_with_input(BenchmarkId::from_parameter(size), &size, |b, _| {
@@ -128,7 +140,13 @@ fn bench_aes_gcm_decrypt(c: &mut Criterion) {
             let nonce = aes_gcm::Nonce::from_slice(&nonce_bytes);
             b.iter(|| {
                 let pt = cipher
-                    .decrypt(nonce, Payload { msg: black_box(&ciphertext), aad })
+                    .decrypt(
+                        nonce,
+                        Payload {
+                            msg: black_box(&ciphertext),
+                            aad,
+                        },
+                    )
                     .unwrap();
                 black_box(pt);
             });

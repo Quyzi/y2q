@@ -29,14 +29,10 @@ pub async fn rebuild(cmd: RebuildCmd, mode: OutputMode) -> Result<(), CliError> 
                 }));
             } else {
                 let desc = match status.state.as_str() {
-                    "running" => format!(
-                        "running ({}%)",
-                        status.percent.unwrap_or(0)
-                    ),
-                    "failed" => format!(
-                        "failed: {}",
-                        status.reason.as_deref().unwrap_or("unknown")
-                    ),
+                    "running" => format!("running ({}%)", status.percent.unwrap_or(0)),
+                    "failed" => {
+                        format!("failed: {}", status.reason.as_deref().unwrap_or("unknown"))
+                    }
                     s => s.to_owned(),
                 };
                 println!("Rebuild [{alias}]: {desc}");
@@ -93,7 +89,10 @@ pub async fn trace(alias: &str, errors_only: bool) -> Result<(), CliError> {
         let ts = format_trace_ts(event.timestamp_ns);
         let (color, reset) = ansi_status(event.status);
         let rb = event.req_bytes.map(fmt_bytes).unwrap_or_else(|| "—".into());
-        let db = event.resp_bytes.map(fmt_bytes).unwrap_or_else(|| "—".into());
+        let db = event
+            .resp_bytes
+            .map(fmt_bytes)
+            .unwrap_or_else(|| "—".into());
         println!(
             "{ts}  {m:<7}  {p:<40}  {color}{s:>3}{reset}  {lat:>8.1}ms  {rb:>9}\u{2191}  {db:>9}\u{2193}",
             m = event.method,
@@ -132,5 +131,8 @@ async fn make_client(alias: &str) -> Result<Y2qClient, CliError> {
     let token = store
         .token_for(alias)
         .ok_or(CliError::Client(y2q_client::ClientError::Unauthenticated))?;
-    Ok(Y2qClient::new(ClientConfig { base_url: profile.url.clone(), token: Some(token) })?)
+    Ok(Y2qClient::new(ClientConfig {
+        base_url: profile.url.clone(),
+        token: Some(token),
+    })?)
 }

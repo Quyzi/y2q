@@ -61,7 +61,11 @@ pub enum Commands {
     /// Delete a remote object (supports glob patterns in key, e.g. alias/bucket/logs/*.log)
     Rm {
         path: String,
-        #[arg(long, short = 'f', help = "Skip confirmation when deleting multiple objects")]
+        #[arg(
+            long,
+            short = 'f',
+            help = "Skip confirmation when deleting multiple objects"
+        )]
         force: bool,
     },
     /// Show metadata for a remote object

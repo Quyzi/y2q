@@ -26,7 +26,8 @@ impl OpRecord {
     }
 
     pub fn ttfb_ns(&self) -> Option<u64> {
-        self.first_byte_ns.map(|fb| fb.saturating_sub(self.start_ns))
+        self.first_byte_ns
+            .map(|fb| fb.saturating_sub(self.start_ns))
     }
 
     pub fn is_error(&self) -> bool {
