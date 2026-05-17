@@ -52,6 +52,7 @@
 //!
 //! Set `RUST_LOG` to control verbosity, e.g. `RUST_LOG=y2qd=debug,actix_web=info`.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -68,7 +69,7 @@ use crate::span::Y2qRootSpanBuilder;
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 use y2q_core::crypto::{Argon2Params, derive_mek, keystore as keystore_mod};
-use y2q_core::{AnyStorage, FilesystemStorage};
+use y2q_core::{AnyStorage, FilesystemStorage, StorageExt};
 
 #[cfg(all(target_os = "linux", feature = "uring"))]
 use y2q_core::{UringStorage, storage::uring::UringConfig};
@@ -278,11 +279,20 @@ async fn main() -> std::io::Result<()> {
         .index_path
         .clone()
         .unwrap_or_else(|| format!("{}/_y2q_index.redb", cfg.storage.base_path));
+
+    let (dirty_tx, dirty_rx) = flume::unbounded::<y2q_core::DirtyEntry>();
+    let flush_notify = Arc::new(tokio::sync::Notify::new());
+
     let storage: Arc<AnyStorage> = Arc::new(match cfg.storage.backend {
         config::StorageBackend::Filesystem => AnyStorage::Filesystem(
             FilesystemStorage::new(&cfg.storage.base_path, &index_path)
                 .map_err(|e| std::io::Error::other(format!("storage init: {e}")))?
-                .with_mek(mek),
+                .with_mek(mek)
+                .with_dirty_channel(
+                    dirty_tx,
+                    flush_notify.clone(),
+                    cfg.storage.sync_flush_limit,
+                ),
         ),
         #[cfg(all(target_os = "linux", feature = "uring"))]
         config::StorageBackend::Uring => AnyStorage::Uring(
@@ -305,6 +315,49 @@ async fn main() -> std::io::Result<()> {
     });
     let storage_data = web::Data::new(storage);
     let label_limits = web::Data::new(config::LabelLimits::from(&cfg.storage));
+    let default_sync = web::Data::new(cfg.storage.default_sync);
+
+    // Background dirty flusher: drains best-effort PUT paths and fsyncs them.
+    {
+        let interval = Duration::from_secs(cfg.storage.sync_flush_interval_secs.max(1));
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep(interval) => {}
+                    _ = flush_notify.notified() => {}
+                }
+                let mut dirs: HashSet<PathBuf> = HashSet::new();
+                let mut files: Vec<PathBuf> = Vec::new();
+                while let Ok(entry) = dirty_rx.try_recv() {
+                    files.push(entry.obj_path);
+                    dirs.insert(entry.parent_dir);
+                }
+                for path in files {
+                    if let Ok(f) = tokio::fs::File::open(&path).await {
+                        let _ = f.sync_data().await;
+                    }
+                }
+                for dir in dirs {
+                    if let Ok(d) = tokio::fs::File::open(&dir).await {
+                        let _ = d.sync_all().await;
+                    }
+                }
+            }
+        });
+    }
+
+    // Startup auto-rebuild: repair index consistency after any unclean shutdown.
+    {
+        let storage_clone = Arc::clone(storage_data.as_ref());
+        tokio::spawn(async move {
+            if let Err(e) = storage_clone.rebuild_cache().await {
+                tracing::warn!(error = %e, "startup cache rebuild failed to initiate");
+            } else {
+                tracing::info!("startup cache rebuild initiated");
+            }
+        });
+    }
+
     let openapi = ApiDoc::openapi();
 
     let trace_hub = web::Data::new(Arc::new(TraceHub::new()));
@@ -366,6 +419,7 @@ async fn main() -> std::io::Result<()> {
             .app_data(trace_hub.clone())
             .app_data(storage_data.clone())
             .app_data(label_limits.clone())
+            .app_data(default_sync.clone())
             .app_data(auth_state.clone())
             .app_data(web::PayloadConfig::new(max_body_bytes));
         // Swagger UI and metrics dashboard are unauthenticated (actix doesn't

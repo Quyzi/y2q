@@ -55,6 +55,9 @@ pub struct FilesystemStorage {
     index: Arc<MetadataIndex>,
     rebuild_state: Arc<tokio::sync::Mutex<CacheRebuildStatus>>,
     mek: Option<[u8; 32]>,
+    dirty_tx: Option<flume::Sender<crate::DirtyEntry>>,
+    flush_notify: Option<Arc<tokio::sync::Notify>>,
+    flush_limit: usize,
 }
 
 impl FilesystemStorage {
@@ -89,6 +92,9 @@ impl FilesystemStorage {
             index: Arc::new(index),
             rebuild_state: Arc::new(tokio::sync::Mutex::new(CacheRebuildStatus::Idle)),
             mek: None,
+            dirty_tx: None,
+            flush_notify: None,
+            flush_limit: 0,
         })
     }
 
@@ -103,6 +109,21 @@ impl FilesystemStorage {
     pub fn with_mek(mut self, mek: [u8; 32]) -> Self {
         self.index.set_mek(mek);
         self.mek = Some(mek);
+        self
+    }
+
+    /// Attach a dirty-write channel for best-effort PUT flushing.
+    /// After each non-Durable commit, the obj path is sent to `tx`.
+    /// When the queue depth reaches `flush_limit`, `notify` is signalled.
+    pub fn with_dirty_channel(
+        mut self,
+        tx: flume::Sender<crate::DirtyEntry>,
+        notify: Arc<tokio::sync::Notify>,
+        flush_limit: usize,
+    ) -> Self {
+        self.dirty_tx = Some(tx);
+        self.flush_notify = Some(notify);
+        self.flush_limit = flush_limit;
         self
     }
 
@@ -301,6 +322,9 @@ pub struct StreamingPutGuard {
     prior_created: Option<u64>,
     index: Arc<MetadataIndex>,
     mek: Option<[u8; 32]>,
+    dirty_tx: Option<flume::Sender<crate::DirtyEntry>>,
+    flush_notify: Option<Arc<tokio::sync::Notify>>,
+    flush_limit: usize,
 }
 
 impl StreamingPutGuard {
@@ -425,9 +449,22 @@ impl StreamingPutGuard {
 
         if options.sync == SyncLevel::Durable {
             if let Some(parent) = self.obj_path.parent()
-                && let Ok(dir) = std::fs::File::open(parent)
+                && let Ok(dir) = tokio::fs::File::open(parent).await
             {
-                let _ = dir.sync_all();
+                let _ = dir.sync_all().await;
+            }
+        } else if let Some(ref tx) = self.dirty_tx {
+            if let Some(parent_dir) = self.obj_path.parent().map(PathBuf::from) {
+                let entry = crate::DirtyEntry {
+                    obj_path: self.obj_path.clone(),
+                    parent_dir,
+                };
+                let _ = tx.send(entry);
+                if tx.len() >= self.flush_limit {
+                    if let Some(ref notify) = self.flush_notify {
+                        notify.notify_one();
+                    }
+                }
             }
         }
 
@@ -530,6 +567,9 @@ impl FilesystemStorage {
             prior_created,
             mek: self.mek,
             index: self.index.clone(),
+            dirty_tx: self.dirty_tx.clone(),
+            flush_notify: self.flush_notify.clone(),
+            flush_limit: self.flush_limit,
         };
         Ok((guard, file))
     }
@@ -874,9 +914,22 @@ impl Storage for FilesystemStorage {
 
             if options.sync == SyncLevel::Durable {
                 if let Some(parent) = obj_path.parent()
-                    && let Ok(dir) = std::fs::File::open(parent)
+                    && let Ok(dir) = tokio::fs::File::open(parent).await
                 {
-                    let _ = dir.sync_all();
+                    let _ = dir.sync_all().await;
+                }
+            } else if let Some(ref tx) = self.dirty_tx {
+                if let Some(parent_dir) = obj_path.parent().map(PathBuf::from) {
+                    let entry = crate::DirtyEntry {
+                        obj_path: obj_path.clone(),
+                        parent_dir,
+                    };
+                    let _ = tx.send(entry);
+                    if tx.len() >= self.flush_limit {
+                        if let Some(ref notify) = self.flush_notify {
+                            notify.notify_one();
+                        }
+                    }
                 }
             }
 
@@ -1139,17 +1192,29 @@ async fn run_rebuild(
         .list_all_keys()
         .await
         .map_err(|e| format!("list index keys: {e}"))?;
+    let mut lost: u64 = 0;
     for (bucket, key) in all_keys {
-        if !seen.contains(&(bucket.clone(), key.clone()))
-            && let Err(e) = index.remove(&bucket, &key).await
-        {
-            tracing::warn!(
+        if !seen.contains(&(bucket.clone(), key.clone())) {
+            lost += 1;
+            tracing::error!(
                 bucket = %bucket,
                 key = %key,
-                error = %e,
-                "rebuild: stale index row removal failed; continuing"
+                "data loss detected: object in index but not on disk; removing stale entry"
             );
+            if let Err(e) = index.remove(&bucket, &key).await {
+                tracing::warn!(
+                    bucket = %bucket,
+                    key = %key,
+                    error = %e,
+                    "rebuild: stale index row removal failed; continuing"
+                );
+            }
         }
+    }
+    if lost > 0 {
+        tracing::error!(count = lost, "rebuild complete: {lost} object(s) lost");
+    } else {
+        tracing::info!("rebuild complete: no data loss detected");
     }
 
     Ok(())
