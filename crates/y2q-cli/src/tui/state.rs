@@ -17,8 +17,15 @@ impl FocusedPane {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(dead_code)]
 pub enum ConfirmAction {
-    DeleteRemote { alias: String, bucket: String, key: String },
-    DeleteUser { alias: String, username: String },
+    DeleteRemote {
+        alias: String,
+        bucket: String,
+        key: String,
+    },
+    DeleteUser {
+        alias: String,
+        username: String,
+    },
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -60,7 +67,14 @@ pub enum Mode {
     Confirm(ConfirmAction),
     Admin(AdminTab),
     Error(String),
-    Input { prompt: String, value: String, action: InputAction },
+    Input {
+        prompt: String,
+        value: String,
+        action: InputAction,
+    },
     /// Object stat popup — pre-formatted lines ready to render.
-    ObjectStat { path: String, lines: Vec<String> },
+    ObjectStat {
+        path: String,
+        lines: Vec<String>,
+    },
 }

@@ -54,7 +54,10 @@ pub fn run_analyze(
             "LIST" => OpKind::List,
             _ => continue,
         };
-        histograms.entry(op).or_insert_with(|| OpHistograms::new(op)).record(rec);
+        histograms
+            .entry(op)
+            .or_insert_with(|| OpHistograms::new(op))
+            .record(rec);
         let window = rec.start_ns / SEGMENT_NS;
         let entry = segment_buckets.entry((op, window)).or_default();
         entry.0 += 1;
@@ -64,15 +67,17 @@ pub fn run_analyze(
         entry.2 += rec.bytes;
     }
 
-    let mut aggregates: Vec<Aggregate> = histograms.values()
-        .filter_map(|h| h.aggregate())
-        .collect();
+    let mut aggregates: Vec<Aggregate> =
+        histograms.values().filter_map(|h| h.aggregate()).collect();
     aggregates.sort_by_key(|a| a.op.as_str());
 
     let duration_s = if aggregates.is_empty() {
         0.0
     } else {
-        aggregates.iter().map(|a| a.duration_s).fold(0.0_f64, f64::max)
+        aggregates
+            .iter()
+            .map(|a| a.duration_s)
+            .fold(0.0_f64, f64::max)
     };
 
     println!("=== y2q-warp analysis ===");
@@ -100,7 +105,9 @@ pub fn run_analyze(
             ns_to_ms_str(agg.p90_ns),
             ns_to_ms_str(agg.p99_ns),
         );
-        if let (Some(p50), Some(p90), Some(p99)) = (agg.ttfb_p50_ns, agg.ttfb_p90_ns, agg.ttfb_p99_ns) {
+        if let (Some(p50), Some(p90), Some(p99)) =
+            (agg.ttfb_p50_ns, agg.ttfb_p90_ns, agg.ttfb_p99_ns)
+        {
             println!(
                 "  TTFB:                                          P50={}  P90={}  P99={}",
                 ns_to_ms_str(p50),
@@ -134,9 +141,18 @@ pub fn run_analyze(
         let fastest = segs.last().unwrap();
         let slowest = segs.first().unwrap();
         let median = &segs[segs.len() / 2];
-        println!("  Fastest:  {:.1} MiB/s ({} ops)", fastest.throughput_mibps, fastest.n_ops);
-        println!("  Median:   {:.1} MiB/s ({} ops)", median.throughput_mibps, median.n_ops);
-        println!("  Slowest:  {:.1} MiB/s ({} ops)", slowest.throughput_mibps, slowest.n_ops);
+        println!(
+            "  Fastest:  {:.1} MiB/s ({} ops)",
+            fastest.throughput_mibps, fastest.n_ops
+        );
+        println!(
+            "  Median:   {:.1} MiB/s ({} ops)",
+            median.throughput_mibps, median.n_ops
+        );
+        println!(
+            "  Slowest:  {:.1} MiB/s ({} ops)",
+            slowest.throughput_mibps, slowest.n_ops
+        );
     }
 
     // Write segment CSV if requested

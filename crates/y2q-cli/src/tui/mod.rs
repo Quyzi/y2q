@@ -13,10 +13,10 @@ use std::time::Duration;
 use crossterm::{
     event::{DisableMouseCapture, EnableMouseCapture, EventStream},
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use futures::StreamExt;
-use ratatui::{backend::CrosstermBackend, Terminal};
+use ratatui::{Terminal, backend::CrosstermBackend};
 use tokio::sync::mpsc;
 use tokio::time::interval;
 
@@ -78,7 +78,9 @@ pub async fn run_tui(config: CliConfig) -> Result<(), CliError> {
     });
 
     loop {
-        let Some(event) = event_rx.recv().await else { break };
+        let Some(event) = event_rx.recv().await else {
+            break;
+        };
         let is_render = matches!(event, Event::Render);
         app.update(event);
         if app.should_quit {

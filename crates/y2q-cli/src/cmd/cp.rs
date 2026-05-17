@@ -31,11 +31,14 @@ pub async fn run(
 
     let mut label_map: BTreeMap<String, String> = BTreeMap::new();
     for raw in &labels {
-        let (k, v) = raw.split_once('=').ok_or_else(|| {
-            CliError::InvalidPath(raw.clone(), "label must be key=value".into())
-        })?;
+        let (k, v) = raw
+            .split_once('=')
+            .ok_or_else(|| CliError::InvalidPath(raw.clone(), "label must be key=value".into()))?;
         if k.is_empty() {
-            return Err(CliError::InvalidPath(raw.clone(), "label key must not be empty".into()));
+            return Err(CliError::InvalidPath(
+                raw.clone(),
+                "label key must not be empty".into(),
+            ));
         }
         label_map.insert(k.to_lowercase(), v.to_owned());
     }
@@ -48,10 +51,24 @@ pub async fn run(
                 }
                 upload_single(local_path, remote, label_map, sync.as_deref(), mode).await
             } else if has_glob(local_path) {
-                upload_glob(local_path, remote, label_map, sync.as_deref(), recursive, mode).await
+                upload_glob(
+                    local_path,
+                    remote,
+                    label_map,
+                    sync.as_deref(),
+                    recursive,
+                    mode,
+                )
+                .await
             } else if recursive {
-                upload_recursive(Path::new(local_path), remote, label_map, sync.as_deref(), mode)
-                    .await
+                upload_recursive(
+                    Path::new(local_path),
+                    remote,
+                    label_map,
+                    sync.as_deref(),
+                    mode,
+                )
+                .await
             } else {
                 upload_single(local_path, remote, label_map, sync.as_deref(), mode).await
             }
@@ -94,19 +111,28 @@ async fn upload_single(
     };
 
     let label = format!("{local_path} → {}/{bucket}/{key}", remote.alias);
-    let reporter =
-        if local_path != "-" { Some(make_reporter(&label, content_length)) } else { None };
+    let reporter = if local_path != "-" {
+        Some(make_reporter(&label, content_length))
+    } else {
+        None
+    };
 
     let created = if let Some(file) = file {
         if let Some(reporter) = reporter {
             let reader = CountingReader::new(file, reporter);
-            client.put_from_reader(bucket, key, reader, content_length, &labels, sync).await?
+            client
+                .put_from_reader(bucket, key, reader, content_length, &labels, sync)
+                .await?
         } else {
-            client.put_from_reader(bucket, key, file, content_length, &labels, sync).await?
+            client
+                .put_from_reader(bucket, key, file, content_length, &labels, sync)
+                .await?
         }
     } else {
         let stdin = tokio::io::stdin();
-        client.put_from_reader(bucket, key, stdin, None, &labels, sync).await?
+        client
+            .put_from_reader(bucket, key, stdin, None, &labels, sync)
+            .await?
     };
 
     let result_path = format!("{}/{bucket}/{key}", remote.alias);
@@ -150,11 +176,21 @@ async fn upload_glob(
         .collect();
 
     if paths.is_empty() {
-        return Err(CliError::Other(format!("glob pattern matched no files: {pattern}")));
+        return Err(CliError::Other(format!(
+            "glob pattern matched no files: {pattern}"
+        )));
     }
 
     let client = make_client(&remote.alias).await?;
-    let ctx = UploadCtx { alias: &remote.alias, bucket, dst_prefix, client: &client, labels: &labels, sync, mode };
+    let ctx = UploadCtx {
+        alias: &remote.alias,
+        bucket,
+        dst_prefix,
+        client: &client,
+        labels: &labels,
+        sync,
+        mode,
+    };
 
     for path in &paths {
         if path.is_dir() {
@@ -197,22 +233,31 @@ async fn upload_recursive(
     })?;
     let dst_prefix = remote.key.as_deref().unwrap_or("");
     let client = make_client(&remote.alias).await?;
-    let ctx = UploadCtx { alias: &remote.alias, bucket, dst_prefix, client: &client, labels: &labels, sync, mode };
+    let ctx = UploadCtx {
+        alias: &remote.alias,
+        bucket,
+        dst_prefix,
+        client: &client,
+        labels: &labels,
+        sync,
+        mode,
+    };
 
     upload_dir_files(src_dir, src_dir, &ctx).await
 }
 
 /// Walk `dir`, uploading each file with a key relative to `root`.
 async fn upload_dir_files(root: &Path, dir: &Path, ctx: &UploadCtx<'_>) -> Result<(), CliError> {
-    for entry in walkdir::WalkDir::new(dir).into_iter().filter_map(|e| {
-        match e {
+    for entry in walkdir::WalkDir::new(dir)
+        .into_iter()
+        .filter_map(|e| match e {
             Ok(e) => Some(e),
             Err(err) => {
                 eprintln!("warning: skipping unreadable entry: {err}");
                 None
             }
-        }
-    }) {
+        })
+    {
         if !entry.file_type().is_file() {
             continue;
         }
@@ -234,8 +279,10 @@ async fn upload_file(path: &Path, key: &str, ctx: &UploadCtx<'_>) -> Result<(), 
     let label_str = format!("{} → {}/{}/{key}", path.display(), ctx.alias, ctx.bucket);
     let reporter = make_reporter(&label_str, Some(size));
     let reader = CountingReader::new(file, reporter);
-    let created =
-        ctx.client.put_from_reader(ctx.bucket, key, reader, Some(size), ctx.labels, ctx.sync).await?;
+    let created = ctx
+        .client
+        .put_from_reader(ctx.bucket, key, reader, Some(size), ctx.labels, ctx.sync)
+        .await?;
 
     let result_path = if ctx.alias.is_empty() {
         format!("{}/{key}", ctx.bucket)
@@ -269,7 +316,11 @@ async fn download(remote: &RemotePath, local_path: &str, mode: OutputMode) -> Re
     } else {
         let mut file = tokio::fs::File::create(local_path).await?;
         let n = client.get_to_writer(bucket, key, &mut file).await?;
-        eprintln!("Downloaded {} ← {}/{bucket}/{key}", fmt_bytes(n), remote.alias);
+        eprintln!(
+            "Downloaded {} ← {}/{bucket}/{key}",
+            fmt_bytes(n),
+            remote.alias
+        );
         n
     };
 
@@ -290,5 +341,8 @@ async fn make_client(alias: &str) -> Result<Y2qClient, CliError> {
     let token = store
         .token_for(alias)
         .ok_or(CliError::Client(y2q_client::ClientError::Unauthenticated))?;
-    Ok(Y2qClient::new(ClientConfig { base_url: profile.url.clone(), token: Some(token) })?)
+    Ok(Y2qClient::new(ClientConfig {
+        base_url: profile.url.clone(),
+        token: Some(token),
+    })?)
 }

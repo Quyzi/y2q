@@ -9,8 +9,8 @@ use ratatui::{
 use super::app::App;
 use super::pane::local::LocalEntry;
 use super::pane::remote::RemoteEntry;
-use super::state::{AdminTab, ConfirmAction, FocusedPane, Mode};
 use super::pane::remote::RemoteLevel;
+use super::state::{AdminTab, ConfirmAction, FocusedPane, Mode};
 use super::widgets::{confirm_dialog, keybindings_bar, transfer_bar};
 
 pub fn render(frame: &mut Frame, app: &mut App) {
@@ -58,10 +58,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             ("d", "delete"),
             ("q/Esc", "close"),
         ],
-        Mode::Input { .. } => &[
-            ("Enter", "confirm"),
-            ("Esc", "cancel"),
-        ],
+        Mode::Input { .. } => &[("Enter", "confirm"), ("Esc", "cancel")],
         _ if show_new_bucket => &[
             ("Tab", "pane"),
             ("↑↓/jk", "nav"),
@@ -317,8 +314,10 @@ fn render_locks_tab(frame: &mut Frame, area: Rect, app: &App) {
         .map(|(i, lock)| {
             let sel = i == app.locks.selected;
             let short_uuid = &lock.uuid[..8.min(lock.uuid.len())];
-            let text =
-                format!("{}/{}… — {}s old", lock.bucket, short_uuid, lock.age_seconds);
+            let text = format!(
+                "{}/{}… — {}s old",
+                lock.bucket, short_uuid, lock.age_seconds
+            );
             let style = if sel {
                 Style::default().bg(Color::DarkGray).fg(Color::White)
             } else {
@@ -368,7 +367,12 @@ fn render_input_dialog(frame: &mut Frame, area: Rect, prompt: &str, value: &str)
     let h = 5u16;
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let y = area.y + (area.height.saturating_sub(h)) / 2;
-    let popup = Rect { x, y, width: w, height: h };
+    let popup = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
     frame.render_widget(Clear, popup);
     let block = Block::default()
         .title(format!(" {prompt} "))
@@ -395,13 +399,21 @@ fn render_object_stat_popup(frame: &mut Frame, area: Rect, lines: &[String]) {
     let h = ((lines.len() as u16) + 4).min(area.height.saturating_sub(4));
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let y = area.y + (area.height.saturating_sub(h)) / 2;
-    let popup = Rect { x, y, width: w, height: h };
+    let popup = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
     frame.render_widget(Clear, popup);
     let block = Block::default()
         .title(" Object Info ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan));
-    let mut text: Vec<Line> = lines.iter().map(|l| Line::from(Span::raw(l.as_str()))).collect();
+    let mut text: Vec<Line> = lines
+        .iter()
+        .map(|l| Line::from(Span::raw(l.as_str())))
+        .collect();
     text.push(Line::from(""));
     text.push(Line::from(Span::styled(
         "[any key] dismiss",
@@ -411,11 +423,18 @@ fn render_object_stat_popup(frame: &mut Frame, area: Rect, lines: &[String]) {
 }
 
 fn render_error_popup(frame: &mut Frame, area: Rect, message: &str) {
-    let w = (message.len() as u16 + 6).max(30).min(area.width.saturating_sub(4));
+    let w = (message.len() as u16 + 6)
+        .max(30)
+        .min(area.width.saturating_sub(4));
     let h = 5u16;
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let y = area.y + (area.height.saturating_sub(h)) / 2;
-    let popup = Rect { x, y, width: w, height: h };
+    let popup = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
     frame.render_widget(Clear, popup);
     let block = Block::default()
         .title(" Error ")
@@ -430,7 +449,9 @@ fn render_error_popup(frame: &mut Frame, area: Rect, message: &str) {
         )),
     ];
     frame.render_widget(
-        Paragraph::new(text).block(block).alignment(Alignment::Center),
+        Paragraph::new(text)
+            .block(block)
+            .alignment(Alignment::Center),
         popup,
     );
 }

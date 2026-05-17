@@ -22,7 +22,11 @@ impl BoundedRepeatReader {
     pub fn new(size: u64) -> Self {
         let mut buf = Box::new([0u8; 65536]);
         StdRng::seed_from_u64(0).fill(&mut buf[..]);
-        Self { buf, pos: 0, remain: size }
+        Self {
+            buf,
+            pos: 0,
+            remain: size,
+        }
     }
 }
 

@@ -17,4 +17,4 @@ mod storage;
 mod streaming;
 
 pub use storage::{UringConfig, UringStorage};
-pub use streaming::{UringStreamingPutGuard, URING_STREAMING_WRITE_OFFSET};
+pub use streaming::{URING_STREAMING_WRITE_OFFSET, UringStreamingPutGuard};

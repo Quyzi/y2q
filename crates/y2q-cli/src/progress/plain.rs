@@ -8,7 +8,10 @@ pub struct PlainProgressReporter {
 
 impl PlainProgressReporter {
     pub fn new() -> Self {
-        Self { label: String::new(), total: None }
+        Self {
+            label: String::new(),
+            total: None,
+        }
     }
 }
 
@@ -24,7 +27,11 @@ impl ProgressReporter for PlainProgressReporter {
         let speed = fmt_bytes(speed_bps);
         if let Some(total) = self.total {
             let pct = bytes_done * 100 / total.max(1);
-            eprint!("\r{}  {done} / {}  {pct}%  {speed}/s", self.label, fmt_bytes(total));
+            eprint!(
+                "\r{}  {done} / {}  {pct}%  {speed}/s",
+                self.label,
+                fmt_bytes(total)
+            );
         } else {
             eprint!("\r{}  {done}  {speed}/s", self.label);
         }

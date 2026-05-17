@@ -9,7 +9,11 @@ use crate::token::TokenStore;
 
 pub async fn run(cmd: UserCmd, mode: OutputMode) -> Result<(), CliError> {
     match cmd {
-        UserCmd::Add { alias, username, password } => {
+        UserCmd::Add {
+            alias,
+            username,
+            password,
+        } => {
             let pw = if let Some(p) = password {
                 Zeroizing::new(p)
             } else {
@@ -67,5 +71,8 @@ async fn make_client(alias: &str) -> Result<Y2qClient, CliError> {
     let token = store
         .token_for(alias)
         .ok_or(CliError::Client(y2q_client::ClientError::Unauthenticated))?;
-    Ok(Y2qClient::new(ClientConfig { base_url: profile.url.clone(), token: Some(token) })?)
+    Ok(Y2qClient::new(ClientConfig {
+        base_url: profile.url.clone(),
+        token: Some(token),
+    })?)
 }

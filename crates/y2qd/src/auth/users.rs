@@ -14,9 +14,7 @@ pub fn validate(username: &str) -> Result<(), AuthError> {
         return Err(AuthError::InvalidUsername { reason: "empty" });
     }
     if username.len() > MAX_USERNAME_BYTES {
-        return Err(AuthError::InvalidUsername {
-            reason: "too long",
-        });
+        return Err(AuthError::InvalidUsername { reason: "too long" });
     }
     if !username
         .chars()

@@ -77,7 +77,10 @@ pub async fn list(
 ) -> Result<HttpResponse, AppError> {
     let now = SystemTime::now();
     let cutoff = parse_older_than(&query.older_than, now)?;
-    let locks = storage.list_stale_locks(cutoff).await.map_err(AppError::from)?;
+    let locks = storage
+        .list_stale_locks(cutoff)
+        .await
+        .map_err(AppError::from)?;
     let entries: Vec<StaleLockEntry> = locks.into_iter().map(|l| to_entry(l, now)).collect();
     Ok(HttpResponse::Ok().json(entries))
 }
@@ -104,7 +107,10 @@ pub async fn clear(
 ) -> Result<HttpResponse, AppError> {
     let now = SystemTime::now();
     let cutoff = parse_older_than(&query.older_than, now)?;
-    let removed = storage.clear_stale_locks(cutoff).await.map_err(AppError::from)?;
+    let removed = storage
+        .clear_stale_locks(cutoff)
+        .await
+        .map_err(AppError::from)?;
     Ok(HttpResponse::Ok().json(ClearStaleLocksResponse { removed }))
 }
 
@@ -196,10 +202,7 @@ mod tests {
         let now = SystemTime::now();
         let cutoff = parse_older_than("1715000000", now).unwrap();
         assert_eq!(
-            cutoff
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
+            cutoff.duration_since(UNIX_EPOCH).unwrap().as_secs(),
             1_715_000_000
         );
     }

@@ -121,5 +121,10 @@ pub async fn stream(hub: web::Data<Arc<TraceHub>>, _auth: Authenticated) -> Http
 }
 
 fn content_length(headers: &header::HeaderMap) -> Option<u64> {
-    headers.get(header::CONTENT_LENGTH)?.to_str().ok()?.parse::<u64>().ok()
+    headers
+        .get(header::CONTENT_LENGTH)?
+        .to_str()
+        .ok()?
+        .parse::<u64>()
+        .ok()
 }

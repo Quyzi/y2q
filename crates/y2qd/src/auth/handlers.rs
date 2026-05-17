@@ -12,11 +12,11 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use y2q_core::crypto::{DecryptedKeystore, UserRecord, UserSummary, kdf};
 
+use super::Authenticated;
 use super::error::AuthError;
 use super::session::{SessionInfo, compute_expiry};
 use super::state::AuthState;
 use super::users::validate as validate_username;
-use super::Authenticated;
 
 fn record_login(result_label: &'static str, session_count: Option<usize>) {
     metrics::counter!(
@@ -121,7 +121,8 @@ pub async fn login(
         if let Err(until) = attempts.check_lockout(&username) {
             record_login("locked", None);
             return Err(AuthError::LockedOut {
-                until: SystemTime::now() + until.saturating_duration_since(std::time::Instant::now()),
+                until: SystemTime::now()
+                    + until.saturating_duration_since(std::time::Instant::now()),
             });
         }
     }
@@ -167,7 +168,11 @@ pub async fn login(
             if let Err(e) = state.user_store.upsert(&updated) {
                 tracing::warn!(error = %e, "failed to persist last_login update");
             }
-            state.login_attempts.lock().unwrap().record_success(&username);
+            state
+                .login_attempts
+                .lock()
+                .unwrap()
+                .record_success(&username);
 
             // Enforce min response time floor.
             apply_floor(state.config.min_login_response_ms, started).await;
@@ -182,7 +187,11 @@ pub async fn login(
             }))
         }
         Err(e) => {
-            let result_label = if not_found { "not_found" } else { "wrong_password" };
+            let result_label = if not_found {
+                "not_found"
+            } else {
+                "wrong_password"
+            };
             record_login(result_label, None);
             state.login_attempts.lock().unwrap().record_failure(
                 &username,
@@ -287,10 +296,11 @@ pub async fn change_password(
 
     let new_params = state.new_argon2_params();
     let wrap_params = new_params.clone();
-    let wrapped = tokio::task::spawn_blocking(move || kdf::wrap_sk(&sk, new.as_bytes(), &wrap_params))
-        .await
-        .map_err(|e| AuthError::Backend(format!("kdf join: {e}")))?
-        .map_err(|e| AuthError::Backend(e.to_string()))?;
+    let wrapped =
+        tokio::task::spawn_blocking(move || kdf::wrap_sk(&sk, new.as_bytes(), &wrap_params))
+            .await
+            .map_err(|e| AuthError::Backend(format!("kdf join: {e}")))?
+            .map_err(|e| AuthError::Backend(e.to_string()))?;
 
     let updated = UserRecord {
         username: rec.username.clone(),
@@ -440,11 +450,10 @@ async fn attempt_unwrap(
 ) -> Result<(UserRecord, Vec<u8>), AuthError> {
     let params = rec.kdf.clone();
     let wrapped = rec.wrapped_sk.clone();
-    let sk_result = tokio::task::spawn_blocking(move || {
-        kdf::unwrap_sk(&wrapped, password.as_bytes(), &params)
-    })
-    .await
-    .map_err(|e| AuthError::Backend(format!("kdf join: {e}")))?;
+    let sk_result =
+        tokio::task::spawn_blocking(move || kdf::unwrap_sk(&wrapped, password.as_bytes(), &params))
+            .await
+            .map_err(|e| AuthError::Backend(format!("kdf join: {e}")))?;
     match sk_result {
         Ok(sk) => Ok((rec, sk)),
         Err(_) => Err(AuthError::InvalidCredentials),

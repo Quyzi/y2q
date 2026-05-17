@@ -1,11 +1,11 @@
 use std::collections::VecDeque;
 
 use ratatui::{
+    Frame,
     layout::Rect,
     style::{Color, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Gauge, Paragraph, Sparkline},
-    Frame,
 };
 
 use crate::output::{fmt_bytes, fmt_speed};
@@ -69,18 +69,28 @@ pub fn render(frame: &mut Frame, area: Rect, entries: &[TransferEntry]) {
     }
 
     let active = entries.iter().find(|e| e.status == TransferStatus::Running);
-    let queue = entries.iter().filter(|e| e.status != TransferStatus::Running).take(3);
+    let queue = entries
+        .iter()
+        .filter(|e| e.status != TransferStatus::Running)
+        .take(3);
 
     if let Some(entry) = active {
         let gauge_area = Rect { height: 1, ..inner };
-        let spark_area = Rect { y: inner.y + 1, height: 1.min(inner.height.saturating_sub(1)), ..inner };
+        let spark_area = Rect {
+            y: inner.y + 1,
+            height: 1.min(inner.height.saturating_sub(1)),
+            ..inner
+        };
 
         let pct = (entry.ratio() * 100.0) as u16;
         let label = format!(
             " {} — {} / {}  {}",
             entry.label,
             fmt_bytes(entry.bytes_done),
-            entry.total_bytes.map(fmt_bytes).unwrap_or_else(|| "?".into()),
+            entry
+                .total_bytes
+                .map(fmt_bytes)
+                .unwrap_or_else(|| "?".into()),
             fmt_speed(entry.current_speed()),
         );
         let gauge = Gauge::default()
@@ -91,7 +101,11 @@ pub fn render(frame: &mut Frame, area: Rect, entries: &[TransferEntry]) {
 
         if spark_area.height > 0 && !entry.speed_samples.is_empty() {
             let max = entry.speed_samples.iter().copied().max().unwrap_or(1);
-            let data: Vec<u64> = entry.speed_samples.iter().map(|&s| s * 8 / max.max(1)).collect();
+            let data: Vec<u64> = entry
+                .speed_samples
+                .iter()
+                .map(|&s| s * 8 / max.max(1))
+                .collect();
             let sparkline = Sparkline::default()
                 .data(&data)
                 .style(Style::default().fg(Color::Green));
@@ -105,14 +119,20 @@ pub fn render(frame: &mut Frame, area: Rect, entries: &[TransferEntry]) {
         if row >= inner.y + inner.height {
             break;
         }
-        let area = Rect { y: row, height: 1, ..inner };
+        let area = Rect {
+            y: row,
+            height: 1,
+            ..inner
+        };
         let (icon, color) = match &entry.status {
             TransferStatus::Queued => ("▶ queued", Color::Yellow),
             TransferStatus::Done => ("✓ done  ", Color::Green),
             TransferStatus::Failed(e) => {
                 let text = format!("✗ failed: {e}");
-                let para =
-                    Paragraph::new(Line::from(vec![Span::styled(text, Style::default().fg(Color::Red))]));
+                let para = Paragraph::new(Line::from(vec![Span::styled(
+                    text,
+                    Style::default().fg(Color::Red),
+                )]));
                 frame.render_widget(para, area);
                 continue;
             }

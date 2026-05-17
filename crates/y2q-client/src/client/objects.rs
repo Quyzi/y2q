@@ -23,9 +23,7 @@ impl Y2qClient {
         let resp = self.authed(self.inner.get(url)).send().await?;
         let resp = Self::check_status(resp).await?;
 
-        let stream = resp
-            .bytes_stream()
-            .map_err(std::io::Error::other);
+        let stream = resp.bytes_stream().map_err(std::io::Error::other);
         let mut reader = StreamReader::new(stream);
         let n = tokio::io::copy(&mut reader, writer).await?;
         Ok(n)
@@ -91,10 +89,20 @@ impl Y2qClient {
         let mut labels = BTreeMap::new();
         for (name, value) in headers {
             let name_str = name.as_str();
-            if let Some(label) = name_str
-                .strip_prefix("x-y2q-")
-                .filter(|s| !matches!(*s, "created" | "modified" | "checksum-md5" | "checksum-sha256" | "cipher-size" | "cipher-sha256" | "kem-alg" | "aead-alg" | "envelope-version"))
-                && let Ok(v) = value.to_str()
+            if let Some(label) = name_str.strip_prefix("x-y2q-").filter(|s| {
+                !matches!(
+                    *s,
+                    "created"
+                        | "modified"
+                        | "checksum-md5"
+                        | "checksum-sha256"
+                        | "cipher-size"
+                        | "cipher-sha256"
+                        | "kem-alg"
+                        | "aead-alg"
+                        | "envelope-version"
+                )
+            }) && let Ok(v) = value.to_str()
             {
                 labels.insert(label.to_owned(), v.to_owned());
             }

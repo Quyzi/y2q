@@ -88,12 +88,12 @@ impl CryptoError {
     /// attaching `bucket`/`key` context where the variant supports it.
     pub fn into_storage_error(self, bucket: &str, key: &str) -> Error {
         match self {
-            CryptoError::AuthFailed
-            | CryptoError::Aead(_)
-            | CryptoError::KemDecode(_) => Error::DecryptionFailed {
-                bucket: bucket.to_owned(),
-                key: key.to_owned(),
-            },
+            CryptoError::AuthFailed | CryptoError::Aead(_) | CryptoError::KemDecode(_) => {
+                Error::DecryptionFailed {
+                    bucket: bucket.to_owned(),
+                    key: key.to_owned(),
+                }
+            }
             CryptoError::Envelope(reason) => Error::EnvelopeMalformed {
                 bucket: bucket.to_owned(),
                 key: key.to_owned(),

@@ -11,14 +11,12 @@ fn has_glob(s: &str) -> bool {
 }
 
 fn require_bucket_key(remote: &RemotePath) -> Result<(&str, &str), CliError> {
-    let bucket = remote
-        .bucket
-        .as_deref()
-        .ok_or_else(|| CliError::InvalidPath(format!("{}/", remote.alias), "missing bucket".into()))?;
-    let key = remote
-        .key
-        .as_deref()
-        .ok_or_else(|| CliError::InvalidPath(format!("{}/{bucket}/", remote.alias), "missing key".into()))?;
+    let bucket = remote.bucket.as_deref().ok_or_else(|| {
+        CliError::InvalidPath(format!("{}/", remote.alias), "missing bucket".into())
+    })?;
+    let key = remote.key.as_deref().ok_or_else(|| {
+        CliError::InvalidPath(format!("{}/{bucket}/", remote.alias), "missing key".into())
+    })?;
     Ok((bucket, key))
 }
 
@@ -29,7 +27,10 @@ async fn make_client(alias: &str) -> Result<Y2qClient, CliError> {
     let token = store
         .token_for(alias)
         .ok_or(CliError::Client(y2q_client::ClientError::Unauthenticated))?;
-    Ok(Y2qClient::new(ClientConfig { base_url: profile.url.clone(), token: Some(token) })?)
+    Ok(Y2qClient::new(ClientConfig {
+        base_url: profile.url.clone(),
+        token: Some(token),
+    })?)
 }
 
 pub async fn rm(path: String, force: bool, mode: OutputMode) -> Result<(), CliError> {
@@ -71,7 +72,11 @@ pub async fn rm(path: String, force: bool, mode: OutputMode) -> Result<(), CliEr
             .list_objects(
                 bucket,
                 &ListOptions {
-                    prefix: if glob_prefix.is_empty() { None } else { Some(glob_prefix.clone()) },
+                    prefix: if glob_prefix.is_empty() {
+                        None
+                    } else {
+                        Some(glob_prefix.clone())
+                    },
                     after: after.clone(),
                     limit: Some(1000),
                 },
@@ -96,7 +101,10 @@ pub async fn rm(path: String, force: bool, mode: OutputMode) -> Result<(), CliEr
     }
 
     if !force {
-        eprintln!("The following {} object(s) will be deleted:", matching_keys.len());
+        eprintln!(
+            "The following {} object(s) will be deleted:",
+            matching_keys.len()
+        );
         for k in &matching_keys {
             eprintln!("  {}/{bucket}/{k}", remote.alias);
         }
@@ -151,7 +159,9 @@ pub async fn stat(path: String, mode: OutputMode) -> Result<(), CliError> {
         println!("Path:     {path}");
         println!("Size:     {}", fmt_bytes(head.size));
         if head.size == 0 && head.kem_alg.is_some() {
-            println!("          (size recorded as 0; object was uploaded before size tracking was active — re-upload to correct)");
+            println!(
+                "          (size recorded as 0; object was uploaded before size tracking was active — re-upload to correct)"
+            );
         }
         println!("Created:  {}", fmt_ns(head.created));
         println!("Modified: {}", fmt_ns(head.modified));

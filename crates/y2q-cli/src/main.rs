@@ -12,7 +12,7 @@ use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
 use cli::{AdminCmd, Cli, Commands};
-use config::{default_config_path, CliConfig};
+use config::{CliConfig, default_config_path};
 use error::CliError;
 use output::OutputMode;
 
@@ -40,7 +40,11 @@ async fn main() {
 }
 
 async fn run(cli: Cli) -> Result<(), CliError> {
-    let mode = if cli.json { OutputMode::Json } else { OutputMode::Human };
+    let mode = if cli.json {
+        OutputMode::Json
+    } else {
+        OutputMode::Human
+    };
 
     match cli.command {
         None | Some(Commands::Tui) => {
@@ -51,22 +55,34 @@ async fn run(cli: Cli) -> Result<(), CliError> {
             tui::run_tui(config).await
         }
         Some(Commands::Config { cmd }) => cmd::config::run(cmd, mode).await,
-        Some(Commands::Login { alias, user, password, ttl }) => {
-            cmd::auth::login(&alias, user, password, ttl, mode).await
-        }
+        Some(Commands::Login {
+            alias,
+            user,
+            password,
+            ttl,
+        }) => cmd::auth::login(&alias, user, password, ttl, mode).await,
         Some(Commands::Logout { alias }) => cmd::auth::logout(&alias, mode).await,
-        Some(Commands::Passwd { alias, current, new }) => {
-            cmd::auth::passwd(&alias, current, new, mode).await
-        }
-        Some(Commands::Ls { path, limit, after, all }) => {
-            cmd::listing::run(path, limit, after, all, mode).await
-        }
+        Some(Commands::Passwd {
+            alias,
+            current,
+            new,
+        }) => cmd::auth::passwd(&alias, current, new, mode).await,
+        Some(Commands::Ls {
+            path,
+            limit,
+            after,
+            all,
+        }) => cmd::listing::run(path, limit, after, all, mode).await,
         Some(Commands::Rm { path, force }) => cmd::objects::rm(path, force, mode).await,
         Some(Commands::Stat { path }) => cmd::objects::stat(path, mode).await,
         Some(Commands::Cat { path }) => cmd::objects::cat(path).await,
-        Some(Commands::Cp { src, dst, label, sync, recursive }) => {
-            cmd::cp::run(src, dst, label, sync, recursive, mode).await
-        }
+        Some(Commands::Cp {
+            src,
+            dst,
+            label,
+            sync,
+            recursive,
+        }) => cmd::cp::run(src, dst, label, sync, recursive, mode).await,
         Some(Commands::Completions { shell }) => {
             cmd::completions::run(shell);
             Ok(())

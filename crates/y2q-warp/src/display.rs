@@ -223,7 +223,11 @@ fn render(f: &mut Frame, sentinel_op: OpKind, total_duration: Duration, state: &
     let area = f.area();
     let outer = Block::default()
         .title(" y2q-warp ")
-        .title_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+        .title_style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan));
     let inner = outer.inner(area);
@@ -256,14 +260,20 @@ fn render_prepare(f: &mut Frame, area: Rect, done: u32, total: u32) {
     };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Length(1), Constraint::Min(0)])
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(0),
+        ])
         .split(area);
 
     let title = Paragraph::new(Line::from(vec![
         Span::styled("Seeding   ", Style::default().fg(Color::Yellow)),
         Span::styled(
             format!("{done} / {total}"),
-            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
         ),
     ]));
     f.render_widget(title, chunks[0]);
@@ -306,8 +316,8 @@ fn render_running(
         1 => op_kinds[0].as_str().to_owned(),
         _ => "MIXED".to_owned(),
     };
-    let pct = ((elapsed.as_secs_f64() / total_duration.as_secs_f64()) * 100.0)
-        .clamp(0.0, 100.0) as u16;
+    let pct =
+        ((elapsed.as_secs_f64() / total_duration.as_secs_f64()) * 100.0).clamp(0.0, 100.0) as u16;
     let gauge = Gauge::default()
         .gauge_style(Style::default().fg(Color::Green).bg(Color::DarkGray))
         .percent(pct)
@@ -322,9 +332,23 @@ fn render_running(
 
     // --- Stats table ---
     let header = Row::new(
-        ["Op", "Ops", "Errors", "Err/s", "Throughput", "Ops/s", "P50", "P90", "P99"].map(|h| {
-            Cell::from(h)
-                .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+        [
+            "Op",
+            "Ops",
+            "Errors",
+            "Err/s",
+            "Throughput",
+            "Ops/s",
+            "P50",
+            "P90",
+            "P99",
+        ]
+        .map(|h| {
+            Cell::from(h).style(
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )
         }),
     )
     .height(1)
@@ -432,17 +456,18 @@ fn render_running(
 
 fn render_statusbar(f: &mut Frame, area: Rect) {
     let bar = Paragraph::new(Line::from(vec![
-        Span::styled("  q", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "  q",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled(" quit", Style::default().fg(Color::DarkGray)),
     ]));
     f.render_widget(bar, area);
 }
 
-async fn plain_fallback(
-    mut rx: mpsc::Receiver<DisplayMsg>,
-    op: OpKind,
-    total_duration: Duration,
-) {
+async fn plain_fallback(mut rx: mpsc::Receiver<DisplayMsg>, op: OpKind, total_duration: Duration) {
     let mut interval = tokio::time::interval(Duration::from_millis(500));
     let mut bench_start: Option<Instant> = None;
 

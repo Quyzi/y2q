@@ -36,7 +36,10 @@ pub async fn login(
         prompt_password(&format!("Password for {username}@{alias}: "))?
     };
 
-    let client = Y2qClient::new(ClientConfig { base_url: profile.url.clone(), token: None })?;
+    let client = Y2qClient::new(ClientConfig {
+        base_url: profile.url.clone(),
+        token: None,
+    })?;
     let token_resp = client.login(&username, pw.as_str(), ttl).await?;
 
     let entry = TokenEntry {
@@ -61,7 +64,10 @@ pub async fn login(
                 .map(|d| d.as_secs())
                 .unwrap_or(0),
         );
-        println!("Logged in as {} (token expires in {}s)", entry.username, secs_left);
+        println!(
+            "Logged in as {} (token expires in {}s)",
+            entry.username, secs_left
+        );
     }
     Ok(())
 }
@@ -122,7 +128,9 @@ pub async fn passwd(
         base_url: profile.url.clone(),
         token: Some(token),
     })?;
-    client.change_password(current_pw.as_str(), new_pw.as_str()).await?;
+    client
+        .change_password(current_pw.as_str(), new_pw.as_str())
+        .await?;
 
     if mode == OutputMode::Json {
         print_json(&serde_json::json!({ "alias": alias, "changed": true }));

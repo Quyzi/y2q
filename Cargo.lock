@@ -4760,6 +4760,7 @@ dependencies = [
  "pqcrypto-traits",
  "rand 0.8.6",
  "redb",
+ "ring",
  "serde",
  "serde_json",
  "sha2",

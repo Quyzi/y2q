@@ -83,7 +83,12 @@ pub struct CountingReader<R> {
 
 impl<R> CountingReader<R> {
     pub fn new(inner: R, reporter: Box<dyn ProgressReporter>) -> Self {
-        Self { inner, bytes_done: 0, speed: SpeedMeter::new(), reporter }
+        Self {
+            inner,
+            bytes_done: 0,
+            speed: SpeedMeter::new(),
+            reporter,
+        }
     }
 }
 
@@ -126,7 +131,12 @@ pub struct CountingWriter<W> {
 
 impl<W> CountingWriter<W> {
     pub fn new(inner: W, reporter: Box<dyn ProgressReporter>) -> Self {
-        Self { inner, bytes_done: 0, speed: SpeedMeter::new(), reporter }
+        Self {
+            inner,
+            bytes_done: 0,
+            speed: SpeedMeter::new(),
+            reporter,
+        }
     }
 }
 

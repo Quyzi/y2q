@@ -14,14 +14,13 @@ use bytes::Bytes;
 use crate::{
     CacheRebuildStatus, CipherMetadata, Error, FilesystemStorage, ListOptions, ListPage, Listing,
     Metadata, Object, PlaintextMetrics, PutOptions, StaleLock, Storage, StorageExt,
-    StreamingPutGuard,
-    storage::format::HEADER_SIZE,
+    StreamingPutGuard, storage::format::HEADER_SIZE,
 };
 
 #[cfg(all(target_os = "linux", feature = "uring"))]
 use crate::UringStorage;
 #[cfg(all(target_os = "linux", feature = "uring"))]
-use crate::storage::uring::{UringStreamingPutGuard, URING_STREAMING_WRITE_OFFSET};
+use crate::storage::uring::{URING_STREAMING_WRITE_OFFSET, UringStreamingPutGuard};
 
 /// One of the available storage backends, selected at startup.
 ///
@@ -131,9 +130,15 @@ impl AnyStreamingPutGuard {
         cipher_metadata: CipherMetadata,
     ) -> Result<bool, Error> {
         match self {
-            Self::Filesystem(g) => g.commit(file, options, plaintext_metrics, cipher_metadata).await,
+            Self::Filesystem(g) => {
+                g.commit(file, options, plaintext_metrics, cipher_metadata)
+                    .await
+            }
             #[cfg(all(target_os = "linux", feature = "uring"))]
-            Self::Uring(g) => g.commit(file, options, plaintext_metrics, cipher_metadata).await,
+            Self::Uring(g) => {
+                g.commit(file, options, plaintext_metrics, cipher_metadata)
+                    .await
+            }
         }
     }
 }
@@ -161,7 +166,11 @@ impl AnyStorage {
             #[cfg(all(target_os = "linux", feature = "uring"))]
             Self::Uring(s) => {
                 let (g, f) = s.begin_streaming_put(bucket, key).await?;
-                Ok((AnyStreamingPutGuard::Uring(g), f, URING_STREAMING_WRITE_OFFSET))
+                Ok((
+                    AnyStreamingPutGuard::Uring(g),
+                    f,
+                    URING_STREAMING_WRITE_OFFSET,
+                ))
             }
         }
     }

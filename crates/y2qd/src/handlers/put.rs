@@ -70,12 +70,17 @@ pub async fn handle(
         .map_err(AppError::from)?;
 
     let (file, plaintext_metrics, cipher_metadata) =
-        cipher::stream_encrypt_for_put(&auth.keystore, payload, file, &bucket, &key, write_offset).await?;
+        cipher::stream_encrypt_for_put(&auth.keystore, payload, file, &bucket, &key, write_offset)
+            .await?;
 
     let was_overwrite = guard
         .commit(
             file,
-            PutOptions { labels, sync, ..Default::default() },
+            PutOptions {
+                labels,
+                sync,
+                ..Default::default()
+            },
             plaintext_metrics,
             cipher_metadata,
         )

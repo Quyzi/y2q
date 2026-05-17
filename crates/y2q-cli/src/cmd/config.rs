@@ -18,11 +18,17 @@ pub async fn run(cmd: ConfigCmd, mode: OutputMode) -> Result<(), CliError> {
                     buf.trim().to_owned()
                 }
             };
-            let profile = Profile { url: url.clone(), username: username.clone(), password: None };
+            let profile = Profile {
+                url: url.clone(),
+                username: username.clone(),
+                password: None,
+            };
             config.add_profile(alias.clone(), profile);
             config.save(&config_path)?;
             if mode == OutputMode::Json {
-                print_json(&serde_json::json!({ "alias": alias, "url": url, "username": username }));
+                print_json(
+                    &serde_json::json!({ "alias": alias, "url": url, "username": username }),
+                );
             } else {
                 println!("Added profile `{alias}`  →  {url}  (user: {username})");
                 println!("Tip: to log in, run: y2q login {alias}");

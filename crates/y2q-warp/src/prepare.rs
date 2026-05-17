@@ -40,12 +40,22 @@ pub async fn prepare(
             use std::collections::BTreeMap;
             let reader = BoundedRepeatReader::new(size);
             client
-                .put_from_reader(&bucket, &key_clone, reader, Some(size), &BTreeMap::new(), None)
+                .put_from_reader(
+                    &bucket,
+                    &key_clone,
+                    reader,
+                    Some(size),
+                    &BTreeMap::new(),
+                    None,
+                )
                 .await
                 .map_err(|e| e.to_string())?;
             let done = prepared.fetch_add(1, Ordering::Relaxed) + 1;
             if let Some(ref tx) = *progress_tx {
-                let _ = tx.try_send(DisplayMsg::Preparing { done, total: objects });
+                let _ = tx.try_send(DisplayMsg::Preparing {
+                    done,
+                    total: objects,
+                });
             } else if done % 100 == 0 || done == objects {
                 eprintln!("  prepared {done}/{objects} objects");
             }
@@ -63,7 +73,10 @@ pub async fn prepare(
     }
 
     if progress_tx.is_none() {
-        eprintln!("prepare complete: {} objects in bucket {bucket}", keys.len());
+        eprintln!(
+            "prepare complete: {} objects in bucket {bucket}",
+            keys.len()
+        );
     }
     Ok(keys)
 }
@@ -83,7 +96,11 @@ pub async fn cleanup(
         let page = client
             .list_objects(
                 bucket,
-                &ListOptions { prefix: Some(prefix.to_owned()), after: after.clone(), limit: Some(1000) },
+                &ListOptions {
+                    prefix: Some(prefix.to_owned()),
+                    after: after.clone(),
+                    limit: Some(1000),
+                },
             )
             .await?;
 

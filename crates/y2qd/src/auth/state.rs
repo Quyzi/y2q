@@ -93,12 +93,7 @@ impl LoginAttempts {
 
     /// Record a failed attempt; if the count reaches `max_failed`, set a
     /// lockout for `lockout_duration`.
-    pub fn record_failure(
-        &mut self,
-        username: &str,
-        max_failed: u32,
-        lockout_duration: Duration,
-    ) {
+    pub fn record_failure(&mut self, username: &str, max_failed: u32, lockout_duration: Duration) {
         if max_failed == 0 {
             return;
         }

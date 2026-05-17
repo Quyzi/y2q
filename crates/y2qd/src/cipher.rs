@@ -18,7 +18,6 @@ use y2q_core::{CipherMetadata, PlaintextMetrics};
 
 use crate::error::AppError;
 
-
 /// Decrypt a GET body. If `bytes` is not a recognized y2q envelope (i.e.
 /// a legacy plaintext object written before encryption was wired in), return
 /// it as-is.
@@ -33,16 +32,18 @@ pub fn decrypt_after_get(
     }
     match envelope::decrypt(&keystore.secret_key, bytes) {
         Ok(pt) => Ok(Bytes::from(pt)),
-        Err(y2q_core::crypto::CryptoError::UnsupportedVersion(v)) => Err(AppError(
-            y2q_core::Error::UnsupportedEnvelopeVersion { version: v },
-        )),
-        Err(y2q_core::crypto::CryptoError::Envelope(reason)) => Err(AppError(
-            y2q_core::Error::EnvelopeMalformed {
+        Err(y2q_core::crypto::CryptoError::UnsupportedVersion(v)) => {
+            Err(AppError(y2q_core::Error::UnsupportedEnvelopeVersion {
+                version: v,
+            }))
+        }
+        Err(y2q_core::crypto::CryptoError::Envelope(reason)) => {
+            Err(AppError(y2q_core::Error::EnvelopeMalformed {
                 bucket: bucket.to_owned(),
                 key: key.to_owned(),
                 reason: reason.to_owned(),
-            },
-        )),
+            }))
+        }
         Err(_) => Err(AppError(y2q_core::Error::DecryptionFailed {
             bucket: bucket.to_owned(),
             key: key.to_owned(),
@@ -80,37 +81,46 @@ pub async fn stream_encrypt_for_put(
 ) -> Result<(tokio::fs::File, PlaintextMetrics, CipherMetadata), AppError> {
     use futures::StreamExt;
 
-    let mut session = envelope::EncryptSession::new(file, &keystore.public.public_key, write_offset)
-        .await
-        .map_err(|_| AppError(y2q_core::Error::EncryptionFailed {
-            bucket: bucket.to_owned(),
-            key: key.to_owned(),
-        }))?;
+    let mut session =
+        envelope::EncryptSession::new(file, &keystore.public.public_key, write_offset)
+            .await
+            .map_err(|_| {
+                AppError(y2q_core::Error::EncryptionFailed {
+                    bucket: bucket.to_owned(),
+                    key: key.to_owned(),
+                })
+            })?;
 
     let mut md5_hasher = Md5::new();
     let mut sha_hasher = Sha256::new();
     let mut plaintext_size: u64 = 0;
 
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| AppError(y2q_core::Error::InternalError {
-            bucket: bucket.to_owned(),
-            key: key.to_owned(),
-            operation: "read body".to_owned(),
-            message: e.to_string(),
-        }))?;
+        let chunk = chunk.map_err(|e| {
+            AppError(y2q_core::Error::InternalError {
+                bucket: bucket.to_owned(),
+                key: key.to_owned(),
+                operation: "read body".to_owned(),
+                message: e.to_string(),
+            })
+        })?;
         md5_hasher.update(&chunk);
         sha_hasher.update(&chunk);
         plaintext_size += chunk.len() as u64;
-        session.feed(&chunk).await.map_err(|_| AppError(y2q_core::Error::EncryptionFailed {
-            bucket: bucket.to_owned(),
-            key: key.to_owned(),
-        }))?;
+        session.feed(&chunk).await.map_err(|_| {
+            AppError(y2q_core::Error::EncryptionFailed {
+                bucket: bucket.to_owned(),
+                key: key.to_owned(),
+            })
+        })?;
     }
 
-    let (file, info) = session.finish().await.map_err(|_| AppError(y2q_core::Error::EncryptionFailed {
-        bucket: bucket.to_owned(),
-        key: key.to_owned(),
-    }))?;
+    let (file, info) = session.finish().await.map_err(|_| {
+        AppError(y2q_core::Error::EncryptionFailed {
+            bucket: bucket.to_owned(),
+            key: key.to_owned(),
+        })
+    })?;
 
     let md5_digest = md5_hasher.finalize();
     let sha_digest = sha_hasher.finalize();

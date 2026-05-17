@@ -158,10 +158,7 @@ mod tests {
         let found = s.get_active(&hash).unwrap();
         assert_eq!(found.username, "alice");
         assert!(s.revoke(&hash));
-        assert!(matches!(
-            s.get_active(&hash),
-            Err(AuthError::TokenInvalid)
-        ));
+        assert!(matches!(s.get_active(&hash), Err(AuthError::TokenInvalid)));
     }
 
     #[test]
