@@ -42,6 +42,8 @@ pub struct Aggregate {
     pub op: OpKind,
     pub n_ops: u64,
     pub n_errors: u64,
+    pub n_errors_4xx: u64,
+    pub n_errors_5xx: u64,
     pub total_bytes: u64,
     pub duration_s: f64,
     pub throughput_mibps: f64,
@@ -76,6 +78,8 @@ pub struct OpHistograms {
     pub total_bytes: u64,
     pub n_ops: u64,
     pub n_errors: u64,
+    pub n_errors_4xx: u64,
+    pub n_errors_5xx: u64,
     pub first_ns: u64,
     pub last_ns: u64,
 }
@@ -89,6 +93,8 @@ impl OpHistograms {
             total_bytes: 0,
             n_ops: 0,
             n_errors: 0,
+            n_errors_4xx: 0,
+            n_errors_5xx: 0,
             first_ns: u64::MAX,
             last_ns: 0,
         }
@@ -100,6 +106,15 @@ impl OpHistograms {
         self.last_ns = self.last_ns.max(rec.end_ns);
         if rec.is_error() {
             self.n_errors += 1;
+            if let Some(ref e) = rec.error {
+                let (is_4xx, is_5xx) = classify_http_error(e);
+                if is_4xx {
+                    self.n_errors_4xx += 1;
+                }
+                if is_5xx {
+                    self.n_errors_5xx += 1;
+                }
+            }
             return;
         }
         self.total_bytes += rec.bytes;
@@ -137,6 +152,8 @@ impl OpHistograms {
             op: self.op,
             n_ops: self.n_ops,
             n_errors: self.n_errors,
+            n_errors_4xx: self.n_errors_4xx,
+            n_errors_5xx: self.n_errors_5xx,
             total_bytes: self.total_bytes,
             duration_s,
             throughput_mibps,
@@ -155,4 +172,28 @@ impl OpHistograms {
 
 pub fn ns_to_ms_str(ns: u64) -> String {
     format!("{:.1}ms", ns as f64 / 1_000_000.0)
+}
+
+/// Returns `(is_4xx, is_5xx)` for an error string.
+/// Handles both direct HTTP status strings ("HTTP 404 Not Found") and
+/// ClientError Display variants ("not found: …", "server error (502): …").
+pub fn classify_http_error(error: &str) -> (bool, bool) {
+    if let Some(rest) = error.strip_prefix("HTTP ") {
+        if let Ok(code) = rest.split_whitespace().next().unwrap_or("").parse::<u16>() {
+            return (code >= 400 && code < 500, code >= 500);
+        }
+    }
+    if error.starts_with("not found:")
+        || error.starts_with("bad request:")
+        || error.starts_with("conflict:")
+    {
+        return (true, false);
+    }
+    if let Some(rest) = error.strip_prefix("server error (") {
+        if let Ok(code) = rest.split(')').next().unwrap_or("").parse::<u16>() {
+            return (code >= 400 && code < 500, code >= 500);
+        }
+        return (false, true);
+    }
+    (false, false)
 }
