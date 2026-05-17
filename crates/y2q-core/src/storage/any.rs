@@ -15,6 +15,7 @@ use crate::{
     CacheRebuildStatus, CipherMetadata, Error, FilesystemStorage, ListOptions, ListPage, Listing,
     Metadata, Object, PlaintextMetrics, PutOptions, StaleLock, Storage, StorageExt,
     StreamingPutGuard,
+    storage::format::HEADER_SIZE,
 };
 
 #[cfg(all(target_os = "linux", feature = "uring"))]
@@ -155,7 +156,7 @@ impl AnyStorage {
         match self {
             Self::Filesystem(s) => {
                 let (g, f) = s.begin_streaming_put(bucket, key).await?;
-                Ok((AnyStreamingPutGuard::Filesystem(g), f, 0))
+                Ok((AnyStreamingPutGuard::Filesystem(g), f, HEADER_SIZE as u64))
             }
             #[cfg(all(target_os = "linux", feature = "uring"))]
             Self::Uring(s) => {

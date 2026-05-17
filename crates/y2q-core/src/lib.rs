@@ -110,9 +110,8 @@ pub struct Metadata {
 /// - [`UringStorage`](crate::storage::uring::UringStorage) (Linux): honoured.
 ///   `Durable` issues `fdatasync` on the object file plus `fsync` on the
 ///   parent directory after `rename`; `BestEffort` skips both.
-/// - [`FilesystemStorage`]: currently best-effort regardless of this field.
-///   The field is informational on that backend; it may be honoured in a
-///   later change without affecting callers.
+/// - [`FilesystemStorage`]: honoured. Same semantics as the uring backend:
+///   `Durable` issues `fdatasync` + parent dir `fsync`; `BestEffort` skips both.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum SyncLevel {
     /// `fdatasync` on the object file + parent directory `fsync` before
