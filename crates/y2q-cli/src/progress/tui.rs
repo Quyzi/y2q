@@ -9,22 +9,44 @@ use crossterm::{
 use crate::output::fmt_bytes;
 use crate::progress::ProgressReporter;
 
-const NEON_PINK: Color = Color::Rgb { r: 255, g: 20, b: 147 };
-const NEON_CYAN: Color = Color::Rgb { r: 0, g: 255, b: 255 };
-const NEON_GREEN: Color = Color::Rgb { r: 57, g: 255, b: 20 };
-const NEON_YELLOW: Color = Color::Rgb { r: 255, g: 215, b: 0 };
-const NEON_PURPLE: Color = Color::Rgb { r: 188, g: 0, b: 255 };
-const DIM: Color = Color::Rgb { r: 50, g: 50, b: 80 };
-const NORMAL: Color = Color::Rgb { r: 200, g: 210, b: 255 };
+const NEON_PINK: Color = Color::Rgb {
+    r: 255,
+    g: 20,
+    b: 147,
+};
+const NEON_CYAN: Color = Color::Rgb {
+    r: 0,
+    g: 255,
+    b: 255,
+};
+const NEON_GREEN: Color = Color::Rgb {
+    r: 57,
+    g: 255,
+    b: 20,
+};
+const NEON_YELLOW: Color = Color::Rgb {
+    r: 255,
+    g: 215,
+    b: 0,
+};
+const NEON_PURPLE: Color = Color::Rgb {
+    r: 188,
+    g: 0,
+    b: 255,
+};
+const DIM: Color = Color::Rgb {
+    r: 50,
+    g: 50,
+    b: 80,
+};
+const NORMAL: Color = Color::Rgb {
+    r: 200,
+    g: 210,
+    b: 255,
+};
 
 /// Particle offsets from fill head (offset, glyph).
-const PARTICLES: &[(usize, &str)] = &[
-    (1, "·"),
-    (3, "∘"),
-    (5, "·"),
-    (8, "⋅"),
-    (11, "·"),
-];
+const PARTICLES: &[(usize, &str)] = &[(1, "·"), (3, "∘"), (5, "·"), (8, "⋅"), (11, "·")];
 
 pub struct TuiProgressReporter {
     label: String,

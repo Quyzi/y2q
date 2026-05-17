@@ -16,7 +16,11 @@ use crate::tui::theme::*;
 pub enum TransferStatus {
     Queued,
     Running,
-    Done { bytes: u64, elapsed: Duration, avg_bps: u64 },
+    Done {
+        bytes: u64,
+        elapsed: Duration,
+        avg_bps: u64,
+    },
     Failed(String),
 }
 
@@ -175,7 +179,11 @@ pub fn render(frame: &mut Frame, area: Rect, entries: &[TransferEntry]) {
         if row >= inner.y + inner.height {
             break;
         }
-        let row_area = Rect { y: row, height: 1, ..inner };
+        let row_area = Rect {
+            y: row,
+            height: 1,
+            ..inner
+        };
         match &entry.status {
             TransferStatus::Queued => {
                 frame.render_widget(
@@ -186,7 +194,11 @@ pub fn render(frame: &mut Frame, area: Rect, entries: &[TransferEntry]) {
                     row_area,
                 );
             }
-            TransferStatus::Done { bytes, elapsed, avg_bps } => {
+            TransferStatus::Done {
+                bytes,
+                elapsed,
+                avg_bps,
+            } => {
                 let secs = elapsed.as_secs_f64();
                 let dur_str = if secs < 60.0 {
                     format!("{secs:.1}s")
@@ -194,7 +206,10 @@ pub fn render(frame: &mut Frame, area: Rect, entries: &[TransferEntry]) {
                     format!("{}m{:.0}s", secs as u64 / 60, secs % 60.0)
                 };
                 let spans = vec![
-                    Span::styled("✓ ", Style::default().fg(NEON_GREEN).add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        "✓ ",
+                        Style::default().fg(NEON_GREEN).add_modifier(Modifier::BOLD),
+                    ),
                     Span::styled(entry.label.clone(), Style::default().fg(NORMAL_TEXT)),
                     Span::styled("  ", Style::default()),
                     Span::styled(fmt_bytes(*bytes), Style::default().fg(NEON_CYAN)),
