@@ -4,12 +4,12 @@ This document describes how `y2qd` is put together: the components, the encrypti
 
 ## Overview
 
-`y2qd` is an HTTP daemon that exposes an object store. Every object is encrypted at rest using ML-KEM-768 key encapsulation feeding AES-256-GCM (via [ring](https://github.com/briansmith/ring)). The deployment's private key is never written to disk in plaintext — it is wrapped under each authorized user's password with Argon2id, unwrapped into process memory on successful login, and dropped when no sessions remain (subject to an optional idle timeout).
+`y2qd` is an HTTP daemon that exposes an object store. Every object is encrypted at rest using ML-KEM-768 key encapsulation feeding AES-256-GCM (via [ring](https://github.com/briansmith/ring)). The deployment's private key is never written to disk in plaintext - it is wrapped under each authorized user's password with Argon2id, unwrapped into process memory on successful login, and dropped when no sessions remain (subject to an optional idle timeout).
 
 Two storage backends ship in tree:
 
-- **Filesystem** (default, all platforms) — built on `tokio::fs`. Each object is a single `.obj` file with an embedded header, payload, metadata, and trailer.
-- **io_uring** (Linux only, `--features uring`) — same `.obj` format, same on-disk layout, driven through `tokio-uring` with optional `O_DIRECT` alignment for large objects.
+- **Filesystem** (default, all platforms) - built on `tokio::fs`. Each object is a single `.obj` file with an embedded header, payload, metadata, and trailer.
+- **io_uring** (Linux only, `--features uring`) - same `.obj` format, same on-disk layout, driven through `tokio-uring` with optional `O_DIRECT` alignment for large objects.
 
 Both backends write the same format. A file written by the uring backend is readable by the filesystem backend and vice versa. A redb-backed metadata index makes listing cheap; it auto-rebuilds on startup and can be manually triggered at any time.
 
@@ -99,8 +99,8 @@ Fixed overhead per object is 1132 bytes (28 header + 1088 KEM + 16 tag).
 
 The content key is derived fresh for every PUT:
 
-1. `(kem_ct, ss) := ML-KEM-768.encapsulate(public_key)` — fresh ephemeral, produces a 32-byte shared secret.
-2. `content_key := HKDF-SHA256(salt = kem_ct, ikm = ss, info = b"y2q/v1/content-key")` — 32 bytes.
+1. `(kem_ct, ss) := ML-KEM-768.encapsulate(public_key)` - fresh ephemeral, produces a 32-byte shared secret.
+2. `content_key := HKDF-SHA256(salt = kem_ct, ikm = ss, info = b"y2q/v1/content-key")` - 32 bytes.
 3. `ciphertext := AES-256-GCM.encrypt(content_key, nonce, plaintext, aad = header)`.
 
 On GET the daemon does the reverse: parse the header, decapsulate with the in-memory secret key, re-derive the content key, decrypt and verify the tag.
@@ -116,7 +116,7 @@ The ML-KEM-768 secret key is 2400 bytes. It is never written to disk in plaintex
 - The wrapped secret, together with the user's Argon2id parameters and salt, is stored as a `UserRecord` in `users.redb`.
 - On login, the password is run through Argon2id (using that user's stored salt and parameters), the KEK is recomputed, and the secret key is unwrapped into a `Zeroizing<Vec<u8>>` that clears on drop.
 
-Adding a new user is just "wrap the in-memory SK under the new user's password" — there is one canonical secret key shared across all users; each user just has their own wrapped copy.
+Adding a new user is just "wrap the in-memory SK under the new user's password" - there is one canonical secret key shared across all users; each user just has their own wrapped copy.
 
 ### Argon2id parameters
 
@@ -232,7 +232,7 @@ The JSON metadata blob embedded in the `.obj` trailer has this shape:
 
 PUT operations are serialized per object by an in-memory `LockRegistry` backed by a lock-free `papaya::HashMap`. `try_acquire(bucket, key)` is atomic: it inserts `(bucket, key) → SystemTime::now()` via `try_insert` and returns `Error::Locked` if the entry already exists. A `LockGuard` removes the entry on drop.
 
-Because locks are in-memory, they vanish on process exit — there are no orphaned lock files after a SIGKILL. `GET /api/v1/locks?older_than=...` lists currently-held locks whose acquisition timestamp exceeds the cutoff (these are stuck in-flight PUTs, not filesystem artifacts). `DELETE /api/v1/locks?older_than=...` force-releases them.
+Because locks are in-memory, they vanish on process exit - there are no orphaned lock files after a SIGKILL. `GET /api/v1/locks?older_than=...` lists currently-held locks whose acquisition timestamp exceeds the cutoff (these are stuck in-flight PUTs, not filesystem artifacts). `DELETE /api/v1/locks?older_than=...` force-releases them.
 
 ```
 ┌──────────────────────────────────────┐
@@ -267,7 +267,7 @@ When a PUT arrives with `X-Y2Q-Sync: best-effort` (or `storage.default_sync = "b
 2. `fdatasync`s each unique object file concurrently.
 3. `fsync`s each unique parent directory.
 
-The flusher wakes on a timer (`storage.sync_flush_interval_secs`, default 5 s) and also wakes early when the pending queue depth exceeds `storage.sync_flush_limit` (default 64). Best-effort PUTs are never dropped — if the daemon crashes before the flusher runs, a recently-PUT object may be lost even though the API returned 200/201.
+The flusher wakes on a timer (`storage.sync_flush_interval_secs`, default 5 s) and also wakes early when the pending queue depth exceeds `storage.sync_flush_limit` (default 64). Best-effort PUTs are never dropped - if the daemon crashes before the flusher runs, a recently-PUT object may be lost even though the API returned 200/201.
 
 ```
 PUT handler                        background flusher
@@ -302,15 +302,15 @@ All composite keys use a 4-byte big-endian length prefix per field, which makes 
 
 Listing operations are implemented as bounded range scans:
 
-- `list_buckets()` skip-walks the OBJECTS table — one read per bucket, jumping to the lex-successor of each bucket prefix. O(num_buckets) reads instead of O(num_objects).
+- `list_buckets()` skip-walks the OBJECTS table - one read per bucket, jumping to the lex-successor of each bucket prefix. O(num_buckets) reads instead of O(num_objects).
 - `scan_objects(bucket, prefix?, after?, limit)` range scans within the bucket, filters by `prefix`, paginates past `after`, and applies `limit`. Returns a `ListPage { items, next }`. Sorted ascending by key. `next` is `None` when the page is the last.
 
 ### Rebuild
 
-The index is a cache. If it goes missing or corrupt, every operation still works against the on-disk truth (by reading `.obj` files directly) — just slower for listings. Two paths kick off a rebuild:
+The index is a cache. If it goes missing or corrupt, every operation still works against the on-disk truth (by reading `.obj` files directly) - just slower for listings. Two paths kick off a rebuild:
 
-1. **Automatic startup rebuild** — on every boot the daemon walks the storage tree and reconciles the index against on-disk `.obj` files. Objects missing from the index are re-inserted; index rows whose `.obj` file is gone are removed and logged as data-loss events.
-2. **Manual rebuild** — `POST /api/v1/rebuild` starts a background scan; `GET /api/v1/rebuild` polls progress.
+1. **Automatic startup rebuild** - on every boot the daemon walks the storage tree and reconciles the index against on-disk `.obj` files. Objects missing from the index are re-inserted; index rows whose `.obj` file is gone are removed and logged as data-loss events.
+2. **Manual rebuild** - `POST /api/v1/rebuild` starts a background scan; `GET /api/v1/rebuild` polls progress.
 
 Rebuild is fire-and-forget: GET and PUT continue to work during a rebuild. Listing may show stale data until rebuild completes.
 
@@ -318,7 +318,7 @@ Rebuild is fire-and-forget: GET and PUT continue to work during a rebuild. Listi
 
 ### Token format
 
-Session tokens are 32 cryptographically random bytes, encoded as URL-safe base64 (no padding) — 43 ASCII characters on the wire. The plaintext token is never persisted: the session store keys on `SHA-256(token)` and only the hash is held in memory. A leaked memory dump still cannot be replayed against a different process.
+Session tokens are 32 cryptographically random bytes, encoded as URL-safe base64 (no padding) - 43 ASCII characters on the wire. The plaintext token is never persisted: the session store keys on `SHA-256(token)` and only the hash is held in memory. A leaked memory dump still cannot be replayed against a different process.
 
 Wire format:
 
@@ -355,16 +355,16 @@ On startup the daemon acquires a POSIX exclusive `flock` on `<keystore_dir>/.loc
 
 What the design defends against:
 
-- **Disk theft** — an adversary with full read access to the storage tree learns object sizes, keys, labels, timestamps, and ciphertext, but cannot recover plaintext without the secret key.
-- **Server-stored-credentials theft** — the user-store database contains only Argon2id-wrapped copies of the secret key; brute-forcing requires the configured Argon2 work per guess.
-- **Quantum adversary** — ML-KEM-768 is a NIST-selected post-quantum KEM. The AES-256-GCM content key derivation is symmetric and unaffected by Shor.
+- **Disk theft** - an adversary with full read access to the storage tree learns object sizes, keys, labels, timestamps, and ciphertext, but cannot recover plaintext without the secret key.
+- **Server-stored-credentials theft** - the user-store database contains only Argon2id-wrapped copies of the secret key; brute-forcing requires the configured Argon2 work per guess.
+- **Quantum adversary** - ML-KEM-768 is a NIST-selected post-quantum KEM. The AES-256-GCM content key derivation is symmetric and unaffected by Shor.
 
 What it doesn't defend against:
 
-- **Compromised running daemon** — once the SK is unwrapped into memory, anything that can read process memory can read objects. The `keystore_idle_drop_seconds` shortens but doesn't eliminate this window.
-- **Compromised client** — Bearer tokens are bearer credentials. A client that leaks one gives the holder full access until expiry or revocation.
-- **Traffic analysis on the wire** — `y2qd` does not currently terminate TLS. Put it behind a reverse proxy.
-- **Replay of encrypted payloads under a different key** — the daemon trusts whatever public key is in `pubkey.json` at process start. Key rotation is not yet implemented.
+- **Compromised running daemon** - once the SK is unwrapped into memory, anything that can read process memory can read objects. The `keystore_idle_drop_seconds` shortens but doesn't eliminate this window.
+- **Compromised client** - Bearer tokens are bearer credentials. A client that leaks one gives the holder full access until expiry or revocation.
+- **Traffic analysis on the wire** - `y2qd` does not currently terminate TLS. Put it behind a reverse proxy.
+- **Replay of encrypted payloads under a different key** - the daemon trusts whatever public key is in `pubkey.json` at process start. Key rotation is not yet implemented.
 
 ## Observability
 
@@ -387,22 +387,22 @@ The `RUST_LOG` environment variable takes precedence over `log_filter`.
 
 Storage and auth metrics are exposed at `/metrics/prometheus` (Prometheus format) and `/metrics/dashboard` (in-browser):
 
-- `y2q_storage_ops_total{op,backend,result}` — operation counters
-- `y2q_storage_duration_seconds{op,backend}` — latency histograms
-- `y2q_auth_logins_total{result}` — login outcomes
-- `y2q_active_sessions` — current session gauge
+- `y2q_storage_ops_total{op,backend,result}` - operation counters
+- `y2q_storage_duration_seconds{op,backend}` - latency histograms
+- `y2q_auth_logins_total{result}` - login outcomes
+- `y2q_active_sessions` - current session gauge
 
 ## Source map
 
-- [crates/y2q-core/src/crypto/envelope.rs](../crates/y2q-core/src/crypto/envelope.rs) — envelope format, encrypt/decrypt
-- [crates/y2q-core/src/crypto/kdf.rs](../crates/y2q-core/src/crypto/kdf.rs) — Argon2id wrap/unwrap
-- [crates/y2q-core/src/crypto/keystore.rs](../crates/y2q-core/src/crypto/keystore.rs) — pubkey.json, first-run, daemon flock
-- [crates/y2q-core/src/crypto/user_store.rs](../crates/y2q-core/src/crypto/user_store.rs) — users.redb schema
-- [crates/y2q-core/src/storage/filesystem.rs](../crates/y2q-core/src/storage/filesystem.rs) — filesystem backend, hex sharding, .obj writes
-- [crates/y2q-core/src/storage/format.rs](../crates/y2q-core/src/storage/format.rs) — shared .obj header/trailer format (both backends)
-- [crates/y2q-core/src/storage/locks.rs](../crates/y2q-core/src/storage/locks.rs) — in-memory LockRegistry
-- [crates/y2q-core/src/storage/index.rs](../crates/y2q-core/src/storage/index.rs) — redb metadata index
-- [crates/y2qd/src/auth/session.rs](../crates/y2qd/src/auth/session.rs) — session store, token hashing
-- [crates/y2qd/src/auth/keystore.rs](../crates/y2qd/src/auth/keystore.rs) — in-memory keystore slot, idle drop
-- [crates/y2qd/src/observability.rs](../crates/y2qd/src/observability.rs) — metrics setup, log format
-- [crates/y2qd/src/main.rs](../crates/y2qd/src/main.rs) — startup, lifecycle, route wiring
+- [crates/y2q-core/src/crypto/envelope.rs](../crates/y2q-core/src/crypto/envelope.rs) - envelope format, encrypt/decrypt
+- [crates/y2q-core/src/crypto/kdf.rs](../crates/y2q-core/src/crypto/kdf.rs) - Argon2id wrap/unwrap
+- [crates/y2q-core/src/crypto/keystore.rs](../crates/y2q-core/src/crypto/keystore.rs) - pubkey.json, first-run, daemon flock
+- [crates/y2q-core/src/crypto/user_store.rs](../crates/y2q-core/src/crypto/user_store.rs) - users.redb schema
+- [crates/y2q-core/src/storage/filesystem.rs](../crates/y2q-core/src/storage/filesystem.rs) - filesystem backend, hex sharding, .obj writes
+- [crates/y2q-core/src/storage/format.rs](../crates/y2q-core/src/storage/format.rs) - shared .obj header/trailer format (both backends)
+- [crates/y2q-core/src/storage/locks.rs](../crates/y2q-core/src/storage/locks.rs) - in-memory LockRegistry
+- [crates/y2q-core/src/storage/index.rs](../crates/y2q-core/src/storage/index.rs) - redb metadata index
+- [crates/y2qd/src/auth/session.rs](../crates/y2qd/src/auth/session.rs) - session store, token hashing
+- [crates/y2qd/src/auth/keystore.rs](../crates/y2qd/src/auth/keystore.rs) - in-memory keystore slot, idle drop
+- [crates/y2qd/src/observability.rs](../crates/y2qd/src/observability.rs) - metrics setup, log format
+- [crates/y2qd/src/main.rs](../crates/y2qd/src/main.rs) - startup, lifecycle, route wiring

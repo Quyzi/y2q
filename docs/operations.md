@@ -35,7 +35,7 @@ How to run, manage, and recover a `y2qd` deployment. Read this before putting an
 4. **Capture the root password.** First start prints this once on stdout:
    ```
    ===========================================================
-     y2qd first-run: ROOT PASSWORD (recorded NOWHERE — copy now)
+     y2qd first-run: ROOT PASSWORD (recorded NOWHERE - copy now)
        username: root
        password: <43 url-safe-base64 chars>
    ===========================================================
@@ -94,7 +94,7 @@ curl -X DELETE https://y2qd.example/api/v1/users/bob \
   -H "Authorization: Bearer $TOKEN"
 ```
 
-The daemon refuses to delete the last remaining user (409). Other users are unaffected — their wrapped SK copies remain valid.
+The daemon refuses to delete the last remaining user (409). Other users are unaffected - their wrapped SK copies remain valid.
 
 ### "Reset" a forgotten password
 
@@ -112,8 +112,8 @@ There is no admin reset. Procedure:
 |---|---|---|
 | `<crypto.keystore_dir>/pubkey.json` | Deployment public key + fingerprint | **Critical** |
 | `<crypto.keystore_dir>/users.redb` | Every user's wrapped SK and Argon2 params | **Critical** |
-| `<storage.base_path>/` | All objects — each is a single `.obj` file containing ciphertext and embedded metadata | **Critical** |
-| `<storage.base_path>/_y2q_index.redb` | redb metadata index | Optional — rebuildable |
+| `<storage.base_path>/` | All objects - each is a single `.obj` file containing ciphertext and embedded metadata | **Critical** |
+| `<storage.base_path>/_y2q_index.redb` | redb metadata index | Optional - rebuildable |
 
 Lose `pubkey.json` or `users.redb` and your ciphertext is unrecoverable. Back them up to a different host (or at least a different volume) than `base_path`.
 
@@ -125,7 +125,7 @@ The keystore and storage tree are both safe to copy while `y2qd` is running, wit
 
 - **`users.redb`** is a redb database. `redb` writes are crash-safe, but a `cp` mid-write can capture a torn copy. Either: stop the daemon briefly, or use a filesystem-level snapshot (LVM, ZFS, btrfs).
 
-Write locks are in-memory and vanish on process exit — there are no lock files in the storage tree to worry about during backup.
+Write locks are in-memory and vanish on process exit - there are no lock files in the storage tree to worry about during backup.
 
 ### Restore
 
@@ -148,23 +148,23 @@ Write locks are in-memory and vanish on process exit — there are no lock files
 
 Workarounds:
 
-- **Password rotation per user** — `POST /api/v1/auth/password` works fine and re-wraps that user's copy of the SK under fresh Argon2 parameters. Do this routinely.
-- **Migrating to a new keypair** — currently requires standing up a fresh deployment, copying objects through (re-encrypting on the new keypair), and switching consumers over.
+- **Password rotation per user** - `POST /api/v1/auth/password` works fine and re-wraps that user's copy of the SK under fresh Argon2 parameters. Do this routinely.
+- **Migrating to a new keypair** - currently requires standing up a fresh deployment, copying objects through (re-encrypting on the new keypair), and switching consumers over.
 
 If your threat model requires periodic SK rotation, file an issue or plan for a migration. Don't pretend the existing pubkey is rotatable.
 
 ## Write locks
 
-`y2qd` holds an in-memory per-object write lock for the duration of each PUT. Locks live in a `LockRegistry` (a lock-free in-memory hash map). Because locks are in-memory, they vanish on process exit — a SIGKILL or daemon crash leaves no orphaned lock files.
+`y2qd` holds an in-memory per-object write lock for the duration of each PUT. Locks live in a `LockRegistry` (a lock-free in-memory hash map). Because locks are in-memory, they vanish on process exit - a SIGKILL or daemon crash leaves no orphaned lock files.
 
-`GET /api/v1/locks?older_than=...` shows locks that are *currently held* and whose acquisition timestamp is older than the cutoff. A lock appearing here means a PUT is actively running and taking longer than expected — this is unusual.
+`GET /api/v1/locks?older_than=...` shows locks that are *currently held* and whose acquisition timestamp is older than the cutoff. A lock appearing here means a PUT is actively running and taking longer than expected - this is unusual.
 
 `DELETE /api/v1/locks?older_than=...` force-releases those locks. Use with care: force-releasing a lock that belongs to a genuinely in-flight PUT may leave the object in a partially written state.
 
 `older_than` formats:
 
-- Relative: `<n>{s|m|h|d|w}` — e.g. `1h`, `30m`, `2d`. Cutoff is `now - duration`.
-- Absolute: bare Unix-seconds integer — e.g. `1715000000`.
+- Relative: `<n>{s|m|h|d|w}` - e.g. `1h`, `30m`, `2d`. Cutoff is `now - duration`.
+- Absolute: bare Unix-seconds integer - e.g. `1715000000`.
 
 ```sh
 # List locks held longer than 30 minutes
@@ -215,7 +215,7 @@ This happens before the daemon begins accepting requests, so listing is always a
 {"state": "failed", "reason": "..."}
 ```
 
-GET and PUT continue to work during a manual rebuild — they read and write the on-disk truth. Listing may temporarily show stale data until rebuild completes.
+GET and PUT continue to work during a manual rebuild - they read and write the on-disk truth. Listing may temporarily show stale data until rebuild completes.
 
 ## Observability
 
@@ -278,23 +278,23 @@ location / {
 }
 ```
 
-`proxy_request_buffering off` matters for large PUTs — otherwise nginx will buffer the whole body to disk before sending it on, doubling the bandwidth and adding latency.
+`proxy_request_buffering off` matters for large PUTs - otherwise nginx will buffer the whole body to disk before sending it on, doubling the bandwidth and adding latency.
 
 ## Failure modes and how to recognize them
 
 | Symptom | Likely cause | What to do |
 |---|---|---|
-| Daemon refuses to start: `acquire keystore lock` | Another `y2qd` is already running against the same `keystore_dir` | Check `ps` / systemd. If stale, the flock is released by the OS — investigate why the daemon didn't exit cleanly. |
-| `503` on any object op | `KeystoreUnavailable` — SK not in memory (idle-dropped, no active sessions) | Log in (any user). The SK is reinstalled on the first successful login. |
+| Daemon refuses to start: `acquire keystore lock` | Another `y2qd` is already running against the same `keystore_dir` | Check `ps` / systemd. If stale, the flock is released by the OS - investigate why the daemon didn't exit cleanly. |
+| `503` on any object op | `KeystoreUnavailable` - SK not in memory (idle-dropped, no active sessions) | Log in (any user). The SK is reinstalled on the first successful login. |
 | `409 Conflict` on PUT | Active in-flight write lock for that key (same key PUT in two concurrent requests) | Normally self-resolves; if stuck, use `GET /api/v1/locks` to check and `DELETE /api/v1/locks` to force-release. |
 | `501 Not Implemented` on GET with `Range` | Range reads on encrypted objects aren't supported (whole-object AEAD) | Don't use `Range` for encrypted objects, or fetch the whole object client-side and slice. |
 | `429 Too Many Requests` on login | Per-username lockout | Wait `lockout_seconds`, or use another user. `Retry-After` tells you exactly how long. |
-| Listing shows missing or stale objects after restore | Index drift after bulk restore | Run `POST /api/v1/rebuild` (or restart the daemon — startup auto-rebuild handles it). |
+| Listing shows missing or stale objects after restore | Index drift after bulk restore | Run `POST /api/v1/rebuild` (or restart the daemon - startup auto-rebuild handles it). |
 | Data-loss `tracing::error!` messages at startup | `.obj` files referenced in index are gone | Indicates actual data loss (e.g. from a partial restore). Startup rebuild logs the affected keys. |
 
 ## Source
 
-- [crates/y2qd/src/main.rs](../crates/y2qd/src/main.rs) — startup, first-run, lifecycle
-- [crates/y2qd/src/handlers/locks.rs](../crates/y2qd/src/handlers/locks.rs) — stale-lock endpoints
-- [crates/y2qd/src/handlers/rebuild.rs](../crates/y2qd/src/handlers/rebuild.rs) — index rebuild endpoints
-- [crates/y2q-core/src/crypto/keystore.rs](../crates/y2q-core/src/crypto/keystore.rs) — keystore on-disk layout
+- [crates/y2qd/src/main.rs](../crates/y2qd/src/main.rs) - startup, first-run, lifecycle
+- [crates/y2qd/src/handlers/locks.rs](../crates/y2qd/src/handlers/locks.rs) - stale-lock endpoints
+- [crates/y2qd/src/handlers/rebuild.rs](../crates/y2qd/src/handlers/rebuild.rs) - index rebuild endpoints
+- [crates/y2q-core/src/crypto/keystore.rs](../crates/y2q-core/src/crypto/keystore.rs) - keystore on-disk layout

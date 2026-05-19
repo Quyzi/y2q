@@ -2,27 +2,27 @@
 
 Post-quantum secure object storage. `y2qd` is a REST daemon that encrypts every object at rest using ML-KEM-768 key encapsulation and AES-256-GCM, with token-based session authentication and a choice of storage backends.
 
-> Early development — APIs and on-disk formats may change.
+> Early development - APIs and on-disk formats may change.
 
 ## Documentation
 
-- [docs/architecture.md](docs/architecture.md) — system design, encryption envelope, storage backends, metadata index, sessions
-- [docs/configuration.md](docs/configuration.md) — full config reference with all fields, defaults, and override syntax
-- [docs/operations.md](docs/operations.md) — first run, user management, backup/recovery, runbook
-- [docs/api.md](docs/api.md) — complete HTTP API reference: routes, schemas, error codes, examples
+- [docs/architecture.md](docs/architecture.md) - system design, encryption envelope, storage backends, metadata index, sessions
+- [docs/configuration.md](docs/configuration.md) - full config reference with all fields, defaults, and override syntax
+- [docs/operations.md](docs/operations.md) - first run, user management, backup/recovery, runbook
+- [docs/api.md](docs/api.md) - complete HTTP API reference: routes, schemas, error codes, examples
 
 ## Features
 
-- **Post-quantum encryption at rest** — each object is encapsulated against an ML-KEM-768 public key; content and metadata is encrypted with AES-256-GCM via [ring](https://github.com/briansmith/ring) (5–7× faster than the pure-Rust aes-gcm crate)
-- **Argon2id-protected secret key** — the ML-KEM private key is never stored in plaintext; it is wrapped under each user's password and only held in memory during an active session
-- **Token-based session auth** — Bearer tokens with configurable TTL, per-account lockout after repeated failures
-- **Dual storage backends** — portable filesystem backend (all platforms); optional Linux io_uring fast path (kernel ≥ 5.6); both use the same on-disk `.obj` format and are fully cross-compatible
-- **Fast listing** — embedded [redb](https://github.com/cberner/redb) metadata index; auto-rebuilt on startup; can be manually triggered at any time
-- **Best-effort mode with background flusher** — skip per-PUT fsyncs for throughput; a background task drains the dirty queue on a configurable interval
-- **Custom object labels** — attach arbitrary key/value metadata to objects via `X-Y2Q-<label>` request headers on PUT
-- **Prometheus metrics** — scrape endpoint at `/metrics/prometheus`; interactive dashboard at `/metrics/dashboard`; storage and auth counters with latency histograms
-- **Structured observability** — per-request IDs (`X-Request-ID`), INFO/ERROR log events on every request, configurable log format (`text` or `json`)
-- **OpenAPI / Swagger UI** — interactive docs at `/swagger-ui/`
+- **Post-quantum encryption at rest** - each object is encapsulated against an ML-KEM-768 public key; content and metadata is encrypted with AES-256-GCM via [ring](https://github.com/briansmith/ring) (5–7× faster than the pure-Rust aes-gcm crate)
+- **Argon2id-protected secret key** - the ML-KEM private key is never stored in plaintext; it is wrapped under each user's password and only held in memory during an active session
+- **Token-based session auth** - Bearer tokens with configurable TTL, per-account lockout after repeated failures
+- **Dual storage backends** - portable filesystem backend (all platforms); optional Linux io_uring fast path (kernel ≥ 5.6); both use the same on-disk `.obj` format and are fully cross-compatible
+- **Fast listing** - embedded [redb](https://github.com/cberner/redb) metadata index; auto-rebuilt on startup; can be manually triggered at any time
+- **Best-effort mode with background flusher** - skip per-PUT fsyncs for throughput; a background task drains the dirty queue on a configurable interval
+- **Custom object labels** - attach arbitrary key/value metadata to objects via `X-Y2Q-<label>` request headers on PUT
+- **Prometheus metrics** - scrape endpoint at `/metrics/prometheus`; interactive dashboard at `/metrics/dashboard`; storage and auth counters with latency histograms
+- **Structured observability** - per-request IDs (`X-Request-ID`), INFO/ERROR log events on every request, configurable log format (`text` or `json`)
+- **OpenAPI / Swagger UI** - interactive docs at `/swagger-ui/`
 
 ## Getting Started
 
@@ -48,7 +48,7 @@ cargo build --release -p y2qd --features uring
 On first startup, `y2qd` generates an ML-KEM-768 keypair and prints a one-time root password to stdout:
 
 ```
-y2qd: first run — root password: <password>
+y2qd: first run - root password: <password>
 y2qd: this password will not be shown again. Store it securely.
 ```
 
@@ -65,7 +65,7 @@ CLI flags:
 | Flag | Default | Purpose |
 |---|---|---|
 | `--config <path>` | `config.toml` | Path to configuration file |
-| `--set KEY=VALUE` | — | Override a config value, e.g. `--set server.port=9090` |
+| `--set KEY=VALUE` | - | Override a config value, e.g. `--set server.port=9090` |
 
 ## CLI (`y2q`)
 
@@ -107,13 +107,13 @@ y2q cp prod/documents/reports/q1.pdf ./q1.pdf
 y2q cat prod/documents/reports/q1.pdf | less
 ```
 
-**Recursive directory upload** — preserves the local directory tree as remote key paths:
+**Recursive directory upload** - preserves the local directory tree as remote key paths:
 
 ```sh
 y2q cp -r ./photos prod/media/photos/
 ```
 
-**Glob patterns** — shell-quote the pattern to prevent local shell expansion when you want y2q to expand it:
+**Glob patterns** - shell-quote the pattern to prevent local shell expansion when you want y2q to expand it:
 
 ```sh
 y2q cp '*.log' prod/logs/host1/
@@ -150,7 +150,7 @@ Delete a single object:
 y2q rm prod/documents/old.txt
 ```
 
-Delete multiple objects matching a glob — prompts for confirmation before deleting:
+Delete multiple objects matching a glob - prompts for confirmation before deleting:
 
 ```sh
 y2q rm 'prod/logs/host1/*.log'
@@ -185,8 +185,8 @@ Each line shows timestamp, method, path, HTTP status (colour-coded), latency, an
 
 ```
 12:34:56.123  PUT      /bucket/key                               200    42.1ms      1.2 KiB↑    4.0 KiB↓
-12:34:57.001  GET      /bucket/other/path                        200     1.2ms          —↑      3.4 KiB↓
-12:34:58.400  DELETE   /bucket/missing                           404     0.8ms          —↑          —↓
+12:34:57.001  GET      /bucket/other/path                        200     1.2ms          -↑      3.4 KiB↓
+12:34:58.400  DELETE   /bucket/missing                           404     0.8ms          -↑          -↓
 ```
 
 Filter to errors only:
@@ -228,8 +228,8 @@ y2q         # same
 | Flag | Short | Env | Effect |
 |---|---|---|---|
 | `--json` | `-j` | `Y2Q_OUTPUT` | Output as JSON |
-| `--verbose` | `-v` | — | Increase log verbosity (repeatable) |
-| `--config <path>` | — | — | Override config file location |
+| `--verbose` | `-v` | - | Increase log verbosity (repeatable) |
+| `--config <path>` | - | - | Override config file location |
 
 ## Load Benchmarking (`y2q-warp`)
 
@@ -292,7 +292,7 @@ port = 8080
 max_body_bytes = 268435456        # 256 MiB upload limit
 unauthenticated_metrics = false   # expose /metrics/* and /swagger-ui/ without auth
 
-# actix HttpServer tuning — entire section optional; omit to use actix defaults
+# actix HttpServer tuning - entire section optional; omit to use actix defaults
 [server.actix]
 # workers = 4                     # default: number of logical CPUs
 backlog = 1024
@@ -332,7 +332,7 @@ log_filter = "info"      # RUST_LOG syntax; RUST_LOG env var takes precedence
 log_format = "text"      # "text" or "json" (for Loki, Datadog, etc.)
 ```
 
-Environment variables override any config file value. Prefix the dotted key with `Y2QD_` and use `__` (two underscores) as the section separator — e.g. `Y2QD_SERVER__PORT=9090`, `Y2QD_OBSERVABILITY__LOG_FORMAT=json`. See [docs/configuration.md](docs/configuration.md) for the full schema.
+Environment variables override any config file value. Prefix the dotted key with `Y2QD_` and use `__` (two underscores) as the section separator - e.g. `Y2QD_SERVER__PORT=9090`, `Y2QD_OBSERVABILITY__LOG_FORMAT=json`. See [docs/configuration.md](docs/configuration.md) for the full schema.
 
 ## API Reference
 
