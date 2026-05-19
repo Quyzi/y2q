@@ -25,7 +25,7 @@
 use bytes::Bytes;
 use core::range::RangeInclusive;
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{path::PathBuf, sync::{Arc, OnceLock}, time::Duration};
 use tempfile::TempDir;
 use tokio::runtime::Runtime;
 use y2q_core::{AnyStorage, FilesystemStorage, Object, PutOptions, Storage, SyncLevel};
@@ -67,41 +67,52 @@ fn scratch_dir() -> TempDir {
         .expect("tempdir_in scratch parent")
 }
 
-/// One backend ready for benching. `_dir` is held to keep its TempDir
-/// alive for the bench process's lifetime.
+/// One backend ready for benching. `_dir` is held to keep the scratch
+/// directory alive for the entire bench process lifetime.
 struct Backend {
     name: &'static str,
     storage: Arc<AnyStorage>,
     _dir: TempDir,
 }
 
-fn backends() -> Vec<Backend> {
-    let mut out = Vec::new();
+// Safety: TempDir is Send+Sync; AnyStorage is Send+Sync via Arc.
+unsafe impl Sync for Backend {}
 
-    let fs_dir = scratch_dir();
-    let fs_base = fs_dir.path().to_path_buf();
-    let fs =
-        FilesystemStorage::new(&fs_base, fs_base.join("idx.redb")).expect("init FilesystemStorage");
-    out.push(Backend {
-        name: "filesystem",
-        storage: Arc::new(AnyStorage::Filesystem(fs)),
-        _dir: fs_dir,
-    });
+static BACKENDS: OnceLock<Vec<Backend>> = OnceLock::new();
 
-    #[cfg(all(target_os = "linux", feature = "uring"))]
-    {
-        let u_dir = scratch_dir();
-        let u_base = u_dir.path().to_path_buf();
-        let u = UringStorage::new(&u_base, u_base.join("idx.redb"), UringConfig::default())
-            .expect("init UringStorage");
+/// Return the shared set of backends, initialising it once.
+///
+/// All bench functions share one set to avoid spinning up duplicate uring
+/// worker pools (each pool pins locked memory for its io_uring rings).
+fn backends() -> &'static [Backend] {
+    BACKENDS.get_or_init(|| {
+        let mut out = Vec::new();
+
+        let fs_dir = scratch_dir();
+        let fs_base = fs_dir.path().to_path_buf();
+        let fs = FilesystemStorage::new(&fs_base, fs_base.join("idx.redb"))
+            .expect("init FilesystemStorage");
         out.push(Backend {
-            name: "uring",
-            storage: Arc::new(AnyStorage::Uring(u)),
-            _dir: u_dir,
+            name: "filesystem",
+            storage: Arc::new(AnyStorage::Filesystem(fs)),
+            _dir: fs_dir,
         });
-    }
 
-    out
+        #[cfg(all(target_os = "linux", feature = "uring"))]
+        {
+            let u_dir = scratch_dir();
+            let u_base = u_dir.path().to_path_buf();
+            let u = UringStorage::new(&u_base, u_base.join("idx.redb"), UringConfig::default())
+                .expect("init UringStorage");
+            out.push(Backend {
+                name: "uring",
+                storage: Arc::new(AnyStorage::Uring(u)),
+                _dir: u_dir,
+            });
+        }
+
+        out
+    })
 }
 
 /// Tighten criterion's sample budget for sizes that take long enough per
@@ -126,7 +137,7 @@ fn bench_put(c: &mut Criterion) {
         configure_for_size(&mut group, size);
         let body = Bytes::from(vec![0u8; size]);
 
-        for backend in &backends {
+        for backend in backends {
             // Overwrite the same key on every iteration. Keeps disk usage
             // bounded (~one file per (backend, size)) at the cost of a tiny
             // overwrite-path read overhead — the same on both backends, so
@@ -164,7 +175,7 @@ fn bench_put_best_effort(c: &mut Criterion) {
         configure_for_size(&mut group, size);
         let body = Bytes::from(vec![0u8; size]);
 
-        for backend in &backends {
+        for backend in backends {
             let key = format!("k-be-{size}");
             let storage = Arc::clone(&backend.storage);
             let body_outer = body.clone();
@@ -206,7 +217,7 @@ fn bench_get(c: &mut Criterion) {
         configure_for_size(&mut group, size);
         let body = Bytes::from(vec![0u8; size]);
 
-        for backend in &backends {
+        for backend in backends {
             let key = format!("k-{size}");
             // Pre-populate one object per (backend, size).
             rt.block_on(backend.storage.put(
@@ -246,7 +257,7 @@ fn bench_get_range(c: &mut Criterion) {
     let mut group = c.benchmark_group("get_range");
     group.throughput(Throughput::Bytes(slice_len as u64));
 
-    for backend in &backends {
+    for backend in backends {
         rt.block_on(backend.storage.put(
             "bench",
             "rng",
