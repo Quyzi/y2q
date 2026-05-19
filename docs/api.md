@@ -204,7 +204,7 @@ Store an object. The body is encrypted (envelope + ML-KEM-768 + AES-256-GCM) and
 
 | Header | Values | Default | Effect |
 |---|---|---|---|
-| `X-Y2Q-Sync` | `durable`, `best-effort` | `durable` | `durable` fsyncs the object and sidecar before responding; `best-effort` skips the fsync for speed. |
+| `X-Y2Q-Sync` | `durable`, `best-effort` | `durable` | `durable` fsyncs the object file and parent directory before responding (crash-safe); `best-effort` skips the fsyncs and queues the write for asynchronous flushing. |
 | `X-Y2Q-<label>` | any UTF-8 string | — | Attach a custom label. Repeatable. The `X-Y2Q-` prefix is stripped and the name is lowercased before storage. |
 
 Reserved label names (rejected case-insensitively): `Created`, `Modified`, `Checksum-MD5`, `Checksum-SHA256`. These conflict with auto-generated headers on GET/HEAD.
@@ -338,7 +338,7 @@ List objects in a bucket, paginated.
       "checksum_sha256":  "<b64 32-byte digest>",
       "bucket":           "photos",
       "key":              "2024/05/cat.jpg",
-      "disk_path":        "/var/lib/y2qd/objects/photos/ab/cd/<uuid>",
+      "disk_path":        "/var/lib/y2qd/objects/photos/ab/cd/<uuid>.obj",
       "url_path":         "photos/2024/05/cat.jpg",
       "labels":           { "owner": "alice", "album": "vacation" },
       "cipher_size":      13477,
@@ -412,7 +412,7 @@ Poll rebuild state.
 
 ### `GET /api/v1/locks`
 
-List stale write locks older than the cutoff.
+List currently active in-flight write locks (PUTs in progress) whose acquisition time is older than the cutoff. Because locks are in-memory, this endpoint shows live state — there are no on-disk lock files.
 
 **Query parameters:**
 
@@ -425,14 +425,14 @@ List stale write locks older than the cutoff.
 [
   {
     "bucket":              "photos",
-    "uuid":                "abc...",
+    "key":                 "2024/05/cat.jpg",
     "locked_since_nanos":  1715000000000000000,
     "age_seconds":         1834
   }
 ]
 ```
 
-`uuid` is the deterministic UUID v5 derived from the object key. To map it back to the original key, cross-reference the metadata index by `(bucket, uuid)`.
+`key` is the original object key. An empty list is the normal case — locks only appear here for PUTs that are taking unusually long.
 
 | Code | Meaning |
 |---|---|
@@ -443,16 +443,16 @@ List stale write locks older than the cutoff.
 
 ### `DELETE /api/v1/locks`
 
-Remove every stale lock matching `older_than`. Same query parameters as the GET.
+Force-release every active lock older than `older_than`. Use carefully — releasing a lock that belongs to a genuinely in-flight PUT may leave the object in a partially written state. Same query parameters as the GET.
 
 **Response (200):**
 ```json
-{ "removed": 3 }
+{ "removed": 1 }
 ```
 
 | Code | Meaning |
 |---|---|
-| 200 | Lock files removed (count reported) |
+| 200 | Locks released (count reported) |
 | 400 | Missing or malformed `older_than` |
 | 401 | Token missing or invalid |
 | 500 | Storage failure |

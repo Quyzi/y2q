@@ -62,16 +62,33 @@ CLI values are coerced as integer first, then `true`/`false`, then string.
 | `max_body_bytes` | usize | `268435456` (256 MiB) | Maximum PUT request body size |
 | `unauthenticated_metrics` | bool | `false` | When `true`, `/metrics/prometheus`, `/metrics/dashboard`, and `/swagger-ui/` are exposed without a Bearer token. Default keeps them auth-gated. |
 
+### `[server.actix]`
+
+The entire section is optional. Omitting it leaves actix's compiled-in defaults in effect.
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `workers` | u32 | *(logical CPUs)* | Worker thread count. Comment out or omit to use the OS-reported CPU count. |
+| `backlog` | u32 | `1024` | TCP listen backlog — depth of the kernel's accept queue. |
+| `max_connections` | usize | `25000` | Maximum concurrent connections handled per worker thread. |
+| `keep_alive_secs` | u64 | `5` | Keep-alive idle timeout in seconds. Set to `0` to disable keep-alive. |
+| `client_request_timeout_secs` | u64 | `5` | How long to wait for the first request bytes after accepting a connection. Silent connections are closed. |
+| `client_disconnect_timeout_secs` | u64 | `1` | How long to wait for the client to close after the final response is sent. |
+| `shutdown_timeout_secs` | u64 | `30` | Graceful shutdown window — in-flight requests have this long to complete after SIGTERM. |
+
 ### `[storage]`
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
-| `backend` | enum | `"filesystem"` | Either `"filesystem"` or `"uring"`. `uring` requires the daemon to be built with `--features uring` on Linux ≥ 5.6. |
+| `backend` | enum | `"filesystem"` | Either `"filesystem"` or `"uring"`. `uring` requires the daemon to be built with `--features uring` on Linux ≥ 5.6. Both backends use the same on-disk `.obj` format and files are cross-compatible. |
 | `base_path` | string | *required* | Root directory for the object tree. Created on first write if absent. |
 | `index_path` | string | `<base_path>/_y2q_index.redb` | Path to the redb metadata index file. Override to put the index on a faster disk. |
 | `max_labels` | usize | `32` | Maximum `X-Y2Q-<label>` headers accepted per PUT. |
 | `max_label_name_bytes` | usize | `64` | Maximum byte length of a label name (after stripping `X-Y2Q-` and lowercasing). |
 | `max_label_value_bytes` | usize | `1024` | Maximum byte length of a label value. |
+| `default_sync` | enum | `"durable"` | Default durability for PUT requests that omit the `X-Y2Q-Sync` header. `"durable"` fsyncs the object and parent directory before responding (crash-safe). `"best-effort"` skips fsyncs; a background flusher drains the write queue asynchronously. Per-request `X-Y2Q-Sync` header overrides this. |
+| `sync_flush_interval_secs` | u64 | `5` | How often (in seconds) the background best-effort flusher wakes to drain pending writes. Minimum 1. Only relevant when `default_sync = "best-effort"` or when requests override to `X-Y2Q-Sync: best-effort`. |
+| `sync_flush_limit` | usize | `64` | Queue depth at which the flusher wakes early (before the timer fires). Acts as a watermark; entries are never dropped. |
 
 The reserved bucket name `"api"` (case-insensitive) is rejected — it would collide with the `/api/v1/...` admin routes. Object keys are also bounded to 1024 bytes and must not contain null bytes.
 
@@ -106,6 +123,13 @@ Changing these only affects newly written records. Existing user records carry t
 | `lockout_seconds` | u64 | `900` (15 min) | Lockout duration once `max_failed_logins` is hit. |
 | `keystore_idle_drop_seconds` | u64 | `0` | Drop the in-memory decrypted SK this many seconds after the last session expires. `0` = drop immediately on the next sweep. Raise to forgive brief gaps between sessions; lower to bound how long the SK lives in memory. |
 
+### `[observability]`
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `log_filter` | string | `"info"` | Log level directive in RUST_LOG syntax. Examples: `"info"`, `"y2qd=debug,actix_web=info"`, `"y2q_core::storage::filesystem=trace"`. The `RUST_LOG` environment variable takes precedence when set. |
+| `log_format` | enum | `"text"` | `"text"` — human-readable coloured output. `"json"` — structured JSON, one object per line; suited for aggregators like Grafana Loki, Elasticsearch, or Datadog. |
+
 ## Worked example
 
 ```toml
@@ -115,6 +139,13 @@ port = 8443
 max_body_bytes = 1073741824           # 1 GiB
 unauthenticated_metrics = false
 
+[server.actix]
+# workers = 8                         # defaults to logical CPU count
+backlog = 2048
+max_connections = 50000
+keep_alive_secs = 10
+shutdown_timeout_secs = 60
+
 [storage]
 backend = "uring"
 base_path = "/var/lib/y2qd/objects"
@@ -122,6 +153,9 @@ index_path = "/var/lib/y2qd/index/objects.redb"
 max_labels = 64
 max_label_name_bytes = 128
 max_label_value_bytes = 4096
+default_sync = "durable"              # change to "best-effort" for max throughput
+sync_flush_interval_secs = 5
+sync_flush_limit = 128
 
 [crypto]
 keystore_dir = "/var/lib/y2qd/keystore"
@@ -139,19 +173,33 @@ min_login_response_ms = 500
 max_failed_logins = 5
 lockout_seconds = 1800                 # 30 min
 keystore_idle_drop_seconds = 300       # forget SK 5 min after last logout
+
+[observability]
+log_filter = "y2qd=info,actix_web=warn"
+log_format = "json"                    # ship to a log aggregator
 ```
 
 ## Logging
 
-Tracing is configured from `RUST_LOG`. Examples:
+Logging is controlled by `[observability]` in config (or the `RUST_LOG` environment variable, which takes precedence). Examples:
 
 ```sh
-RUST_LOG=info                                  # default if unset
-RUST_LOG=y2qd=debug,actix_web=info             # debug the daemon, info from actix
-RUST_LOG=y2q_core::storage::filesystem=trace   # trace one module
+# via environment variable (overrides config)
+RUST_LOG=info y2qd
+RUST_LOG=y2qd=debug,actix_web=info y2qd
+RUST_LOG=y2q_core::storage::filesystem=trace y2qd   # very loud
+
+# via config (no env var needed)
+[observability]
+log_filter = "y2qd=debug,actix_web=info"
+log_format = "json"    # structured output for log aggregators
 ```
+
+Per-request spans flow through `tracing-actix-web`. Each HTTP request gets a span with method, path, status, elapsed time, and a UUID `X-Request-ID`. Override verbosity with `RUST_LOG=tracing_actix_web=warn` if it's too noisy.
 
 ## Source
 
-- [crates/y2qd/src/config.rs](../crates/y2qd/src/config.rs) — schema, defaults, and Figment wiring
+- [crates/y2qd/src/config.rs](../crates/y2qd/src/config.rs) — schema, defaults, and Figment wiring (includes `ActixConfig`, `ObservabilityConfig`, `SyncLevel`)
 - [crates/y2qd/src/cli.rs](../crates/y2qd/src/cli.rs) — `--config` and `--set` parsing
+- [crates/y2q-config/src/config.rs](../crates/y2q-config/src/config.rs) — shared config types used by `y2q-cli` and `y2q-warp`
+- [config.default.toml](../config.default.toml) — fully-commented reference for every daemon knob

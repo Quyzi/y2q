@@ -112,7 +112,7 @@ There is no admin reset. Procedure:
 |---|---|---|
 | `<crypto.keystore_dir>/pubkey.json` | Deployment public key + fingerprint | **Critical** |
 | `<crypto.keystore_dir>/users.redb` | Every user's wrapped SK and Argon2 params | **Critical** |
-| `<storage.base_path>/` | All objects (ciphertext) and metadata sidecars | **Critical** |
+| `<storage.base_path>/` | All objects — each is a single `.obj` file containing ciphertext and embedded metadata | **Critical** |
 | `<storage.base_path>/_y2q_index.redb` | redb metadata index | Optional — rebuildable |
 
 Lose `pubkey.json` or `users.redb` and your ciphertext is unrecoverable. Back them up to a different host (or at least a different volume) than `base_path`.
@@ -121,10 +121,11 @@ Recommended: keep `keystore_dir` and `base_path` on different mount points. A `c
 
 ### Hot backup
 
-The keystore and storage tree are both safe to copy while `y2qd` is running, with two caveats:
+The keystore and storage tree are both safe to copy while `y2qd` is running, with one caveat:
 
 - **`users.redb`** is a redb database. `redb` writes are crash-safe, but a `cp` mid-write can capture a torn copy. Either: stop the daemon briefly, or use a filesystem-level snapshot (LVM, ZFS, btrfs).
-- **`.lock` files** in the storage tree are ephemeral and may or may not be present at backup time. They are harmless; restore them or skip them — the `GET /api/v1/locks` endpoint can clean stragglers later.
+
+Write locks are in-memory and vanish on process exit — there are no lock files in the storage tree to worry about during backup.
 
 ### Restore
 
@@ -152,38 +153,39 @@ Workarounds:
 
 If your threat model requires periodic SK rotation, file an issue or plan for a migration. Don't pretend the existing pubkey is rotatable.
 
-## Stale write locks
+## Write locks
 
-`y2qd` writes objects atomically through a `<uuid>.lock` sidecar acquired with `O_EXCL`. If the daemon is killed mid-PUT (SIGKILL, panic, host crash), the lock is left behind and blocks any subsequent PUT to the same key.
+`y2qd` holds an in-memory per-object write lock for the duration of each PUT. Locks live in a `LockRegistry` (a lock-free in-memory hash map). Because locks are in-memory, they vanish on process exit — a SIGKILL or daemon crash leaves no orphaned lock files.
 
-### Find stale locks
+`GET /api/v1/locks?older_than=...` shows locks that are *currently held* and whose acquisition timestamp is older than the cutoff. A lock appearing here means a PUT is actively running and taking longer than expected — this is unusual.
 
-`older_than` is required. Accepted forms:
+`DELETE /api/v1/locks?older_than=...` force-releases those locks. Use with care: force-releasing a lock that belongs to a genuinely in-flight PUT may leave the object in a partially written state.
+
+`older_than` formats:
 
 - Relative: `<n>{s|m|h|d|w}` — e.g. `1h`, `30m`, `2d`. Cutoff is `now - duration`.
 - Absolute: bare Unix-seconds integer — e.g. `1715000000`.
 
 ```sh
-# Locks held longer than 30 minutes
+# List locks held longer than 30 minutes
 curl "https://y2qd.example/api/v1/locks?older_than=30m" \
   -H "Authorization: Bearer $TOKEN"
 # [
-#   {"bucket":"my-bucket", "uuid":"abc...", "locked_since_nanos":1715000000000000000, "age_seconds":1834},
-#   ...
+#   {
+#     "bucket": "my-bucket",
+#     "key": "path/to/object",
+#     "locked_since_nanos": 1715000000000000000,
+#     "age_seconds": 1834
+#   }
 # ]
-```
 
-### Clear stale locks
-
-Same query, with `DELETE`:
-
-```sh
+# Force-release them
 curl -X DELETE "https://y2qd.example/api/v1/locks?older_than=30m" \
   -H "Authorization: Bearer $TOKEN"
-# {"removed": 3}
+# {"removed": 1}
 ```
 
-Clearing a stale lock does *not* touch the metadata index. If the partial PUT corrupted the object file or its sidecar, run an index rebuild afterward:
+After force-releasing a stuck lock, run an index rebuild to repair any inconsistent state:
 
 ```sh
 curl -X POST https://y2qd.example/api/v1/rebuild -H "Authorization: Bearer $TOKEN"
@@ -191,9 +193,20 @@ curl -X POST https://y2qd.example/api/v1/rebuild -H "Authorization: Bearer $TOKE
 
 ## Index rebuild
 
-The metadata index in `_y2q_index.redb` is a cache built from the on-disk sidecars. The daemon keeps it in sync during normal operation, but it can drift after a crash, a bulk file restore, or a stale-lock cleanup of a partial PUT.
+The metadata index in `_y2q_index.redb` is a cache. The daemon keeps it in sync during normal operation, but it can drift after a crash or a bulk file restore.
 
-Rebuild is fire-and-forget. `POST /api/v1/rebuild` returns 202 and starts a background scan; concurrent kicks return 409. `GET /api/v1/rebuild` polls progress:
+### Automatic startup rebuild
+
+On every startup, `y2qd` automatically walks the storage tree and reconciles the index against the on-disk `.obj` files:
+
+- Objects present on disk but missing from the index are re-inserted.
+- Index rows whose `.obj` file is gone are removed (logged as `tracing::error!` data-loss events with the affected key).
+
+This happens before the daemon begins accepting requests, so listing is always authoritative by the time the first request arrives. No operator action is required after an unclean shutdown.
+
+### Manual rebuild
+
+`POST /api/v1/rebuild` returns 202 and starts a background scan; concurrent kicks return 409. `GET /api/v1/rebuild` polls progress:
 
 ```json
 {"state": "idle"}
@@ -202,7 +215,7 @@ Rebuild is fire-and-forget. `POST /api/v1/rebuild` returns 202 and starts a back
 {"state": "failed", "reason": "..."}
 ```
 
-GET and PUT continue to work during a rebuild — they read and write the on-disk truth. Listing operations may temporarily show stale data until rebuild completes.
+GET and PUT continue to work during a manual rebuild — they read and write the on-disk truth. Listing may temporarily show stale data until rebuild completes.
 
 ## Observability
 
@@ -271,12 +284,13 @@ location / {
 
 | Symptom | Likely cause | What to do |
 |---|---|---|
-| Daemon refuses to start: `acquire keystore lock` | Another `y2qd` is already running against the same `keystore_dir` | Check `ps` / systemd. If stale, the lock should have been released by the OS — investigate. |
+| Daemon refuses to start: `acquire keystore lock` | Another `y2qd` is already running against the same `keystore_dir` | Check `ps` / systemd. If stale, the flock is released by the OS — investigate why the daemon didn't exit cleanly. |
 | `503` on any object op | `KeystoreUnavailable` — SK not in memory (idle-dropped, no active sessions) | Log in (any user). The SK is reinstalled on the first successful login. |
-| `409 Conflict` on PUT | Active write lock for that key | If unexpected, the previous writer crashed — clean stale locks. |
+| `409 Conflict` on PUT | Active in-flight write lock for that key (same key PUT in two concurrent requests) | Normally self-resolves; if stuck, use `GET /api/v1/locks` to check and `DELETE /api/v1/locks` to force-release. |
 | `501 Not Implemented` on GET with `Range` | Range reads on encrypted objects aren't supported (whole-object AEAD) | Don't use `Range` for encrypted objects, or fetch the whole object client-side and slice. |
 | `429 Too Many Requests` on login | Per-username lockout | Wait `lockout_seconds`, or use another user. `Retry-After` tells you exactly how long. |
-| Listing shows missing or stale objects | Index drift after restore or crash | Run `POST /api/v1/rebuild`. |
+| Listing shows missing or stale objects after restore | Index drift after bulk restore | Run `POST /api/v1/rebuild` (or restart the daemon — startup auto-rebuild handles it). |
+| Data-loss `tracing::error!` messages at startup | `.obj` files referenced in index are gone | Indicates actual data loss (e.g. from a partial restore). Startup rebuild logs the affected keys. |
 
 ## Source
 
