@@ -18,7 +18,7 @@ use crate::{
     crypto::{decrypt_meta, encrypt_meta},
     storage::{
         format::{self, HEADER_SIZE, Header},
-        locks::{clear_stale_locks_under, list_stale_locks_under},
+        locks::LockRegistry,
     },
 };
 
@@ -58,6 +58,7 @@ pub struct FilesystemStorage {
     dirty_tx: Option<flume::Sender<crate::DirtyEntry>>,
     flush_notify: Option<Arc<tokio::sync::Notify>>,
     flush_limit: usize,
+    locks: LockRegistry,
 }
 
 impl FilesystemStorage {
@@ -95,6 +96,7 @@ impl FilesystemStorage {
             dirty_tx: None,
             flush_notify: None,
             flush_limit: 0,
+            locks: LockRegistry::new(),
         })
     }
 
@@ -205,77 +207,6 @@ fn record_storage_op<T, E>(op: &'static str, result: &Result<T, E>, elapsed_ms: 
     .record(elapsed_ms);
 }
 
-/// RAII guard that holds a write lock on an object for the duration of a
-/// [`Storage::put`] operation.
-///
-/// The lock is a `.lock` sidecar file created with `O_EXCL`. The file
-/// contains the lock acquisition time as a little-endian `u64` of nanoseconds
-/// since the Unix epoch so callers can report how long the lock has been held.
-///
-/// The lock file is removed synchronously in [`Drop`] so it is always cleaned
-/// up even if the future holding the guard is cancelled.
-struct LockGuard {
-    path: PathBuf,
-}
-
-impl LockGuard {
-    async fn acquire(path: PathBuf, bucket: &str, key: &str) -> Result<Self, Error> {
-        let result = tokio::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .await;
-
-        match result {
-            Ok(mut f) => {
-                f.write_all(&now_nanos().to_le_bytes()).await.ok();
-                Ok(LockGuard { path })
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                let since = read_lock_timestamp(&path).await;
-                Err(Error::Locked {
-                    bucket: bucket.to_owned(),
-                    key: key.to_owned(),
-                    since,
-                })
-            }
-            Err(e) => Err(Error::InternalError {
-                bucket: bucket.to_owned(),
-                key: key.to_owned(),
-                operation: "lock".to_owned(),
-                message: e.to_string(),
-            }),
-        }
-    }
-}
-
-impl Drop for LockGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-    }
-}
-
-async fn read_lock_timestamp(path: &Path) -> SystemTime {
-    if let Ok(bytes) = tokio::fs::read(path).await
-        && bytes.len() >= 8
-    {
-        let nanos = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
-        return UNIX_EPOCH + std::time::Duration::from_nanos(nanos);
-    }
-    SystemTime::now()
-}
-
-async fn check_not_locked(lock_path: &Path, bucket: &str, key: &str) -> Result<(), Error> {
-    if tokio::fs::try_exists(lock_path).await.unwrap_or(false) {
-        let since = read_lock_timestamp(lock_path).await;
-        return Err(Error::Locked {
-            bucket: bucket.to_owned(),
-            key: key.to_owned(),
-            since,
-        });
-    }
-    Ok(())
-}
 
 /// Read and decode the metadata embedded in a `.obj` file at `path`.
 async fn read_obj_metadata(
@@ -315,7 +246,7 @@ async fn read_obj_created(path: &Path, mek: Option<&[u8; 32]>) -> Option<u64> {
 pub struct StreamingPutGuard {
     tmp_path: PathBuf,
     obj_path: PathBuf,
-    _lock: LockGuard,
+    _lock: crate::storage::locks::LockGuard,
     bucket: String,
     key: String,
     is_overwrite: bool,
@@ -503,7 +434,6 @@ impl FilesystemStorage {
 
         let obj_path = self.key_path(bucket, key);
         let tmp_path = obj_path.with_extension("tmp");
-        let lock_path = obj_path.with_extension("lock");
 
         if let Some(parent) = obj_path.parent() {
             tokio::fs::create_dir_all(parent)
@@ -532,7 +462,7 @@ impl FilesystemStorage {
             }
         };
 
-        let lock = LockGuard::acquire(lock_path, bucket, key).await?;
+        let lock = self.locks.try_acquire(bucket, key)?;
 
         let mut file = tokio::fs::OpenOptions::new()
             .write(true)
@@ -583,7 +513,7 @@ impl Storage for FilesystemStorage {
             validate_key(key)?;
 
             let obj_path = self.key_path(bucket, key);
-            check_not_locked(&obj_path.with_extension("lock"), bucket, key).await?;
+            self.locks.check_not_locked(bucket, key)?;
 
             let mut file = match tokio::fs::File::open(&obj_path).await {
                 Ok(f) => f,
@@ -655,7 +585,7 @@ impl Storage for FilesystemStorage {
         validate_key(key)?;
 
         let obj_path = self.key_path(bucket, key);
-        check_not_locked(&obj_path.with_extension("lock"), bucket, key).await?;
+        self.locks.check_not_locked(bucket, key)?;
 
         let mut file = match tokio::fs::File::open(&obj_path).await {
             Ok(f) => f,
@@ -735,7 +665,6 @@ impl Storage for FilesystemStorage {
 
             let obj_path = self.key_path(bucket, key);
             let tmp_path = obj_path.with_extension("tmp");
-            let lock_path = obj_path.with_extension("lock");
 
             if let Some(parent) = obj_path.parent() {
                 tokio::fs::create_dir_all(parent)
@@ -748,7 +677,7 @@ impl Storage for FilesystemStorage {
                     })?;
             }
 
-            let _lock = LockGuard::acquire(lock_path, bucket, key).await?;
+            let _lock = self.locks.try_acquire(bucket, key)?;
 
             let (is_overwrite, prior_created) = match tokio::fs::metadata(&obj_path).await {
                 Ok(_) => {
@@ -956,7 +885,7 @@ impl Storage for FilesystemStorage {
             validate_key(key)?;
 
             let obj_path = self.key_path(bucket, key);
-            check_not_locked(&obj_path.with_extension("lock"), bucket, key).await?;
+            self.locks.check_not_locked(bucket, key)?;
 
             let mut file = match tokio::fs::File::open(&obj_path).await {
                 Ok(f) => f,
@@ -1037,7 +966,7 @@ impl Storage for FilesystemStorage {
             validate_key(key)?;
 
             let obj_path = self.key_path(bucket, key);
-            check_not_locked(&obj_path.with_extension("lock"), bucket, key).await?;
+            self.locks.check_not_locked(bucket, key)?;
 
             if !tokio::fs::try_exists(&obj_path).await.unwrap_or(false) {
                 return Err(Error::NotFound {
@@ -1122,25 +1051,11 @@ impl StorageExt for FilesystemStorage {
     }
 
     async fn list_stale_locks(&self, older_than: SystemTime) -> Result<Vec<StaleLock>, Error> {
-        list_stale_locks_under(&self.base_path, older_than)
-            .await
-            .map_err(|e| Error::InternalError {
-                bucket: String::new(),
-                key: String::new(),
-                operation: "list_stale_locks".to_owned(),
-                message: e.to_string(),
-            })
+        Ok(self.locks.list_stale(older_than))
     }
 
     async fn clear_stale_locks(&self, older_than: SystemTime) -> Result<u64, Error> {
-        clear_stale_locks_under(&self.base_path, older_than)
-            .await
-            .map_err(|e| Error::InternalError {
-                bucket: String::new(),
-                key: String::new(),
-                operation: "clear_stale_locks".to_owned(),
-                message: e.to_string(),
-            })
+        Ok(self.locks.clear_stale(older_than))
     }
 }
 
@@ -1375,13 +1290,9 @@ mod tests {
         s.put("b", "k", make_object(b"x"), PutOptions::default())
             .await
             .unwrap();
-        let lock_path = s.key_path("b", "k").with_extension("lock");
-        tokio::fs::write(&lock_path, 1_000_000_000u64.to_le_bytes())
-            .await
-            .unwrap();
+        let _guard = s.locks.try_acquire("b", "k").expect("registry free after put");
         let err = s.get("b", "k").await.unwrap_err();
         assert!(matches!(err, crate::Error::Locked { .. }));
-        tokio::fs::remove_file(&lock_path).await.unwrap();
     }
 
     #[tokio::test]
