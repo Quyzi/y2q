@@ -54,6 +54,78 @@ How to run, manage, and recover a `y2qd` deployment. Read this before putting an
      -d '{"username":"alice","password":"<strong password>"}'
    ```
 
+## Container
+
+Two image variants:
+
+| Image | Backend | Requirement |
+|---|---|---|
+| `y2q:latest` | filesystem | any kernel |
+| `y2q:latest-uring` | io_uring | Linux kernel >= 5.6 |
+
+Build locally:
+
+```sh
+make image          # y2q:latest
+make image-uring    # y2q:latest-uring
+```
+
+### First container run
+
+1. Create host directories and write a config:
+   ```sh
+   mkdir -p ~/y2q/data ~/y2q/keys
+   cp config.default.toml ~/y2q/config.toml
+   # edit ~/y2q/config.toml -- at minimum set base_path and keystore_dir
+   ```
+
+2. Run (rootless podman):
+   ```sh
+   podman run \
+     --network=host \
+     --userns=keep-id \
+     --user $(id -u):$(id -g) \
+     -v ~/y2q/config.toml:/etc/y2q/config.toml:ro \
+     -v ~/y2q/data:/var/lib/y2q/data \
+     -v ~/y2q/keys:/var/lib/y2q/keys \
+     y2q:latest
+   ```
+
+   - `--network=host` - container uses the host network directly; required for rootless podman to expose a port without NAT
+   - `--userns=keep-id` - maps your host UID into the container so bind-mounted directories are writable
+   - `--user $(id -u):$(id -g)` - runs the daemon as your host user
+
+3. **Capture the root password** from stdout - it appears once on first run, same as native.
+
+### Config in containers
+
+The image ships a default config at `/etc/y2q/config.toml` with `base_path = "/var/lib/y2q/data"` and `keystore_dir = "/var/lib/y2q/keys"`. Three ways to configure:
+
+- **Mount your own config** (shown above, `:ro` recommended)
+- **Environment variable overrides** - any config key can be overridden at runtime:
+  ```sh
+  -e Y2QD_SERVER__PORT=9090
+  -e Y2QD_OBSERVABILITY__LOG_FORMAT=json
+  -e Y2QD_STORAGE__BACKEND=filesystem
+  ```
+  Syntax: `Y2QD_SECTION__KEY=value` (double underscore for nesting). See [configuration.md](configuration.md) for the full reference.
+
+### Running other binaries
+
+All three binaries (`y2qd`, `y2q`, `y2q-warp`) are present in the image. The default entrypoint is `y2qd`. Override to run others:
+
+```sh
+# client CLI
+podman run --entrypoint y2q --network=host \
+  --userns=keep-id --user $(id -u):$(id -g) \
+  y2q:latest ls prod/
+
+# benchmarking tool
+podman run --entrypoint y2q-warp --network=host \
+  --userns=keep-id --user $(id -u):$(id -g) \
+  y2q:latest prod put --duration 5m
+```
+
 ## User management
 
 `y2q`'s authentication model is unusual in one key way: **every user record carries its own wrapped copy of the same deployment secret key**. To add a user you must already be logged in (so the daemon has the unwrapped SK in memory), and adding the user re-wraps that SK under the new password.

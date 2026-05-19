@@ -39,7 +39,7 @@ ARG URING=0
 FROM cgr.dev/chainguard/curl:latest AS swagger-dl
 RUN ["/usr/bin/curl", "-fsSL", \
      "https://github.com/swagger-api/swagger-ui/archive/refs/tags/v5.17.14.zip", \
-     "-o", "/swagger-ui.zip"]
+     "-o", "/tmp/swagger-ui.zip"]
 
 # ---------------------------------------------------------------------------
 # Build stage
@@ -50,7 +50,7 @@ WORKDIR /work
 
 # Point utoipa-swagger-ui's build.rs at the pre-fetched zip; build.rs handles
 # file:// URLs natively without invoking curl.
-COPY --from=swagger-dl /swagger-ui.zip /tmp/swagger-ui.zip
+COPY --from=swagger-dl /tmp/swagger-ui.zip /tmp/swagger-ui.zip
 ENV SWAGGER_UI_DOWNLOAD_URL=file:///tmp/swagger-ui.zip
 
 COPY Cargo.toml Cargo.lock ./

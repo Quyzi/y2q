@@ -67,6 +67,42 @@ CLI flags:
 | `--config <path>` | `config.toml` | Path to configuration file |
 | `--set KEY=VALUE` | - | Override a config value, e.g. `--set server.port=9090` |
 
+### Container
+
+Build images locally with `make`:
+
+```sh
+make image          # y2q:latest  (filesystem backend)
+make image-uring    # y2q:latest-uring  (io_uring backend, kernel >= 5.6)
+make images         # both
+```
+
+Run with rootless podman:
+
+```sh
+podman run \
+  --network=host \
+  --userns=keep-id \
+  --user $(id -u):$(id -g) \
+  -v /path/to/config.toml:/etc/y2q/config.toml:ro \
+  -v /path/to/data:/var/lib/y2q/data \
+  -v /path/to/keys:/var/lib/y2q/keys \
+  y2q:latest
+```
+
+`--network=host` gives the container direct access to the host network stack - required for rootless podman to expose a port without NAT.
+`--userns=keep-id` maps your host UID into the container unchanged so bind-mounted directories are writable.
+
+The image ships a default config at `/etc/y2q/config.toml` with `base_path = "/var/lib/y2q/data"` and `keystore_dir = "/var/lib/y2q/keys"`. Mount your own config over it or override individual values with environment variables (`Y2QD_SECTION__KEY=value`).
+
+All three binaries (`y2qd`, `y2q`, `y2q-warp`) are present in the image. The entrypoint is `y2qd`; override to run the others:
+
+```sh
+podman run --entrypoint y2q --network=host ... y2q:latest ls prod/
+```
+
+**The root password is printed once on first run** - same as the native path. Check stdout/container logs before doing anything else.
+
 ## CLI (`y2q`)
 
 Build the client:
@@ -405,9 +441,11 @@ The ML-KEM private key is never written to disk in plaintext. At rest it is wrap
 ## Development
 
 ```sh
-cargo build         # debug build
-cargo build --release
-cargo test          # run all tests
-cargo clippy        # lint
-cargo fmt           # format
+make build     # debug build, all workspace crates
+make test      # run all tests
+make clippy    # lint (warnings as errors)
+make fmt       # format
+make check     # fmt-check + clippy + test (CI gate)
 ```
+
+Run `make help` for all targets including per-binary builds, uring variants, and image targets.
