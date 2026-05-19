@@ -25,21 +25,21 @@
 #   podman run ... -v /host/config.toml:/etc/y2q/config.toml:ro y2q:latest
 
 ARG URING=0
-# Swagger UI version embedded by utoipa-swagger-ui 9.0.2.
-# Update this if utoipa-swagger-ui is upgraded.
-ARG SWAGGER_UI_VERSION=5.17.14
 
 # ---------------------------------------------------------------------------
 # Download Swagger UI zip
 # utoipa-swagger-ui's build.rs fetches this at compile time. Pre-fetching in
 # a separate stage keeps the download cached independently of the Rust build,
 # and avoids needing curl in the build image (build.rs handles file:// natively).
+#
+# cgr.dev/chainguard/curl is distroless (no shell); use exec-form RUN.
+# v5.17.14 is the version bundled by utoipa-swagger-ui 9.0.2 -- update if
+# the crate is upgraded.
 # ---------------------------------------------------------------------------
 FROM cgr.dev/chainguard/curl:latest AS swagger-dl
-ARG SWAGGER_UI_VERSION
-RUN curl -fsSL \
-    "https://github.com/swagger-api/swagger-ui/archive/refs/tags/v${SWAGGER_UI_VERSION}.zip" \
-    -o /swagger-ui.zip
+RUN ["/usr/bin/curl", "-fsSL", \
+     "https://github.com/swagger-api/swagger-ui/archive/refs/tags/v5.17.14.zip", \
+     "-o", "/swagger-ui.zip"]
 
 # ---------------------------------------------------------------------------
 # Build stage
