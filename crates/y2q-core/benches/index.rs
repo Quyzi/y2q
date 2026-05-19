@@ -15,7 +15,7 @@ use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 use tempfile::TempDir;
 use tokio::runtime::Runtime;
-use y2q_core::{Metadata, MetadataIndex};
+use y2q_core::{Metadata, MetadataIndex, SyncLevel};
 
 fn make_meta(bucket: &str, key: &str) -> Metadata {
     Metadata {
@@ -73,6 +73,29 @@ fn bench_upsert(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_upsert_best_effort(c: &mut Criterion) {
+    let rt = Arc::new(Runtime::new().unwrap());
+    let mut group = c.benchmark_group("index_upsert_best_effort");
+
+    for n in [100usize, 1_000, 10_000] {
+        let (idx, _dir) = open_index();
+        populate(&rt, &idx, "bench", n);
+
+        let seq = Arc::new(std::sync::atomic::AtomicUsize::new(n));
+        let rt_outer = Arc::clone(&rt);
+
+        group.bench_with_input(BenchmarkId::from_parameter(n), &n, move |b, _| {
+            b.to_async(&*rt_outer).iter(|| {
+                let idx = idx.clone();
+                let i = seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let key = format!("key-{i:08}");
+                async move { idx.upsert(&make_meta("bench", &key), SyncLevel::BestEffort).await.unwrap() }
+            });
+        });
+    }
+    group.finish();
+}
+
 fn bench_lookup(c: &mut Criterion) {
     let rt = Arc::new(Runtime::new().unwrap());
     let mut group = c.benchmark_group("index_lookup");
@@ -116,5 +139,5 @@ fn bench_scan(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_upsert, bench_lookup, bench_scan);
+criterion_group!(benches, bench_upsert, bench_upsert_best_effort, bench_lookup, bench_scan);
 criterion_main!(benches);
