@@ -28,7 +28,7 @@ Status codes follow the table in each endpoint section. A few semantics worth kn
 
 - **401** uses `WWW-Authenticate: Bearer` for auth errors.
 - **429** on login uses `Retry-After: <seconds>` for lockouts.
-- **`401 invalid credentials`** is returned identically whether the username doesn't exist or the password is wrong. By design — probing user existence isn't possible.
+- **`401 invalid credentials`** is returned identically whether the username doesn't exist or the password is wrong. By design - probing user existence isn't possible.
 - **`500 decryption failed`** and **`500 object format error`** are deliberately generic. They cover both genuine corruption and adversarial probing.
 
 ## Auth and users
@@ -66,7 +66,7 @@ Authenticate a user and mint a session token.
 | 200 | Logged in |
 | 400 | `ttl_seconds` out of range or malformed username |
 | 401 | Invalid credentials (user-doesn't-exist and wrong-password are indistinguishable) |
-| 429 | Account locked out — `Retry-After` header set |
+| 429 | Account locked out - `Retry-After` header set |
 
 **Example:**
 ```sh
@@ -124,7 +124,7 @@ Change the caller's password. Re-wraps the SK under the new password using the *
 
 ### `PUT /api/v1/users/add`
 
-Create a new user. Requires an active session — the SK is wrapped under the new user's password from the in-memory copy.
+Create a new user. Requires an active session - the SK is wrapped under the new user's password from the in-memory copy.
 
 **Request:**
 ```json
@@ -189,7 +189,7 @@ Remove a user. Other users keep their wrapped SK copies and continue to work. Re
 
 ## Objects
 
-Object paths take the form `/{bucket}/{key}`. Keys may contain `/` characters and are matched by a greedy tail pattern — `/photos/2024/05/cat.jpg` is bucket `photos`, key `2024/05/cat.jpg`.
+Object paths take the form `/{bucket}/{key}`. Keys may contain `/` characters and are matched by a greedy tail pattern - `/photos/2024/05/cat.jpg` is bucket `photos`, key `2024/05/cat.jpg`.
 
 Bucket names: ASCII alphanumeric plus `-` and `_`. The case-insensitive name `api` is reserved.
 Keys: up to 1024 bytes, no null bytes, non-empty.
@@ -205,7 +205,7 @@ Store an object. The body is encrypted (envelope + ML-KEM-768 + AES-256-GCM) and
 | Header | Values | Default | Effect |
 |---|---|---|---|
 | `X-Y2Q-Sync` | `durable`, `best-effort` | `durable` | `durable` fsyncs the object file and parent directory before responding (crash-safe); `best-effort` skips the fsyncs and queues the write for asynchronous flushing. |
-| `X-Y2Q-<label>` | any UTF-8 string | — | Attach a custom label. Repeatable. The `X-Y2Q-` prefix is stripped and the name is lowercased before storage. |
+| `X-Y2Q-<label>` | any UTF-8 string | - | Attach a custom label. Repeatable. The `X-Y2Q-` prefix is stripped and the name is lowercased before storage. |
 
 Reserved label names (rejected case-insensitively): `Created`, `Modified`, `Checksum-MD5`, `Checksum-SHA256`. These conflict with auto-generated headers on GET/HEAD.
 
@@ -254,7 +254,7 @@ Retrieve and decrypt an object.
 
 ### `HEAD /{bucket}/{key}`
 
-Metadata only — no body.
+Metadata only - no body.
 
 **Response (200):** empty body. Metadata is exposed as headers:
 
@@ -322,8 +322,8 @@ List objects in a bucket, paginated.
 
 | Name | Type | Default | Notes |
 |---|---|---|---|
-| `prefix` | string | — | Only return keys with this prefix |
-| `after` | string | — | Pagination cursor — return keys strictly greater than this |
+| `prefix` | string | - | Only return keys with this prefix |
+| `after` | string | - | Pagination cursor - return keys strictly greater than this |
 | `limit` | integer | 1000 | Page size. Capped at 10 000. |
 
 **Response (200):**
@@ -412,7 +412,7 @@ Poll rebuild state.
 
 ### `GET /api/v1/locks`
 
-List currently active in-flight write locks (PUTs in progress) whose acquisition time is older than the cutoff. Because locks are in-memory, this endpoint shows live state — there are no on-disk lock files.
+List currently active in-flight write locks (PUTs in progress) whose acquisition time is older than the cutoff. Because locks are in-memory, this endpoint shows live state - there are no on-disk lock files.
 
 **Query parameters:**
 
@@ -432,7 +432,7 @@ List currently active in-flight write locks (PUTs in progress) whose acquisition
 ]
 ```
 
-`key` is the original object key. An empty list is the normal case — locks only appear here for PUTs that are taking unusually long.
+`key` is the original object key. An empty list is the normal case - locks only appear here for PUTs that are taking unusually long.
 
 | Code | Meaning |
 |---|---|
@@ -443,7 +443,7 @@ List currently active in-flight write locks (PUTs in progress) whose acquisition
 
 ### `DELETE /api/v1/locks`
 
-Force-release every active lock older than `older_than`. Use carefully — releasing a lock that belongs to a genuinely in-flight PUT may leave the object in a partially written state. Same query parameters as the GET.
+Force-release every active lock older than `older_than`. Use carefully - releasing a lock that belongs to a genuinely in-flight PUT may leave the object in a partially written state. Same query parameters as the GET.
 
 **Response (200):**
 ```json
@@ -480,15 +480,15 @@ These are usually auth-gated. Set `[server] unauthenticated_metrics = true` to e
 | 400 | Bad bucket name, key, label, request body, or query parameter |
 | 401 | Auth missing/invalid, or login credentials wrong |
 | 404 | Object or user not found |
-| 409 | Conflict — object locked, rebuild already running, username taken, last-user deletion |
-| 429 | Login lockout — see `Retry-After` |
+| 409 | Conflict - object locked, rebuild already running, username taken, last-user deletion |
+| 429 | Login lockout - see `Retry-After` |
 | 500 | Internal failure: encryption, decryption, index, or storage |
 | 501 | `Range` request on an encrypted object |
-| 503 | `KeystoreUnavailable` — daemon has no SK in memory (idle-dropped). Log in to install it. |
+| 503 | `KeystoreUnavailable` - daemon has no SK in memory (idle-dropped). Log in to install it. |
 
 ## Source
 
-- [crates/y2qd/src/handlers/](../crates/y2qd/src/handlers/) — object, listing, and admin handlers
-- [crates/y2qd/src/auth/handlers.rs](../crates/y2qd/src/auth/handlers.rs) — auth and user handlers
-- [crates/y2qd/src/error.rs](../crates/y2qd/src/error.rs) — AppError → status mapping
-- [crates/y2qd/src/auth/error.rs](../crates/y2qd/src/auth/error.rs) — AuthError → status mapping
+- [crates/y2qd/src/handlers/](../crates/y2qd/src/handlers/) - object, listing, and admin handlers
+- [crates/y2qd/src/auth/handlers.rs](../crates/y2qd/src/auth/handlers.rs) - auth and user handlers
+- [crates/y2qd/src/error.rs](../crates/y2qd/src/error.rs) - AppError → status mapping
+- [crates/y2qd/src/auth/error.rs](../crates/y2qd/src/auth/error.rs) - AuthError → status mapping

@@ -10,7 +10,7 @@ Later sources win. Anything not set at all falls back to the documented default 
 
 ## Required fields
 
-These three have no default — the daemon will refuse to start without them:
+These three have no default - the daemon will refuse to start without them:
 
 | Field | Why it's required |
 |---|---|
@@ -39,7 +39,7 @@ Y2QD_CRYPTO__ARGON2__M_COST_KIB=131072
 Y2QD_AUTH__KEYSTORE_IDLE_DROP_SECONDS=600
 ```
 
-Single underscores are kept as-is — `max_body_bytes` stays `MAX_BODY_BYTES`.
+Single underscores are kept as-is - `max_body_bytes` stays `MAX_BODY_BYTES`.
 
 ### CLI `--set`
 
@@ -57,7 +57,7 @@ CLI values are coerced as integer first, then `true`/`false`, then string.
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
-| `host` | string | *required* | Bind address — `127.0.0.1` for local-only, `0.0.0.0` for all interfaces |
+| `host` | string | *required* | Bind address - `127.0.0.1` for local-only, `0.0.0.0` for all interfaces |
 | `port` | u16 | *required* | TCP port |
 | `max_body_bytes` | usize | `268435456` (256 MiB) | Maximum PUT request body size |
 | `unauthenticated_metrics` | bool | `false` | When `true`, `/metrics/prometheus`, `/metrics/dashboard`, and `/swagger-ui/` are exposed without a Bearer token. Default keeps them auth-gated. |
@@ -69,12 +69,12 @@ The entire section is optional. Omitting it leaves actix's compiled-in defaults 
 | Field | Type | Default | Notes |
 |---|---|---|---|
 | `workers` | u32 | *(logical CPUs)* | Worker thread count. Comment out or omit to use the OS-reported CPU count. |
-| `backlog` | u32 | `1024` | TCP listen backlog — depth of the kernel's accept queue. |
+| `backlog` | u32 | `1024` | TCP listen backlog - depth of the kernel's accept queue. |
 | `max_connections` | usize | `25000` | Maximum concurrent connections handled per worker thread. |
 | `keep_alive_secs` | u64 | `5` | Keep-alive idle timeout in seconds. Set to `0` to disable keep-alive. |
 | `client_request_timeout_secs` | u64 | `5` | How long to wait for the first request bytes after accepting a connection. Silent connections are closed. |
 | `client_disconnect_timeout_secs` | u64 | `1` | How long to wait for the client to close after the final response is sent. |
-| `shutdown_timeout_secs` | u64 | `30` | Graceful shutdown window — in-flight requests have this long to complete after SIGTERM. |
+| `shutdown_timeout_secs` | u64 | `30` | Graceful shutdown window - in-flight requests have this long to complete after SIGTERM. |
 
 ### `[storage]`
 
@@ -90,7 +90,7 @@ The entire section is optional. Omitting it leaves actix's compiled-in defaults 
 | `sync_flush_interval_secs` | u64 | `5` | How often (in seconds) the background best-effort flusher wakes to drain pending writes. Minimum 1. Only relevant when `default_sync = "best-effort"` or when requests override to `X-Y2Q-Sync: best-effort`. |
 | `sync_flush_limit` | usize | `64` | Queue depth at which the flusher wakes early (before the timer fires). Acts as a watermark; entries are never dropped. |
 
-The reserved bucket name `"api"` (case-insensitive) is rejected — it would collide with the `/api/v1/...` admin routes. Object keys are also bounded to 1024 bytes and must not contain null bytes.
+The reserved bucket name `"api"` (case-insensitive) is rejected - it would collide with the `/api/v1/...` admin routes. Object keys are also bounded to 1024 bytes and must not contain null bytes.
 
 ### `[crypto]`
 
@@ -107,16 +107,16 @@ The reserved bucket name `"api"` (case-insensitive) is rejected — it would col
 | `t_cost` | u32 | `3` | Iteration count. |
 | `p_cost` | u32 | `4` | Parallel lanes. |
 
-Defaults follow OWASP's "second-tier" recommendation. Raise `m_cost_kib` first if you want more cost — it's the parameter attackers can't easily parallelize across cheap hardware.
+Defaults follow OWASP's "second-tier" recommendation. Raise `m_cost_kib` first if you want more cost - it's the parameter attackers can't easily parallelize across cheap hardware.
 
-Changing these only affects newly written records. Existing user records carry the parameters they were created with. To migrate a user to stronger parameters, call `POST /api/v1/auth/password` while logged in as that user — the SK gets re-wrapped under the current defaults.
+Changing these only affects newly written records. Existing user records carry the parameters they were created with. To migrate a user to stronger parameters, call `POST /api/v1/auth/password` while logged in as that user - the SK gets re-wrapped under the current defaults.
 
 ### `[auth]`
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
 | `default_ttl_seconds` | u64 | `3600` (1 hour) | Session lifetime when `ttl_seconds` is omitted on login. |
-| `max_ttl_seconds` | u64 | `86400` (24 hours) | Hard ceiling — logins requesting `ttl_seconds > max_ttl_seconds` get a 400. |
+| `max_ttl_seconds` | u64 | `86400` (24 hours) | Hard ceiling - logins requesting `ttl_seconds > max_ttl_seconds` get a 400. |
 | `session_sweep_interval_seconds` | u64 | `300` (5 min) | How often the background sweeper purges expired sessions and runs idle-keystore reconciliation. |
 | `min_login_response_ms` | u64 | `250` | Floor on login response latency, success or failure. Smooths timing differences between "user not found" and "wrong password". |
 | `max_failed_logins` | u32 | `10` | Consecutive failed logins per username before lockout. Set to `0` to disable lockout. |
@@ -128,7 +128,7 @@ Changing these only affects newly written records. Existing user records carry t
 | Field | Type | Default | Notes |
 |---|---|---|---|
 | `log_filter` | string | `"info"` | Log level directive in RUST_LOG syntax. Examples: `"info"`, `"y2qd=debug,actix_web=info"`, `"y2q_core::storage::filesystem=trace"`. The `RUST_LOG` environment variable takes precedence when set. |
-| `log_format` | enum | `"text"` | `"text"` — human-readable coloured output. `"json"` — structured JSON, one object per line; suited for aggregators like Grafana Loki, Elasticsearch, or Datadog. |
+| `log_format` | enum | `"text"` | `"text"` - human-readable coloured output. `"json"` - structured JSON, one object per line; suited for aggregators like Grafana Loki, Elasticsearch, or Datadog. |
 
 ## Worked example
 
@@ -161,7 +161,7 @@ sync_flush_limit = 128
 keystore_dir = "/var/lib/y2qd/keystore"
 
 [crypto.argon2]
-m_cost_kib = 131072                    # 128 MiB — doubled from default
+m_cost_kib = 131072                    # 128 MiB - doubled from default
 t_cost = 3
 p_cost = 4
 
@@ -199,7 +199,7 @@ Per-request spans flow through `tracing-actix-web`. Each HTTP request gets a spa
 
 ## Source
 
-- [crates/y2qd/src/config.rs](../crates/y2qd/src/config.rs) — schema, defaults, and Figment wiring (includes `ActixConfig`, `ObservabilityConfig`, `SyncLevel`)
-- [crates/y2qd/src/cli.rs](../crates/y2qd/src/cli.rs) — `--config` and `--set` parsing
-- [crates/y2q-config/src/config.rs](../crates/y2q-config/src/config.rs) — shared config types used by `y2q-cli` and `y2q-warp`
-- [config.default.toml](../config.default.toml) — fully-commented reference for every daemon knob
+- [crates/y2qd/src/config.rs](../crates/y2qd/src/config.rs) - schema, defaults, and Figment wiring (includes `ActixConfig`, `ObservabilityConfig`, `SyncLevel`)
+- [crates/y2qd/src/cli.rs](../crates/y2qd/src/cli.rs) - `--config` and `--set` parsing
+- [crates/y2q-config/src/config.rs](../crates/y2q-config/src/config.rs) - shared config types used by `y2q-cli` and `y2q-warp`
+- [config.default.toml](../config.default.toml) - fully-commented reference for every daemon knob
