@@ -13,6 +13,7 @@ IMAGE_URING ?= y2q:latest-uring
         fmt fmt-check \
         check \
         image image-uring images \
+		install-local \
         clean help
 
 # Default
@@ -99,6 +100,15 @@ image-uring: ## Build container image -- y2q:latest-uring (io_uring backend)
 	$(PODMAN) build --build-arg URING=1 -t $(IMAGE_URING) .
 
 images: image image-uring ## Build both container image variants
+
+# ---------------------------------------------------------------------------
+# Install local binaries
+# ---------------------------------------------------------------------------
+
+install-local: ## Build release binaries and install to ~/.cargo/bin
+	$(CARGO) install --path crates/y2q-cli
+	$(CARGO) install --path crates/y2qd
+	$(CARGO) install --path crates/y2q-warp
 
 # ---------------------------------------------------------------------------
 # Housekeeping
