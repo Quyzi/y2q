@@ -10,10 +10,10 @@
 //!
 //! ```bash
 //! # Default sweep ({1 KiB, 1 MiB, 16 MiB}; ~tens of seconds)
-//! cargo bench --features y2qd/uring -p y2q-core
+//! cargo bench --features uring -p y2q-core
 //!
 //! # Full sweep from the plan ({1 KiB, 1 MiB, 256 MiB, 2 GiB}; minutes)
-//! Y2Q_BENCH_FULL=1 cargo bench --features y2qd/uring -p y2q-core
+//! Y2Q_BENCH_FULL=1 cargo bench --features uring -p y2q-core
 //!
 //! # Point at a specific disk for clean perf numbers
 //! Y2Q_BENCH_PATH=/mnt/nvme/y2q-bench cargo bench --features y2qd/uring -p y2q-core
