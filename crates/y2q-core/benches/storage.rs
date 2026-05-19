@@ -28,7 +28,7 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_m
 use std::{path::PathBuf, sync::Arc, time::Duration};
 use tempfile::TempDir;
 use tokio::runtime::Runtime;
-use y2q_core::{AnyStorage, FilesystemStorage, Object, PutOptions, Storage};
+use y2q_core::{AnyStorage, FilesystemStorage, Object, PutOptions, Storage, SyncLevel};
 
 #[cfg(all(target_os = "linux", feature = "uring"))]
 use y2q_core::{UringStorage, storage::uring::UringConfig};
@@ -154,6 +154,48 @@ fn bench_put(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_put_best_effort(c: &mut Criterion) {
+    let rt = Arc::new(Runtime::new().unwrap());
+    let backends = backends();
+    let mut group = c.benchmark_group("put_best_effort");
+
+    for size in sizes() {
+        group.throughput(Throughput::Bytes(size as u64));
+        configure_for_size(&mut group, size);
+        let body = Bytes::from(vec![0u8; size]);
+
+        for backend in &backends {
+            let key = format!("k-be-{size}");
+            let storage = Arc::clone(&backend.storage);
+            let body_outer = body.clone();
+            let rt_outer = Arc::clone(&rt);
+
+            group.bench_with_input(BenchmarkId::new(backend.name, size), &size, move |b, _| {
+                b.to_async(&*rt_outer).iter(|| {
+                    let storage = Arc::clone(&storage);
+                    let body = body_outer.clone();
+                    let key = key.clone();
+                    async move {
+                        storage
+                            .put(
+                                "bench",
+                                &key,
+                                Object::new(body),
+                                PutOptions {
+                                    sync: SyncLevel::BestEffort,
+                                    ..PutOptions::default()
+                                },
+                            )
+                            .await
+                            .expect("put");
+                    }
+                });
+            });
+        }
+    }
+    group.finish();
+}
+
 fn bench_get(c: &mut Criterion) {
     let rt = Arc::new(Runtime::new().unwrap());
     let backends = backends();
@@ -240,5 +282,5 @@ fn bench_get_range(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_put, bench_get, bench_get_range);
+criterion_group!(benches, bench_put, bench_put_best_effort, bench_get, bench_get_range);
 criterion_main!(benches);
