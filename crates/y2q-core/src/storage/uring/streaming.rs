@@ -16,6 +16,8 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use crate::storage::locks::LockGuard;
+
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
 use crate::{
@@ -30,17 +32,6 @@ fn now_nanos() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos() as u64
-}
-
-/// Removes a lock file synchronously on drop.
-struct LockGuard {
-    path: PathBuf,
-}
-
-impl Drop for LockGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-    }
 }
 
 /// RAII guard for an in-progress streaming PUT to the uring backend.
@@ -70,7 +61,7 @@ impl UringStreamingPutGuard {
     pub(super) fn new(
         tmp_path: PathBuf,
         obj_path: PathBuf,
-        lock_path: PathBuf,
+        lock: LockGuard,
         bucket: String,
         key: String,
         is_overwrite: bool,
@@ -81,7 +72,7 @@ impl UringStreamingPutGuard {
         Self {
             tmp_path,
             obj_path,
-            _lock: LockGuard { path: lock_path },
+            _lock: lock,
             bucket,
             key,
             is_overwrite,

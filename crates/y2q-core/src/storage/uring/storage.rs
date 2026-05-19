@@ -19,7 +19,7 @@ use std::time::{Instant, SystemTime};
 use crate::{
     CacheRebuildStatus, DEFAULT_LIST_LIMIT, Error, ListOptions, ListPage, Listing, MAX_LIST_LIMIT,
     Metadata, MetadataIndex, Object, PutOptions, StaleLock, Storage, StorageExt, SyncLevel,
-    storage::locks::{clear_stale_locks_under, list_stale_locks_under},
+    storage::locks::LockRegistry,
 };
 
 use super::{ops::UringOp, runtime::WorkerPool, streaming::UringStreamingPutGuard};
@@ -47,6 +47,7 @@ pub struct UringStorage {
     /// `Arc` so a spawned rebuild task can share dispatch without making
     /// `WorkerPool` cloneable (the `JoinHandle`s aren't).
     pool: Arc<WorkerPool>,
+    locks: LockRegistry,
 }
 
 /// Tunables for [`UringStorage`].
@@ -130,6 +131,7 @@ impl UringStorage {
             rebuild_state: Arc::new(tokio::sync::Mutex::new(CacheRebuildStatus::Idle)),
             config,
             pool,
+            locks: LockRegistry::new(),
         })
     }
 
@@ -211,7 +213,6 @@ impl UringStorage {
 
         let obj_path = self.obj_path(bucket, key);
         let tmp_path = obj_path.with_extension("tmp");
-        let lock_path = obj_path.with_extension("lock");
 
         if let Some(parent) = obj_path.parent() {
             tokio::fs::create_dir_all(parent)
@@ -261,35 +262,7 @@ impl UringStorage {
             }
         };
 
-        // Acquire lock synchronously. Using std::fs so we don't need a uring
-        // worker dispatch for the lock-file creation.
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&lock_path)
-        {
-            Ok(mut f) => {
-                use std::io::Write as _;
-                let stamp = now_nanos_sync().to_le_bytes();
-                let _ = f.write_all(&stamp);
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                let since = read_lock_since_sync(&lock_path);
-                return Err(Error::Locked {
-                    bucket: bucket.to_owned(),
-                    key: key.to_owned(),
-                    since,
-                });
-            }
-            Err(e) => {
-                return Err(Error::InternalError {
-                    bucket: bucket.to_owned(),
-                    key: key.to_owned(),
-                    operation: "begin_streaming_put".to_owned(),
-                    message: format!("acquire lock: {e}"),
-                });
-            }
-        }
+        let lock = self.locks.try_acquire(bucket, key)?;
 
         // Open the tmp file and write a placeholder `.obj` header so the
         // EncryptSession starts writing at data_offset (= HEADER_SIZE = 64).
@@ -321,7 +294,7 @@ impl UringStorage {
         let guard = UringStreamingPutGuard::new(
             tmp_path,
             obj_path,
-            lock_path,
+            lock,
             bucket.to_owned(),
             key.to_owned(),
             is_overwrite,
@@ -332,26 +305,6 @@ impl UringStorage {
 
         Ok((guard, file))
     }
-}
-
-fn now_nanos_sync() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as u64
-}
-
-fn read_lock_since_sync(path: &std::path::Path) -> std::time::SystemTime {
-    std::fs::read(path)
-        .ok()
-        .and_then(|b| {
-            b.get(..8)
-                .and_then(|s| <[u8; 8]>::try_from(s).ok())
-                .map(|arr| {
-                    std::time::UNIX_EPOCH + std::time::Duration::from_nanos(u64::from_le_bytes(arr))
-                })
-        })
-        .unwrap_or(std::time::UNIX_EPOCH)
 }
 
 /// Reserved bucket names that conflict with the `/api/v1/*` admin namespace.
@@ -409,11 +362,10 @@ impl Storage for UringStorage {
         validate_key(key)?;
         let started = Instant::now();
         let obj_path = self.obj_path(bucket, key);
-        let lock_path = obj_path.with_extension("lock");
         let (reply, reply_rx) = tokio::sync::oneshot::channel();
         let op = UringOp::Get {
             obj_path,
-            lock_path,
+            locks: self.locks.clone(),
             bucket: bucket.to_owned(),
             key: key.to_owned(),
             reply,
@@ -432,11 +384,10 @@ impl Storage for UringStorage {
         validate_bucket(bucket)?;
         validate_key(key)?;
         let obj_path = self.obj_path(bucket, key);
-        let lock_path = obj_path.with_extension("lock");
         let (reply, reply_rx) = tokio::sync::oneshot::channel();
         let op = UringOp::GetRange {
             obj_path,
-            lock_path,
+            locks: self.locks.clone(),
             bucket: bucket.to_owned(),
             key: key.to_owned(),
             range,
@@ -456,7 +407,6 @@ impl Storage for UringStorage {
         validate_key(key)?;
         let started = Instant::now();
         let obj_path = self.obj_path(bucket, key);
-        let lock_path = obj_path.with_extension("lock");
         let tmp_path = obj_path.with_extension("tmp");
         let (reply, reply_rx) = tokio::sync::oneshot::channel();
         let crypto = match (options.plaintext_metrics, options.cipher_metadata) {
@@ -469,7 +419,7 @@ impl Storage for UringStorage {
         let op = UringOp::Put {
             obj_path,
             tmp_path,
-            lock_path,
+            locks: self.locks.clone(),
             bucket: bucket.to_owned(),
             key: key.to_owned(),
             url_path: format!("{bucket}/{key}"),
@@ -505,11 +455,10 @@ impl Storage for UringStorage {
         validate_key(key)?;
         let started = Instant::now();
         let obj_path = self.obj_path(bucket, key);
-        let lock_path = obj_path.with_extension("lock");
         let (reply, reply_rx) = tokio::sync::oneshot::channel();
         let op = UringOp::Delete {
             obj_path,
-            lock_path,
+            locks: self.locks.clone(),
             bucket: bucket.to_owned(),
             key: key.to_owned(),
             reply,
@@ -534,11 +483,10 @@ impl Storage for UringStorage {
         validate_key(key)?;
         let started = Instant::now();
         let obj_path = self.obj_path(bucket, key);
-        let lock_path = obj_path.with_extension("lock");
         let (reply, reply_rx) = tokio::sync::oneshot::channel();
         let op = UringOp::Describe {
             obj_path,
-            lock_path,
+            locks: self.locks.clone(),
             bucket: bucket.to_owned(),
             key: key.to_owned(),
             mek: self.config.mek,
@@ -619,25 +567,11 @@ impl StorageExt for UringStorage {
     }
 
     async fn list_stale_locks(&self, older_than: SystemTime) -> Result<Vec<StaleLock>, Error> {
-        list_stale_locks_under(&self.base_path, older_than)
-            .await
-            .map_err(|e| Error::InternalError {
-                bucket: String::new(),
-                key: String::new(),
-                operation: "list_stale_locks".to_owned(),
-                message: e.to_string(),
-            })
+        Ok(self.locks.list_stale(older_than))
     }
 
     async fn clear_stale_locks(&self, older_than: SystemTime) -> Result<u64, Error> {
-        clear_stale_locks_under(&self.base_path, older_than)
-            .await
-            .map_err(|e| Error::InternalError {
-                bucket: String::new(),
-                key: String::new(),
-                operation: "clear_stale_locks".to_owned(),
-                message: e.to_string(),
-            })
+        Ok(self.locks.clear_stale(older_than))
     }
 }
 

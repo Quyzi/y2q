@@ -16,7 +16,7 @@ use std::{
     collections::BTreeMap,
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use base64::Engine;
@@ -28,6 +28,7 @@ use tokio_uring::fs::{File, OpenOptions};
 use crate::{
     Error, Metadata, Object, SyncLevel,
     crypto::{decrypt_meta, encrypt_meta},
+    storage::locks::LockRegistry,
 };
 
 use super::{
@@ -47,7 +48,7 @@ pub(super) enum UringOp {
     /// Read the full object payload.
     Get {
         obj_path: PathBuf,
-        lock_path: PathBuf,
+        locks: LockRegistry,
         bucket: String,
         key: String,
         reply: oneshot::Sender<Result<Object, Error>>,
@@ -55,7 +56,7 @@ pub(super) enum UringOp {
     /// Read a byte range of the object payload.
     GetRange {
         obj_path: PathBuf,
-        lock_path: PathBuf,
+        locks: LockRegistry,
         bucket: String,
         key: String,
         range: RangeInclusive<u64>,
@@ -65,7 +66,7 @@ pub(super) enum UringOp {
     Put {
         obj_path: PathBuf,
         tmp_path: PathBuf,
-        lock_path: PathBuf,
+        locks: LockRegistry,
         bucket: String,
         key: String,
         url_path: String,
@@ -88,7 +89,7 @@ pub(super) enum UringOp {
     /// Read the object, then unlink it. Returns the deleted bytes.
     Delete {
         obj_path: PathBuf,
-        lock_path: PathBuf,
+        locks: LockRegistry,
         bucket: String,
         key: String,
         reply: oneshot::Sender<Result<Object, Error>>,
@@ -96,7 +97,7 @@ pub(super) enum UringOp {
     /// Read and decode just the metadata blob.
     Describe {
         obj_path: PathBuf,
-        lock_path: PathBuf,
+        locks: LockRegistry,
         bucket: String,
         key: String,
         /// Metadata Encryption Key for decrypting the embedded metadata blob.
@@ -125,27 +126,27 @@ pub(super) async fn handle(op: UringOp) {
     match op {
         UringOp::Get {
             obj_path,
-            lock_path,
+            locks,
             bucket,
             key,
             reply,
         } => {
-            let _ = reply.send(do_get(obj_path, lock_path, bucket, key).await);
+            let _ = reply.send(do_get(obj_path, locks, bucket, key).await);
         }
         UringOp::GetRange {
             obj_path,
-            lock_path,
+            locks,
             bucket,
             key,
             range,
             reply,
         } => {
-            let _ = reply.send(do_get_range(obj_path, lock_path, bucket, key, range).await);
+            let _ = reply.send(do_get_range(obj_path, locks, bucket, key, range).await);
         }
         UringOp::Put {
             obj_path,
             tmp_path,
-            lock_path,
+            locks,
             bucket,
             key,
             url_path,
@@ -165,7 +166,7 @@ pub(super) async fn handle(op: UringOp) {
                 do_put(
                     obj_path,
                     tmp_path,
-                    lock_path,
+                    locks,
                     bucket,
                     key,
                     url_path,
@@ -182,22 +183,22 @@ pub(super) async fn handle(op: UringOp) {
         }
         UringOp::Delete {
             obj_path,
-            lock_path,
+            locks,
             bucket,
             key,
             reply,
         } => {
-            let _ = reply.send(do_delete(obj_path, lock_path, bucket, key).await);
+            let _ = reply.send(do_delete(obj_path, locks, bucket, key).await);
         }
         UringOp::Describe {
             obj_path,
-            lock_path,
+            locks,
             bucket,
             key,
             mek,
             reply,
         } => {
-            let _ = reply.send(do_describe(obj_path, lock_path, bucket, key, mek).await);
+            let _ = reply.send(do_describe(obj_path, locks, bucket, key, mek).await);
         }
         UringOp::ReadObjectMeta { path, mek, reply } => {
             let _ = reply.send(do_read_object_meta(path, mek).await);
@@ -223,81 +224,6 @@ fn internal(bucket: &str, key: &str, op: &str, msg: impl std::fmt::Display) -> E
     }
 }
 
-/// Returns `Err(Error::Locked)` if a `.lock` sidecar exists for this object.
-/// A best-effort timestamp is read from the lock file's first 8 bytes; if
-/// unreadable, `since` falls back to `UNIX_EPOCH`.
-async fn check_not_locked(lock_path: &Path, bucket: &str, key: &str) -> Result<(), Error> {
-    match tokio_uring::fs::statx(lock_path).await {
-        Ok(_) => {
-            let since = read_lock_timestamp(lock_path).await;
-            Err(Error::Locked {
-                bucket: bucket.to_owned(),
-                key: key.to_owned(),
-                since,
-            })
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(internal(bucket, key, "lock", format!("statx: {e}"))),
-    }
-}
-
-async fn read_lock_timestamp(path: &Path) -> SystemTime {
-    let Ok(file) = File::open(path).await else {
-        return UNIX_EPOCH;
-    };
-    let buf = vec![0u8; 8];
-    let (res, buf) = file.read_exact_at(buf, 0).await;
-    let _ = file.close().await;
-    if res.is_ok()
-        && let Ok(arr) = <[u8; 8]>::try_from(buf.as_slice())
-    {
-        return UNIX_EPOCH + Duration::from_nanos(u64::from_le_bytes(arr));
-    }
-    UNIX_EPOCH
-}
-
-/// RAII guard that removes a `.lock` sidecar on drop.
-///
-/// Removal is synchronous because async-Drop doesn't exist; this is the same
-/// trick [`crate::FilesystemStorage`]'s `LockGuard` uses. The blocking call
-/// here is a single `unlink(2)`, cheap even inside a uring worker thread.
-struct LockGuard {
-    path: PathBuf,
-}
-
-impl Drop for LockGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-    }
-}
-
-/// Acquire an exclusive lock for `lock_path` via `openat(O_EXCL|O_CREAT)`.
-///
-/// Writes the current timestamp into the lock so subsequent
-/// [`Error::Locked`] errors carry useful `since` data.
-async fn acquire_lock(lock_path: PathBuf, bucket: &str, key: &str) -> Result<LockGuard, Error> {
-    let file = match OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&lock_path)
-        .await
-    {
-        Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            let since = read_lock_timestamp(&lock_path).await;
-            return Err(Error::Locked {
-                bucket: bucket.to_owned(),
-                key: key.to_owned(),
-                since,
-            });
-        }
-        Err(e) => return Err(internal(bucket, key, "lock", format!("create: {e}"))),
-    };
-    let stamp = now_nanos().to_le_bytes().to_vec();
-    let (_, _) = file.write_all_at(stamp, 0).await;
-    let _ = file.close().await;
-    Ok(LockGuard { path: lock_path })
-}
 
 /// Open an object file and decode + validate its 64-byte header.
 async fn open_and_read_header(
@@ -365,12 +291,12 @@ async fn read_meta_blob(
 
 async fn do_describe(
     obj_path: PathBuf,
-    lock_path: PathBuf,
+    locks: LockRegistry,
     bucket: String,
     key: String,
     mek: Option<[u8; 32]>,
 ) -> Result<Metadata, Error> {
-    check_not_locked(&lock_path, &bucket, &key).await?;
+    locks.check_not_locked(&bucket, &key)?;
     let (file, header) = open_and_read_header(&obj_path, &bucket, &key, "describe").await?;
     let meta = read_meta_blob(&file, &header, &bucket, &key, "describe", mek.as_ref()).await;
     let _ = file.close().await;
@@ -420,11 +346,11 @@ async fn do_read_object_meta(path: PathBuf, mek: Option<[u8; 32]>) -> Result<Met
 
 async fn do_get(
     obj_path: PathBuf,
-    lock_path: PathBuf,
+    locks: LockRegistry,
     bucket: String,
     key: String,
 ) -> Result<Object, Error> {
-    check_not_locked(&lock_path, &bucket, &key).await?;
+    locks.check_not_locked(&bucket, &key)?;
     let (file, header) = open_and_read_header(&obj_path, &bucket, &key, "get").await?;
 
     let data_len = header.data_len as usize;
@@ -437,12 +363,12 @@ async fn do_get(
 
 async fn do_get_range(
     obj_path: PathBuf,
-    lock_path: PathBuf,
+    locks: LockRegistry,
     bucket: String,
     key: String,
     range: RangeInclusive<u64>,
 ) -> Result<Bytes, Error> {
-    check_not_locked(&lock_path, &bucket, &key).await?;
+    locks.check_not_locked(&bucket, &key)?;
     let (file, header) = open_and_read_header(&obj_path, &bucket, &key, "get_range").await?;
 
     if header.data_len == 0 || range.start >= header.data_len {
@@ -463,11 +389,11 @@ async fn do_get_range(
 
 async fn do_delete(
     obj_path: PathBuf,
-    lock_path: PathBuf,
+    locks: LockRegistry,
     bucket: String,
     key: String,
 ) -> Result<Object, Error> {
-    check_not_locked(&lock_path, &bucket, &key).await?;
+    locks.check_not_locked(&bucket, &key)?;
     let (file, header) = open_and_read_header(&obj_path, &bucket, &key, "delete").await?;
 
     let data_len = header.data_len as usize;
@@ -486,7 +412,7 @@ async fn do_delete(
 async fn do_put(
     obj_path: PathBuf,
     tmp_path: PathBuf,
-    lock_path: PathBuf,
+    locks: LockRegistry,
     bucket: String,
     key: String,
     url_path: String,
@@ -503,7 +429,7 @@ async fn do_put(
             .map_err(|e| internal(&bucket, &key, "put", format!("mkdir: {e}")))?;
     }
 
-    let _lock = acquire_lock(lock_path, &bucket, &key).await?;
+    let _lock = locks.try_acquire(&bucket, &key)?;
 
     // Detect overwrite by looking up the existing object header, which also
     // gives us its prior `created` timestamp for preservation.

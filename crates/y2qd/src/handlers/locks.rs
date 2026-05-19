@@ -33,16 +33,14 @@ pub struct LocksQuery {
     pub older_than: String,
 }
 
-/// One stale lock returned by `GET /api/v1/locks`.
+/// One active write lock returned by `GET /api/v1/locks`.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct StaleLockEntry {
-    /// Bucket directory the lock lives under.
+    /// Bucket the locked object belongs to.
     pub bucket: String,
-    /// `<uuid>` portion of the `.lock` filename. Cross-reference with the
-    /// metadata index to recover the original object key.
-    pub uuid: String,
-    /// Unix nanoseconds since epoch — the timestamp recorded inside the
-    /// lock file at acquisition time.
+    /// The original object key.
+    pub key: String,
+    /// Unix nanoseconds since epoch — the timestamp recorded at lock acquisition.
     pub locked_since_nanos: u64,
     /// Seconds elapsed between `locked_since` and the time of the scan.
     pub age_seconds: u64,
@@ -62,7 +60,7 @@ pub struct ClearStaleLocksResponse {
     path = "/api/v1/locks",
     params(LocksQuery),
     responses(
-        (status = 200, description = "Stale locks (dry-run)", body = [StaleLockEntry], content_type = "application/json"),
+        (status = 200, description = "Active in-flight locks older than cutoff (dry-run)", body = [StaleLockEntry], content_type = "application/json"),
         (status = 400, description = "Missing or malformed `older_than`", body = ErrorBody, content_type = "application/json"),
         (status = 401, description = "Authentication required", body = ErrorBody, content_type = "application/json"),
         (status = 500, description = "Internal error", body = ErrorBody, content_type = "application/json"),
@@ -126,7 +124,7 @@ fn to_entry(l: StaleLock, now: SystemTime) -> StaleLockEntry {
         .unwrap_or(0);
     StaleLockEntry {
         bucket: l.bucket,
-        uuid: l.uuid,
+        key: l.key,
         locked_since_nanos,
         age_seconds,
     }

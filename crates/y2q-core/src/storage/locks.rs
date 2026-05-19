@@ -1,305 +1,206 @@
-//! Stale `.lock` sidecar discovery and cleanup.
+//! In-memory per-object write-lock registry.
 //!
-//! Both backends serialize per-object writes through a sibling
-//! `<uuid>.lock` file created with `O_EXCL` and containing 8 LE bytes of
-//! nanoseconds-since-UNIX_EPOCH. The lock is released by
-//! `LockGuard::drop` via `remove_file`, but a `SIGKILL` (or any abrupt
-//! process death) mid-PUT leaves the file behind. Future writes to that
-//! key then fail with [`crate::Error::Locked`] until an operator
-//! intervenes.
+//! Replaces the on-disk `.lock` sidecar approach. Since only one `y2qd`
+//! process accesses the data directory, disk files add I/O overhead and
+//! create orphan-lock risk on `SIGKILL`. With an in-memory registry, all
+//! locks vanish on process exit — no orphan recovery needed.
 //!
-//! This module walks the on-disk tree and offers two operations against
-//! that orphan set: list (dry-run) and clear. The walker is layout-aware
-//! but extension-agnostic between backends — both write `.lock` at the
-//! same 4-level path shape (`<base>/<bucket>/<xx>/<yy>/<uuid>.lock`).
-//!
-//! ## Race semantics
-//!
-//! Scan and unlink are not atomic across the tree. A lock acquired
-//! between the scan and the corresponding `remove_file` could be
-//! unlinked under a live writer. The worst case is a single retry on
-//! the in-flight PUT — `acquire_lock`'s `O_EXCL` semantics mean two
-//! writers can never both believe they hold the lock.
-//!
-//! ## Cross-node clock skew
-//!
-//! The stamped timestamp comes from the *writing* node's wall clock.
-//! Multi-node deployments sharing the backing dir over NFS (not a
-//! supported configuration today) would see "stale" relative to that
-//! node, not to the clearing node.
+//! Mutual exclusion is provided by [`papaya::HashMap::try_insert`], which is
+//! atomic across concurrent callers. Each entry maps
+//! `(bucket, key) -> SystemTime` (acquisition time).
 
-use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
+use std::time::SystemTime;
 
-use tokio::fs;
-use tokio::io::AsyncReadExt;
+use papaya::HashMap;
 
-/// One stale lock found on disk.
-///
-/// `uuid` is the lock file's stem — the deterministic UUID we derive
-/// from the original object key. Recovering the human-readable key
-/// requires consulting [`crate::MetadataIndex`].
-#[derive(Debug, Clone)]
-pub struct StaleLock {
-    /// The bucket directory the lock lives under.
-    pub bucket: String,
-    /// `<uuid>` portion of the `.lock` filename, no extension.
-    pub uuid: String,
-    /// Wall-clock time the lock was acquired, recovered from the file
-    /// contents.
-    pub locked_since: SystemTime,
+use crate::Error;
+
+/// RAII guard that removes the registry entry on drop, releasing the lock.
+pub(crate) struct LockGuard {
+    map: Arc<HashMap<(String, String), SystemTime>>,
+    key: (String, String),
 }
 
-/// List every `.lock` file whose recorded `locked_since` is **strictly
-/// earlier** than `older_than`.
+impl Drop for LockGuard {
+    fn drop(&mut self) {
+        self.map.pin().remove(&self.key);
+    }
+}
+
+/// In-memory registry of active per-object write locks.
 ///
-/// Locks whose 8-byte timestamp is missing or short-read are treated as
-/// "fresh" (skipped) so a half-written lock file is never reported as
-/// stale on the basis of partial data.
-pub(crate) async fn list_stale_locks_under(
-    base_path: &Path,
-    older_than: SystemTime,
-) -> std::io::Result<Vec<StaleLock>> {
-    let mut out = Vec::new();
-    let mut paths = Vec::new();
-    walk_lock_files(base_path, &mut paths).await?;
-    for path in paths {
-        let Some((bucket, uuid)) = split_bucket_and_uuid(base_path, &path) else {
-            continue;
-        };
-        let Some(stamp) = read_lock_timestamp(&path).await else {
-            continue;
-        };
-        if stamp < older_than {
-            out.push(StaleLock {
-                bucket,
-                uuid,
-                locked_since: stamp,
+/// Cheaply cloneable — the underlying map is reference-counted.
+#[derive(Clone)]
+pub(crate) struct LockRegistry {
+    inner: Arc<HashMap<(String, String), SystemTime>>,
+}
+
+impl LockRegistry {
+    pub(crate) fn new() -> Self {
+        Self {
+            inner: Arc::new(HashMap::new()),
+        }
+    }
+
+    /// Acquire an exclusive write lock for `(bucket, key)`.
+    ///
+    /// Returns [`Error::Locked`] if a lock for this object is already held.
+    pub(crate) fn try_acquire(&self, bucket: &str, key: &str) -> Result<LockGuard, Error> {
+        let k = (bucket.to_owned(), key.to_owned());
+        let now = SystemTime::now();
+        match self.inner.pin().try_insert(k.clone(), now) {
+            Ok(_) => Ok(LockGuard {
+                map: Arc::clone(&self.inner),
+                key: k,
+            }),
+            Err(e) => Err(Error::Locked {
+                bucket: bucket.to_owned(),
+                key: key.to_owned(),
+                since: *e.current,
+            }),
+        }
+    }
+
+    /// Return [`Error::Locked`] if `(bucket, key)` is currently locked.
+    pub(crate) fn check_not_locked(&self, bucket: &str, key: &str) -> Result<(), Error> {
+        let k = (bucket.to_owned(), key.to_owned());
+        if let Some(&since) = self.inner.pin().get(&k) {
+            return Err(Error::Locked {
+                bucket: bucket.to_owned(),
+                key: key.to_owned(),
+                since,
             });
         }
+        Ok(())
     }
-    Ok(out)
-}
 
-/// Remove every `.lock` file whose recorded `locked_since` is strictly
-/// earlier than `older_than`. Returns the number successfully removed.
-///
-/// `ENOENT` on the unlink is treated as success — another worker may
-/// have legitimately released the lock between scan and unlink. Any
-/// other I/O error aborts the walk.
-pub(crate) async fn clear_stale_locks_under(
-    base_path: &Path,
-    older_than: SystemTime,
-) -> std::io::Result<u64> {
-    let mut paths = Vec::new();
-    walk_lock_files(base_path, &mut paths).await?;
-    let mut removed: u64 = 0;
-    for path in paths {
-        let Some(stamp) = read_lock_timestamp(&path).await else {
-            continue;
-        };
-        if stamp >= older_than {
-            continue;
-        }
-        match fs::remove_file(&path).await {
-            Ok(()) => removed += 1,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e),
-        }
+    /// List all locks acquired before `older_than` (stuck in-flight PUTs).
+    pub(crate) fn list_stale(&self, older_than: SystemTime) -> Vec<StaleLock> {
+        let guard = self.inner.pin();
+        guard
+            .iter()
+            .filter(|(_, since)| **since < older_than)
+            .map(|(k, since)| StaleLock {
+                bucket: k.0.clone(),
+                key: k.1.clone(),
+                locked_since: *since,
+            })
+            .collect()
     }
-    Ok(removed)
-}
 
-/// Recursively gather every `*.lock` path under `<base>/<bucket>/xx/yy/`.
-///
-/// The walk mirrors `collect_obj_files` and `collect_sidecars` so the
-/// three backend rebuild / cleanup paths stay shaped the same way.
-/// Directory names are not validated here — `validate_bucket` would
-/// require an [`crate::Error`] type and this helper returns
-/// `std::io::Result` so it composes with callers. Anything that isn't a
-/// directory is silently skipped.
-async fn walk_lock_files(base_path: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
-    let mut buckets = match fs::read_dir(base_path).await {
-        Ok(rd) => rd,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e),
-    };
-    while let Some(b_entry) = buckets.next_entry().await? {
-        if !b_entry.file_type().await?.is_dir() {
-            continue;
-        }
-        let bucket_path = b_entry.path();
-        let mut l1 = fs::read_dir(&bucket_path).await?;
-        while let Some(l1_entry) = l1.next_entry().await? {
-            if !l1_entry.file_type().await?.is_dir() {
-                continue;
-            }
-            let mut l2 = fs::read_dir(l1_entry.path()).await?;
-            while let Some(l2_entry) = l2.next_entry().await? {
-                if !l2_entry.file_type().await?.is_dir() {
-                    continue;
-                }
-                let mut files = fs::read_dir(l2_entry.path()).await?;
-                while let Some(f) = files.next_entry().await? {
-                    let p = f.path();
-                    if p.extension().is_some_and(|e| e == "lock") {
-                        out.push(p);
-                    }
-                }
+    /// Remove all locks acquired before `older_than`. Returns count removed.
+    ///
+    /// Forcibly evicts registry entries for stuck in-flight PUTs. The
+    /// in-flight operation is not cancelled, but subsequent readers and writers
+    /// will no longer see the lock.
+    pub(crate) fn clear_stale(&self, older_than: SystemTime) -> u64 {
+        let guard = self.inner.pin();
+        let stale: Vec<(String, String)> = guard
+            .iter()
+            .filter(|(_, since)| **since < older_than)
+            .map(|(k, _)| k.clone())
+            .collect();
+        let mut removed = 0u64;
+        for k in stale {
+            if guard.remove(&k).is_some() {
+                removed += 1;
             }
         }
+        removed
     }
-    Ok(())
 }
 
-/// Read the 8-byte LE timestamp embedded in a `.lock` file.
+/// One active write lock returned by `GET /api/v1/locks`.
 ///
-/// Returns `None` on any I/O error or a short read — callers treat that
-/// as "lock looks fresh, leave it alone." Mirrors the read pattern in
-/// `filesystem::read_lock_timestamp` / `uring::ops::read_lock_timestamp`
-/// but is independent so this module stays self-contained.
-async fn read_lock_timestamp(path: &Path) -> Option<SystemTime> {
-    let mut f = fs::File::open(path).await.ok()?;
-    let mut buf = [0u8; 8];
-    if f.read_exact(&mut buf).await.is_err() {
-        return None;
-    }
-    let nanos = u64::from_le_bytes(buf);
-    Some(UNIX_EPOCH + Duration::from_nanos(nanos))
-}
-
-/// Split a `<base>/<bucket>/xx/yy/<uuid>.lock` path into `(bucket, uuid)`.
-///
-/// Returns `None` if the path doesn't have the expected three-component
-/// suffix below `base_path`, or if its stem can't be parsed as UTF-8.
-fn split_bucket_and_uuid(base_path: &Path, lock_path: &Path) -> Option<(String, String)> {
-    let rel = lock_path.strip_prefix(base_path).ok()?;
-    let mut comps = rel.components();
-    let bucket = comps.next()?.as_os_str().to_str()?.to_owned();
-    // skip <xx>/<yy>/
-    comps.next()?;
-    comps.next()?;
-    let file = comps.next()?.as_os_str().to_str()?;
-    let stem = file.strip_suffix(".lock")?.to_owned();
-    if comps.next().is_some() {
-        return None;
-    }
-    Some((bucket, stem))
+/// Unlike the previous disk-based implementation, this always represents a
+/// live in-flight PUT (not an orphaned sidecar file). All locks disappear on
+/// process restart.
+#[derive(Debug, Clone)]
+pub struct StaleLock {
+    /// The bucket the locked object belongs to.
+    pub bucket: String,
+    /// The original object key.
+    pub key: String,
+    /// Wall-clock time the lock was acquired.
+    pub locked_since: SystemTime,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Duration;
-    use tempfile::TempDir;
 
-    /// Build the canonical 4-level path and write `stamp_nanos` as 8 LE
-    /// bytes into a `.lock` file at that location.
-    async fn plant_lock(base: &Path, bucket: &str, uuid: &str, stamp_nanos: u64) -> PathBuf {
-        let dir = base.join(bucket).join(&uuid[0..2]).join(&uuid[2..4]);
-        fs::create_dir_all(&dir).await.unwrap();
-        let path = dir.join(format!("{uuid}.lock"));
-        fs::write(&path, stamp_nanos.to_le_bytes()).await.unwrap();
-        path
+    #[test]
+    fn acquire_and_release() {
+        let reg = LockRegistry::new();
+        let guard = reg.try_acquire("b", "k").expect("first acquire ok");
+        assert!(matches!(
+            reg.try_acquire("b", "k"),
+            Err(crate::Error::Locked { .. })
+        ));
+        drop(guard);
+        assert!(reg.try_acquire("b", "k").is_ok());
     }
 
-    fn nanos(t: SystemTime) -> u64 {
-        t.duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64
+    #[test]
+    fn check_not_locked_reflects_state() {
+        let reg = LockRegistry::new();
+        assert!(reg.check_not_locked("b", "k").is_ok());
+        let _guard = reg.try_acquire("b", "k").unwrap();
+        assert!(matches!(
+            reg.check_not_locked("b", "k"),
+            Err(crate::Error::Locked { .. })
+        ));
     }
 
-    #[tokio::test]
-    async fn list_returns_only_locks_older_than_cutoff() {
-        let dir = TempDir::new().unwrap();
-        let base = dir.path();
+    #[test]
+    fn different_keys_are_independent() {
+        let reg = LockRegistry::new();
+        let _g1 = reg.try_acquire("b", "k1").unwrap();
+        let _g2 = reg.try_acquire("b", "k2").unwrap();
+        let _g3 = reg.try_acquire("b2", "k1").unwrap();
+    }
+
+    #[test]
+    fn list_and_clear_stale() {
+        let reg = LockRegistry::new();
         let now = SystemTime::now();
-        let old = now - Duration::from_secs(60);
-        let young = now;
-        plant_lock(base, "b1", "aabbccdd-stale", nanos(old)).await;
-        plant_lock(base, "b1", "eeffgghh-fresh", nanos(young)).await;
+        let old_time = now - Duration::from_secs(60);
+        reg.inner
+            .pin()
+            .insert(("b".to_owned(), "old".to_owned()), old_time);
+        reg.inner
+            .pin()
+            .insert(("b".to_owned(), "fresh".to_owned()), now);
 
         let cutoff = now - Duration::from_secs(30);
-        let locks = list_stale_locks_under(base, cutoff).await.unwrap();
-        assert_eq!(locks.len(), 1);
-        assert_eq!(locks[0].bucket, "b1");
-        assert_eq!(locks[0].uuid, "aabbccdd-stale");
-    }
+        let stale = reg.list_stale(cutoff);
+        assert_eq!(stale.len(), 1);
+        assert_eq!(stale[0].key, "old");
 
-    #[tokio::test]
-    async fn clear_removes_only_stale_locks() {
-        let dir = TempDir::new().unwrap();
-        let base = dir.path();
-        let now = SystemTime::now();
-        let stale_p = plant_lock(
-            base,
-            "b",
-            "11223344-stale",
-            nanos(now - Duration::from_secs(60)),
-        )
-        .await;
-        let fresh_p = plant_lock(base, "b", "55667788-fresh", nanos(now)).await;
-
-        let cutoff = now - Duration::from_secs(30);
-        let removed = clear_stale_locks_under(base, cutoff).await.unwrap();
+        let removed = reg.clear_stale(cutoff);
         assert_eq!(removed, 1);
-        assert!(!stale_p.exists());
-        assert!(fresh_p.exists());
+        assert!(reg
+            .inner
+            .pin()
+            .get(&("b".to_owned(), "old".to_owned()))
+            .is_none());
+        assert!(reg
+            .inner
+            .pin()
+            .get(&("b".to_owned(), "fresh".to_owned()))
+            .is_some());
     }
 
-    #[tokio::test]
-    async fn malformed_lock_files_are_skipped() {
-        // < 8 bytes — short read — treated as fresh (not reported, not removed).
-        let dir = TempDir::new().unwrap();
-        let base = dir.path();
-        let leaf = base.join("b").join("aa").join("bb");
-        fs::create_dir_all(&leaf).await.unwrap();
-        let p = leaf.join("partial.lock");
-        fs::write(&p, b"abc").await.unwrap();
-
-        let cutoff = SystemTime::now() + Duration::from_secs(60);
-        let locks = list_stale_locks_under(base, cutoff).await.unwrap();
-        assert!(locks.is_empty());
-        let removed = clear_stale_locks_under(base, cutoff).await.unwrap();
-        assert_eq!(removed, 0);
-        assert!(p.exists(), "malformed lock must not be deleted");
-    }
-
-    #[tokio::test]
-    async fn missing_base_dir_yields_empty_results() {
-        let dir = TempDir::new().unwrap();
-        let missing = dir.path().join("does-not-exist");
+    #[test]
+    fn cutoff_boundary_is_strict_less_than() {
+        let reg = LockRegistry::new();
         let now = SystemTime::now();
-        assert!(
-            list_stale_locks_under(&missing, now)
-                .await
-                .unwrap()
-                .is_empty()
-        );
-        assert_eq!(clear_stale_locks_under(&missing, now).await.unwrap(), 0);
-    }
-
-    #[tokio::test]
-    async fn non_lock_files_are_ignored() {
-        let dir = TempDir::new().unwrap();
-        let base = dir.path();
-        let leaf = base.join("b").join("aa").join("bb");
-        fs::create_dir_all(&leaf).await.unwrap();
-        fs::write(leaf.join("foo.obj"), b"\0").await.unwrap();
-        fs::write(leaf.join("foo.meta"), b"{}").await.unwrap();
-
-        let cutoff = SystemTime::now() + Duration::from_secs(60);
-        let locks = list_stale_locks_under(base, cutoff).await.unwrap();
-        assert!(locks.is_empty());
-    }
-
-    #[tokio::test]
-    async fn cutoff_boundary_is_strict_less_than() {
-        // A lock whose stamp equals the cutoff is NOT stale.
-        let dir = TempDir::new().unwrap();
-        let base = dir.path();
-        let now = SystemTime::now();
-        plant_lock(base, "b", "deadbeef-edge", nanos(now)).await;
-
-        let locks = list_stale_locks_under(base, now).await.unwrap();
-        assert!(locks.is_empty(), "stamp == cutoff must not be reported");
+        reg.inner
+            .pin()
+            .insert(("b".to_owned(), "k".to_owned()), now);
+        let stale = reg.list_stale(now);
+        assert!(stale.is_empty(), "stamp == cutoff must not be reported");
     }
 }
