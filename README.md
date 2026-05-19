@@ -8,18 +8,20 @@ Post-quantum secure object storage. `y2qd` is a REST daemon that encrypts every 
 
 - [docs/architecture.md](docs/architecture.md) — system design, encryption envelope, storage backends, metadata index, sessions
 - [docs/configuration.md](docs/configuration.md) — full config reference with all fields, defaults, and override syntax
-- [docs/operations.md](docs/operations.md) — first run, user management, backup/recovery, stale-lock cleanup, runbook
+- [docs/operations.md](docs/operations.md) — first run, user management, backup/recovery, runbook
 - [docs/api.md](docs/api.md) — complete HTTP API reference: routes, schemas, error codes, examples
 
 ## Features
 
-- **Post-quantum encryption at rest** — each object is encapsulated against an ML-KEM-768 public key; content and metadata is encrypted with AES-256-GCM
+- **Post-quantum encryption at rest** — each object is encapsulated against an ML-KEM-768 public key; content and metadata is encrypted with AES-256-GCM via [ring](https://github.com/briansmith/ring) (5–7× faster than the pure-Rust aes-gcm crate)
 - **Argon2id-protected secret key** — the ML-KEM private key is never stored in plaintext; it is wrapped under each user's password and only held in memory during an active session
 - **Token-based session auth** — Bearer tokens with configurable TTL, per-account lockout after repeated failures
-- **Dual storage backends** — portable filesystem backend (all platforms); optional Linux io_uring fast path (kernel ≥ 5.6)
-- **Fast listing** — embedded [redb](https://github.com/cberner/redb) metadata index; can be rebuilt from on-disk sidecars at any time
+- **Dual storage backends** — portable filesystem backend (all platforms); optional Linux io_uring fast path (kernel ≥ 5.6); both use the same on-disk `.obj` format and are fully cross-compatible
+- **Fast listing** — embedded [redb](https://github.com/cberner/redb) metadata index; auto-rebuilt on startup; can be manually triggered at any time
+- **Best-effort mode with background flusher** — skip per-PUT fsyncs for throughput; a background task drains the dirty queue on a configurable interval
 - **Custom object labels** — attach arbitrary key/value metadata to objects via `X-Y2Q-<label>` request headers on PUT
-- **Prometheus metrics** — scrape endpoint at `/metrics/prometheus`; interactive dashboard at `/metrics/dashboard`
+- **Prometheus metrics** — scrape endpoint at `/metrics/prometheus`; interactive dashboard at `/metrics/dashboard`; storage and auth counters with latency histograms
+- **Structured observability** — per-request IDs (`X-Request-ID`), INFO/ERROR log events on every request, configurable log format (`text` or `json`)
 - **OpenAPI / Swagger UI** — interactive docs at `/swagger-ui/`
 
 ## Getting Started
@@ -165,7 +167,9 @@ y2q admin user rm prod bob
 y2q admin rebuild start prod
 y2q admin rebuild status prod
 
+# List active in-flight PUTs held longer than a threshold
 y2q admin locks ls prod --older-than 30m
+# Force-release locks stuck longer than a threshold (use carefully)
 y2q admin locks clear prod --older-than 30m
 ```
 
@@ -227,55 +231,108 @@ y2q         # same
 | `--verbose` | `-v` | — | Increase log verbosity (repeatable) |
 | `--config <path>` | — | — | Override config file location |
 
+## Load Benchmarking (`y2q-warp`)
+
+`y2q-warp` is a dedicated load benchmarking tool modelled after MinIO's `warp`. It runs timed workloads against a live `y2qd` server and records per-operation latencies to a compressed CSV file for offline analysis.
+
+Build:
+
+```sh
+cargo build --release -p y2q-warp
+```
+
+### Workloads
+
+```sh
+# Single-operation benchmarks (5 minutes, 8 concurrent workers, 4 MiB objects)
+y2q-warp prod put   --duration 5m --concurrent 8 --obj-size 4MiB
+y2q-warp prod get   --duration 5m --concurrent 8 --objects 1000
+y2q-warp prod stat  --duration 5m --concurrent 16
+y2q-warp prod delete --duration 2m
+
+# Mixed workload (GET 45% / PUT 15% / DELETE 25% / STAT 15%)
+y2q-warp prod mixed --duration 10m --concurrent 16
+
+# Pre-seed objects without timing, then run a read benchmark
+y2q-warp prod prepare --objects 5000 --obj-size 1MiB
+y2q-warp prod get --duration 5m --no-cleanup
+y2q-warp prod cleanup
+```
+
+Variable-size objects:
+
+```sh
+y2q-warp prod put --obj-size-min 64KiB --obj-size-max 16MiB
+```
+
+### Offline analysis
+
+```sh
+y2q-warp analyze warp-mixed-*.csv.zst
+y2q-warp analyze warp-put-*.csv.zst --op PUT --skip 5s
+```
+
+Outputs a per-operation summary table: throughput (MiB/s and ops/s), p50/p90/p99 latency, total ops, error count.
+
+### TUI during a run
+
+While a benchmark is running, a live ratatui TUI shows:
+- Per-operation ops/s sparklines (stacked for mixed workloads)
+- 4xx/5xx error rates
+- Live throughput and latency
+
 ## Configuration
+
+`config.default.toml` in the repo root contains every knob with inline comments. Copy it and fill in the three required fields (`server.host`, `server.port`, `storage.base_path`, `crypto.keystore_dir`). The sections below show the key options.
 
 ```toml
 [server]
 host = "127.0.0.1"
 port = 8080
-# Maximum request body size in bytes (default: 256 MiB)
-max_body_bytes = 268435456
-# Allow unauthenticated access to /metrics/* and /swagger-ui/
-unauthenticated_metrics = false
+max_body_bytes = 268435456        # 256 MiB upload limit
+unauthenticated_metrics = false   # expose /metrics/* and /swagger-ui/ without auth
+
+# actix HttpServer tuning — entire section optional; omit to use actix defaults
+[server.actix]
+# workers = 4                     # default: number of logical CPUs
+backlog = 1024
+max_connections = 25000
+keep_alive_secs = 5
+shutdown_timeout_secs = 30
 
 [storage]
-# Where objects are stored on disk
-base_path = "/var/lib/y2qd/objects"
-# "filesystem" (default) or "uring" (Linux only, requires --features uring)
-backend = "filesystem"
-# Path for the metadata index database (default: <base_path>/_y2q_index.redb)
+base_path = "/var/lib/y2qd/objects"   # required
+backend = "filesystem"                 # "filesystem" or "uring" (Linux, --features uring)
 # index_path = "/var/lib/y2qd/objects/_y2q_index.redb"
-# Label limits per object
 max_labels = 32
 max_label_name_bytes = 64
 max_label_value_bytes = 1024
+default_sync = "durable"              # "durable" (fsync) or "best-effort" (no fsync)
+sync_flush_interval_secs = 5          # how often the background flusher drains best-effort writes
+sync_flush_limit = 64                 # pending-write watermark that triggers an early flush
 
 [crypto]
-# Directory holding pubkey.json and the user store database
-keystore_dir = "/var/lib/y2qd/keystore"
-# Argon2id parameters for secret key wrapping
+keystore_dir = "/var/lib/y2qd/keystore"   # required; keep separate from base_path
 [crypto.argon2]
-m_cost_kib = 65536  # 64 MiB memory
-t_cost = 3          # iterations
-p_cost = 4          # parallelism
+m_cost_kib = 65536   # 64 MiB
+t_cost = 3
+p_cost = 4
 
 [auth]
-# Default and maximum session lifetimes
 default_ttl_seconds = 3600
 max_ttl_seconds = 86400
-# How often the session sweeper runs
 session_sweep_interval_seconds = 300
-# Minimum login response time (milliseconds) — prevents timing attacks
 min_login_response_ms = 250
-# Lockout policy
 max_failed_logins = 10
 lockout_seconds = 900
-# Drop the decrypted secret key from memory after this many idle seconds
-# 0 = keep it for the lifetime of the process
 keystore_idle_drop_seconds = 0
+
+[observability]
+log_filter = "info"      # RUST_LOG syntax; RUST_LOG env var takes precedence
+log_format = "text"      # "text" or "json" (for Loki, Datadog, etc.)
 ```
 
-Environment variables override config file values. Prefix any config key with `Y2QD_`, use `__` (two underscores) as the section separator, and convert to uppercase — e.g. `Y2QD_SERVER__PORT=9090`, `Y2QD_CRYPTO__ARGON2__M_COST_KIB=131072`. See [docs/configuration.md](docs/configuration.md) for the full schema.
+Environment variables override any config file value. Prefix the dotted key with `Y2QD_` and use `__` (two underscores) as the section separator — e.g. `Y2QD_SERVER__PORT=9090`, `Y2QD_OBSERVABILITY__LOG_FORMAT=json`. See [docs/configuration.md](docs/configuration.md) for the full schema.
 
 ## API Reference
 
@@ -326,8 +383,8 @@ Listing query parameters: `?prefix=<str>`, `?after=<cursor>`, `?limit=<n>`.
 |---|---|---|---|
 | `POST` | `/api/v1/rebuild` | Yes | Start a metadata index rebuild |
 | `GET` | `/api/v1/rebuild` | Yes | Poll rebuild status |
-| `GET` | `/api/v1/locks` | Yes | List stale write locks |
-| `DELETE` | `/api/v1/locks` | Yes | Clear stale write locks |
+| `GET` | `/api/v1/locks` | Yes | List active in-flight write locks older than a threshold |
+| `DELETE` | `/api/v1/locks` | Yes | Force-release write locks older than a threshold |
 
 ### Observability
 

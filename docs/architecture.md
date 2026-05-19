@@ -4,58 +4,77 @@ This document describes how `y2qd` is put together: the components, the encrypti
 
 ## Overview
 
-`y2qd` is an HTTP daemon that exposes an object store. Every object is encrypted at rest using ML-KEM-768 key encapsulation feeding AES-256-GCM. The deployment's private key is never written to disk in plaintext — it is wrapped under each authorized user's password with Argon2id, unwrapped into process memory on successful login, and dropped when no sessions remain (subject to an optional idle timeout).
+`y2qd` is an HTTP daemon that exposes an object store. Every object is encrypted at rest using ML-KEM-768 key encapsulation feeding AES-256-GCM (via [ring](https://github.com/briansmith/ring)). The deployment's private key is never written to disk in plaintext — it is wrapped under each authorized user's password with Argon2id, unwrapped into process memory on successful login, and dropped when no sessions remain (subject to an optional idle timeout).
 
 Two storage backends ship in tree:
 
-- **Filesystem** (default, all platforms) — built on `tokio::fs`. Each object lives in its own file with a JSON metadata sidecar.
-- **io_uring** (Linux only, `--features uring`) — a single-file format with a header/trailer pair for torn-write recovery, driven through `tokio-uring`.
+- **Filesystem** (default, all platforms) — built on `tokio::fs`. Each object is a single `.obj` file with an embedded header, payload, metadata, and trailer.
+- **io_uring** (Linux only, `--features uring`) — same `.obj` format, same on-disk layout, driven through `tokio-uring` with optional `O_DIRECT` alignment for large objects.
 
-A redb-backed metadata index sits in front of both backends to make listing operations cheap. The index is a cache: the on-disk sidecars (filesystem) and per-object headers (uring) are the source of truth, and the index can be rebuilt from them at any time.
+Both backends write the same format. A file written by the uring backend is readable by the filesystem backend and vice versa. A redb-backed metadata index makes listing cheap; it auto-rebuilds on startup and can be manually triggered at any time.
 
 ```
-                  ┌──────────────────────────┐
-   HTTP request → │  actix-web + middleware  │
-                  │  (auth, tracing, metrics)│
-                  └────────────┬─────────────┘
-                               │
-                  ┌────────────▼─────────────┐
-                  │   Authenticated extractor│  ← Bearer token → session store
-                  └────────────┬─────────────┘
-                               │
-                  ┌────────────▼─────────────┐
-                  │      handlers/*.rs       │
-                  │  (put, get, list, …)     │
-                  └────────────┬─────────────┘
-                               │
-                  ┌────────────▼─────────────┐
-                  │  envelope.rs (encrypt /  │
-                  │  decrypt with in-memory  │
-                  │  SK from session)        │
-                  └────────────┬─────────────┘
-                               │
-                  ┌────────────▼─────────────┐
-                  │   AnyStorage dispatcher  │
-                  │  ┌──────────┬─────────┐  │
-                  │  │Filesystem│ Uring   │  │
-                  │  └────┬─────┴────┬────┘  │
-                  └───────┼──────────┼───────┘
-                          │          │
-                  ┌───────▼───┐  ┌───▼──────┐
-                  │ disk (fs) │  │ disk (uring│
-                  │ + sidecars│  │  single-  │
-                  │           │  │  file fmt) │
-                  └───────────┘  └────────────┘
-                          │          │
-                          └────┬─────┘
-                               │
-                  ┌────────────▼─────────────┐
-                  │   MetadataIndex (redb)   │
-                  │  OBJECTS + LABELS tables │
-                  └──────────────────────────┘
+┌─────────────────────────────────────────────────────────┐
+│                   y2qd process                          │
+│                                                         │
+│  HTTP ──► actix-web middleware                          │
+│           (X-Request-ID, RootSpanBuilder, metrics)      │
+│                │                                        │
+│           auth extractor  ◄── DashMap<token_hash,       │
+│                │                      SessionInfo>      │
+│                │                                        │
+│           handlers/*.rs                                 │
+│                │                                        │
+│           envelope.rs  ──► ML-KEM-768 + HKDF + ring     │
+│           (encrypt/decrypt using in-memory SK)          │
+│                │                                        │
+│           AnyStorage dispatcher                         │
+│           ┌───┴───────────────┐                        │
+│           │                   │                        │
+│      FilesystemStorage   UringStorage                  │
+│           │                   │                        │
+│           └────────┬──────────┘                        │
+│                    │                                    │
+│           .obj files (shared format)                    │
+│           [hdr64|data N|meta M|trl64]                   │
+│                    │                                    │
+│           LockRegistry (in-memory, per-object)          │
+│                    │                                    │
+│           MetadataIndex (redb)                          │
+│           ┌── OBJECTS table                             │
+│           └── LABELS table                              │
+│                                                         │
+│           best-effort flusher  (background task)        │
+│           ├── drains dirty-write channel                │
+│           └── fdatasync + fsync on interval/watermark   │
+└─────────────────────────────────────────────────────────┘
+```
+
+### PUT request flow
+
+```
+client PUT ──► auth check ──► LockRegistry.try_acquire(bucket, key)
+                │
+           ML-KEM-768.encapsulate(pubkey) → kem_ct, ss
+           HKDF-SHA256(salt=kem_ct, ikm=ss) → content_key
+           ring AES-256-GCM.seal(content_key, nonce, body, aad=header)
+                │
+           write header + ciphertext + metadata to tmp .obj
+           fdatasync(tmp)  [durable only]
+           rename(tmp → final)
+           fsync(parent_dir)  [durable only]
+                │           [best-effort: push to flusher channel]
+           upsert MetadataIndex
+           LockGuard::drop  ──► registry entry removed
+                │
+           ◄── 201 Created
 ```
 
 ## Cryptography
+
+### AES-256-GCM implementation
+
+AES-256-GCM is implemented via [ring](https://github.com/briansmith/ring), which uses hardware AES-NI where available. This is 5–7× faster than the pure-Rust `aes-gcm` crate and is the performance-critical path for every PUT and GET.
 
 ### Envelope format
 
@@ -145,21 +164,47 @@ Each user's `UserRecord` records the parameters used at the time of password wri
 
 ## Storage
 
+### Shared on-disk format
+
+Both the filesystem and uring backends use the same single-file `.obj` format. Files written by either backend are fully readable by the other. An object at rest is one file:
+
+```
+[ header   64 B ]
+[ data     N B  ]   N = data_len  (the encrypted envelope)
+[ meta     M B  ]   M = meta_len  (JSON-encoded Metadata)
+[ trailer  64 B ]   bitwise mirror of the header
+```
+
+The header and trailer each carry a CRC32 over their 64-byte record. A torn write is detectable by mismatching CRCs, and the surviving copy can be used for repair.
+
+Header layout (little-endian):
+
+```
+offset  size   field
+------  ----   -----
+0       4      magic        = b"Y2QO"
+4       2      version      = 1
+6       2      flags        bit 0 = WRITTEN_O_DIRECT, bit 1 = DURABLE
+8       8      data_len
+16      4      meta_len
+20      4      data_offset  64 (buffered) or 4096 (O_DIRECT)
+24      36     reserved (zeros)
+60      4      crc32 of bytes 0..60
+```
+
 ### Filesystem backend
 
-Each object becomes a triple of files in a two-level hex-sharded directory:
+Each object is a single `.obj` file in a two-level hex-sharded directory:
 
 ```
-<base_path>/<bucket>/<xx>/<yy>/<uuid>          object payload (envelope)
-<base_path>/<bucket>/<xx>/<yy>/<uuid>.meta     JSON metadata sidecar
-<base_path>/<bucket>/<xx>/<yy>/<uuid>.lock     ephemeral write lock (only during PUT)
+<base_path>/<bucket>/<xx>/<yy>/<uuid>.obj
 ```
 
-The UUID is deterministic: `uuid::Uuid::new_v5(NAMESPACE_URL, key.as_bytes())`. The same key always maps to the same UUID, so the address of an object is a pure function of its key. `<xx><yy>` is the first four hex characters of that UUID.
+`<uuid>` is deterministic: `uuid::Uuid::new_v5(NAMESPACE_URL, key.as_bytes())`. The same key always maps to the same UUID across restarts and backends. `<xx><yy>` is the first four hex digits of that UUID.
 
-Bucket names are validated: ASCII alphanumeric plus `-` and `_`, case-insensitive `"api"` is reserved (it would otherwise collide with `/api/v1/*` routes). Object keys are bounded to 1024 bytes and must not contain null bytes.
+Bucket names: ASCII alphanumeric plus `-` and `_`; case-insensitive `"api"` is reserved (collides with `/api/v1/*`). Keys: up to 1024 bytes, no null bytes.
 
-`Metadata` sidecar schema:
+The JSON metadata blob embedded in the `.obj` trailer has this shape:
 
 ```json
 {
@@ -170,7 +215,7 @@ Bucket names are validated: ASCII alphanumeric plus `-` and `_`, case-insensitiv
   "checksum_sha256": "<b64 32-byte digest>",
   "bucket":          "my-bucket",
   "key":             "path/to/object",
-  "disk_path":       "/var/lib/y2qd/objects/my-bucket/ab/cd/<uuid>",
+  "disk_path":       "/var/lib/y2qd/objects/my-bucket/ab/cd/<uuid>.obj",
   "url_path":        "my-bucket/path/to/object",
   "labels":          { "owner": "alice" },
   "cipher_size":     13477,
@@ -181,44 +226,70 @@ Bucket names are validated: ASCII alphanumeric plus `-` and `_`, case-insensitiv
 }
 ```
 
-`size` always refers to the plaintext length. The `cipher_*` fields and crypto algorithm names are populated when the object is encrypted (which is always, in current builds).
+`size` is the plaintext length. The `cipher_*` fields and algorithm names are always populated in current builds.
 
-### Write locks
+### Write locks (in-memory)
 
-PUT acquires a `.lock` sidecar with `O_EXCL` (atomic on Linux) before writing data or metadata. The lock file contains a single little-endian `u64`: the nanosecond timestamp of acquisition. On successful PUT (or any clean failure) it is removed in `Drop`.
+PUT operations are serialized per object by an in-memory `LockRegistry` backed by a lock-free `papaya::HashMap`. `try_acquire(bucket, key)` is atomic: it inserts `(bucket, key) → SystemTime::now()` via `try_insert` and returns `Error::Locked` if the entry already exists. A `LockGuard` removes the entry on drop.
 
-If `y2qd` is killed mid-PUT, the lock file is left behind and blocks concurrent writes to that key. `GET /api/v1/locks?older_than=...` enumerates such locks; `DELETE /api/v1/locks?older_than=...` removes them. See [Operations](operations.md) for the runbook.
+Because locks are in-memory, they vanish on process exit — there are no orphaned lock files after a SIGKILL. `GET /api/v1/locks?older_than=...` lists currently-held locks whose acquisition timestamp exceeds the cutoff (these are stuck in-flight PUTs, not filesystem artifacts). `DELETE /api/v1/locks?older_than=...` force-releases them.
+
+```
+┌──────────────────────────────────────┐
+│           LockRegistry               │
+│  papaya::HashMap<(bucket,key), time> │
+│                                      │
+│  try_acquire → LockGuard (RAII)      │
+│  LockGuard::drop removes entry       │
+│  vanishes on process exit            │
+└──────────────────────────────────────┘
+```
 
 ### io_uring backend
 
-The uring backend stores each object as a single file with this layout:
+The uring backend uses the same shared `.obj` layout described above. The only structural difference is that large objects use `data_offset = 4096` (instead of 64) so the data section starts on a 4 KiB boundary, satisfying `O_DIRECT` alignment requirements on NVMe drives.
 
 ```
-[ header   64 B ]
-[ padding  P    ]    P = data_offset - 64
-[ data     N    ]    N = data_len      (plaintext or envelope, same as filesystem)
-[ meta     M    ]    M = meta_len      (JSON metadata, same schema as sidecar)
-[ trailer  64 B ]    bitwise copy of the header
+[ header   64 B   ]
+[ padding  P B    ]   P = data_offset - 64  (0 on buffered path, 4032 on O_DIRECT path)
+[ data     N B    ]
+[ meta     M B    ]
+[ trailer  64 B   ]
 ```
 
-Header layout (little-endian):
+Files written by the uring backend can be read by the filesystem backend and vice versa. The `WRITTEN_O_DIRECT` flag bit in the header records which path was used at write time.
+
+### Best-effort flusher
+
+When a PUT arrives with `X-Y2Q-Sync: best-effort` (or `storage.default_sync = "best-effort"` is configured), the write path skips per-call `fdatasync`. Instead, the completed `(obj_path, parent_dir)` pair is pushed onto a `flume` channel. A background flusher task reads the channel and:
+
+1. Deduplicates parent directories across pending writes.
+2. `fdatasync`s each unique object file concurrently.
+3. `fsync`s each unique parent directory.
+
+The flusher wakes on a timer (`storage.sync_flush_interval_secs`, default 5 s) and also wakes early when the pending queue depth exceeds `storage.sync_flush_limit` (default 64). Best-effort PUTs are never dropped — if the daemon crashes before the flusher runs, a recently-PUT object may be lost even though the API returned 200/201.
 
 ```
-offset  size   field
-------  ----   -----
-0       4      magic   = b"Y2QO"
-4       2      version = 1
-6       2      flags   bit 0 = WRITTEN_O_DIRECT, bit 1 = DURABLE
-8       8      data_len
-16      4      meta_len
-20      4      data_offset  (64 for buffered, 4096 for O_DIRECT)
-24      36     reserved (zeros)
-60      4      crc32 of bytes 0..60
+PUT handler                        background flusher
+───────────                        ──────────────────
+write .obj to tmp                  ◄─── timer (5s) or queue ≥ 64
+rename tmp → final      ──push──►  dedup parent dirs
+return 200/201                     fdatasync objs concurrently
+                                   fsync parent dirs
 ```
 
-The trailer is byte-identical to the header. Both carry the same CRC32 over bytes 0..60. A mismatch on either copy indicates a torn write, and the surviving copy is used for repair. Buffered writes place data at offset 64; O_DIRECT writes pad to 4096 to satisfy alignment.
+### Durability summary
+
+| X-Y2Q-Sync value | What happens before response | Crash safety |
+|---|---|---|
+| `durable` (default) | `fdatasync(obj)` + `fsync(parent_dir)` | crash-safe |
+| `best-effort` | nothing; flushed asynchronously | may lose very recent writes |
 
 ## Metadata index
+
+### Structure
+
+The index is a single redb database with two tables:
 
 The index is a single redb database with two tables:
 
@@ -234,7 +305,14 @@ Listing operations are implemented as bounded range scans:
 - `list_buckets()` skip-walks the OBJECTS table — one read per bucket, jumping to the lex-successor of each bucket prefix. O(num_buckets) reads instead of O(num_objects).
 - `scan_objects(bucket, prefix?, after?, limit)` range scans within the bucket, filters by `prefix`, paginates past `after`, and applies `limit`. Returns a `ListPage { items, next }`. Sorted ascending by key. `next` is `None` when the page is the last.
 
-The index is a cache. If it goes missing or corrupt, every operation still works against the on-disk truth — just slower for listings. `POST /api/v1/rebuild` walks the storage tree and reconciles the index. Rebuild is fire-and-forget and reports progress through `GET /api/v1/rebuild`.
+### Rebuild
+
+The index is a cache. If it goes missing or corrupt, every operation still works against the on-disk truth (by reading `.obj` files directly) — just slower for listings. Two paths kick off a rebuild:
+
+1. **Automatic startup rebuild** — on every boot the daemon walks the storage tree and reconciles the index against on-disk `.obj` files. Objects missing from the index are re-inserted; index rows whose `.obj` file is gone are removed and logged as data-loss events.
+2. **Manual rebuild** — `POST /api/v1/rebuild` starts a background scan; `GET /api/v1/rebuild` polls progress.
+
+Rebuild is fire-and-forget: GET and PUT continue to work during a rebuild. Listing may show stale data until rebuild completes.
 
 ## Authentication and sessions
 
@@ -288,15 +366,43 @@ What it doesn't defend against:
 - **Traffic analysis on the wire** — `y2qd` does not currently terminate TLS. Put it behind a reverse proxy.
 - **Replay of encrypted payloads under a different key** — the daemon trusts whatever public key is in `pubkey.json` at process start. Key rotation is not yet implemented.
 
+## Observability
+
+### Per-request IDs
+
+Every HTTP request is assigned a UUID (`X-Request-ID` header). The ID is propagated through tracing spans and appears in the SSE trace stream (`y2q admin trace`).
+
+### Log events
+
+A custom `RootSpanBuilder` emits an `INFO` event on every completed request (method, path, status, latency) and an `ERROR` event on 5xx responses. Log output is controlled by `[observability]` in config:
+
+| Field | Values | Default |
+|---|---|---|
+| `log_filter` | RUST_LOG syntax (e.g. `"y2qd=debug,actix_web=info"`) | `"info"` |
+| `log_format` | `"text"` (coloured) or `"json"` (structured, one object per line) | `"text"` |
+
+The `RUST_LOG` environment variable takes precedence over `log_filter`.
+
+### Metrics
+
+Storage and auth metrics are exposed at `/metrics/prometheus` (Prometheus format) and `/metrics/dashboard` (in-browser):
+
+- `y2q_storage_ops_total{op,backend,result}` — operation counters
+- `y2q_storage_duration_seconds{op,backend}` — latency histograms
+- `y2q_auth_logins_total{result}` — login outcomes
+- `y2q_active_sessions` — current session gauge
+
 ## Source map
 
 - [crates/y2q-core/src/crypto/envelope.rs](../crates/y2q-core/src/crypto/envelope.rs) — envelope format, encrypt/decrypt
 - [crates/y2q-core/src/crypto/kdf.rs](../crates/y2q-core/src/crypto/kdf.rs) — Argon2id wrap/unwrap
 - [crates/y2q-core/src/crypto/keystore.rs](../crates/y2q-core/src/crypto/keystore.rs) — pubkey.json, first-run, daemon flock
 - [crates/y2q-core/src/crypto/user_store.rs](../crates/y2q-core/src/crypto/user_store.rs) — users.redb schema
-- [crates/y2q-core/src/storage/filesystem.rs](../crates/y2q-core/src/storage/filesystem.rs) — filesystem backend, sharding, lock files
-- [crates/y2q-core/src/storage/uring/format.rs](../crates/y2q-core/src/storage/uring/format.rs) — uring single-file format
+- [crates/y2q-core/src/storage/filesystem.rs](../crates/y2q-core/src/storage/filesystem.rs) — filesystem backend, hex sharding, .obj writes
+- [crates/y2q-core/src/storage/format.rs](../crates/y2q-core/src/storage/format.rs) — shared .obj header/trailer format (both backends)
+- [crates/y2q-core/src/storage/locks.rs](../crates/y2q-core/src/storage/locks.rs) — in-memory LockRegistry
 - [crates/y2q-core/src/storage/index.rs](../crates/y2q-core/src/storage/index.rs) — redb metadata index
 - [crates/y2qd/src/auth/session.rs](../crates/y2qd/src/auth/session.rs) — session store, token hashing
 - [crates/y2qd/src/auth/keystore.rs](../crates/y2qd/src/auth/keystore.rs) — in-memory keystore slot, idle drop
+- [crates/y2qd/src/observability.rs](../crates/y2qd/src/observability.rs) — metrics setup, log format
 - [crates/y2qd/src/main.rs](../crates/y2qd/src/main.rs) — startup, lifecycle, route wiring
