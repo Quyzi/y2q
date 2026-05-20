@@ -55,6 +55,28 @@ client_disconnect_timeout_secs = 1
 shutdown_timeout_secs = 30
 
 # ---------------------------------------------------------------------------
+# [server.tls] — HTTPS / TLS listener
+#
+# When enabled = true, the daemon binds HTTPS at [server] port using rustls
+# and refuses plaintext HTTP entirely. Both cert_path and key_path must be
+# set and point to PEM-encoded files. The private key may be PKCS#8, PKCS#1,
+# or SEC1 encoded.
+#
+# To run plaintext HTTP and HTTPS side by side, run two y2qd processes on
+# different ports — this section flips a single listener between modes.
+# ---------------------------------------------------------------------------
+[server.tls]
+enabled   = false
+# cert_path = "/etc/y2q/tls/fullchain.pem"
+# key_path  = "/etc/y2q/tls/privkey.pem"
+#
+# Optional: enforce mutual TLS. When set, every client must present a
+# certificate that chains to one of the CAs in this PEM bundle; otherwise the
+# handshake is rejected. Leave unset to accept any client without client-cert
+# verification.
+# client_ca_path = "/etc/y2q/tls/client-ca.pem"
+
+# ---------------------------------------------------------------------------
 # [storage] — object storage backend
 # ---------------------------------------------------------------------------
 [storage]

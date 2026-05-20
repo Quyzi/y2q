@@ -26,14 +26,53 @@ pub struct Profile {
     pub username: String,
     #[serde(default)]
     pub password: Option<String>,
+    /// Skip TLS certificate verification for this profile. Use only for
+    /// self-signed dev/staging servers.
+    #[serde(default)]
+    pub insecure: bool,
+    /// Optional PEM-encoded CA bundle to trust for the server certificate.
+    /// Ignored when `insecure` is true.
+    #[serde(default)]
+    pub ca_cert_path: Option<String>,
+    /// Optional client certificate (PEM) presented for mutual TLS.
+    #[serde(default)]
+    pub client_cert_path: Option<String>,
+    /// Optional client private key (PEM) paired with `client_cert_path`.
+    #[serde(default)]
+    pub client_key_path: Option<String>,
 }
 
 impl Serialize for Profile {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut state = s.serialize_struct("Profile", 2)?;
+        let mut len = 2;
+        if self.insecure {
+            len += 1;
+        }
+        if self.ca_cert_path.is_some() {
+            len += 1;
+        }
+        if self.client_cert_path.is_some() {
+            len += 1;
+        }
+        if self.client_key_path.is_some() {
+            len += 1;
+        }
+        let mut state = s.serialize_struct("Profile", len)?;
         state.serialize_field("url", &self.url)?;
         state.serialize_field("username", &self.username)?;
+        if self.insecure {
+            state.serialize_field("insecure", &self.insecure)?;
+        }
+        if let Some(p) = &self.ca_cert_path {
+            state.serialize_field("ca_cert_path", p)?;
+        }
+        if let Some(p) = &self.client_cert_path {
+            state.serialize_field("client_cert_path", p)?;
+        }
+        if let Some(p) = &self.client_key_path {
+            state.serialize_field("client_key_path", p)?;
+        }
         state.end()
     }
 }

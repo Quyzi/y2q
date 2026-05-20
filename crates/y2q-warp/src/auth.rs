@@ -104,9 +104,8 @@ pub fn spawn_refresh_task(
 
 /// Build a Y2qClient for an alias, using the given token.
 pub fn build_client(base_url: &str, token: &Zeroizing<String>) -> Result<Y2qClient, WarpError> {
-    let client = Y2qClient::new(ClientConfig {
-        base_url: base_url.to_owned(),
-        token: Some(token.clone()),
-    })?;
+    let mut cfg = ClientConfig::new(base_url.to_owned());
+    cfg.token = Some(token.clone());
+    let client = Y2qClient::new(cfg)?;
     Ok(client)
 }

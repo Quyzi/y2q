@@ -290,10 +290,8 @@ async fn init_client(
     let profile = cfg.get_profile(alias)?.clone();
 
     // Build an unauthenticated client solely for the login call if needed
-    let base_client = y2q_client::Y2qClient::new(y2q_client::ClientConfig {
-        base_url: profile.url.clone(),
-        token: None,
-    })?;
+    let base_client =
+        y2q_client::Y2qClient::new(y2q_client::ClientConfig::new(profile.url.clone()))?;
 
     let effective_pw = password.or(profile.password.as_deref());
     let (token, expires_at) =

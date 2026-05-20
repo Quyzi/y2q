@@ -88,6 +88,7 @@ mod handlers;
 pub(crate) mod observability;
 mod request_id;
 mod span;
+mod tls;
 mod trace;
 
 use crate::auth::AuthState;
@@ -480,16 +481,52 @@ async fn main() -> std::io::Result<()> {
     if let Some(w) = actix_workers {
         server = server.workers(w);
     }
-    let result = server
+    server = server
         .backlog(actix_backlog)
         .max_connections(actix_max_connections)
         .keep_alive(actix_keep_alive)
         .client_request_timeout(actix_req_timeout)
         .client_disconnect_timeout(actix_disc_timeout)
-        .shutdown_timeout(actix_shutdown)
-        .bind((cfg.server.host.as_str(), cfg.server.port))?
-        .run()
-        .await;
+        .shutdown_timeout(actix_shutdown);
+
+    let bind_addr = (cfg.server.host.as_str(), cfg.server.port);
+    let server = if cfg.server.tls.enabled {
+        let cert_path = cfg.server.tls.cert_path.as_deref().ok_or_else(|| {
+            std::io::Error::other("server.tls.enabled = true but server.tls.cert_path is unset")
+        })?;
+        let key_path = cfg.server.tls.key_path.as_deref().ok_or_else(|| {
+            std::io::Error::other("server.tls.enabled = true but server.tls.key_path is unset")
+        })?;
+        // rustls 0.23 requires a crypto provider be installed before any TLS
+        // configuration is built. We use the ring backend to match the rest
+        // of the project's crypto dependency tree.
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .map_err(|_| std::io::Error::other("install rustls ring provider"))?;
+        let client_ca = cfg.server.tls.client_ca_path.as_deref();
+        let tls_cfg = tls::build_server_config(
+            std::path::Path::new(cert_path),
+            std::path::Path::new(key_path),
+            client_ca.map(std::path::Path::new),
+        )?;
+        match client_ca {
+            Some(ca) => tracing::info!(
+                cert = cert_path,
+                key = key_path,
+                client_ca = ca,
+                "TLS + mTLS enabled"
+            ),
+            None => tracing::info!(cert = cert_path, key = key_path, "TLS enabled"),
+        }
+        server.bind_rustls_0_23(bind_addr, tls_cfg)?
+    } else {
+        tracing::warn!(
+            "TLS disabled — y2qd is serving plaintext HTTP. Set [server.tls] enabled = true for production."
+        );
+        server.bind(bind_addr)?
+    };
+
+    let result = server.run().await;
 
     #[cfg(feature = "pyroscope")]
     if let Some(agent_running) = _pyroscope_agent {

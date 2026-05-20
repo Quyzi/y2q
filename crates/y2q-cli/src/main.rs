@@ -1,4 +1,5 @@
 mod cli;
+mod client_builder;
 mod cmd;
 mod config;
 mod error;

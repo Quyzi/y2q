@@ -8,7 +8,15 @@ pub async fn run(cmd: ConfigCmd, mode: OutputMode) -> Result<(), CliError> {
     let mut config = CliConfig::load(&config_path)?;
 
     match cmd {
-        ConfigCmd::Add { alias, url, user } => {
+        ConfigCmd::Add {
+            alias,
+            url,
+            user,
+            insecure,
+            ca_cert,
+            client_cert,
+            client_key,
+        } => {
             let username = match user {
                 Some(u) => u,
                 None => {
@@ -22,6 +30,10 @@ pub async fn run(cmd: ConfigCmd, mode: OutputMode) -> Result<(), CliError> {
                 url: url.clone(),
                 username: username.clone(),
                 password: None,
+                insecure,
+                ca_cert_path: ca_cert.map(|p| p.to_string_lossy().into_owned()),
+                client_cert_path: client_cert.map(|p| p.to_string_lossy().into_owned()),
+                client_key_path: client_key.map(|p| p.to_string_lossy().into_owned()),
             };
             config.add_profile(alias.clone(), profile);
             config.save(&config_path)?;

@@ -3,8 +3,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use tokio::sync::mpsc::UnboundedSender;
-use y2q_client::{ClientConfig, ListOptions, Y2qClient};
+use y2q_client::ListOptions;
 
+use crate::client_builder::client_from_profile;
 use crate::config::{CliConfig, default_tokens_path};
 use crate::output::{fmt_bytes, fmt_ns};
 use crate::progress::{CountingReader, CountingWriter, ProgressReporter};
@@ -471,11 +472,8 @@ impl App {
                 let token = store
                     .token_for(&alias)
                     .ok_or_else(|| "not authenticated".to_string())?;
-                let client = Y2qClient::new(ClientConfig {
-                    base_url: profile.url.clone(),
-                    token: Some(token),
-                })
-                .map_err(|e| e.to_string())?;
+                let client =
+                    client_from_profile(profile, Some(token)).map_err(|e| e.to_string())?;
                 client.list_buckets().await.map_err(|e| e.to_string())
             }
             .await;
@@ -506,11 +504,8 @@ impl App {
                 let token = store
                     .token_for(&alias)
                     .ok_or_else(|| "not authenticated".to_string())?;
-                let client = Y2qClient::new(ClientConfig {
-                    base_url: profile.url.clone(),
-                    token: Some(token),
-                })
-                .map_err(|e| e.to_string())?;
+                let client =
+                    client_from_profile(profile, Some(token)).map_err(|e| e.to_string())?;
                 let opts = ListOptions {
                     prefix: prefix.clone(),
                     after: None,
@@ -578,11 +573,8 @@ impl App {
                             let token = store
                                 .token_for(&alias)
                                 .ok_or_else(|| "unauthenticated".to_string())?;
-                            let client = Y2qClient::new(ClientConfig {
-                                base_url: profile.url.clone(),
-                                token: Some(token),
-                            })
-                            .map_err(|e| e.to_string())?;
+                            let client = client_from_profile(profile, Some(token))
+                                .map_err(|e| e.to_string())?;
                             let file = tokio::fs::File::open(&local_path)
                                 .await
                                 .map_err(|e| e.to_string())?;
@@ -633,11 +625,8 @@ impl App {
                             let token = store
                                 .token_for(&alias)
                                 .ok_or_else(|| "unauthenticated".to_string())?;
-                            let client = Y2qClient::new(ClientConfig {
-                                base_url: profile.url.clone(),
-                                token: Some(token),
-                            })
-                            .map_err(|e| e.to_string())?;
+                            let client = client_from_profile(profile, Some(token))
+                                .map_err(|e| e.to_string())?;
                             let file = tokio::fs::File::create(&local_dst)
                                 .await
                                 .map_err(|e| e.to_string())?;
@@ -681,11 +670,7 @@ impl App {
                         let profile = config.profiles.get(&alias)?;
                         let store = TokenStore::load(&tokens_path).ok()?;
                         let token = store.token_for(&alias)?;
-                        let client = Y2qClient::new(ClientConfig {
-                            base_url: profile.url.clone(),
-                            token: Some(token),
-                        })
-                        .ok()?;
+                        let client = client_from_profile(profile, Some(token)).ok()?;
                         client.delete(&bucket, &key).await.ok()
                     }
                     .await;
@@ -706,11 +691,8 @@ impl App {
                         let token = store
                             .token_for(&alias_clone)
                             .ok_or_else(|| "not authenticated".to_string())?;
-                        let client = Y2qClient::new(ClientConfig {
-                            base_url: profile.url.clone(),
-                            token: Some(token),
-                        })
-                        .map_err(|e| e.to_string())?;
+                        let client =
+                            client_from_profile(profile, Some(token)).map_err(|e| e.to_string())?;
                         client
                             .delete_user(&username)
                             .await
@@ -766,11 +748,8 @@ impl App {
                 let token = store
                     .token_for(&alias)
                     .ok_or_else(|| "not authenticated".to_string())?;
-                let client = Y2qClient::new(ClientConfig {
-                    base_url: profile.url.clone(),
-                    token: Some(token),
-                })
-                .map_err(|e| e.to_string())?;
+                let client =
+                    client_from_profile(profile, Some(token)).map_err(|e| e.to_string())?;
                 client.head(&bucket, &key).await.map_err(|e| e.to_string())
             }
             .await;
@@ -797,11 +776,8 @@ impl App {
                 let token = store
                     .token_for(&alias)
                     .ok_or_else(|| "not authenticated".to_string())?;
-                let client = Y2qClient::new(ClientConfig {
-                    base_url: profile.url.clone(),
-                    token: Some(token),
-                })
-                .map_err(|e| e.to_string())?;
+                let client =
+                    client_from_profile(profile, Some(token)).map_err(|e| e.to_string())?;
                 client.list_users().await.map_err(|e| e.to_string())
             }
             .await;
@@ -830,11 +806,8 @@ impl App {
                 let token = store
                     .token_for(&alias)
                     .ok_or_else(|| "not authenticated".to_string())?;
-                let client = Y2qClient::new(ClientConfig {
-                    base_url: profile.url.clone(),
-                    token: Some(token),
-                })
-                .map_err(|e| e.to_string())?;
+                let client =
+                    client_from_profile(profile, Some(token)).map_err(|e| e.to_string())?;
                 client.locks_list("5m").await.map_err(|e| e.to_string())
             }
             .await;
@@ -919,11 +892,8 @@ impl App {
                         let token = store
                             .token_for(&alias_clone)
                             .ok_or_else(|| "not authenticated".to_string())?;
-                        let client = Y2qClient::new(ClientConfig {
-                            base_url: profile.url.clone(),
-                            token: Some(token),
-                        })
-                        .map_err(|e| e.to_string())?;
+                        let client =
+                            client_from_profile(profile, Some(token)).map_err(|e| e.to_string())?;
                         client
                             .add_user(&username, &password)
                             .await

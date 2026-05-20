@@ -106,6 +106,18 @@ pub enum ConfigCmd {
         url: String,
         #[arg(long, short)]
         user: Option<String>,
+        /// Skip TLS certificate verification (dangerous — dev/staging only)
+        #[arg(long)]
+        insecure: bool,
+        /// Path to a PEM CA bundle used to verify the server certificate
+        #[arg(long, value_name = "PATH")]
+        ca_cert: Option<std::path::PathBuf>,
+        /// Path to a PEM client certificate (mutual TLS); requires --client-key
+        #[arg(long, value_name = "PATH", requires = "client_key")]
+        client_cert: Option<std::path::PathBuf>,
+        /// Path to a PEM client private key (mutual TLS); requires --client-cert
+        #[arg(long, value_name = "PATH", requires = "client_cert")]
+        client_key: Option<std::path::PathBuf>,
     },
     /// List configured profiles
     Ls,
