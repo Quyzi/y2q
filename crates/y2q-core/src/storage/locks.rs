@@ -181,16 +181,18 @@ mod tests {
 
         let removed = reg.clear_stale(cutoff);
         assert_eq!(removed, 1);
-        assert!(reg
-            .inner
-            .pin()
-            .get(&("b".to_owned(), "old".to_owned()))
-            .is_none());
-        assert!(reg
-            .inner
-            .pin()
-            .get(&("b".to_owned(), "fresh".to_owned()))
-            .is_some());
+        assert!(
+            reg.inner
+                .pin()
+                .get(&("b".to_owned(), "old".to_owned()))
+                .is_none()
+        );
+        assert!(
+            reg.inner
+                .pin()
+                .get(&("b".to_owned(), "fresh".to_owned()))
+                .is_some()
+        );
     }
 
     #[test]

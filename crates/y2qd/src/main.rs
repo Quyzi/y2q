@@ -57,6 +57,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+#[cfg(feature = "pyroscope")]
+use pyroscope::backend::{BackendConfig, PprofConfig, pprof_backend};
+#[cfg(feature = "pyroscope")]
+use pyroscope::pyroscope::PyroscopeAgentBuilder;
+
 use actix_web::{App, HttpServer, http::KeepAlive, middleware::from_fn, web};
 use clap::Parser;
 use metrics_exporter_prometheus::Matcher;
@@ -209,6 +214,43 @@ async fn main() -> std::io::Result<()> {
     }
 
     tracing::info!(host = %cfg.server.host, port = cfg.server.port, "starting y2qd");
+
+    #[cfg(feature = "pyroscope")]
+    let _pyroscope_agent = {
+        let pcfg = &cfg.observability.pyroscope;
+        if pcfg.enabled {
+            let sample_rate = pcfg.sample_rate;
+            let backend_label = match cfg.storage.backend {
+                config::StorageBackend::Filesystem => "filesystem",
+                config::StorageBackend::Uring => "uring",
+            };
+            let mut builder = PyroscopeAgentBuilder::new(
+                &pcfg.server_url,
+                "y2qd",
+                sample_rate,
+                "pyroscope-rs",
+                env!("CARGO_PKG_VERSION"),
+                pprof_backend(PprofConfig { sample_rate }, BackendConfig::default()),
+            )
+            .tags(vec![
+                ("version", env!("CARGO_PKG_VERSION")),
+                ("backend", backend_label),
+            ]);
+            if let (Some(user), Some(pass)) = (&pcfg.basic_auth_user, &pcfg.basic_auth_password) {
+                builder = builder.basic_auth(user.as_str(), pass.as_str());
+            }
+            let agent = builder
+                .build()
+                .map_err(|e| std::io::Error::other(format!("pyroscope build: {e}")))?;
+            let agent_running = agent
+                .start()
+                .map_err(|e| std::io::Error::other(format!("pyroscope start: {e}")))?;
+            tracing::info!(server_url = %pcfg.server_url, sample_rate, "pyroscope profiling started");
+            Some(agent_running)
+        } else {
+            None
+        }
+    };
 
     // Acquire daemon-wide flock on the keystore directory before doing
     // anything else — prevents two y2qd processes from racing over the
@@ -438,7 +480,7 @@ async fn main() -> std::io::Result<()> {
     if let Some(w) = actix_workers {
         server = server.workers(w);
     }
-    server
+    let result = server
         .backlog(actix_backlog)
         .max_connections(actix_max_connections)
         .keep_alive(actix_keep_alive)
@@ -447,7 +489,17 @@ async fn main() -> std::io::Result<()> {
         .shutdown_timeout(actix_shutdown)
         .bind((cfg.server.host.as_str(), cfg.server.port))?
         .run()
-        .await
+        .await;
+
+    #[cfg(feature = "pyroscope")]
+    if let Some(agent_running) = _pyroscope_agent {
+        match agent_running.stop() {
+            Ok(agent_ready) => agent_ready.shutdown(),
+            Err(e) => tracing::warn!(error = %e, "pyroscope stop failed"),
+        }
+    }
+
+    result
 }
 
 /// Print the first-run root password to stdout exactly once.

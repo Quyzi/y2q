@@ -22,6 +22,7 @@ Post-quantum secure object storage. `y2qd` is a REST daemon that encrypts every 
 - **Custom object labels** - attach arbitrary key/value metadata to objects via `X-Y2Q-<label>` request headers on PUT
 - **Prometheus metrics** - scrape endpoint at `/metrics/prometheus`; interactive dashboard at `/metrics/dashboard`; storage and auth counters with latency histograms
 - **Structured observability** - per-request IDs (`X-Request-ID`), INFO/ERROR log events on every request, configurable log format (`text` or `json`)
+- **Continuous profiling** - optional Pyroscope/pprof-rs integration; opt-in with `--features pyroscope`, ships CPU profiles to a Pyroscope server or Grafana Cloud
 - **OpenAPI / Swagger UI** - interactive docs at `/swagger-ui/`
 
 ## Getting Started
@@ -37,10 +38,16 @@ Post-quantum secure object storage. `y2qd` is a REST daemon that encrypts every 
 cargo build --release -p y2qd
 ```
 
-To build with the io_uring backend:
+The io_uring backend is included by default (`uring` is a default feature, Linux only). To build without it (e.g. on macOS for tooling):
 
 ```sh
-cargo build --release -p y2qd --features uring
+cargo build --release -p y2qd --no-default-features
+```
+
+To enable continuous profiling (Pyroscope/pprof-rs):
+
+```sh
+cargo build --release -p y2qd --features pyroscope
 ```
 
 ### First Run
@@ -366,6 +373,14 @@ keystore_idle_drop_seconds = 0
 [observability]
 log_filter = "info"      # RUST_LOG syntax; RUST_LOG env var takes precedence
 log_format = "text"      # "text" or "json" (for Loki, Datadog, etc.)
+
+# Continuous profiling — requires building with --features pyroscope
+[observability.pyroscope]
+enabled     = false
+server_url  = "http://localhost:4040"
+sample_rate = 100
+# basic_auth_user     = "123456"   # Grafana Cloud numeric user ID
+# basic_auth_password = "glc_..."  # Grafana Cloud API token
 ```
 
 Environment variables override any config file value. Prefix the dotted key with `Y2QD_` and use `__` (two underscores) as the section separator - e.g. `Y2QD_SERVER__PORT=9090`, `Y2QD_OBSERVABILITY__LOG_FORMAT=json`. See [docs/configuration.md](docs/configuration.md) for the full schema.

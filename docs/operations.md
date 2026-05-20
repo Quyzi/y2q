@@ -7,8 +7,10 @@ How to run, manage, and recover a `y2qd` deployment. Read this before putting an
 1. Build the daemon:
    ```sh
    cargo build --release -p y2qd
-   # or, for the Linux io_uring backend:
-   cargo build --release -p y2qd --features uring
+   ```
+   The io_uring backend is included by default. To build with Pyroscope profiling:
+   ```sh
+   cargo build --release -p y2qd --features pyroscope
    ```
 
 2. Write a minimal `config.toml`:
@@ -325,6 +327,28 @@ RUST_LOG=y2qd=trace,y2q_core=trace y2qd          # very loud
 ```
 
 Per-request spans flow through `tracing-actix-web`, so each HTTP request gets a span with method, path, status, and elapsed time. Override via `RUST_LOG=tracing_actix_web=warn` if it's too noisy.
+
+### Continuous profiling (Pyroscope)
+
+Requires building with `--features pyroscope`. Enable in config:
+
+```toml
+[observability.pyroscope]
+enabled    = true
+server_url = "http://localhost:4040"   # or Grafana Cloud endpoint
+sample_rate = 100                       # Hz
+```
+
+For Grafana Cloud add credentials:
+
+```toml
+basic_auth_user     = "123456"   # numeric user ID
+basic_auth_password = "glc_..."  # API token with profiling write scope
+```
+
+The agent starts a background OS thread using SIGPROF before the HTTP server begins accepting connections. On shutdown (SIGTERM / graceful stop) the agent flushes and stops cleanly. Tags `version` and `backend` are attached to every profile.
+
+To profile a running deployment without restarting, rebuild with `--features pyroscope`, set `enabled = true`, and restart. The agent has no effect when `enabled = false` even if the feature is compiled in.
 
 ### Daemon flock
 

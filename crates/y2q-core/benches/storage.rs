@@ -25,7 +25,11 @@
 use bytes::Bytes;
 use core::range::RangeInclusive;
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use std::{path::PathBuf, sync::{Arc, OnceLock}, time::Duration};
+use std::{
+    path::PathBuf,
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
 use tempfile::TempDir;
 use tokio::runtime::Runtime;
 use y2q_core::{AnyStorage, FilesystemStorage, Object, PutOptions, Storage, SyncLevel};
@@ -293,5 +297,11 @@ fn bench_get_range(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_put, bench_put_best_effort, bench_get, bench_get_range);
+criterion_group!(
+    benches,
+    bench_put,
+    bench_put_best_effort,
+    bench_get,
+    bench_get_range
+);
 criterion_main!(benches);

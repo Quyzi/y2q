@@ -151,3 +151,18 @@ log_filter = "info"
 # "json" — structured JSON, one object per line; suited for log aggregators
 #          such as Grafana Loki, Elasticsearch, or Datadog.
 log_format = "text"
+
+# ---------------------------------------------------------------------------
+# [observability.pyroscope] — continuous CPU profiling via Pyroscope / pprof-rs
+#
+# Requires building with `--features pyroscope`. Disabled by default.
+# Point server_url at a local Pyroscope instance or a Grafana Cloud endpoint.
+# ---------------------------------------------------------------------------
+[observability.pyroscope]
+enabled     = false
+server_url  = "http://localhost:4040"
+sample_rate = 100   # pprof sampling rate in Hz
+
+# Grafana Cloud credentials. Omit (or comment out) for unauthenticated servers.
+# basic_auth_user     = "123456"   # numeric user ID shown in the Grafana Cloud UI
+# basic_auth_password = "glc_..."  # Grafana Cloud API token with profiling write scope

@@ -80,7 +80,7 @@ The entire section is optional. Omitting it leaves actix's compiled-in defaults 
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
-| `backend` | enum | `"filesystem"` | Either `"filesystem"` or `"uring"`. `uring` requires the daemon to be built with `--features uring` on Linux ≥ 5.6. Both backends use the same on-disk `.obj` format and files are cross-compatible. |
+| `backend` | enum | `"filesystem"` | Either `"filesystem"` or `"uring"`. `uring` requires Linux ≥ 5.6; the `uring` cargo feature is enabled by default, so a standard `cargo build` already includes it. Both backends use the same on-disk `.obj` format and files are cross-compatible. |
 | `base_path` | string | *required* | Root directory for the object tree. Created on first write if absent. |
 | `index_path` | string | `<base_path>/_y2q_index.redb` | Path to the redb metadata index file. Override to put the index on a faster disk. |
 | `max_labels` | usize | `32` | Maximum `X-Y2Q-<label>` headers accepted per PUT. |
@@ -130,6 +130,22 @@ Changing these only affects newly written records. Existing user records carry t
 | `log_filter` | string | `"info"` | Log level directive in RUST_LOG syntax. Examples: `"info"`, `"y2qd=debug,actix_web=info"`, `"y2q_core::storage::filesystem=trace"`. The `RUST_LOG` environment variable takes precedence when set. |
 | `log_format` | enum | `"text"` | `"text"` - human-readable coloured output. `"json"` - structured JSON, one object per line; suited for aggregators like Grafana Loki, Elasticsearch, or Datadog. |
 
+### `[observability.pyroscope]`
+
+Continuous CPU profiling via pprof-rs shipped to a Pyroscope server or Grafana Cloud. Requires building with `--features pyroscope`. All fields have safe defaults; the section can be omitted entirely.
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `enabled` | bool | `false` | Start the Pyroscope agent on daemon startup. Must be `true` to collect profiles. |
+| `server_url` | string | `"http://localhost:4040"` | Pyroscope server URL. For Grafana Cloud use the profiling push endpoint shown in your stack settings. |
+| `sample_rate` | u32 | `100` | pprof CPU sampling rate in Hz. Higher rates give finer resolution at the cost of overhead. 100 Hz is a good default. |
+| `basic_auth_user` | string | *(none)* | HTTP Basic auth username. Grafana Cloud uses a numeric user ID. Omit for unauthenticated servers. |
+| `basic_auth_password` | string | *(none)* | HTTP Basic auth password. Grafana Cloud uses an API token with profiling write scope. Omit for unauthenticated servers. |
+
+Tags attached to every profile: `version` (daemon version), `backend` (`"filesystem"` or `"uring"`).
+
+The agent runs a background OS thread using SIGPROF; it does not interact with the tokio runtime and has negligible impact on request latency.
+
 ## Worked example
 
 ```toml
@@ -177,6 +193,13 @@ keystore_idle_drop_seconds = 300       # forget SK 5 min after last logout
 [observability]
 log_filter = "y2qd=info,actix_web=warn"
 log_format = "json"                    # ship to a log aggregator
+
+[observability.pyroscope]
+enabled     = false
+server_url  = "http://localhost:4040"
+sample_rate = 100
+# basic_auth_user     = "123456"
+# basic_auth_password = "glc_..."
 ```
 
 ## Logging

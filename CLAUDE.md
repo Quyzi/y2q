@@ -6,31 +6,45 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `y2q` is a post-quantum secure storage system written in Rust (edition 2024). It is early in development.
 
+## Workspace crates
+
+| Crate | Binary | Purpose |
+|---|---|---|
+| `y2qd` | `y2qd` | HTTP REST daemon |
+| `y2q-core` | - | Crypto, storage backends, metadata index |
+| `y2q-cli` | `y2q` | Client CLI and TUI |
+| `y2q-client` | - | HTTP client library |
+| `y2q-config` | - | Shared config types |
+| `y2q-warp` | `y2q-warp` | Load benchmarking tool |
+
 ## Commands
 
 ```bash
-cargo build              # debug build
-cargo build --release    # release build
-cargo run                # run binary
-cargo test               # run all tests
-cargo test <name>        # run a single test by name or module path
-cargo clippy             # lint
-cargo fmt                # format
+cargo build -p y2qd                           # debug build (uring enabled by default)
+cargo build --release -p y2qd                 # release build
+cargo build -p y2qd --features pyroscope      # with Pyroscope continuous profiling
+cargo build -p y2qd --no-default-features     # without io_uring (non-Linux builds)
+cargo run -p y2qd -- --config config.toml     # run daemon
+cargo test                                     # run all tests
+cargo test <name>                              # run by name or module path
+cargo clippy                                   # lint
+cargo fmt                                      # format
+make check                                     # fmt-check + clippy + test (CI gate)
 ```
 
-## Dependencies
+## Cargo features (`y2qd`)
 
-- **pqcrypto** — post-quantum cryptographic primitives (KEM, signatures). Uses the `serialization` feature.
-- **figment** (toml feature) — layered configuration from TOML files and environment.
-- **tokio** (full) — async runtime; the binary is expected to be async.
-- **tracing** — structured instrumentation/logging.
-- **thiserror** — derive macros for typed error enums.
+| Feature | Default | Notes |
+|---|---|---|
+| `uring` | yes | Linux io_uring storage backend. Hard `compile_error!` on non-Linux. |
+| `pyroscope` | no | Pyroscope continuous profiling via pprof-rs. Enable for profiling sessions. |
 
 ## Architecture Notes
 
-The project is in early scaffolding. As it grows, the intended shape is:
-- Async entry point (`#[tokio::main]`) in `crates/y2q/src/main.rs`
-- Configuration loaded via `figment` (TOML + env overrides)
-- Post-quantum crypto operations via `pqcrypto` — prefer its KEM and signature APIs over rolling custom crypto
-- Structured errors using `thiserror` — define domain error enums rather than using `anyhow` or `Box<dyn Error>`
-- Observability via `tracing` spans/events, not `println!`
+- Daemon entry: `crates/y2qd/src/main.rs`
+- Config: `figment` (TOML + `Y2QD_*` env vars + `--set` flags); reference: `config.default.toml`
+- Crypto: `pqcrypto` for ML-KEM-768; `ring` for AES-256-GCM
+- Storage: `FilesystemStorage` (default) or `UringStorage` (Linux, `uring` feature)
+- Errors: `thiserror` typed enums — no `anyhow` or `Box<dyn Error>`
+- Observability: `tracing` spans/events, Prometheus via `metrics` crate, optional Pyroscope profiling
+- Full docs: `docs/` (architecture.md, configuration.md, operations.md, api.md)

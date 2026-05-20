@@ -64,9 +64,7 @@ impl WorkerPool {
                             let msg = payload
                                 .downcast_ref::<String>()
                                 .cloned()
-                                .or_else(|| {
-                                    payload.downcast_ref::<&str>().map(|s| s.to_string())
-                                })
+                                .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
                                 .unwrap_or_else(|| "io_uring runtime panic".to_owned());
                             let _ = probe_tx.send(Err(msg));
                             false

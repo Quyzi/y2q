@@ -224,7 +224,6 @@ fn internal(bucket: &str, key: &str, op: &str, msg: impl std::fmt::Display) -> E
     }
 }
 
-
 /// Open an object file and decode + validate its 64-byte header.
 async fn open_and_read_header(
     obj_path: &Path,

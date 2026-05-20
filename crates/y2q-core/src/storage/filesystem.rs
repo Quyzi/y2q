@@ -207,7 +207,6 @@ fn record_storage_op<T, E>(op: &'static str, result: &Result<T, E>, elapsed_ms: 
     .record(elapsed_ms);
 }
 
-
 /// Read and decode the metadata embedded in a `.obj` file at `path`.
 async fn read_obj_metadata(
     path: &Path,
@@ -1290,7 +1289,10 @@ mod tests {
         s.put("b", "k", make_object(b"x"), PutOptions::default())
             .await
             .unwrap();
-        let _guard = s.locks.try_acquire("b", "k").expect("registry free after put");
+        let _guard = s
+            .locks
+            .try_acquire("b", "k")
+            .expect("registry free after put");
         let err = s.get("b", "k").await.unwrap_err();
         assert!(matches!(err, crate::Error::Locked { .. }));
     }
