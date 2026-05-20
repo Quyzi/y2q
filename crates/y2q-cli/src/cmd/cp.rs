@@ -1,8 +1,9 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use y2q_client::{ClientConfig, Y2qClient};
+use y2q_client::Y2qClient;
 
+use crate::client_builder::client_from_profile;
 use crate::config::{CliConfig, default_config_path, default_tokens_path};
 use crate::error::CliError;
 use crate::output::{OutputMode, fmt_bytes, print_json};
@@ -341,8 +342,5 @@ async fn make_client(alias: &str) -> Result<Y2qClient, CliError> {
     let token = store
         .token_for(alias)
         .ok_or(CliError::Client(y2q_client::ClientError::Unauthenticated))?;
-    Ok(Y2qClient::new(ClientConfig {
-        base_url: profile.url.clone(),
-        token: Some(token),
-    })?)
+    client_from_profile(profile, Some(token))
 }

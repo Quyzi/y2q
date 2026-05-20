@@ -1,6 +1,6 @@
-use y2q_client::{ClientConfig, Y2qClient};
 use zeroize::Zeroizing;
 
+use crate::client_builder::client_from_profile;
 use crate::config::{CliConfig, default_config_path, default_tokens_path};
 use crate::error::CliError;
 use crate::output::{OutputMode, print_json};
@@ -36,10 +36,7 @@ pub async fn login(
         prompt_password(&format!("Password for {username}@{alias}: "))?
     };
 
-    let client = Y2qClient::new(ClientConfig {
-        base_url: profile.url.clone(),
-        token: None,
-    })?;
+    let client = client_from_profile(profile, None)?;
     let token_resp = client.login(&username, pw.as_str(), ttl).await?;
 
     let entry = TokenEntry {
@@ -80,10 +77,7 @@ pub async fn logout(alias: &str, mode: OutputMode) -> Result<(), CliError> {
 
     let mut store = TokenStore::load(&tokens_path)?;
     if let Some(entry) = store.get_valid(alias) {
-        let client = Y2qClient::new(ClientConfig {
-            base_url: profile.url.clone(),
-            token: Some(zeroize::Zeroizing::new(entry.token.clone())),
-        })?;
+        let client = client_from_profile(profile, Some(Zeroizing::new(entry.token.clone())))?;
         let _ = client.logout().await;
     }
     store.clear(alias);
@@ -124,10 +118,7 @@ pub async fn passwd(
         prompt_password("New password: ")?
     };
 
-    let client = Y2qClient::new(ClientConfig {
-        base_url: profile.url.clone(),
-        token: Some(token),
-    })?;
+    let client = client_from_profile(profile, Some(token))?;
     client
         .change_password(current_pw.as_str(), new_pw.as_str())
         .await?;

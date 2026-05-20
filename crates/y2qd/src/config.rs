@@ -208,6 +208,36 @@ pub struct ServerConfig {
     /// Actix `HttpServer` tuning knobs.
     #[serde(default)]
     pub actix: ActixConfig,
+    /// TLS (HTTPS) settings. Disabled by default.
+    #[serde(default)]
+    pub tls: TlsConfig,
+}
+
+/// TLS settings. When `enabled` is true, the daemon binds HTTPS at
+/// `server.port` using rustls and refuses plain HTTP. Both `cert_path` and
+/// `key_path` must point to PEM-encoded files (certificate chain and PKCS#8
+/// or RSA private key respectively).
+///
+/// When `client_ca_path` is set, the daemon requires every client to present
+/// a certificate chained to the bundled CA(s) — mutual TLS. Otherwise the
+/// daemon accepts any client without certificate verification.
+#[derive(Debug, Deserialize, Default)]
+pub struct TlsConfig {
+    /// Whether to bind HTTPS instead of plain HTTP. Default: false.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Path to the PEM-encoded certificate chain. Required when `enabled`.
+    #[serde(default)]
+    pub cert_path: Option<String>,
+    /// Path to the PEM-encoded private key (PKCS#8, PKCS#1, or SEC1).
+    /// Required when `enabled`.
+    #[serde(default)]
+    pub key_path: Option<String>,
+    /// Path to a PEM-encoded CA bundle. When set, the daemon enforces mTLS:
+    /// every client must present a certificate chained to one of these CAs
+    /// or the handshake is rejected. Unset = no client cert required.
+    #[serde(default)]
+    pub client_ca_path: Option<String>,
 }
 
 /// Argon2id parameters for newly-added user records.

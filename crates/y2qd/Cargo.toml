@@ -15,7 +15,7 @@ pyroscope = ["dep:pyroscope"]
 uring = ["y2q-core/uring"]
 
 [dependencies]
-actix-web                   = { workspace = true }
+actix-web                   = { workspace = true, features = ["rustls-0_23"] }
 base64                      = { workspace = true }
 bytes                       = { workspace = true }
 clap                        = { workspace = true }
@@ -29,6 +29,8 @@ metrics-exporter-prometheus = { workspace = true }
 metrics-rs-dashboard-actix  = { workspace = true }
 pyroscope                   = { version = "2.0.0", features = ["backend-pprof-rs"], optional = true }
 rand                        = { workspace = true }
+rustls                      = { workspace = true }
+rustls-pemfile              = { workspace = true }
 serde                       = { workspace = true }
 serde_json                  = { workspace = true }
 sha2                        = { workspace = true }
