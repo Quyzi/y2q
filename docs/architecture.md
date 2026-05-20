@@ -13,61 +13,40 @@ Two storage backends ship in tree:
 
 Both backends write the same format. A file written by the uring backend is readable by the filesystem backend and vice versa. A redb-backed metadata index makes listing cheap; it auto-rebuilds on startup and can be manually triggered at any time.
 
-```
-┌─────────────────────────────────────────────────────────┐
-│                   y2qd process                          │
-│                                                         │
-│  HTTP ──► actix-web middleware                          │
-│           (X-Request-ID, RootSpanBuilder, metrics)      │
-│                │                                        │
-│           auth extractor  ◄── DashMap<token_hash,       │
-│                │                      SessionInfo>      │
-│                │                                        │
-│           handlers/*.rs                                 │
-│                │                                        │
-│           envelope.rs  ──► ML-KEM-768 + HKDF + ring     │
-│           (encrypt/decrypt using in-memory SK)          │
-│                │                                        │
-│           AnyStorage dispatcher                         │
-│           ┌───┴───────────────┐                        │
-│           │                   │                        │
-│      FilesystemStorage   UringStorage                  │
-│           │                   │                        │
-│           └────────┬──────────┘                        │
-│                    │                                    │
-│           .obj files (shared format)                    │
-│           [hdr64|data N|meta M|trl64]                   │
-│                    │                                    │
-│           LockRegistry (in-memory, per-object)          │
-│                    │                                    │
-│           MetadataIndex (redb)                          │
-│           ┌── OBJECTS table                             │
-│           └── LABELS table                              │
-│                                                         │
-│           best-effort flusher  (background task)        │
-│           ├── drains dirty-write channel                │
-│           └── fdatasync + fsync on interval/watermark   │
-└─────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    HTTP[HTTP Request] --> MW["actix-web middleware\nX-Request-ID · RootSpanBuilder · metrics"]
+    MW --> AUTH[auth extractor]
+    SESSIONS[("DashMap\ntoken_hash → SessionInfo")] --> AUTH
+    AUTH --> HANDLERS["handlers/*.rs"]
+    HANDLERS --> ENV["envelope.rs\nML-KEM-768 + HKDF + ring\nencrypt/decrypt via in-memory SK"]
+    ENV --> STORAGE[AnyStorage dispatcher]
+    STORAGE --> FS[FilesystemStorage]
+    STORAGE --> URING[UringStorage]
+    FS --> OBJ[".obj files\nhdr64 | data N | meta M | trl64"]
+    URING --> OBJ
+    OBJ --> LOCKS["LockRegistry\nin-memory, per-object"]
+    OBJ --> INDEX[("MetadataIndex (redb)\nOBJECTS table · LABELS table")]
+    OBJ --> FLUSHER["best-effort flusher (background)\ndrains dirty-write channel\nfdatasync + fsync on interval/watermark"]
 ```
 
 ### PUT request flow
 
-```
-client PUT ──► auth check ──► LockRegistry.try_acquire(bucket, key)
-                │
-           ML-KEM-768.encapsulate(pubkey) → kem_ct, ss
-           HKDF-SHA256(salt=kem_ct, ikm=ss) → content_key
-           ring AES-256-GCM.seal(content_key, nonce, body, aad=header)
-                │
-           write header + ciphertext + metadata to tmp .obj
-           fdatasync(tmp)  [durable only]
-           rename(tmp → final)
-           fsync(parent_dir)  [durable only]
-                │           [best-effort: push to flusher channel]
-           upsert MetadataIndex
-           LockGuard::drop  ──► registry entry removed
-                │
-           ◄── 201 Created
+```mermaid
+flowchart TD
+    C[client PUT] --> A[auth check]
+    A --> L["LockRegistry.try_acquire(bucket, key)"]
+    L --> K["ML-KEM-768.encapsulate(pubkey)\n→ kem_ct, ss"]
+    K --> H["HKDF-SHA256(salt=kem_ct, ikm=ss)\n→ content_key"]
+    H --> E["ring AES-256-GCM.seal\n(content_key, nonce, body, aad=header)"]
+    E --> W["write header + ciphertext + metadata\nto tmp .obj"]
+    W --> S{sync mode?}
+    S -->|durable| D["fdatasync(tmp)\nrename(tmp → final)\nfsync(parent_dir)"]
+    S -->|best-effort| B["rename(tmp → final)\npush to flusher channel"]
+    D --> M[upsert MetadataIndex]
+    B --> M
+    M --> G["LockGuard::drop\nremoves registry entry"]
+    G --> R[201 Created]
 ```
 
 ## Cryptography
@@ -80,17 +59,17 @@ AES-256-GCM is implemented via [ring](https://github.com/briansmith/ring), which
 
 Each object on disk is wrapped in a 28-byte fixed header followed by the ML-KEM-768 ciphertext and the AES-256-GCM ciphertext. The header doubles as additional authenticated data (AAD) for AES-GCM, so tampering with any header field invalidates the tag.
 
-```
-offset  size   field
-------  ----   -----
-0       4      magic         = b"Y2Q1"
-4       2      format_ver    = 1 (BE)
-6       1      kem_alg       = 1 (ML-KEM-768)
-7       1      aead_alg      = 1 (AES-256-GCM)
-8       12     nonce         random per encryption
-20      8      plaintext_len BE
-28      1088   kem_ct        ML-KEM-768 ciphertext
-1116    N+16   aead_ct       ciphertext || GCM tag
+```mermaid
+%%{init: {"packet": {"showBits": false}}}%%
+packet-beta
+0-3: "magic b'Y2Q1' (4 B)"
+4-5: "format_ver (2 B)"
+6-6: "kem_alg (1)"
+7-7: "aead_alg (1)"
+8-19: "nonce — 12 B random"
+20-27: "plaintext_len (8 B, BE)"
+28-1115: "kem_ct — ML-KEM-768 ciphertext (1088 B)"
+1116-1131: "aead_ct — ciphertext || GCM tag (N+16 B)"
 ```
 
 Fixed overhead per object is 1132 bytes (28 header + 1088 KEM + 16 tag).
@@ -168,28 +147,30 @@ Each user's `UserRecord` records the parameters used at the time of password wri
 
 Both the filesystem and uring backends use the same single-file `.obj` format. Files written by either backend are fully readable by the other. An object at rest is one file:
 
-```
-[ header   64 B ]
-[ data     N B  ]   N = data_len  (the encrypted envelope)
-[ meta     M B  ]   M = meta_len  (JSON-encoded Metadata)
-[ trailer  64 B ]   bitwise mirror of the header
+```mermaid
+%%{init: {"packet": {"showBits": false}}}%%
+packet-beta
+0-63: "header (64 B)"
+64-319: "data — N B (encrypted envelope)"
+320-447: "meta — M B (JSON metadata)"
+448-511: "trailer (64 B) — mirror of header"
 ```
 
 The header and trailer each carry a CRC32 over their 64-byte record. A torn write is detectable by mismatching CRCs, and the surviving copy can be used for repair.
 
 Header layout (little-endian):
 
-```
-offset  size   field
-------  ----   -----
-0       4      magic        = b"Y2QO"
-4       2      version      = 1
-6       2      flags        bit 0 = WRITTEN_O_DIRECT, bit 1 = DURABLE
-8       8      data_len
-16      4      meta_len
-20      4      data_offset  64 (buffered) or 4096 (O_DIRECT)
-24      36     reserved (zeros)
-60      4      crc32 of bytes 0..60
+```mermaid
+%%{init: {"packet": {"showBits": false}}}%%
+packet-beta
+0-3: "magic b'Y2QO' (4 B)"
+4-5: "version (2 B)"
+6-7: "flags (2 B)"
+8-15: "data_len (8 B)"
+16-19: "meta_len (4 B)"
+20-23: "data_offset (4 B)"
+24-59: "reserved — 36 B (zeros)"
+60-63: "crc32 (4 B)"
 ```
 
 ### Filesystem backend
@@ -234,15 +215,15 @@ PUT operations are serialized per object by an in-memory `LockRegistry` backed b
 
 Because locks are in-memory, they vanish on process exit - there are no orphaned lock files after a SIGKILL. `GET /api/v1/locks?older_than=...` lists currently-held locks whose acquisition timestamp exceeds the cutoff (these are stuck in-flight PUTs, not filesystem artifacts). `DELETE /api/v1/locks?older_than=...` force-releases them.
 
-```
-┌──────────────────────────────────────┐
-│           LockRegistry               │
-│  papaya::HashMap<(bucket,key), time> │
-│                                      │
-│  try_acquire → LockGuard (RAII)      │
-│  LockGuard::drop removes entry       │
-│  vanishes on process exit            │
-└──────────────────────────────────────┘
+```mermaid
+flowchart LR
+    PUT["PUT handler"] -->|"try_acquire(bucket, key)"| LR
+    subgraph LR["LockRegistry"]
+        MAP["papaya::HashMap\n(bucket, key) → SystemTime"]
+        MAP -->|"entry absent: insert"| GUARD["LockGuard (RAII)"]
+        MAP -->|"entry present"| ERR["Error::Locked"]
+    end
+    GUARD -->|"drop"| REMOVE["removes entry\nvanishes on process exit"]
 ```
 
 ### io_uring backend
@@ -269,13 +250,22 @@ When a PUT arrives with `X-Y2Q-Sync: best-effort` (or `storage.default_sync = "b
 
 The flusher wakes on a timer (`storage.sync_flush_interval_secs`, default 5 s) and also wakes early when the pending queue depth exceeds `storage.sync_flush_limit` (default 64). Best-effort PUTs are never dropped - if the daemon crashes before the flusher runs, a recently-PUT object may be lost even though the API returned 200/201.
 
-```
-PUT handler                        background flusher
-───────────                        ──────────────────
-write .obj to tmp                  ◄─── timer (5s) or queue ≥ 64
-rename tmp → final      ──push──►  dedup parent dirs
-return 200/201                     fdatasync objs concurrently
-                                   fsync parent dirs
+```mermaid
+sequenceDiagram
+    participant P as PUT handler
+    participant CH as flume channel
+    participant FL as background flusher
+
+    P->>P: write .obj to tmp
+    P->>P: rename tmp → final
+    P->>CH: push (obj_path, parent_dir)
+    P-->>P: return 200/201
+
+    Note over FL: wakes on timer (5 s)<br/>or queue depth ≥ 64
+    FL->>CH: drain pending writes
+    FL->>FL: dedup parent dirs
+    FL->>FL: fdatasync objs concurrently
+    FL->>FL: fsync parent dirs
 ```
 
 ### Durability summary
