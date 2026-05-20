@@ -124,7 +124,12 @@ impl UringStorage {
         if let Some(mek) = config.mek {
             index.set_mek(mek);
         }
-        let pool = Arc::new(WorkerPool::spawn(&config));
+        let pool = Arc::new(WorkerPool::spawn(&config).map_err(|msg| Error::InternalError {
+            bucket: String::new(),
+            key: String::new(),
+            operation: "open".to_owned(),
+            message: format!("uring worker pool init: {msg}"),
+        })?);
         Ok(Self {
             base_path,
             index: Arc::new(index),
