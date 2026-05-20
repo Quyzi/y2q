@@ -75,6 +75,13 @@ enabled   = false
 # handshake is rejected. Leave unset to accept any client without client-cert
 # verification.
 # client_ca_path = "/etc/y2q/tls/client-ca.pem"
+#
+# Require a post-quantum (X25519MLKEM768 hybrid) key exchange on every TLS
+# handshake. When true (default), the daemon offers ONLY the PQ-hybrid group;
+# clients that cannot negotiate it are refused at handshake time. Set to false
+# to fall back to the default rustls preference list (PQ preferred but classic
+# X25519/ECDH groups still offered).
+require_pq_kex = true
 
 # ---------------------------------------------------------------------------
 # [storage] — object storage backend

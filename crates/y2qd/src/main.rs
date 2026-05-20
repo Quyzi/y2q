@@ -497,26 +497,33 @@ async fn main() -> std::io::Result<()> {
         let key_path = cfg.server.tls.key_path.as_deref().ok_or_else(|| {
             std::io::Error::other("server.tls.enabled = true but server.tls.key_path is unset")
         })?;
-        // rustls 0.23 requires a crypto provider be installed before any TLS
-        // configuration is built. We use the ring backend to match the rest
-        // of the project's crypto dependency tree.
-        rustls::crypto::ring::default_provider()
-            .install_default()
-            .map_err(|_| std::io::Error::other("install rustls ring provider"))?;
         let client_ca = cfg.server.tls.client_ca_path.as_deref();
+        let require_pq = cfg.server.tls.require_pq_kex;
         let tls_cfg = tls::build_server_config(
             std::path::Path::new(cert_path),
             std::path::Path::new(key_path),
             client_ca.map(std::path::Path::new),
+            require_pq,
         )?;
+        let kex_label = if require_pq {
+            "X25519MLKEM768 (PQ-only)"
+        } else {
+            "default (PQ preferred)"
+        };
         match client_ca {
             Some(ca) => tracing::info!(
                 cert = cert_path,
                 key = key_path,
                 client_ca = ca,
+                kex = kex_label,
                 "TLS + mTLS enabled"
             ),
-            None => tracing::info!(cert = cert_path, key = key_path, "TLS enabled"),
+            None => tracing::info!(
+                cert = cert_path,
+                key = key_path,
+                kex = kex_label,
+                "TLS enabled"
+            ),
         }
         server.bind_rustls_0_23(bind_addr, tls_cfg)?
     } else {
