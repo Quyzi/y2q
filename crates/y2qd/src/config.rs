@@ -221,7 +221,7 @@ pub struct ServerConfig {
 /// When `client_ca_path` is set, the daemon requires every client to present
 /// a certificate chained to the bundled CA(s) — mutual TLS. Otherwise the
 /// daemon accepts any client without certificate verification.
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize)]
 pub struct TlsConfig {
     /// Whether to bind HTTPS instead of plain HTTP. Default: false.
     #[serde(default)]
@@ -238,6 +238,29 @@ pub struct TlsConfig {
     /// or the handshake is rejected. Unset = no client cert required.
     #[serde(default)]
     pub client_ca_path: Option<String>,
+    /// Require a post-quantum key exchange (X25519MLKEM768 hybrid) on every
+    /// TLS handshake. When true, the daemon restricts its offered KX groups
+    /// to the PQ-hybrid group only; clients that cannot negotiate it are
+    /// refused at handshake time. Default: true — refuse to serve TLS without
+    /// PQ key agreement.
+    #[serde(default = "default_require_pq_kex")]
+    pub require_pq_kex: bool,
+}
+
+fn default_require_pq_kex() -> bool {
+    true
+}
+
+impl Default for TlsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            cert_path: None,
+            key_path: None,
+            client_ca_path: None,
+            require_pq_kex: default_require_pq_kex(),
+        }
+    }
 }
 
 /// Argon2id parameters for newly-added user records.
