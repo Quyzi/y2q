@@ -38,27 +38,61 @@ pub(super) struct WorkerPool {
 impl WorkerPool {
     /// Spawn `config.workers` (≥1) dedicated uring worker threads.
     ///
-    /// Each thread starts its own `tokio-uring` runtime; this requires a
-    /// Linux kernel with `io_uring` enabled (≥ 5.6). If the syscall fails
-    /// the spawned thread panics on first op — callers should treat
-    /// kernel-version sniffing as a higher-layer concern.
-    pub fn spawn(config: &UringConfig) -> Self {
+    /// Each thread runs an io_uring probe before entering the work loop. If
+    /// io_uring is unavailable (kernel too old, seccomp blocking the syscall,
+    /// or missing permissions) this returns `Err` immediately rather than
+    /// failing silently on the first dispatched op.
+    pub fn spawn(config: &UringConfig) -> Result<Self, String> {
         let n = config.workers.max(1);
         let mut senders = Vec::with_capacity(n);
         let mut handles = Vec::with_capacity(n);
         for i in 0..n {
             let (tx, rx) = async_channel::unbounded::<UringOp>();
+            let (probe_tx, probe_rx) = std::sync::mpsc::channel::<Result<(), String>>();
             senders.push(tx);
             let handle = std::thread::Builder::new()
                 .name(format!("y2q-uring-worker-{i}"))
-                .spawn(move || worker_main(rx))
+                .spawn(move || {
+                    let ok = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        tokio_uring::start(async {})
+                    })) {
+                        Ok(()) => {
+                            let _ = probe_tx.send(Ok(()));
+                            true
+                        }
+                        Err(payload) => {
+                            let msg = payload
+                                .downcast_ref::<String>()
+                                .cloned()
+                                .or_else(|| {
+                                    payload.downcast_ref::<&str>().map(|s| s.to_string())
+                                })
+                                .unwrap_or_else(|| "io_uring runtime panic".to_owned());
+                            let _ = probe_tx.send(Err(msg));
+                            false
+                        }
+                    };
+                    if ok {
+                        worker_main(rx);
+                    }
+                })
                 .expect("spawn uring worker thread");
             handles.push(handle);
+
+            match probe_rx.recv() {
+                Ok(Ok(())) => {}
+                Ok(Err(msg)) => {
+                    return Err(format!("worker {i}: io_uring setup failed: {msg}"));
+                }
+                Err(_) => {
+                    return Err(format!("worker {i}: thread died during io_uring probe"));
+                }
+            }
         }
-        Self {
+        Ok(Self {
             senders,
             handles: Mutex::new(handles),
-        }
+        })
     }
 
     /// Pick the worker that owns `(bucket, key)`.
