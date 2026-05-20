@@ -25,6 +25,7 @@
 #   podman run ... -v /host/config.toml:/etc/y2q/config.toml:ro y2q:latest
 
 ARG URING=0
+ARG PYROSCOPE=0
 
 # ---------------------------------------------------------------------------
 # Download Swagger UI zip
@@ -58,14 +59,18 @@ COPY crates/ ./crates/
 COPY config.default.toml ./
 
 ARG URING
+ARG PYROSCOPE
 
-RUN if [ "$URING" = "1" ]; then \
-        cargo build --release -p y2qd --features uring && \
-        cargo build --release -p y2q-cli && \
-        cargo build --release -p y2q-warp; \
+RUN FEATURES=""; \
+    [ "$URING"     = "1" ] && FEATURES="${FEATURES:+$FEATURES,}uring"; \
+    [ "$PYROSCOPE" = "1" ] && FEATURES="${FEATURES:+$FEATURES,}pyroscope"; \
+    if [ -n "$FEATURES" ]; then \
+        cargo build --release -p y2qd --features "$FEATURES"; \
     else \
-        cargo build --release -p y2qd -p y2q-cli -p y2q-warp; \
-    fi
+        cargo build --release -p y2qd; \
+    fi && \
+    cargo build --release -p y2q-cli && \
+    cargo build --release -p y2q-warp
 
 # Assemble the runtime filesystem layout so the runtime stage is a single
 # layer of COPY instructions with no shell required.

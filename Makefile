@@ -1,8 +1,10 @@
 CARGO  ?= cargo
 PODMAN ?= podman
 
-IMAGE       ?= y2q:latest
-IMAGE_URING ?= y2q:latest-uring
+IMAGE           ?= y2q:latest
+IMAGE_URING     ?= y2q:latest-uring
+IMAGE_DEV       ?= y2q:dev
+IMAGE_DEV_URING ?= y2q:dev-uring
 
 .PHONY: all \
         build build-y2qd build-y2q build-y2q-warp \
@@ -13,6 +15,7 @@ IMAGE_URING ?= y2q:latest-uring
         fmt fmt-check \
         check \
         image image-uring images \
+        image-dev image-dev-uring images-dev \
 		install-local \
         clean help
 
@@ -100,6 +103,14 @@ image-uring: ## Build container image -- y2q:latest-uring (io_uring backend)
 	$(PODMAN) build --build-arg URING=1 -t $(IMAGE_URING) .
 
 images: image image-uring ## Build both container image variants
+
+image-dev: ## Build dev image -- y2q:dev (filesystem + Pyroscope)
+	$(PODMAN) build --build-arg PYROSCOPE=1 -t $(IMAGE_DEV) .
+
+image-dev-uring: ## Build dev image -- y2q:dev-uring (io_uring + Pyroscope)
+	$(PODMAN) build --build-arg URING=1 --build-arg PYROSCOPE=1 -t $(IMAGE_DEV_URING) .
+
+images-dev: image-dev image-dev-uring ## Build both dev image variants (Pyroscope enabled)
 
 # ---------------------------------------------------------------------------
 # Install local binaries
