@@ -53,6 +53,11 @@ pub struct ObservabilityConfig {
     /// output consumed by log aggregators.
     #[serde(default)]
     pub log_format: LogFormat,
+    /// Pyroscope continuous-profiling agent. Disabled by default.
+    /// Requires building with `--features pyroscope` to take effect.
+    #[serde(default)]
+    #[cfg_attr(not(feature = "pyroscope"), allow(dead_code))]
+    pub pyroscope: PyroscopeConfig,
 }
 
 fn default_log_filter() -> String {
@@ -64,6 +69,50 @@ impl Default for ObservabilityConfig {
         Self {
             log_filter: default_log_filter(),
             log_format: LogFormat::Text,
+            pyroscope: PyroscopeConfig::default(),
+        }
+    }
+}
+
+/// Pyroscope continuous-profiling agent settings.
+///
+/// Disabled by default. Enable by setting `enabled = true` and pointing
+/// `server_url` at a Pyroscope server or Grafana Cloud profiling endpoint.
+/// Compile the daemon with `--features pyroscope` for this section to take effect.
+#[derive(Debug, Deserialize)]
+#[cfg_attr(not(feature = "pyroscope"), allow(dead_code))]
+pub struct PyroscopeConfig {
+    /// Whether to start the Pyroscope agent. Default: false.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Pyroscope server URL. Default: `"http://localhost:4040"`.
+    #[serde(default = "default_pyroscope_url")]
+    pub server_url: String,
+    /// pprof sampling rate in Hz. Default: 100.
+    #[serde(default = "default_pyroscope_sample_rate")]
+    pub sample_rate: u32,
+    /// HTTP Basic auth username (Grafana Cloud: numeric user ID).
+    pub basic_auth_user: Option<String>,
+    /// HTTP Basic auth password (Grafana Cloud: API token).
+    pub basic_auth_password: Option<String>,
+}
+
+fn default_pyroscope_url() -> String {
+    "http://localhost:4040".to_string()
+}
+
+fn default_pyroscope_sample_rate() -> u32 {
+    100
+}
+
+impl Default for PyroscopeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            server_url: default_pyroscope_url(),
+            sample_rate: default_pyroscope_sample_rate(),
+            basic_auth_user: None,
+            basic_auth_password: None,
         }
     }
 }

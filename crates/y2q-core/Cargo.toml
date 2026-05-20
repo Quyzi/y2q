@@ -3,47 +3,47 @@ name = "y2q-core"
 version = "0.1.0"
 edition = "2024"
 
-[dependencies]
-aes-gcm         = { workspace = true }
-argon2          = { workspace = true }
-base64          = { workspace = true }
-bytes           = { workspace = true }
-fs2             = { workspace = true }
-hmac            = { workspace = true }
-hkdf            = { workspace = true }
-md-5            = { workspace = true }
-pqcrypto        = { workspace = true }
-ring            = { workspace = true }
-pqcrypto-traits = { workspace = true }
-rand            = { workspace = true }
-redb            = { workspace = true }
-crc32fast       = { workspace = true }
-flume           = { workspace = true }
-papaya          = { workspace = true }
-serde           = { workspace = true }
-serde_json      = { workspace = true }
-sha2            = { workspace = true }
-subtle          = { workspace = true }
-thiserror       = { workspace = true }
-tokio           = { workspace = true }
-metrics         = { workspace = true }
-tracing         = { workspace = true }
-uuid            = { workspace = true }
-zeroize         = { workspace = true }
-
-# Linux-only fast-path deps; pulled in by the `uring` feature.
-[target.'cfg(target_os = "linux")'.dependencies]
-tokio-uring   = { workspace = true, optional = true }
-aligned-vec   = { workspace = true, optional = true }
-async-channel = { workspace = true, optional = true }
-libc          = { workspace = true, optional = true }
-
 [features]
 default = []
 # Enables the io_uring-based UringStorage backend. Linux-only at runtime:
 # the module is `#[cfg(target_os = "linux")]`, so on other targets the
 # feature is accepted but contributes nothing.
 uring = ["dep:tokio-uring", "dep:aligned-vec", "dep:async-channel", "dep:libc"]
+
+[dependencies]
+aes-gcm         = { workspace = true }
+argon2          = { workspace = true }
+base64          = { workspace = true }
+bytes           = { workspace = true }
+crc32fast       = { workspace = true }
+flume           = { workspace = true }
+fs2             = { workspace = true }
+hkdf            = { workspace = true }
+hmac            = { workspace = true }
+md-5            = { workspace = true }
+metrics         = { workspace = true }
+papaya          = { workspace = true }
+pqcrypto        = { workspace = true }
+pqcrypto-traits = { workspace = true }
+rand            = { workspace = true }
+redb            = { workspace = true }
+ring            = { workspace = true }
+serde           = { workspace = true }
+serde_json      = { workspace = true }
+sha2            = { workspace = true }
+subtle          = { workspace = true }
+thiserror       = { workspace = true }
+tokio           = { workspace = true }
+tracing         = { workspace = true }
+uuid            = { workspace = true }
+zeroize         = { workspace = true }
+
+# Linux-only fast-path deps; pulled in by the `uring` feature.
+[target.'cfg(target_os = "linux")'.dependencies]
+aligned-vec   = { workspace = true, optional = true }
+async-channel = { workspace = true, optional = true }
+libc          = { workspace = true, optional = true }
+tokio-uring   = { workspace = true, optional = true }
 
 [dev-dependencies]
 criterion = { workspace = true }

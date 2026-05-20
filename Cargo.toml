@@ -1,11 +1,11 @@
 [workspace]
 members = [
-    "crates/y2q-core",
-    "crates/y2qd",
+    "crates/y2q-cli",
     "crates/y2q-client",
     "crates/y2q-config",
-    "crates/y2q-cli",
+    "crates/y2q-core",
     "crates/y2q-warp",
+    "crates/y2qd",
 ]
 resolver = "2"
 
@@ -16,54 +16,54 @@ aligned-vec                 = "0.6"
 argon2                      = "0.5"
 async-channel               = "2"
 base64                      = "0.22"
+bytes                       = { version = "1.11.1", features = ["serde"] }
+chrono                      = "0.4"
+clap                        = { version = "4", features = ["derive", "env"] }
 crc32fast                   = "1.4"
 criterion                   = { version = "0.5", features = ["async_tokio"] }
+crossterm                   = { version = "0.28", features = ["event-stream"] }
+csv                         = "1.3"
 dashmap                     = "6"
-papaya                      = "0.1"
+directories                 = "5"
+figment                     = { version = "0.10.19", features = ["toml", "env"] }
 flume                       = "0.12"
 fs2                         = "0.4"
-hmac                        = "0.12"
+futures                     = "0.3"
+hdrhistogram                = "7"
 hkdf                        = "0.12"
+hmac                        = "0.12"
+humantime                   = "2"
+indexmap                    = { version = "2", features = ["serde"] }
 libc                        = "0.2"
-utoipa                      = "5"
-utoipa-swagger-ui           = { version = "9", features = ["actix-web"] }
-bytes                       = { version = "1.11.1", features = ["serde"] }
-figment                     = { version = "0.10.19", features = ["toml", "env"] }
 md-5                        = "0.10"
 metrics                     = "0.24"
 metrics-exporter-prometheus = "0.17"
 metrics-rs-dashboard-actix  = "0.1"
+papaya                      = "0.1"
 pqcrypto                    = { version = "0.18.1", features = ["serialization"] }
 pqcrypto-traits             = "0.3.5"
 rand                        = "0.8"
-ring                        = "0.17"
+ratatui                     = { version = "0.29", features = ["crossterm"] }
 redb                        = "4.1.0"
+reqwest                     = { version = "0.12", features = ["json", "stream", "rustls-tls"], default-features = false }
+ring                        = "0.17"
+rpassword                   = "7"
 serde                       = { version = "1", features = ["derive"] }
 serde_json                  = "1"
 sha2                        = "0.10"
 subtle                      = "2"
+tempfile                    = "3"
 thiserror                   = "2.0.18"
+throbber-widgets-tui        = "0.8"
 tokio                       = { version = "1.52.3", features = ["full"] }
 tokio-uring                 = "0.5"
+tokio-util                  = { version = "0.7", features = ["io", "codec"] }
+toml                        = "0.8"
 tracing                     = "0.1.44"
 tracing-actix-web           = "0.7"
 tracing-subscriber          = { version = "0.3", features = ["env-filter", "json"] }
+utoipa                      = "5"
+utoipa-swagger-ui           = { version = "9", features = ["actix-web"] }
 uuid                        = { version = "1", features = ["v4", "v5"] }
-clap                        = { version = "4", features = ["derive", "env"] }
-tempfile                    = "3"
 zeroize                     = { version = "1", features = ["derive"] }
-chrono                      = "0.4"
-crossterm                   = { version = "0.28", features = ["event-stream"] }
-directories                 = "5"
-futures                     = "0.3"
-indexmap                    = { version = "2", features = ["serde"] }
-ratatui                     = { version = "0.29", features = ["crossterm"] }
-reqwest                     = { version = "0.12", features = ["json", "stream", "rustls-tls"], default-features = false }
-rpassword                   = "7"
-throbber-widgets-tui        = "0.8"
-tokio-util                  = { version = "0.7", features = ["io", "codec"] }
-toml                        = "0.8"
-hdrhistogram                = "7"
 zstd                        = "0.13"
-csv                         = "1.3"
-humantime                   = "2"

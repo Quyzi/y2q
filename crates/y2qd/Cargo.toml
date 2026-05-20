@@ -3,38 +3,43 @@ name = "y2qd"
 version = "0.1.0"
 edition = "2024"
 
-[dependencies]
-y2q-core                    = { path = "../y2q-core" }
-base64                      = { workspace = true }
-bytes                       = { workspace = true }
-clap                        = { workspace = true }
-actix-web                   = { workspace = true }
-dashmap                     = { workspace = true }
-md-5                        = { workspace = true }
-metrics                     = { workspace = true }
-metrics-exporter-prometheus = { workspace = true }
-metrics-rs-dashboard-actix  = { workspace = true }
-rand                        = { workspace = true }
-uuid                        = { workspace = true }
-sha2                        = { workspace = true }
-subtle                      = { workspace = true }
-thiserror                   = { workspace = true }
-tracing-actix-web           = { workspace = true }
-tracing-subscriber          = { workspace = true }
-figment                     = { workspace = true }
-flume                       = { workspace = true }
-tokio                       = { workspace = true }
-tracing                     = { workspace = true }
-serde                       = { workspace = true }
-serde_json                  = { workspace = true }
-utoipa                      = { workspace = true }
-utoipa-swagger-ui           = { workspace = true }
-futures                     = { workspace = true }
-zeroize                     = { workspace = true }
-
 [features]
-default = []
+default = ["uring"]
+# Continuous profiling via Grafana Pyroscope / pprof-rs. Opt-in — enable with
+# `--features pyroscope` for profiling sessions. Requires a running Pyroscope
+# server or Grafana Cloud endpoint.
+pyroscope = ["dep:pyroscope"]
 # Enables the io_uring-backed storage backend (Linux only). Forwards to
 # y2q-core's matching feature so the `UringStorage` type is reachable and
 # the daemon can construct it when `storage.backend = "uring"`.
 uring = ["y2q-core/uring"]
+
+[dependencies]
+actix-web                   = { workspace = true }
+base64                      = { workspace = true }
+bytes                       = { workspace = true }
+clap                        = { workspace = true }
+dashmap                     = { workspace = true }
+figment                     = { workspace = true }
+flume                       = { workspace = true }
+futures                     = { workspace = true }
+md-5                        = { workspace = true }
+metrics                     = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
+metrics-rs-dashboard-actix  = { workspace = true }
+pyroscope                   = { version = "2.0.0", features = ["backend-pprof-rs"], optional = true }
+rand                        = { workspace = true }
+serde                       = { workspace = true }
+serde_json                  = { workspace = true }
+sha2                        = { workspace = true }
+subtle                      = { workspace = true }
+thiserror                   = { workspace = true }
+tokio                       = { workspace = true }
+tracing                     = { workspace = true }
+tracing-actix-web           = { workspace = true }
+tracing-subscriber          = { workspace = true }
+utoipa                      = { workspace = true }
+utoipa-swagger-ui           = { workspace = true }
+uuid                        = { workspace = true }
+y2q-core                    = { path = "../y2q-core" }
+zeroize                     = { workspace = true }

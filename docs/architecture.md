@@ -8,8 +8,8 @@ This document describes how `y2qd` is put together: the components, the encrypti
 
 Two storage backends ship in tree:
 
-- **Filesystem** (default, all platforms) - built on `tokio::fs`. Each object is a single `.obj` file with an embedded header, payload, metadata, and trailer.
-- **io_uring** (Linux only, `--features uring`) - same `.obj` format, same on-disk layout, driven through `tokio-uring` with optional `O_DIRECT` alignment for large objects.
+- **Filesystem** (all platforms) - built on `tokio::fs`. Each object is a single `.obj` file with an embedded header, payload, metadata, and trailer. Default config value (`backend = "filesystem"`).
+- **io_uring** (Linux only) - same `.obj` format, same on-disk layout, driven through `tokio-uring` with optional `O_DIRECT` alignment for large objects. The `uring` cargo feature is enabled by default; a hard `compile_error!` fires on non-Linux when it is active.
 
 Both backends write the same format. A file written by the uring backend is readable by the filesystem backend and vice versa. A redb-backed metadata index makes listing cheap; it auto-rebuilds on startup and can be manually triggered at any time.
 
@@ -391,6 +391,10 @@ Storage and auth metrics are exposed at `/metrics/prometheus` (Prometheus format
 - `y2q_storage_duration_seconds{op,backend}` - latency histograms
 - `y2q_auth_logins_total{result}` - login outcomes
 - `y2q_active_sessions` - current session gauge
+
+### Continuous profiling
+
+When built with `--features pyroscope` and `[observability.pyroscope] enabled = true`, the daemon starts a Pyroscope agent before the HTTP server and stops it on graceful shutdown. The agent runs a background OS thread using SIGPROF (pprof-rs) and pushes CPU profiles to the configured server on each sample interval. It is fully independent of the tokio runtime. Tags `version` and `backend` are attached to every profile so flame graphs can be filtered by deployment variant.
 
 ## Source map
 

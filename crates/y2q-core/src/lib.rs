@@ -5,6 +5,9 @@
 //! [`MetadataIndex`], and the [`crypto`] layer (ML-KEM-768 + AES-256-GCM
 //! envelope format, Argon2id key wrapping, and the user-store database).
 
+#[cfg(all(feature = "uring", not(target_os = "linux")))]
+compile_error!("feature `uring` is only supported on Linux");
+
 use bytes::Bytes;
 use core::range::RangeInclusive;
 use serde::{Deserialize, Serialize};
