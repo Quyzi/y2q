@@ -11,14 +11,17 @@
 //! rename and directory fsync at commit time go through the standard syscalls.
 
 use std::{
+    io,
     path::PathBuf,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use crate::storage::locks::LockGuard;
+use async_channel::Sender;
+use bytes::Bytes;
+use tokio::sync::oneshot;
 
-use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+use crate::storage::locks::LockGuard;
 
 use crate::{
     CipherMetadata, Error, Metadata, MetadataIndex, PlaintextMetrics, PutOptions, SyncLevel,
@@ -26,6 +29,7 @@ use crate::{
 };
 
 use super::format::{self, HEADER_SIZE, Header};
+use super::ops::UringOp;
 
 fn now_nanos() -> u64 {
     SystemTime::now()
@@ -84,16 +88,16 @@ impl UringStreamingPutGuard {
 
     /// Finalise the streaming PUT.
     ///
-    /// `file` must be the `tokio::fs::File` returned by
+    /// `writer` must be the [`UringStreamingWriter`] returned by
     /// [`UringStorage::begin_streaming_put`], currently positioned at the end
     /// of the encrypted data (i.e. right after the last byte written by the
     /// encrypt session). This method writes the metadata blob and `.obj`
     /// trailer, overwrites the placeholder header at offset 0 with the real
     /// header, optionally fsyncs, renames the tmp file into place, and
-    /// updates the secondary index.
+    /// updates the secondary index — all via uring worker ops.
     pub async fn commit(
         self,
-        mut file: tokio::fs::File,
+        mut writer: UringStreamingWriter,
         options: PutOptions,
         plaintext_metrics: PlaintextMetrics,
         cipher_metadata: CipherMetadata,
@@ -109,8 +113,7 @@ impl UringStreamingPutGuard {
             created,
             modified: now,
             size: plaintext_metrics.size,
-            checksum_md5: plaintext_metrics.checksum_md5_b64,
-            checksum_sha256: plaintext_metrics.checksum_sha256_b64,
+            checksum_gxhash: plaintext_metrics.checksum_gxhash_b64,
             bucket: bucket.to_owned(),
             key: key.to_owned(),
             disk_path: self.obj_path.clone(),
@@ -153,69 +156,39 @@ impl UringStreamingPutGuard {
             version: format::VERSION,
         };
 
-        // File is at EOF (after v2 envelope). Append meta then trailer.
-        file.write_all(&meta_bytes)
+        let map_io = |stage: &'static str, e: io::Error| Error::InternalError {
+            bucket: bucket.to_owned(),
+            key: key.to_owned(),
+            operation: "put".to_owned(),
+            message: format!("{stage}: {e}"),
+        };
+
+        // Writer cursor is at the end of the encrypted data. Append meta then
+        // trailer.
+        writer
+            .write_all(&meta_bytes)
             .await
-            .map_err(|e| Error::InternalError {
-                bucket: bucket.to_owned(),
-                key: key.to_owned(),
-                operation: "put".to_owned(),
-                message: format!("write meta: {e}"),
-            })?;
-        file.write_all(&header.encode())
+            .map_err(|e| map_io("write meta", e))?;
+        let trailer = header.encode();
+        writer
+            .write_all(&trailer)
             .await
-            .map_err(|e| Error::InternalError {
-                bucket: bucket.to_owned(),
-                key: key.to_owned(),
-                operation: "put".to_owned(),
-                message: format!("write trailer: {e}"),
-            })?;
+            .map_err(|e| map_io("write trailer", e))?;
 
         // Overwrite the placeholder header at offset 0 with the real one.
-        file.seek(std::io::SeekFrom::Start(0))
+        writer
+            .write_all_at(&header.encode(), 0)
             .await
-            .map_err(|e| Error::InternalError {
-                bucket: bucket.to_owned(),
-                key: key.to_owned(),
-                operation: "put".to_owned(),
-                message: format!("seek to header: {e}"),
-            })?;
-        file.write_all(&header.encode())
-            .await
-            .map_err(|e| Error::InternalError {
-                bucket: bucket.to_owned(),
-                key: key.to_owned(),
-                operation: "put".to_owned(),
-                message: format!("write header: {e}"),
-            })?;
+            .map_err(|e| map_io("write header", e))?;
 
         if options.sync == SyncLevel::Durable {
-            file.sync_data().await.map_err(|e| Error::InternalError {
-                bucket: bucket.to_owned(),
-                key: key.to_owned(),
-                operation: "put".to_owned(),
-                message: format!("fdatasync: {e}"),
-            })?;
+            writer
+                .sync_data()
+                .await
+                .map_err(|e| map_io("fdatasync", e))?;
         }
 
-        drop(file);
-
-        tokio::fs::rename(&self.tmp_path, &self.obj_path)
-            .await
-            .map_err(|e| Error::InternalError {
-                bucket: bucket.to_owned(),
-                key: key.to_owned(),
-                operation: "put".to_owned(),
-                message: format!("rename: {e}"),
-            })?;
-
-        if options.sync == SyncLevel::Durable {
-            if let Some(parent) = self.obj_path.parent()
-                && let Ok(dir) = tokio::fs::File::open(parent).await
-            {
-                let _ = dir.sync_all().await;
-            }
-        }
+        writer.rename(self.obj_path.clone(), options.sync).await?;
 
         if let Err(e) = self.index.upsert(&metadata, options.sync).await {
             tracing::warn!(
@@ -243,3 +216,129 @@ impl Drop for UringStreamingPutGuard {
 /// Passed as `write_offset` to [`crate::crypto::envelope::EncryptSession::new`]
 /// so `finish()` seeks to the correct position to patch `plaintext_len`.
 pub const URING_STREAMING_WRITE_OFFSET: u64 = HEADER_SIZE as u64;
+
+/// Channel-bound writer that funnels streaming-PUT writes through the uring
+/// worker thread that owns the `(bucket, key)` shard.
+///
+/// Each write becomes a [`UringOp::StreamWrite`] dispatched to the worker,
+/// which opens the file via `tokio_uring::fs::OpenOptions`, calls
+/// `write_all_at`, and closes — all on an io_uring SQE chain, bypassing the
+/// tokio blocking thread pool.
+///
+/// The writer tracks its own `cursor` (next append offset) and `end`
+/// (high-water mark) so it can answer `seek_to_end` without an `fstat`.
+pub struct UringStreamingWriter {
+    tx: Sender<UringOp>,
+    path: PathBuf,
+    cursor: u64,
+    end: u64,
+}
+
+impl UringStreamingWriter {
+    pub(super) fn new(tx: Sender<UringOp>, path: PathBuf, start_offset: u64) -> Self {
+        Self {
+            tx,
+            path,
+            cursor: start_offset,
+            end: start_offset,
+        }
+    }
+
+    /// High-water mark of any byte written so far. Equivalent to the file's
+    /// data length, assuming no holes.
+    pub fn end_offset(&self) -> u64 {
+        self.end
+    }
+
+    /// Set the logical write cursor. Subsequent `write_all` calls begin here.
+    pub fn set_offset(&mut self, offset: u64) {
+        self.cursor = offset;
+    }
+
+    /// Append `bytes` at the current cursor; advance cursor by `bytes.len()`.
+    pub async fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
+        let offset = self.cursor;
+        self.write_all_at(bytes, offset).await
+    }
+
+    /// Write `bytes` at `offset`. Cursor moves to `offset + bytes.len()`.
+    pub async fn write_all_at(&mut self, bytes: &[u8], offset: u64) -> io::Result<()> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        let payload = Bytes::copy_from_slice(bytes);
+        let (reply, reply_rx) = oneshot::channel();
+        self.tx
+            .send(UringOp::StreamWrite {
+                path: self.path.clone(),
+                offset,
+                bytes: payload,
+                reply,
+            })
+            .await
+            .map_err(|_| io::Error::other("uring worker channel closed"))?;
+        match reply_rx.await {
+            Ok(Ok(())) => {
+                let end = offset + bytes.len() as u64;
+                self.cursor = end;
+                if end > self.end {
+                    self.end = end;
+                }
+                Ok(())
+            }
+            Ok(Err(e)) => Err(io::Error::other(format!("{e}"))),
+            Err(_) => Err(io::Error::other("uring worker reply dropped")),
+        }
+    }
+
+    /// `fdatasync` the underlying tmp file via the worker.
+    pub async fn sync_data(&self) -> io::Result<()> {
+        let (reply, reply_rx) = oneshot::channel();
+        self.tx
+            .send(UringOp::StreamSyncData {
+                path: self.path.clone(),
+                reply,
+            })
+            .await
+            .map_err(|_| io::Error::other("uring worker channel closed"))?;
+        match reply_rx.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(io::Error::other(format!("{e}"))),
+            Err(_) => Err(io::Error::other("uring worker reply dropped")),
+        }
+    }
+
+    /// Rename the tmp file into place via the worker. Honours `sync` for the
+    /// optional parent-directory fsync.
+    pub(super) async fn rename(
+        self,
+        target: PathBuf,
+        sync: SyncLevel,
+    ) -> Result<(), Error> {
+        let (reply, reply_rx) = oneshot::channel();
+        self.tx
+            .send(UringOp::StreamRename {
+                from: self.path.clone(),
+                to: target,
+                sync,
+                reply,
+            })
+            .await
+            .map_err(|_| Error::InternalError {
+                bucket: String::new(),
+                key: String::new(),
+                operation: "stream_rename".to_owned(),
+                message: "worker channel closed".to_owned(),
+            })?;
+        match reply_rx.await {
+            Ok(r) => r,
+            Err(_) => Err(Error::InternalError {
+                bucket: String::new(),
+                key: String::new(),
+                operation: "stream_rename".to_owned(),
+                message: "worker reply dropped".to_owned(),
+            }),
+        }
+    }
+
+}

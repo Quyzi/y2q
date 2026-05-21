@@ -60,8 +60,9 @@ impl Deref for Object {
 
 /// Descriptive information about a stored object.
 ///
-/// Timestamps are nanoseconds since the Unix epoch. Checksums are the full
-/// digest encoded as standard base64 (RFC 4648 §4, with padding).
+/// Timestamps are nanoseconds since the Unix epoch. The plaintext checksum
+/// is a non-cryptographic `gxhash64` digest encoded as standard base64,
+/// suitable for accidental-corruption detection (not tamper detection).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Metadata {
     /// Nanoseconds since Unix epoch when the object was first written.
@@ -70,10 +71,9 @@ pub struct Metadata {
     pub modified: u64,
     /// Size of the object in bytes.
     pub size: u64,
-    /// Full 16-byte MD5 digest as standard base64 (24 chars, padded).
-    pub checksum_md5: String,
-    /// Full 32-byte SHA-256 digest as standard base64 (44 chars, padded).
-    pub checksum_sha256: String,
+    /// 8-byte gxhash64 digest of the plaintext as standard base64
+    /// (12 chars including padding). Seed = 0.
+    pub checksum_gxhash: String,
     /// Bucket the object belongs to.
     pub bucket: String,
     /// Object key within the bucket.
@@ -154,19 +154,17 @@ pub struct PutOptions {
     pub cipher_metadata: Option<CipherMetadata>,
 }
 
-/// Plaintext-derived size and checksums supplied by the daemon when it has
+/// Plaintext-derived size and checksum supplied by the daemon when it has
 /// encrypted the body before handing it to the backend. The backend should
-/// store these values in [`Metadata::size`], [`Metadata::checksum_md5`], and
-/// [`Metadata::checksum_sha256`] in place of values it would otherwise
-/// compute from the (encrypted) bytes it sees.
+/// store these values in [`Metadata::size`] and [`Metadata::checksum_gxhash`]
+/// in place of values it would otherwise compute from the (encrypted) bytes
+/// it sees.
 #[derive(Debug, Clone)]
 pub struct PlaintextMetrics {
     /// Plaintext size in bytes.
     pub size: u64,
-    /// Full 16-byte MD5 of the plaintext, standard base64 (24 chars).
-    pub checksum_md5_b64: String,
-    /// Full 32-byte SHA-256 of the plaintext, standard base64 (44 chars).
-    pub checksum_sha256_b64: String,
+    /// 8-byte gxhash64 of the plaintext, standard base64 (12 chars).
+    pub checksum_gxhash_b64: String,
 }
 
 /// Ciphertext-side metadata fields supplied by the daemon for the backend to
@@ -256,7 +254,7 @@ pub enum Error {
     },
 
     /// A label name collides with a reserved system metadata name
-    /// (`created`, `modified`, `checksum-md5`, `checksum-sha256`).
+    /// (`created`, `modified`, `checksum-gxhash`).
     #[error("reserved label: {name}")]
     ReservedLabel {
         /// The reserved label name that was rejected.

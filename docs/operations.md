@@ -13,6 +13,19 @@ How to run, manage, and recover a `y2qd` deployment. Read this before putting an
    cargo build --release -p y2qd --features pyroscope
    ```
 
+   The workspace `.cargo/config.toml` sets `RUSTFLAGS = -C target-cpu=native`
+   and `[profile.release]` enables thin LTO with one codegen unit. This pulls
+   in SHA-NI, AES-NI, and AVX2 instructions automatically, but ties the
+   resulting binary to the build host's CPU family. To produce a portable
+   binary, override the rustflags on the command line:
+   ```sh
+   RUSTFLAGS="" cargo build --release -p y2qd
+   ```
+   or set a portable feature subset (for x86_64-v3 hosts):
+   ```sh
+   RUSTFLAGS="-C target-feature=+sha,+aes,+ssse3,+avx2" cargo build --release -p y2qd
+   ```
+
 2. Write a minimal `config.toml`:
    ```toml
    [server]

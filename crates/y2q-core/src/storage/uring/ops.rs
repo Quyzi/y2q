@@ -21,14 +21,15 @@ use std::{
 
 use base64::Engine;
 use bytes::Bytes;
-use sha2::Digest;
+use gxhash::GxHasher;
+use std::hash::Hasher;
 use tokio::sync::oneshot;
 use tokio_uring::fs::{File, OpenOptions};
 
 use crate::{
     Error, Metadata, Object, SyncLevel,
     crypto::{decrypt_meta, encrypt_meta},
-    storage::locks::LockRegistry,
+    storage::{bufpool, locks::LockRegistry},
 };
 
 use super::{
@@ -119,6 +120,35 @@ pub(super) enum UringOp {
         mek: Option<[u8; 32]>,
         reply: oneshot::Sender<Result<Metadata, Error>>,
     },
+    /// Create a streaming-put tmp file and write a placeholder header at
+    /// offset 0. The encrypt session then writes the v2 envelope starting at
+    /// `placeholder.len()`.
+    StreamCreate {
+        path: PathBuf,
+        placeholder: Vec<u8>,
+        reply: oneshot::Sender<Result<(), Error>>,
+    },
+    /// Write `bytes` to an existing streaming-put tmp file at `offset`.
+    /// Used for bulk encrypted chunks and the final header overwrite.
+    StreamWrite {
+        path: PathBuf,
+        offset: u64,
+        bytes: Bytes,
+        reply: oneshot::Sender<Result<(), Error>>,
+    },
+    /// `fdatasync` an existing streaming-put tmp file.
+    StreamSyncData {
+        path: PathBuf,
+        reply: oneshot::Sender<Result<(), Error>>,
+    },
+    /// Atomic rename of a streaming-put tmp file into place, with optional
+    /// parent-directory fsync for crash safety.
+    StreamRename {
+        from: PathBuf,
+        to: PathBuf,
+        sync: SyncLevel,
+        reply: oneshot::Sender<Result<(), Error>>,
+    },
 }
 
 /// Dispatch one op to its handler. Called from the worker's recv loop.
@@ -203,6 +233,32 @@ pub(super) async fn handle(op: UringOp) {
         UringOp::ReadObjectMeta { path, mek, reply } => {
             let _ = reply.send(do_read_object_meta(path, mek).await);
         }
+        UringOp::StreamCreate {
+            path,
+            placeholder,
+            reply,
+        } => {
+            let _ = reply.send(do_stream_create(path, placeholder).await);
+        }
+        UringOp::StreamWrite {
+            path,
+            offset,
+            bytes,
+            reply,
+        } => {
+            let _ = reply.send(do_stream_write(path, offset, bytes).await);
+        }
+        UringOp::StreamSyncData { path, reply } => {
+            let _ = reply.send(do_stream_sync_data(path).await);
+        }
+        UringOp::StreamRename {
+            from,
+            to,
+            sync,
+            reply,
+        } => {
+            let _ = reply.send(do_stream_rename(from, to, sync).await);
+        }
     }
 }
 
@@ -241,13 +297,17 @@ async fn open_and_read_header(
         }
         Err(e) => return Err(internal(bucket, key, op_name, format!("open: {e}"))),
     };
-    let buf = vec![0u8; HEADER_SIZE];
+    // SAFETY: read_exact_at writes exactly HEADER_SIZE bytes on Ok; we never
+    // read from the buffer before the read completes.
+    let buf = unsafe { bufpool::acquire_uninit(HEADER_SIZE) };
     let (res, buf) = file.read_exact_at(buf, 0).await;
     if let Err(e) = res {
         let _ = file.close().await;
+        bufpool::release(buf);
         return Err(internal(bucket, key, op_name, format!("read header: {e}")));
     }
     let header_bytes: [u8; HEADER_SIZE] = buf.as_slice().try_into().expect("HEADER_SIZE buffer");
+    bufpool::release(buf);
     let header = match Header::decode(&header_bytes) {
         Ok(h) => h,
         Err(e) => {
@@ -273,17 +333,24 @@ async fn read_meta_blob(
     op_name: &str,
     mek: Option<&[u8; 32]>,
 ) -> Result<Metadata, Error> {
-    let buf = vec![0u8; header.meta_len as usize];
+    // SAFETY: read_exact_at writes exactly meta_len bytes on Ok; bytes are
+    // not read before the read completes.
+    let buf = unsafe { bufpool::acquire_uninit(header.meta_len as usize) };
     let (res, buf) = file.read_exact_at(buf, header.meta_offset()).await;
     res.map_err(|e| internal(bucket, key, op_name, format!("read meta: {e}")))?;
-    let json = if let Some(mek) = mek {
-        decrypt_meta(mek, &buf)
-            .map_err(|e| internal(bucket, key, op_name, format!("decrypt meta: {e}")))?
+    let result = if let Some(mek) = mek {
+        let plaintext = decrypt_meta(mek, &buf)
+            .map_err(|e| internal(bucket, key, op_name, format!("decrypt meta: {e}")))?;
+        bufpool::release(buf);
+        serde_json::from_slice(&plaintext)
+            .map_err(|e| internal(bucket, key, op_name, format!("decode meta: {e}")))
     } else {
-        buf
+        let r = serde_json::from_slice(&buf)
+            .map_err(|e| internal(bucket, key, op_name, format!("decode meta: {e}")));
+        bufpool::release(buf);
+        r
     };
-    serde_json::from_slice(&json)
-        .map_err(|e| internal(bucket, key, op_name, format!("decode meta: {e}")))
+    result
 }
 
 // ───── operation handlers ────────────────────────────────────────────────────
@@ -317,13 +384,16 @@ async fn do_read_object_meta(path: PathBuf, mek: Option<[u8; 32]>) -> Result<Met
     let file = File::open(&path)
         .await
         .map_err(|e| make_err(format!("open: {e}")))?;
-    let buf = vec![0u8; HEADER_SIZE];
+    // SAFETY: read_exact_at writes exactly HEADER_SIZE bytes on Ok.
+    let buf = unsafe { bufpool::acquire_uninit(HEADER_SIZE) };
     let (res, buf) = file.read_exact_at(buf, 0).await;
     if let Err(e) = res {
         let _ = file.close().await;
+        bufpool::release(buf);
         return Err(make_err(format!("read header: {e}")));
     }
     let header_bytes: [u8; HEADER_SIZE] = buf.as_slice().try_into().expect("HEADER_SIZE buffer");
+    bufpool::release(buf);
     let header = match Header::decode(&header_bytes) {
         Ok(h) => h,
         Err(e) => {
@@ -331,16 +401,23 @@ async fn do_read_object_meta(path: PathBuf, mek: Option<[u8; 32]>) -> Result<Met
             return Err(make_err(format!("decode header: {e}")));
         }
     };
-    let meta_buf = vec![0u8; header.meta_len as usize];
+    // SAFETY: read_exact_at writes exactly meta_len bytes on Ok.
+    let meta_buf = unsafe { bufpool::acquire_uninit(header.meta_len as usize) };
     let (res, meta_buf) = file.read_exact_at(meta_buf, header.meta_offset()).await;
     let _ = file.close().await;
     res.map_err(|e| make_err(format!("read meta: {e}")))?;
-    let json = if let Some(ref mek) = mek {
-        decrypt_meta(mek, &meta_buf).map_err(|e| make_err(format!("decrypt meta: {e}")))?
+    let result = if let Some(ref mek) = mek {
+        let plaintext =
+            decrypt_meta(mek, &meta_buf).map_err(|e| make_err(format!("decrypt meta: {e}")))?;
+        bufpool::release(meta_buf);
+        serde_json::from_slice(&plaintext).map_err(|e| make_err(format!("decode meta: {e}")))
     } else {
-        meta_buf
+        let r = serde_json::from_slice(&meta_buf)
+            .map_err(|e| make_err(format!("decode meta: {e}")));
+        bufpool::release(meta_buf);
+        r
     };
-    serde_json::from_slice(&json).map_err(|e| make_err(format!("decode meta: {e}")))
+    result
 }
 
 async fn do_get(
@@ -353,10 +430,15 @@ async fn do_get(
     let (file, header) = open_and_read_header(&obj_path, &bucket, &key, "get").await?;
 
     let data_len = header.data_len as usize;
-    let buf = vec![0u8; data_len];
+    // SAFETY: read_exact_at writes exactly data_len bytes on Ok; the buffer
+    // is moved into Bytes only after the read returns Ok.
+    let buf = unsafe { bufpool::acquire_uninit(data_len) };
     let (res, buf) = file.read_exact_at(buf, header.data_offset as u64).await;
     let _ = file.close().await;
-    res.map_err(|e| internal(&bucket, &key, "get", format!("read data: {e}")))?;
+    if let Err(e) = res {
+        bufpool::release(buf);
+        return Err(internal(&bucket, &key, "get", format!("read data: {e}")));
+    }
     Ok(Object::new(Bytes::from(buf)))
 }
 
@@ -377,12 +459,21 @@ async fn do_get_range(
     let start = range.start;
     let end_inclusive = range.last.min(header.data_len - 1);
     let len = (end_inclusive - start + 1) as usize;
-    let buf = vec![0u8; len];
+    // SAFETY: read_exact_at writes exactly len bytes on Ok.
+    let buf = unsafe { bufpool::acquire_uninit(len) };
     let (res, buf) = file
         .read_exact_at(buf, header.data_offset as u64 + start)
         .await;
     let _ = file.close().await;
-    res.map_err(|e| internal(&bucket, &key, "get_range", format!("read data: {e}")))?;
+    if let Err(e) = res {
+        bufpool::release(buf);
+        return Err(internal(
+            &bucket,
+            &key,
+            "get_range",
+            format!("read data: {e}"),
+        ));
+    }
     Ok(Bytes::from(buf))
 }
 
@@ -396,12 +487,17 @@ async fn do_delete(
     let (file, header) = open_and_read_header(&obj_path, &bucket, &key, "delete").await?;
 
     let data_len = header.data_len as usize;
-    let buf = vec![0u8; data_len];
+    // SAFETY: read_exact_at writes exactly data_len bytes on Ok.
+    let buf = unsafe { bufpool::acquire_uninit(data_len) };
     let (res, buf) = file.read_exact_at(buf, header.data_offset as u64).await;
     let _ = file.close().await;
-    res.map_err(|e| internal(&bucket, &key, "delete", format!("read data: {e}")))?;
+    if let Err(e) = res {
+        bufpool::release(buf);
+        return Err(internal(&bucket, &key, "delete", format!("read data: {e}")));
+    }
 
     if let Err(e) = tokio_uring::fs::remove_file(&obj_path).await {
+        bufpool::release(buf);
         return Err(internal(&bucket, &key, "delete", format!("unlink: {e}")));
     }
     Ok(Object::new(Bytes::from(buf)))
@@ -452,25 +548,22 @@ async fn do_put(
     // When the daemon supplied plaintext-derived size + checksums, persist
     // those instead of values computed from the (possibly encrypted) bytes
     // we're about to write to disk.
-    let (size, checksum_md5, checksum_sha256) = match plaintext_metrics {
-        Some(p) => (p.size, p.checksum_md5_b64, p.checksum_sha256_b64),
+    let (size, checksum_gxhash) = match plaintext_metrics {
+        Some(p) => (p.size, p.checksum_gxhash_b64),
         None => {
-            // Stream the checksums chunk-by-chunk. Memory is the same as a
+            // Stream the checksum chunk-by-chunk. Memory is the same as a
             // single hash call (the payload is already resident here), but
             // the streaming shape mirrors how the O_DIRECT path consumes
             // the buffer in chunks.
             const HASH_CHUNK: usize = 1024 * 1024;
-            let mut md5_hasher = md5::Md5::new();
-            let mut sha_hasher = sha2::Sha256::new();
+            let mut hasher = GxHasher::with_seed(0);
             for chunk in payload.chunks(HASH_CHUNK) {
-                md5_hasher.update(chunk);
-                sha_hasher.update(chunk);
+                hasher.write(chunk);
             }
             let b64 = base64::engine::general_purpose::STANDARD;
             (
                 payload.len() as u64,
-                b64.encode(md5_hasher.finalize()),
-                b64.encode(sha_hasher.finalize()),
+                b64.encode(hasher.finish().to_le_bytes()),
             )
         }
     };
@@ -491,8 +584,7 @@ async fn do_put(
         created,
         modified: now,
         size,
-        checksum_md5,
-        checksum_sha256,
+        checksum_gxhash,
         bucket: bucket.clone(),
         key: key.clone(),
         disk_path: obj_path.clone(),
@@ -801,20 +893,98 @@ async fn finalize_rename_and_dir_fsync(
 /// Read the `created` timestamp from an existing object by parsing its
 /// header + metadata blob. Returns `None` if anything is unreadable; the
 /// caller falls back to "now" in that case.
+// ───── streaming-put op handlers ─────────────────────────────────────────────
+
+fn stream_err(path: &Path, op: &'static str, msg: impl std::fmt::Display) -> Error {
+    Error::InternalError {
+        bucket: String::new(),
+        key: String::new(),
+        operation: op.to_owned(),
+        message: format!("{}: {msg}", path.display()),
+    }
+}
+
+async fn do_stream_create(path: PathBuf, placeholder: Vec<u8>) -> Result<(), Error> {
+    let file = OpenOptions::new()
+        .write(true)
+        .read(true)
+        .create(true)
+        .truncate(true)
+        .open(&path)
+        .await
+        .map_err(|e| stream_err(&path, "stream_create", format!("open: {e}")))?;
+    let (res, _buf) = file.write_all_at(placeholder, 0).await;
+    let close_res = file.close().await;
+    res.map_err(|e| stream_err(&path, "stream_create", format!("write: {e}")))?;
+    close_res.map_err(|e| stream_err(&path, "stream_create", format!("close: {e}")))?;
+    Ok(())
+}
+
+async fn do_stream_write(path: PathBuf, offset: u64, bytes: Bytes) -> Result<(), Error> {
+    let file = OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .await
+        .map_err(|e| stream_err(&path, "stream_write", format!("open: {e}")))?;
+    let (res, _buf) = file.write_all_at(bytes.to_vec(), offset).await;
+    let close_res = file.close().await;
+    res.map_err(|e| stream_err(&path, "stream_write", format!("write: {e}")))?;
+    close_res.map_err(|e| stream_err(&path, "stream_write", format!("close: {e}")))?;
+    Ok(())
+}
+
+async fn do_stream_sync_data(path: PathBuf) -> Result<(), Error> {
+    let file = OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .await
+        .map_err(|e| stream_err(&path, "stream_sync_data", format!("open: {e}")))?;
+    let sync_res = file.sync_data().await;
+    let close_res = file.close().await;
+    sync_res.map_err(|e| stream_err(&path, "stream_sync_data", format!("fdatasync: {e}")))?;
+    close_res.map_err(|e| stream_err(&path, "stream_sync_data", format!("close: {e}")))?;
+    Ok(())
+}
+
+async fn do_stream_rename(from: PathBuf, to: PathBuf, sync: SyncLevel) -> Result<(), Error> {
+    tokio_uring::fs::rename(&from, &to)
+        .await
+        .map_err(|e| stream_err(&from, "stream_rename", format!("rename: {e}")))?;
+    if sync == SyncLevel::Durable
+        && let Some(parent) = to.parent()
+        && let Ok(dir) = std::fs::File::open(parent)
+    {
+        let _ = dir.sync_all();
+    }
+    Ok(())
+}
+
 async fn read_existing_created(file: &File, mek: Option<&[u8; 32]>) -> Option<u64> {
-    let buf = vec![0u8; HEADER_SIZE];
+    // SAFETY: read_exact_at writes exactly HEADER_SIZE bytes on Ok.
+    let buf = unsafe { bufpool::acquire_uninit(HEADER_SIZE) };
     let (res, buf) = file.read_exact_at(buf, 0).await;
-    res.ok()?;
+    if res.is_err() {
+        bufpool::release(buf);
+        return None;
+    }
     let header_bytes: [u8; HEADER_SIZE] = buf.as_slice().try_into().ok()?;
+    bufpool::release(buf);
     let header = Header::decode(&header_bytes).ok()?;
-    let meta_buf = vec![0u8; header.meta_len as usize];
+    // SAFETY: read_exact_at writes exactly meta_len bytes on Ok.
+    let meta_buf = unsafe { bufpool::acquire_uninit(header.meta_len as usize) };
     let (res, meta_buf) = file.read_exact_at(meta_buf, header.meta_offset()).await;
-    res.ok()?;
-    let json = if let Some(mek) = mek {
-        decrypt_meta(mek, &meta_buf).ok()?
+    if res.is_err() {
+        bufpool::release(meta_buf);
+        return None;
+    }
+    let m: Option<Metadata> = if let Some(mek) = mek {
+        let plaintext = decrypt_meta(mek, &meta_buf).ok();
+        bufpool::release(meta_buf);
+        plaintext.and_then(|p| serde_json::from_slice(&p).ok())
     } else {
-        meta_buf
+        let r = serde_json::from_slice(&meta_buf).ok();
+        bufpool::release(meta_buf);
+        r
     };
-    let m: Metadata = serde_json::from_slice(&json).ok()?;
-    Some(m.created)
+    Some(m?.created)
 }

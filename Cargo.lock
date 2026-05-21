@@ -1584,6 +1584,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
 
 [[package]]
+name = "gxhash"
+version = "3.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f3ce1bab7aa741d4e7042b2aae415b78741f267a98a7271ea226cd5ba6c43d7d"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "h2"
 version = "0.3.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2346,16 +2355,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d1525a2a28c7f4fa0fc98bb91ae755d1e2d1505079e05539e35bc876b5d65ae9"
 dependencies = [
  "regex-automata",
-]
-
-[[package]]
-name = "md-5"
-version = "0.10.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d89e7ee0cfbedfc4da3340218492196241d89eefb6dab27de5df917a6d2e78cf"
-dependencies = [
- "cfg-if",
- "digest 0.10.7",
 ]
 
 [[package]]
@@ -5320,10 +5319,10 @@ dependencies = [
  "criterion",
  "flume",
  "fs2",
+ "gxhash",
  "hkdf",
  "hmac",
  "libc",
- "md-5",
  "metrics",
  "papaya",
  "pqcrypto",
@@ -5385,7 +5384,7 @@ dependencies = [
  "figment",
  "flume",
  "futures",
- "md-5",
+ "gxhash",
  "metrics",
  "metrics-exporter-prometheus",
  "metrics-rs-dashboard-actix",

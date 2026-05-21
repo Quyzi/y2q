@@ -14,7 +14,7 @@ mod format;
 mod ops;
 mod runtime;
 mod storage;
-mod streaming;
+pub mod streaming;
 
 pub use storage::{UringConfig, UringStorage};
 pub use streaming::{URING_STREAMING_WRITE_OFFSET, UringStreamingPutGuard};

@@ -87,11 +87,11 @@ pub async fn run(
                                     m.key.clone(),
                                     fmt_bytes(m.size),
                                     fmt_ns(m.modified),
-                                    m.checksum_md5[..8].to_owned(),
+                                    m.checksum_gxhash.clone(),
                                 ]
                             })
                             .collect();
-                        print_table(&["KEY", "SIZE", "MODIFIED", "MD5"], &rows);
+                        print_table(&["KEY", "SIZE", "MODIFIED", "GXHASH"], &rows);
                     }
                 } else {
                     let page = client.list_objects(bucket, &opts).await?;
@@ -106,11 +106,11 @@ pub async fn run(
                                     m.key.clone(),
                                     fmt_bytes(m.size),
                                     fmt_ns(m.modified),
-                                    m.checksum_md5[..8.min(m.checksum_md5.len())].to_owned(),
+                                    m.checksum_gxhash.clone(),
                                 ]
                             })
                             .collect();
-                        print_table(&["KEY", "SIZE", "MODIFIED", "MD5"], &rows);
+                        print_table(&["KEY", "SIZE", "MODIFIED", "GXHASH"], &rows);
                         if let Some(ref next) = page.next {
                             println!("\n(next: {next})");
                         }

@@ -144,8 +144,7 @@ pub async fn stat(path: String, mode: OutputMode) -> Result<(), CliError> {
             "size": head.size,
             "created": head.created,
             "modified": head.modified,
-            "checksum_md5": head.checksum_md5,
-            "checksum_sha256": head.checksum_sha256,
+            "checksum_gxhash": head.checksum_gxhash,
             "labels": head.labels,
             "cipher_size": head.cipher_size,
             "cipher_sha256": head.cipher_sha256,
@@ -163,8 +162,7 @@ pub async fn stat(path: String, mode: OutputMode) -> Result<(), CliError> {
         }
         println!("Created:  {}", fmt_ns(head.created));
         println!("Modified: {}", fmt_ns(head.modified));
-        println!("MD5:      {}", head.checksum_md5);
-        println!("SHA256:   {}", head.checksum_sha256);
+        println!("GxHash:   {}", head.checksum_gxhash);
         if !head.labels.is_empty() {
             println!("Labels:");
             for (k, v) in &head.labels {

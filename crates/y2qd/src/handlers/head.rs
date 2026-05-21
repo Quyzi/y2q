@@ -18,8 +18,7 @@ use crate::error::{AppError, ErrorBody};
 /// | `Content-Type` | `application/octet-stream` |
 /// | `X-Y2Q-Created` | Nanoseconds since Unix epoch when first written |
 /// | `X-Y2Q-Modified` | Nanoseconds since Unix epoch when last overwritten |
-/// | `X-Y2Q-Checksum-MD5` | Full 16-byte MD5 digest as standard base64 (24 chars) |
-/// | `X-Y2Q-Checksum-SHA256` | Full 32-byte SHA-256 digest as standard base64 (44 chars) |
+/// | `X-Y2Q-Checksum-GxHash` | 8-byte gxhash64 digest as standard base64 (12 chars) |
 /// | `X-Y2Q-<label>` | Any custom label attached to the object on PUT |
 ///
 /// Custom label names are echoed back lowercased.
@@ -35,7 +34,7 @@ use crate::error::{AppError, ErrorBody};
     responses(
         (status = 200, description = "Object exists. Metadata is returned in response headers: \
             `X-Y2Q-Created` (ns since epoch), `X-Y2Q-Modified` (ns since epoch), \
-            `X-Y2Q-Checksum-MD5` (base64, 24 chars), `X-Y2Q-Checksum-SHA256` (base64, 44 chars), \
+            `X-Y2Q-Checksum-GxHash` (base64, 12 chars), \
             plus any `X-Y2Q-<label>` headers attached on PUT. \
             Encrypted objects also expose `X-Y2Q-Cipher-Size`, `X-Y2Q-Cipher-SHA256`, \
             `X-Y2Q-Kem-Alg`, `X-Y2Q-Aead-Alg`, and `X-Y2Q-Envelope-Version`."),
@@ -65,8 +64,7 @@ pub async fn handle(
         .insert_header(("Content-Type", "application/octet-stream"))
         .insert_header(("X-Y2Q-Created", meta.created.to_string()))
         .insert_header(("X-Y2Q-Modified", meta.modified.to_string()))
-        .insert_header(("X-Y2Q-Checksum-MD5", meta.checksum_md5.clone()))
-        .insert_header(("X-Y2Q-Checksum-SHA256", meta.checksum_sha256.clone()));
+        .insert_header(("X-Y2Q-Checksum-GxHash", meta.checksum_gxhash.clone()));
 
     if let Some(v) = meta.cipher_size {
         builder.insert_header(("X-Y2Q-Cipher-Size", v.to_string()));

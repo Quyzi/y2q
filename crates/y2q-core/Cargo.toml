@@ -18,9 +18,9 @@ bytes           = { workspace = true }
 crc32fast       = { workspace = true }
 flume           = { workspace = true }
 fs2             = { workspace = true }
+gxhash          = { workspace = true }
 hkdf            = { workspace = true }
 hmac            = { workspace = true }
-md-5            = { workspace = true }
 metrics         = { workspace = true }
 papaya          = { workspace = true }
 pqcrypto        = { workspace = true }

@@ -23,7 +23,7 @@ dashmap                     = { workspace = true }
 figment                     = { workspace = true }
 flume                       = { workspace = true }
 futures                     = { workspace = true }
-md-5                        = { workspace = true }
+gxhash                      = { workspace = true }
 metrics                     = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
 metrics-rs-dashboard-actix  = { workspace = true }

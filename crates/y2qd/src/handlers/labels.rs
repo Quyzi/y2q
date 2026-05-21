@@ -1,7 +1,7 @@
 //! Parse `X-Y2Q-<label>` request headers into a label map.
 //!
 //! Reserved names emitted by the server on HEAD (`created`, `modified`,
-//! `checksum-md5`, `checksum-sha256`) cannot be supplied by clients on PUT.
+//! `checksum-gxhash`) cannot be supplied by clients on PUT.
 
 use std::collections::BTreeMap;
 
@@ -14,7 +14,7 @@ use crate::error::AppError;
 const HEADER_PREFIX: &str = "x-y2q-";
 /// Server-emitted metadata header names that clients may not supply on PUT.
 /// Used by HEAD to surface object state; sending these on a PUT yields 400.
-const RESERVED: &[&str] = &["created", "modified", "checksum-md5", "checksum-sha256"];
+const RESERVED: &[&str] = &["created", "modified", "checksum-gxhash"];
 /// Header names in the `X-Y2Q-` namespace that are consumed by dedicated
 /// handler logic and must not be persisted as user labels. The extractor
 /// silently skips them — the relevant handler parses them separately.
@@ -129,8 +129,7 @@ mod tests {
         for header in [
             "X-Y2Q-Created",
             "X-Y2Q-Modified",
-            "x-y2q-CHECKSUM-MD5",
-            "X-Y2Q-checksum-sha256",
+            "X-Y2Q-checksum-gxhash",
         ] {
             let req = TestRequest::default()
                 .insert_header((header, "1"))

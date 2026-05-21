@@ -94,8 +94,7 @@ impl Y2qClient {
                     *s,
                     "created"
                         | "modified"
-                        | "checksum-md5"
-                        | "checksum-sha256"
+                        | "checksum-gxhash"
                         | "cipher-size"
                         | "cipher-sha256"
                         | "kem-alg"
@@ -114,8 +113,7 @@ impl Y2qClient {
                 .unwrap_or(0),
             created: hdr_u64(headers, "x-y2q-created").unwrap_or(0),
             modified: hdr_u64(headers, "x-y2q-modified").unwrap_or(0),
-            checksum_md5: hdr(headers, "x-y2q-checksum-md5").unwrap_or_default(),
-            checksum_sha256: hdr(headers, "x-y2q-checksum-sha256").unwrap_or_default(),
+            checksum_gxhash: hdr(headers, "x-y2q-checksum-gxhash").unwrap_or_default(),
             labels,
             cipher_size: hdr_u64(headers, "x-y2q-cipher-size"),
             cipher_sha256: hdr(headers, "x-y2q-cipher-sha256"),
