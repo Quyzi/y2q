@@ -268,14 +268,14 @@ async fn bench(
 }
 
 /// Initialise a Y2qClient for the given alias.
-/// Returns: (profile, authed client, token expiry secs, token string)
+/// Returns: (alias entry, authed client, token expiry secs, token string)
 async fn init_client(
     alias: &str,
     config_path: &Option<std::path::PathBuf>,
     password: Option<&str>,
 ) -> Result<
     (
-        y2q_config::Profile,
+        y2q_config::Alias,
         y2q_client::Y2qClient,
         u64,
         Zeroizing<String>,
@@ -287,7 +287,7 @@ async fn init_client(
         None => y2q_config::default_config_path()?,
     };
     let cfg = y2q_config::CliConfig::load(&cfg_path)?;
-    let profile = cfg.get_profile(alias)?.clone();
+    let profile = cfg.get_alias(alias)?.clone();
 
     // Build an unauthenticated client solely for the login call if needed
     let base_client =

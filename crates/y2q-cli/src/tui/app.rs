@@ -5,7 +5,7 @@ use std::time::Instant;
 use tokio::sync::mpsc::UnboundedSender;
 use y2q_client::ListOptions;
 
-use crate::client_builder::client_from_profile;
+use crate::client_builder::client_from_alias;
 use crate::config::{CliConfig, default_tokens_path};
 use crate::output::{fmt_bytes, fmt_ns};
 use crate::progress::{CountingReader, CountingWriter, ProgressReporter};
@@ -58,7 +58,7 @@ pub struct App {
 
 impl App {
     pub fn new(config: CliConfig, event_tx: UnboundedSender<Event>) -> Self {
-        let aliases: Vec<String> = config.profiles.keys().cloned().collect();
+        let aliases: Vec<String> = config.aliases.keys().cloned().collect();
         let remote = RemotePane::new(aliases);
         Self {
             mode: Mode::default(),
@@ -463,15 +463,14 @@ impl App {
         tokio::spawn(async move {
             let result = async {
                 let profile = config
-                    .profiles
+                    .aliases
                     .get(&alias)
                     .ok_or_else(|| format!("unknown alias `{alias}`"))?;
                 let store = TokenStore::load(&tokens_path).map_err(|e| e.to_string())?;
                 let token = store
                     .token_for(&alias)
                     .ok_or_else(|| "not authenticated".to_string())?;
-                let client =
-                    client_from_profile(profile, Some(token)).map_err(|e| e.to_string())?;
+                let client = client_from_alias(profile, Some(token)).map_err(|e| e.to_string())?;
                 client.list_buckets().await.map_err(|e| e.to_string())
             }
             .await;
@@ -495,15 +494,14 @@ impl App {
         tokio::spawn(async move {
             let result = async {
                 let profile = config
-                    .profiles
+                    .aliases
                     .get(&alias)
                     .ok_or_else(|| format!("unknown alias `{alias}`"))?;
                 let store = TokenStore::load(&tokens_path).map_err(|e| e.to_string())?;
                 let token = store
                     .token_for(&alias)
                     .ok_or_else(|| "not authenticated".to_string())?;
-                let client =
-                    client_from_profile(profile, Some(token)).map_err(|e| e.to_string())?;
+                let client = client_from_alias(profile, Some(token)).map_err(|e| e.to_string())?;
                 let opts = ListOptions {
                     prefix: prefix.clone(),
                     after: None,
@@ -563,7 +561,7 @@ impl App {
                     tokio::spawn(async move {
                         let result = async {
                             let profile = config
-                                .profiles
+                                .aliases
                                 .get(&alias)
                                 .ok_or_else(|| "unknown alias".to_string())?;
                             let store =
@@ -571,7 +569,7 @@ impl App {
                             let token = store
                                 .token_for(&alias)
                                 .ok_or_else(|| "unauthenticated".to_string())?;
-                            let client = client_from_profile(profile, Some(token))
+                            let client = client_from_alias(profile, Some(token))
                                 .map_err(|e| e.to_string())?;
                             let file = tokio::fs::File::open(&local_path)
                                 .await
@@ -615,7 +613,7 @@ impl App {
                     tokio::spawn(async move {
                         let result = async {
                             let profile = config
-                                .profiles
+                                .aliases
                                 .get(&alias)
                                 .ok_or_else(|| "unknown alias".to_string())?;
                             let store =
@@ -623,7 +621,7 @@ impl App {
                             let token = store
                                 .token_for(&alias)
                                 .ok_or_else(|| "unauthenticated".to_string())?;
-                            let client = client_from_profile(profile, Some(token))
+                            let client = client_from_alias(profile, Some(token))
                                 .map_err(|e| e.to_string())?;
                             let file = tokio::fs::File::create(&local_dst)
                                 .await
@@ -665,10 +663,10 @@ impl App {
                 let tokens_path = default_tokens_path().unwrap_or_default();
                 tokio::spawn(async move {
                     let _ = async {
-                        let profile = config.profiles.get(&alias)?;
+                        let profile = config.aliases.get(&alias)?;
                         let store = TokenStore::load(&tokens_path).ok()?;
                         let token = store.token_for(&alias)?;
-                        let client = client_from_profile(profile, Some(token)).ok()?;
+                        let client = client_from_alias(profile, Some(token)).ok()?;
                         client.delete(&bucket, &key).await.ok()
                     }
                     .await;
@@ -682,7 +680,7 @@ impl App {
                 tokio::spawn(async move {
                     let result = async {
                         let profile = config
-                            .profiles
+                            .aliases
                             .get(&alias_clone)
                             .ok_or_else(|| "unknown alias".to_string())?;
                         let store = TokenStore::load(&tokens_path).map_err(|e| e.to_string())?;
@@ -690,7 +688,7 @@ impl App {
                             .token_for(&alias_clone)
                             .ok_or_else(|| "not authenticated".to_string())?;
                         let client =
-                            client_from_profile(profile, Some(token)).map_err(|e| e.to_string())?;
+                            client_from_alias(profile, Some(token)).map_err(|e| e.to_string())?;
                         client
                             .delete_user(&username)
                             .await
@@ -739,15 +737,14 @@ impl App {
         tokio::spawn(async move {
             let result = async {
                 let profile = config
-                    .profiles
+                    .aliases
                     .get(&alias)
                     .ok_or_else(|| format!("unknown alias `{alias}`"))?;
                 let store = TokenStore::load(&tokens_path).map_err(|e| e.to_string())?;
                 let token = store
                     .token_for(&alias)
                     .ok_or_else(|| "not authenticated".to_string())?;
-                let client =
-                    client_from_profile(profile, Some(token)).map_err(|e| e.to_string())?;
+                let client = client_from_alias(profile, Some(token)).map_err(|e| e.to_string())?;
                 client.head(&bucket, &key).await.map_err(|e| e.to_string())
             }
             .await;
@@ -767,15 +764,14 @@ impl App {
         tokio::spawn(async move {
             let result = async {
                 let profile = config
-                    .profiles
+                    .aliases
                     .get(&alias)
                     .ok_or_else(|| format!("unknown alias `{alias}`"))?;
                 let store = TokenStore::load(&tokens_path).map_err(|e| e.to_string())?;
                 let token = store
                     .token_for(&alias)
                     .ok_or_else(|| "not authenticated".to_string())?;
-                let client =
-                    client_from_profile(profile, Some(token)).map_err(|e| e.to_string())?;
+                let client = client_from_alias(profile, Some(token)).map_err(|e| e.to_string())?;
                 client.list_users().await.map_err(|e| e.to_string())
             }
             .await;
@@ -797,15 +793,14 @@ impl App {
         tokio::spawn(async move {
             let result = async {
                 let profile = config
-                    .profiles
+                    .aliases
                     .get(&alias)
                     .ok_or_else(|| format!("unknown alias `{alias}`"))?;
                 let store = TokenStore::load(&tokens_path).map_err(|e| e.to_string())?;
                 let token = store
                     .token_for(&alias)
                     .ok_or_else(|| "not authenticated".to_string())?;
-                let client =
-                    client_from_profile(profile, Some(token)).map_err(|e| e.to_string())?;
+                let client = client_from_alias(profile, Some(token)).map_err(|e| e.to_string())?;
                 client.locks_list("5m").await.map_err(|e| e.to_string())
             }
             .await;
@@ -883,7 +878,7 @@ impl App {
                 tokio::spawn(async move {
                     let result = async {
                         let profile = config
-                            .profiles
+                            .aliases
                             .get(&alias_clone)
                             .ok_or_else(|| "unknown alias".to_string())?;
                         let store = TokenStore::load(&tokens_path).map_err(|e| e.to_string())?;
@@ -891,7 +886,7 @@ impl App {
                             .token_for(&alias_clone)
                             .ok_or_else(|| "not authenticated".to_string())?;
                         let client =
-                            client_from_profile(profile, Some(token)).map_err(|e| e.to_string())?;
+                            client_from_alias(profile, Some(token)).map_err(|e| e.to_string())?;
                         client
                             .add_user(&username, &password)
                             .await

@@ -1,6 +1,6 @@
 use zeroize::Zeroizing;
 
-use crate::client_builder::client_from_profile;
+use crate::client_builder::client_from_alias;
 use crate::config::{CliConfig, default_config_path, default_tokens_path};
 use crate::error::CliError;
 use crate::output::{OutputMode, print_json};
@@ -22,40 +22,40 @@ pub async fn login(
     let config_path = default_config_path()?;
     let tokens_path = default_tokens_path()?;
     let config = CliConfig::load(&config_path)?;
-    let profile = config.get_profile(alias)?;
+    let entry = config.get_alias(alias)?;
 
     let username = user
-        .or_else(|| Some(profile.username.clone()))
+        .or_else(|| Some(entry.username.clone()))
         .unwrap_or_default();
 
     let pw = if let Some(p) = password {
         Zeroizing::new(p)
-    } else if let Some(ref p) = profile.password {
+    } else if let Some(ref p) = entry.password {
         Zeroizing::new(p.clone())
     } else {
         prompt_password(&format!("Password for {username}@{alias}: "))?
     };
 
-    let client = client_from_profile(profile, None)?;
+    let client = client_from_alias(entry, None)?;
     let token_resp = client.login(&username, pw.as_str(), ttl).await?;
 
-    let entry = TokenEntry {
+    let token_entry = TokenEntry {
         token: token_resp.token,
         expires_at: token_resp.expires_at,
         username: token_resp.username.clone(),
     };
     let mut store = TokenStore::load(&tokens_path)?;
-    store.set(alias, entry.clone());
+    store.set(alias, token_entry.clone());
     store.save(&tokens_path)?;
 
     if mode == OutputMode::Json {
         print_json(&serde_json::json!({
             "alias": alias,
-            "username": entry.username,
-            "expires_at": entry.expires_at,
+            "username": token_entry.username,
+            "expires_at": token_entry.expires_at,
         }));
     } else {
-        let secs_left = entry.expires_at.saturating_sub(
+        let secs_left = token_entry.expires_at.saturating_sub(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
@@ -63,7 +63,7 @@ pub async fn login(
         );
         println!(
             "Logged in as {} (token expires in {}s)",
-            entry.username, secs_left
+            token_entry.username, secs_left
         );
     }
     Ok(())
@@ -73,11 +73,11 @@ pub async fn logout(alias: &str, mode: OutputMode) -> Result<(), CliError> {
     let config_path = default_config_path()?;
     let tokens_path = default_tokens_path()?;
     let config = CliConfig::load(&config_path)?;
-    let profile = config.get_profile(alias)?;
+    let entry = config.get_alias(alias)?;
 
     let mut store = TokenStore::load(&tokens_path)?;
-    if let Some(entry) = store.get_valid(alias) {
-        let client = client_from_profile(profile, Some(Zeroizing::new(entry.token.clone())))?;
+    if let Some(tok) = store.get_valid(alias) {
+        let client = client_from_alias(entry, Some(Zeroizing::new(tok.token.clone())))?;
         let _ = client.logout().await;
     }
     store.clear(alias);
@@ -100,7 +100,7 @@ pub async fn passwd(
     let config_path = default_config_path()?;
     let tokens_path = default_tokens_path()?;
     let config = CliConfig::load(&config_path)?;
-    let profile = config.get_profile(alias)?;
+    let entry = config.get_alias(alias)?;
     let store = TokenStore::load(&tokens_path)?;
 
     let token = store
@@ -118,7 +118,7 @@ pub async fn passwd(
         prompt_password("New password: ")?
     };
 
-    let client = client_from_profile(profile, Some(token))?;
+    let client = client_from_alias(entry, Some(token))?;
     client
         .change_password(current_pw.as_str(), new_pw.as_str())
         .await?;

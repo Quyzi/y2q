@@ -1,8 +1,11 @@
 pub mod admin;
+pub mod alias;
 pub mod auth;
 pub mod completions;
-pub mod config;
 pub mod cp;
+pub mod head;
 pub mod listing;
+pub mod mv;
 pub mod objects;
+pub mod pipe;
 pub mod users;

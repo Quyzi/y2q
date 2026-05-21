@@ -1,6 +1,6 @@
 use y2q_client::{ListOptions, Y2qClient};
 
-use crate::client_builder::client_from_profile;
+use crate::client_builder::client_from_alias;
 use crate::config::{CliConfig, default_config_path, default_tokens_path};
 use crate::error::CliError;
 use crate::output::{OutputMode, fmt_bytes, fmt_ns, print_json};
@@ -21,14 +21,14 @@ fn require_bucket_key(remote: &RemotePath) -> Result<(&str, &str), CliError> {
     Ok((bucket, key))
 }
 
-async fn make_client(alias: &str) -> Result<Y2qClient, CliError> {
+pub(crate) async fn make_client(alias: &str) -> Result<Y2qClient, CliError> {
     let config = CliConfig::load(&default_config_path()?)?;
-    let profile = config.get_profile(alias)?;
+    let entry = config.get_alias(alias)?;
     let store = TokenStore::load(&default_tokens_path()?)?;
     let token = store
         .token_for(alias)
         .ok_or(CliError::Client(y2q_client::ClientError::Unauthenticated))?;
-    client_from_profile(profile, Some(token))
+    client_from_alias(entry, Some(token))
 }
 
 pub async fn rm(path: String, force: bool, mode: OutputMode) -> Result<(), CliError> {
