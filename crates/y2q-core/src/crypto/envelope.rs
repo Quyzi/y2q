@@ -40,6 +40,7 @@
 //! Chunk nonce_i = nonce_base XOR (i as u64 BE in bytes [4..12]).
 //! AAD for each chunk = the 32-byte v2 fixed header.
 
+use bytes::{Bytes, BytesMut};
 use hkdf::Hkdf;
 use pqcrypto::kem::mlkem768;
 use pqcrypto_traits::kem::{
@@ -274,6 +275,135 @@ fn decrypt_v2(sk_bytes: &[u8], envelope: &[u8]) -> Result<Vec<u8>, CryptoError> 
         return Err(CryptoError::Envelope("plaintext length mismatch"));
     }
     Ok(plaintext)
+}
+
+/// Decrypt a complete envelope, consuming an owned `BytesMut` buffer.
+///
+/// Identical semantics to [`decrypt`], but lets v1/v2 reuse the input
+/// allocation for the in-place AEAD open instead of allocating a fresh
+/// ciphertext buffer per call. Returns the recovered plaintext as `Bytes`
+/// (zero-copy of the freed underlying allocation).
+pub fn decrypt_owned(sk_bytes: &[u8], envelope: BytesMut) -> Result<Bytes, CryptoError> {
+    if envelope.len() < 4 {
+        return Err(CryptoError::Envelope("truncated header"));
+    }
+    match &envelope[..4] {
+        m if m == MAGIC_V1 => decrypt_v1_owned(sk_bytes, envelope),
+        m if m == MAGIC_V2 => decrypt_v2_owned(sk_bytes, envelope),
+        _ => Err(CryptoError::Envelope("bad magic")),
+    }
+}
+
+fn decrypt_v1_owned(sk_bytes: &[u8], mut envelope: BytesMut) -> Result<Bytes, CryptoError> {
+    let header = parse_and_validate_v1_header(&envelope)?;
+    let kem_ct_start = ENVELOPE_HEADER_FIXED_LEN;
+    let kem_ct_end = kem_ct_start + mlkem768::ciphertext_bytes();
+    if envelope.len() < kem_ct_end + TAG_LEN {
+        return Err(CryptoError::Envelope("truncated envelope"));
+    }
+    // Small fixed-size AAD snapshot — released before we split the body off.
+    let mut aad_bytes = [0u8; ENVELOPE_HEADER_FIXED_LEN];
+    aad_bytes.copy_from_slice(&envelope[..ENVELOPE_HEADER_FIXED_LEN]);
+    // ML-KEM ciphertext is small (1088 bytes); cheap to clone out so we can
+    // free the prefix and decrypt the (potentially huge) aead_ct in place.
+    let kem_ct_owned: Vec<u8> = envelope[kem_ct_start..kem_ct_end].to_vec();
+
+    let sk = mlkem768::SecretKey::from_bytes(sk_bytes)
+        .map_err(|_| CryptoError::KemDecode("secret key"))?;
+    let kem_ct = mlkem768::Ciphertext::from_bytes(&kem_ct_owned)
+        .map_err(|_| CryptoError::KemDecode("kem ciphertext"))?;
+    let ss = mlkem768::decapsulate(&kem_ct, &sk);
+
+    let mut key_bytes = derive_content_key(ss.as_bytes(), &kem_ct_owned)?;
+    let ring_key = make_ring_key(&key_bytes)?;
+    key_bytes.zeroize();
+
+    // O(1) split: `body` owns the aead_ct region of the original allocation.
+    let mut body = envelope.split_off(kem_ct_end);
+    drop(envelope);
+    let pt_len = ring_key
+        .open_in_place(
+            ring_nonce(&header.nonce)?,
+            Aad::from(&aad_bytes[..]),
+            &mut body,
+        )
+        .map_err(|_| CryptoError::AuthFailed)?
+        .len();
+    body.truncate(pt_len);
+
+    if body.len() as u64 != header.plaintext_len {
+        return Err(CryptoError::Envelope("plaintext length mismatch"));
+    }
+    Ok(body.freeze())
+}
+
+fn decrypt_v2_owned(sk_bytes: &[u8], mut envelope: BytesMut) -> Result<Bytes, CryptoError> {
+    let preamble_len = ENVELOPE_V2_HEADER_FIXED_LEN + mlkem768::ciphertext_bytes();
+    if envelope.len() < preamble_len {
+        return Err(CryptoError::Envelope("truncated v2 envelope"));
+    }
+    if envelope[6] != KEM_ALG_MLKEM768 {
+        return Err(CryptoError::Envelope("unknown kem_alg"));
+    }
+    if envelope[7] != AEAD_ALG_AES256GCM {
+        return Err(CryptoError::Envelope("unknown aead_alg"));
+    }
+    let mut nonce_base = [0u8; 12];
+    nonce_base.copy_from_slice(&envelope[8..20]);
+    let plaintext_len = u64::from_be_bytes(envelope[20..28].try_into().unwrap());
+    let chunk_size = u32::from_be_bytes(envelope[28..32].try_into().unwrap()) as usize;
+    if chunk_size == 0 {
+        return Err(CryptoError::Envelope("zero chunk_size"));
+    }
+    let mut aad = [0u8; V2_AAD_LEN];
+    aad.copy_from_slice(&envelope[..V2_AAD_LEN]);
+    let kem_ct_owned: Vec<u8> = envelope[ENVELOPE_V2_HEADER_FIXED_LEN..preamble_len].to_vec();
+
+    let sk = mlkem768::SecretKey::from_bytes(sk_bytes)
+        .map_err(|_| CryptoError::KemDecode("secret key"))?;
+    let kem_ct = mlkem768::Ciphertext::from_bytes(&kem_ct_owned)
+        .map_err(|_| CryptoError::KemDecode("kem ciphertext"))?;
+    let ss = mlkem768::decapsulate(&kem_ct, &sk);
+
+    let mut key_bytes = derive_content_key(ss.as_bytes(), &kem_ct_owned)?;
+    let ring_key = make_ring_key(&key_bytes)?;
+    key_bytes.zeroize();
+
+    // Drop the preamble; `body` retains the chunked ciphertext region.
+    let mut body = envelope.split_off(preamble_len);
+    drop(envelope);
+
+    let mut plaintext = if plaintext_len > 0 {
+        BytesMut::with_capacity(plaintext_len as usize)
+    } else {
+        BytesMut::new()
+    };
+
+    let mut chunk_idx: u64 = 0;
+    while !body.is_empty() {
+        let take = (chunk_size + TAG_LEN).min(body.len());
+        if take < TAG_LEN {
+            return Err(CryptoError::Envelope("truncated chunk ciphertext"));
+        }
+        let chunk_nonce_bytes = chunk_nonce(&nonce_base, chunk_idx);
+        // O(1) split: `chunk_buf` owns this chunk's ciphertext region.
+        let mut chunk_buf = body.split_to(take);
+        let pt_len = ring_key
+            .open_in_place(
+                ring_nonce(&chunk_nonce_bytes)?,
+                Aad::from(&aad[..]),
+                &mut chunk_buf,
+            )
+            .map_err(|_| CryptoError::AuthFailed)?
+            .len();
+        plaintext.extend_from_slice(&chunk_buf[..pt_len]);
+        chunk_idx += 1;
+    }
+
+    if plaintext_len > 0 && plaintext.len() as u64 != plaintext_len {
+        return Err(CryptoError::Envelope("plaintext length mismatch"));
+    }
+    Ok(plaintext.freeze())
 }
 
 /// Length of the stable prefix used as per-chunk AAD in v2.
@@ -572,6 +702,27 @@ mod tests {
     }
 
     #[test]
+    fn decrypt_owned_v1_roundtrip() {
+        let (pk, sk) = mlkem768::keypair();
+        let pt = vec![0xCD; 4096];
+        let (env, _) = encrypt(pk.as_bytes(), &pt).unwrap();
+        let rec = decrypt_owned(sk.as_bytes(), BytesMut::from(env.as_slice())).unwrap();
+        assert_eq!(rec.as_ref(), pt.as_slice());
+    }
+
+    #[test]
+    fn decrypt_owned_v1_tamper() {
+        let (pk, sk) = mlkem768::keypair();
+        let (mut env, _) = encrypt(pk.as_bytes(), b"abc").unwrap();
+        let last = env.len() - 1;
+        env[last] ^= 1;
+        assert!(matches!(
+            decrypt_owned(sk.as_bytes(), BytesMut::from(env.as_slice())),
+            Err(CryptoError::AuthFailed)
+        ));
+    }
+
+    #[test]
     fn fresh_kem_per_call() {
         let (pk, _sk) = mlkem768::keypair();
         let (a, _) = encrypt(pk.as_bytes(), b"x").unwrap();
@@ -678,6 +829,21 @@ mod tests {
         let env = read_file(file).await;
         let recovered = decrypt(sk.as_bytes(), &env).unwrap();
         assert_eq!(recovered, pt);
+    }
+
+    #[tokio::test]
+    async fn decrypt_owned_v2_multi_chunk() {
+        let (pk, sk) = mlkem768::keypair();
+        let pt = vec![0x37_u8; 5 * (1 << 20) / 2];
+        let file = tempfile_v2().await;
+        let mut session = EncryptSession::new(file, pk.as_bytes(), 0).await.unwrap();
+        for chunk in pt.chunks(65536) {
+            session.feed(chunk).await.unwrap();
+        }
+        let (file, _) = session.finish().await.unwrap();
+        let env = read_file(file).await;
+        let rec = decrypt_owned(sk.as_bytes(), BytesMut::from(env.as_slice())).unwrap();
+        assert_eq!(rec.as_ref(), pt.as_slice());
     }
 
     #[tokio::test]

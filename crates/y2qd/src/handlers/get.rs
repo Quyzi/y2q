@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use actix_web::http::header;
 use actix_web::{HttpRequest, HttpResponse, web};
+use bytes::BytesMut;
 use y2q_core::{AnyStorage, Storage};
 
 use crate::auth::Authenticated;
@@ -60,13 +61,18 @@ pub async fn handle(
     // Always fetch the full stored bytes — even for a Range request we need
     // to determine if the object is encrypted (in which case Range fails).
     let object = storage.get(&bucket, &key).await.map_err(AppError::from)?;
-    let stored = (*object).clone();
+    let stored = object.into_inner();
 
     if cipher::is_encrypted_envelope(&stored) {
         if range_header.is_some() {
             return Err(AppError(y2q_core::Error::RangeReadOnEncrypted));
         }
-        let plaintext = cipher::decrypt_after_get(&auth.keystore, &bucket, &key, &stored)?;
+        // Try to consume the storage allocation directly so the AEAD open
+        // happens in place; fall back to a copy if the buffer is shared.
+        let buf = stored
+            .try_into_mut()
+            .unwrap_or_else(|b| BytesMut::from(b.as_ref()));
+        let plaintext = cipher::decrypt_after_get(&auth.keystore, &bucket, &key, buf)?;
         return Ok(HttpResponse::Ok()
             .content_type("application/octet-stream")
             .body(plaintext));
