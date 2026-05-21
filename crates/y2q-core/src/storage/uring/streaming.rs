@@ -62,6 +62,7 @@ pub struct UringStreamingPutGuard {
 }
 
 impl UringStreamingPutGuard {
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         tmp_path: PathBuf,
         obj_path: PathBuf,
@@ -310,11 +311,7 @@ impl UringStreamingWriter {
 
     /// Rename the tmp file into place via the worker. Honours `sync` for the
     /// optional parent-directory fsync.
-    pub(super) async fn rename(
-        self,
-        target: PathBuf,
-        sync: SyncLevel,
-    ) -> Result<(), Error> {
+    pub(super) async fn rename(self, target: PathBuf, sync: SyncLevel) -> Result<(), Error> {
         let (reply, reply_rx) = oneshot::channel();
         self.tx
             .send(UringOp::StreamRename {
@@ -340,5 +337,4 @@ impl UringStreamingWriter {
             }),
         }
     }
-
 }

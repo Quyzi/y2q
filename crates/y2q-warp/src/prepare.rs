@@ -56,7 +56,7 @@ pub async fn prepare(
                     done,
                     total: objects,
                 });
-            } else if done % 100 == 0 || done == objects {
+            } else if done.is_multiple_of(100) || done == objects {
                 eprintln!("  prepared {done}/{objects} objects");
             }
             Ok(key_clone)

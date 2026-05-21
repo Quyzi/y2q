@@ -331,16 +331,15 @@ impl App {
                     Action::None
                 }
                 KeyCode::Char('d') => {
-                    if matches!(tab, AdminTab::Users) {
-                        if let Some(user) =
+                    if matches!(tab, AdminTab::Users)
+                        && let Some(user) =
                             self.users_view.users.get(self.users_view.selected).cloned()
-                        {
-                            let alias = self.active_alias.clone().unwrap_or_default();
-                            self.mode = Mode::Confirm(ConfirmAction::DeleteUser {
-                                alias,
-                                username: user.username,
-                            });
-                        }
+                    {
+                        let alias = self.active_alias.clone().unwrap_or_default();
+                        self.mode = Mode::Confirm(ConfirmAction::DeleteUser {
+                            alias,
+                            username: user.username,
+                        });
                     }
                     Action::Delete
                 }

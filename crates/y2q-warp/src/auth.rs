@@ -79,18 +79,18 @@ pub fn spawn_refresh_task(
                     let tok = Zeroizing::new(resp.token.clone());
                     let _ = tx.send(tok);
 
-                    if let Ok(tokens_path) = default_tokens_path() {
-                        if let Ok(mut store) = TokenStore::load(&tokens_path) {
-                            store.set(
-                                &alias,
-                                TokenEntry {
-                                    token: resp.token,
-                                    expires_at: resp.expires_at,
-                                    username: username.clone(),
-                                },
-                            );
-                            let _ = store.save(&tokens_path);
-                        }
+                    if let Ok(tokens_path) = default_tokens_path()
+                        && let Ok(mut store) = TokenStore::load(&tokens_path)
+                    {
+                        store.set(
+                            &alias,
+                            TokenEntry {
+                                token: resp.token,
+                                expires_at: resp.expires_at,
+                                username: username.clone(),
+                            },
+                        );
+                        let _ = store.save(&tokens_path);
                     }
                 }
                 Err(e) => {

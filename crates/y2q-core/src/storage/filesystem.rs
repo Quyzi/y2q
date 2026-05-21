@@ -383,18 +383,18 @@ impl StreamingPutGuard {
             {
                 let _ = dir.sync_all().await;
             }
-        } else if let Some(ref tx) = self.dirty_tx {
-            if let Some(parent_dir) = self.obj_path.parent().map(PathBuf::from) {
-                let entry = crate::DirtyEntry {
-                    obj_path: self.obj_path.clone(),
-                    parent_dir,
-                };
-                let _ = tx.send(entry);
-                if tx.len() >= self.flush_limit {
-                    if let Some(ref notify) = self.flush_notify {
-                        notify.notify_one();
-                    }
-                }
+        } else if let Some(ref tx) = self.dirty_tx
+            && let Some(parent_dir) = self.obj_path.parent().map(PathBuf::from)
+        {
+            let entry = crate::DirtyEntry {
+                obj_path: self.obj_path.clone(),
+                parent_dir,
+            };
+            let _ = tx.send(entry);
+            if tx.len() >= self.flush_limit
+                && let Some(ref notify) = self.flush_notify
+            {
+                notify.notify_one();
             }
         }
 
@@ -838,18 +838,18 @@ impl Storage for FilesystemStorage {
                 {
                     let _ = dir.sync_all().await;
                 }
-            } else if let Some(ref tx) = self.dirty_tx {
-                if let Some(parent_dir) = obj_path.parent().map(PathBuf::from) {
-                    let entry = crate::DirtyEntry {
-                        obj_path: obj_path.clone(),
-                        parent_dir,
-                    };
-                    let _ = tx.send(entry);
-                    if tx.len() >= self.flush_limit {
-                        if let Some(ref notify) = self.flush_notify {
-                            notify.notify_one();
-                        }
-                    }
+            } else if let Some(ref tx) = self.dirty_tx
+                && let Some(parent_dir) = obj_path.parent().map(PathBuf::from)
+            {
+                let entry = crate::DirtyEntry {
+                    obj_path: obj_path.clone(),
+                    parent_dir,
+                };
+                let _ = tx.send(entry);
+                if tx.len() >= self.flush_limit
+                    && let Some(ref notify) = self.flush_notify
+                {
+                    notify.notify_one();
                 }
             }
 
