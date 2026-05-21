@@ -9,6 +9,10 @@ members = [
 ]
 resolver = "2"
 
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
 [workspace.dependencies]
 actix-web                   = "4"
 aes-gcm                     = "0.10"
@@ -29,13 +33,13 @@ figment                     = { version = "0.10.19", features = ["toml", "env"] 
 flume                       = "0.12"
 fs2                         = "0.4"
 futures                     = "0.3"
+gxhash                      = "3"
 hdrhistogram                = "7"
 hkdf                        = "0.12"
 hmac                        = "0.12"
 humantime                   = "2"
 indexmap                    = { version = "2", features = ["serde"] }
 libc                        = "0.2"
-md-5                        = "0.10"
 metrics                     = "0.24"
 metrics-exporter-prometheus = "0.17"
 metrics-rs-dashboard-actix  = "0.1"

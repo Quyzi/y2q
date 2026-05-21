@@ -136,9 +136,10 @@ impl Drop for WorkerPool {
 ///
 /// Blocks the OS thread via `recv_blocking` (futex) when idle, so the thread
 /// parks at zero CPU cost rather than spinning inside `tokio_uring::start`.
-/// The `tokio-uring` runtime is entered only when there is real work to do;
-/// one `io_uring` ring is created and torn down per op. The loop exits when
-/// the matching `Sender` is dropped or closed.
+/// The `tokio-uring` runtime is entered only when there is real work to do.
+/// Once entered, the runtime drains any further ops already queued before
+/// tearing the ring down, so a burst of requests amortizes the ring
+/// setup/teardown cost across all ops in the burst.
 ///
 /// Background: `tokio_uring::start` parks by calling `io_uring_enter` with
 /// `IORING_ENTER_GETEVENTS`. When the submission ring is empty that syscall
@@ -146,6 +147,15 @@ impl Drop for WorkerPool {
 /// Keeping the blocking wait outside the uring runtime avoids this entirely.
 fn worker_main(rx: Receiver<UringOp>) {
     while let Ok(op) = rx.recv_blocking() {
-        tokio_uring::start(super::ops::handle(op));
+        let r = &rx;
+        tokio_uring::start(async move {
+            super::ops::handle(op).await;
+            // Drain ops already queued. Per-key serialization is preserved
+            // because same-key ops still funnel through this one channel in
+            // send order, and we process them sequentially.
+            while let Ok(next) = r.try_recv() {
+                super::ops::handle(next).await;
+            }
+        });
     }
 }

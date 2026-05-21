@@ -49,7 +49,6 @@ use pqcrypto_traits::kem::{
 use rand::RngCore;
 use ring::aead::{AES_256_GCM, Aad, LessSafeKey, Nonce, UnboundKey};
 use sha2::Sha256;
-use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use zeroize::Zeroize;
 
 use super::CryptoError;
@@ -298,7 +297,7 @@ const V2_AAD_LEN: usize = 20; // up to and including nonce_base
 /// (uring backend — the caller pre-writes a placeholder header before creating
 /// the session).
 pub struct EncryptSession {
-    file: tokio::fs::File,
+    sink: crate::storage::streaming_sink::StreamingSink,
     key: LessSafeKey,
     nonce_base: [u8; 12],
     chunk_idx: u64,
@@ -315,12 +314,12 @@ impl EncryptSession {
     /// Create a new encrypt session for a v2 envelope.
     ///
     /// Writes the 32-byte fixed header (with `plaintext_len = 0`) and the
-    /// 1088-byte KEM ciphertext to `file`, starting at the current file
-    /// position (which must equal `write_offset`). Pass `write_offset = 0`
+    /// 1088-byte KEM ciphertext to `sink`, starting at the sink's current
+    /// cursor (which must equal `write_offset`). Pass `write_offset = 0`
     /// when the envelope is the entire file; pass a non-zero value when a
     /// container header precedes it.
     pub async fn new(
-        mut file: tokio::fs::File,
+        mut sink: crate::storage::streaming_sink::StreamingSink,
         pk_bytes: &[u8],
         write_offset: u64,
     ) -> Result<Self, CryptoError> {
@@ -342,10 +341,10 @@ impl EncryptSession {
         header.extend_from_slice(&0u64.to_be_bytes()); // plaintext_len placeholder
         header.extend_from_slice(&(CHUNK_SIZE as u32).to_be_bytes());
 
-        file.write_all(&header)
+        sink.write_all(&header)
             .await
             .map_err(|_| CryptoError::Aead("write header"))?;
-        file.write_all(kem_ct_bytes)
+        sink.write_all(kem_ct_bytes)
             .await
             .map_err(|_| CryptoError::Aead("write kem ct"))?;
 
@@ -359,7 +358,7 @@ impl EncryptSession {
         aad.copy_from_slice(&header[..V2_AAD_LEN]);
 
         Ok(Self {
-            file,
+            sink,
             key: ring_key,
             nonce_base,
             chunk_idx: 0,
@@ -371,7 +370,7 @@ impl EncryptSession {
         })
     }
 
-    /// Buffer `data` and flush complete 1 MiB chunks to the file as encrypted.
+    /// Buffer `data` and flush complete 1 MiB chunks to the sink as encrypted.
     pub async fn feed(&mut self, data: &[u8]) -> Result<(), CryptoError> {
         let mut remaining = data;
         while !remaining.is_empty() {
@@ -386,33 +385,33 @@ impl EncryptSession {
         Ok(())
     }
 
-    /// Flush remaining buffered data, seek back to patch `plaintext_len`, and
-    /// return the file handle plus [`EnvelopeInfo`].
-    pub async fn finish(mut self) -> Result<(tokio::fs::File, EnvelopeInfo), CryptoError> {
+    /// Flush remaining buffered data, patch `plaintext_len` at its v2 header
+    /// position, and return the sink (now positioned at end-of-data) plus
+    /// [`EnvelopeInfo`].
+    pub async fn finish(
+        mut self,
+    ) -> Result<(crate::storage::streaming_sink::StreamingSink, EnvelopeInfo), CryptoError> {
         if !self.buf.is_empty() {
             self.flush_chunk().await?;
         }
         let cipher_size = self.bytes_written;
 
         // Patch plaintext_len at its position within the v2 envelope.
-        self.file
-            .seek(std::io::SeekFrom::Start(
+        self.sink
+            .write_all_at(
+                &self.plaintext_total.to_be_bytes(),
                 self.write_offset + V2_PLAINTEXT_LEN_OFFSET,
-            ))
-            .await
-            .map_err(|_| CryptoError::Aead("seek plaintext_len"))?;
-        self.file
-            .write_all(&self.plaintext_total.to_be_bytes())
+            )
             .await
             .map_err(|_| CryptoError::Aead("write plaintext_len"))?;
         // Return to end so callers can do further writes / flush / close.
-        self.file
-            .seek(std::io::SeekFrom::End(0))
+        self.sink
+            .seek_to_end()
             .await
             .map_err(|_| CryptoError::Aead("seek end"))?;
 
         Ok((
-            self.file,
+            self.sink,
             EnvelopeInfo {
                 envelope_version: FORMAT_VER_V2,
                 kem_alg: KEM_ALG_NAME,
@@ -438,7 +437,7 @@ impl EncryptSession {
 
         self.plaintext_total += plaintext_len as u64;
         self.bytes_written += self.buf.len() as u64;
-        self.file
+        self.sink
             .write_all(&self.buf)
             .await
             .map_err(|_| CryptoError::Aead("write chunk"))?;
@@ -694,30 +693,44 @@ mod tests {
         assert!(decrypt(sk.as_bytes(), &env).is_err());
     }
 
-    async fn tempfile_v2() -> tokio::fs::File {
+    async fn tempfile_v2() -> crate::storage::streaming_sink::StreamingSink {
         let path = std::env::temp_dir().join(format!("y2q_test_{}.env", rand_u64()));
-        tokio::fs::OpenOptions::new()
+        let file = tokio::fs::OpenOptions::new()
             .write(true)
             .read(true)
             .create(true)
             .truncate(true)
             .open(&path)
             .await
-            .unwrap()
+            .unwrap();
+        crate::storage::streaming_sink::StreamingSink::Tokio(file)
     }
 
-    async fn read_file(file: tokio::fs::File) -> Vec<u8> {
+    fn into_file(sink: crate::storage::streaming_sink::StreamingSink) -> tokio::fs::File {
+        match sink {
+            crate::storage::streaming_sink::StreamingSink::Tokio(f) => f,
+            #[cfg(all(target_os = "linux", feature = "uring"))]
+            _ => panic!("envelope tests expect a Tokio sink"),
+        }
+    }
+
+    async fn read_file(sink: crate::storage::streaming_sink::StreamingSink) -> Vec<u8> {
         use tokio::io::{AsyncReadExt, AsyncSeekExt};
-        let mut f = file;
+        let mut f = into_file(sink);
         f.seek(std::io::SeekFrom::Start(0)).await.unwrap();
         let mut buf = Vec::new();
         f.read_to_end(&mut buf).await.unwrap();
         buf
     }
 
-    async fn read_file_clone(file: &tokio::fs::File) -> Vec<u8> {
+    async fn read_file_clone(sink: &crate::storage::streaming_sink::StreamingSink) -> Vec<u8> {
+        let f = match sink {
+            crate::storage::streaming_sink::StreamingSink::Tokio(f) => f,
+            #[cfg(all(target_os = "linux", feature = "uring"))]
+            _ => panic!("envelope tests expect a Tokio sink"),
+        };
         use tokio::io::{AsyncReadExt, AsyncSeekExt};
-        let mut f = file.try_clone().await.unwrap();
+        let mut f = f.try_clone().await.unwrap();
         f.seek(std::io::SeekFrom::Start(0)).await.unwrap();
         let mut buf = Vec::new();
         f.read_to_end(&mut buf).await.unwrap();

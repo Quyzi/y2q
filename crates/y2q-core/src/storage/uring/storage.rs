@@ -214,7 +214,7 @@ impl UringStorage {
         &self,
         bucket: &str,
         key: &str,
-    ) -> Result<(UringStreamingPutGuard, tokio::fs::File), Error> {
+    ) -> Result<(UringStreamingPutGuard, super::streaming::UringStreamingWriter), Error> {
         validate_bucket(bucket)?;
         validate_key(key)?;
 
@@ -271,32 +271,39 @@ impl UringStorage {
 
         let lock = self.locks.try_acquire(bucket, key)?;
 
-        // Open the tmp file and write a placeholder `.obj` header so the
-        // EncryptSession starts writing at data_offset (= HEADER_SIZE = 64).
-        let mut file = tokio::fs::OpenOptions::new()
-            .write(true)
-            .read(true)
-            .create(true)
-            .truncate(true)
-            .open(&tmp_path)
+        // Create the tmp file and write a placeholder `.obj` header via the
+        // uring worker that owns this (bucket, key) shard. All subsequent
+        // stream writes route through the same worker so per-key serialization
+        // is preserved.
+        let tx = self.pool.dispatch_for_key(bucket, key).clone();
+        let placeholder = vec![0u8; super::format::HEADER_SIZE];
+        let (reply, reply_rx) = tokio::sync::oneshot::channel();
+        tx.send(UringOp::StreamCreate {
+            path: tmp_path.clone(),
+            placeholder,
+            reply,
+        })
+        .await
+        .map_err(|_| Error::InternalError {
+            bucket: bucket.to_owned(),
+            key: key.to_owned(),
+            operation: "begin_streaming_put".to_owned(),
+            message: "worker pool closed".to_owned(),
+        })?;
+        reply_rx
             .await
-            .map_err(|e| Error::InternalError {
+            .map_err(|_| Error::InternalError {
                 bucket: bucket.to_owned(),
                 key: key.to_owned(),
                 operation: "begin_streaming_put".to_owned(),
-                message: format!("open tmp: {e}"),
-            })?;
+                message: "worker reply dropped".to_owned(),
+            })??;
 
-        use tokio::io::AsyncWriteExt as _;
-        let placeholder = [0u8; super::format::HEADER_SIZE];
-        file.write_all(&placeholder)
-            .await
-            .map_err(|e| Error::InternalError {
-                bucket: bucket.to_owned(),
-                key: key.to_owned(),
-                operation: "begin_streaming_put".to_owned(),
-                message: format!("write placeholder header: {e}"),
-            })?;
+        let writer = super::streaming::UringStreamingWriter::new(
+            tx,
+            tmp_path.clone(),
+            super::streaming::URING_STREAMING_WRITE_OFFSET,
+        );
 
         let guard = UringStreamingPutGuard::new(
             tmp_path,
@@ -310,7 +317,7 @@ impl UringStorage {
             self.index.clone(),
         );
 
-        Ok((guard, file))
+        Ok((guard, writer))
     }
 }
 
@@ -826,8 +833,7 @@ mod tests {
         assert_eq!(meta.bucket, "b");
         assert_eq!(meta.key, "k");
         assert_eq!(meta.labels.get("env"), Some(&"prod".to_owned()));
-        assert!(!meta.checksum_md5.is_empty());
-        assert!(!meta.checksum_sha256.is_empty());
+        assert!(!meta.checksum_gxhash.is_empty());
     }
 
     #[tokio::test]

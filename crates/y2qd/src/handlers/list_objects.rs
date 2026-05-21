@@ -35,10 +35,8 @@ pub struct MetadataView {
     pub modified: u64,
     /// Size of the object in bytes.
     pub size: u64,
-    /// Full 16-byte MD5 digest as standard base64 (24 chars, padded).
-    pub checksum_md5: String,
-    /// Full 32-byte SHA-256 digest as standard base64 (44 chars, padded).
-    pub checksum_sha256: String,
+    /// 8-byte gxhash64 digest as standard base64 (12 chars, padded).
+    pub checksum_gxhash: String,
     /// Bucket the object belongs to.
     pub bucket: String,
     /// Object key within the bucket.
@@ -72,8 +70,7 @@ impl From<Metadata> for MetadataView {
             created: m.created,
             modified: m.modified,
             size: m.size,
-            checksum_md5: m.checksum_md5,
-            checksum_sha256: m.checksum_sha256,
+            checksum_gxhash: m.checksum_gxhash,
             bucket: m.bucket,
             key: m.key,
             disk_path: m.disk_path.to_string_lossy().into_owned(),

@@ -11,9 +11,10 @@
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use bytes::Bytes;
-use md5::Md5;
-use sha2::{Digest, Sha256};
+use gxhash::GxHasher;
+use std::hash::Hasher;
 use y2q_core::crypto::{DecryptedKeystore, envelope};
+use y2q_core::storage::streaming_sink::StreamingSink;
 use y2q_core::{CipherMetadata, PlaintextMetrics};
 
 use crate::error::AppError;
@@ -74,15 +75,15 @@ pub fn is_encrypted_envelope(bytes: &[u8]) -> bool {
 pub async fn stream_encrypt_for_put(
     keystore: &DecryptedKeystore,
     mut stream: actix_web::web::Payload,
-    file: tokio::fs::File,
+    sink: StreamingSink,
     bucket: &str,
     key: &str,
     write_offset: u64,
-) -> Result<(tokio::fs::File, PlaintextMetrics, CipherMetadata), AppError> {
+) -> Result<(StreamingSink, PlaintextMetrics, CipherMetadata), AppError> {
     use futures::StreamExt;
 
     let mut session =
-        envelope::EncryptSession::new(file, &keystore.public.public_key, write_offset)
+        envelope::EncryptSession::new(sink, &keystore.public.public_key, write_offset)
             .await
             .map_err(|_| {
                 AppError(y2q_core::Error::EncryptionFailed {
@@ -91,8 +92,7 @@ pub async fn stream_encrypt_for_put(
                 })
             })?;
 
-    let mut md5_hasher = Md5::new();
-    let mut sha_hasher = Sha256::new();
+    let mut hasher = GxHasher::with_seed(0);
     let mut plaintext_size: u64 = 0;
 
     while let Some(chunk) = stream.next().await {
@@ -104,8 +104,7 @@ pub async fn stream_encrypt_for_put(
                 message: e.to_string(),
             })
         })?;
-        md5_hasher.update(&chunk);
-        sha_hasher.update(&chunk);
+        hasher.write(&chunk);
         plaintext_size += chunk.len() as u64;
         session.feed(&chunk).await.map_err(|_| {
             AppError(y2q_core::Error::EncryptionFailed {
@@ -115,24 +114,22 @@ pub async fn stream_encrypt_for_put(
         })?;
     }
 
-    let (file, info) = session.finish().await.map_err(|_| {
+    let (sink, info) = session.finish().await.map_err(|_| {
         AppError(y2q_core::Error::EncryptionFailed {
             bucket: bucket.to_owned(),
             key: key.to_owned(),
         })
     })?;
 
-    let md5_digest = md5_hasher.finalize();
-    let sha_digest = sha_hasher.finalize();
+    let digest = hasher.finish().to_le_bytes();
 
     let cipher_size = info.cipher_size;
-    // Compute SHA-256 of the on-disk envelope by reading it back would be
-    // expensive; omit cipher_sha256 for streaming puts (set to empty string).
-    // The plaintext checksums remain authoritative for integrity.
+    // SHA-256 of the on-disk envelope would require a read-back; omit
+    // cipher_sha256 here (set to empty string). The plaintext checksum
+    // is a non-cryptographic gxhash64 for fast corruption detection.
     let plaintext_metrics = PlaintextMetrics {
         size: plaintext_size,
-        checksum_md5_b64: B64.encode(md5_digest),
-        checksum_sha256_b64: B64.encode(sha_digest),
+        checksum_gxhash_b64: B64.encode(digest),
     };
     let cipher_metadata = CipherMetadata {
         cipher_size,
@@ -142,5 +139,5 @@ pub async fn stream_encrypt_for_put(
         envelope_version: info.envelope_version,
     };
 
-    Ok((file, plaintext_metrics, cipher_metadata))
+    Ok((sink, plaintext_metrics, cipher_metadata))
 }

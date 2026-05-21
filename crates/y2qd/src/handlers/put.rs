@@ -20,10 +20,10 @@ use crate::handlers::labels::extract_labels;
 /// Any request header matching `X-Y2Q-<label>` (case-insensitive) is captured
 /// as a custom label and persisted with the object. The label name is
 /// lowercased on storage. The reserved names `X-Y2Q-Created`,
-/// `X-Y2Q-Modified`, `X-Y2Q-Checksum-MD5`, and `X-Y2Q-Checksum-SHA256` are
-/// emitted by the server on `HEAD` and may not be supplied by clients;
-/// supplying any reserved name returns 400. When the same label is sent
-/// multiple times, the last value wins.
+/// `X-Y2Q-Modified`, and `X-Y2Q-Checksum-GxHash` are emitted by the server
+/// on `HEAD` and may not be supplied by clients; supplying any reserved name
+/// returns 400. When the same label is sent multiple times, the last value
+/// wins.
 ///
 /// Returns 201 Created if the key did not previously exist, or 200 OK if an
 /// existing object was replaced.
@@ -39,7 +39,7 @@ use crate::handlers::labels::extract_labels;
         content = Vec<u8>,
         content_type = "application/octet-stream",
         description = "Raw object bytes to store. Custom labels may be attached via `X-Y2Q-<label>` request headers; \
-            the reserved names `Created`, `Modified`, `Checksum-MD5`, `Checksum-SHA256` are rejected.",
+            the reserved names `Created`, `Modified`, `Checksum-GxHash` are rejected.",
     ),
     responses(
         (status = 201, description = "Object created"),
@@ -65,18 +65,18 @@ pub async fn handle(
     let labels = extract_labels(&req, limits.get_ref())?;
     let sync = parse_sync_header(&req, *default_sync.get_ref())?;
 
-    let (guard, file, write_offset) = storage
+    let (guard, sink, write_offset) = storage
         .begin_streaming_put(&bucket, &key)
         .await
         .map_err(AppError::from)?;
 
-    let (file, plaintext_metrics, cipher_metadata) =
-        cipher::stream_encrypt_for_put(&auth.keystore, payload, file, &bucket, &key, write_offset)
+    let (sink, plaintext_metrics, cipher_metadata) =
+        cipher::stream_encrypt_for_put(&auth.keystore, payload, sink, &bucket, &key, write_offset)
             .await?;
 
     let was_overwrite = guard
         .commit(
-            file,
+            sink,
             PutOptions {
                 labels,
                 sync,

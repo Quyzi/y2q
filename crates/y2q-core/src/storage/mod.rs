@@ -8,12 +8,14 @@
 //! - [`uring`] — Linux-only io_uring fast-path backend (feature-gated).
 
 pub mod any;
+pub mod bufpool;
 /// Portable tokio::fs-based storage backend.
 pub mod filesystem;
 /// Shared on-disk `.obj` single-file format used by both storage backends.
 pub mod format;
 pub mod index;
 pub mod locks;
+pub mod streaming_sink;
 
 #[cfg(all(target_os = "linux", feature = "uring"))]
 pub mod uring;

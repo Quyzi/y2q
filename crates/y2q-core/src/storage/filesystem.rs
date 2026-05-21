@@ -7,7 +7,6 @@ use std::{
 
 use base64::Engine;
 use bytes::Bytes;
-use sha2::Digest;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use uuid::Uuid;
 
@@ -179,11 +178,13 @@ fn validate_key(key: &str) -> Result<(), Error> {
     Ok(())
 }
 
-fn compute_checksums(data: &[u8]) -> (String, String) {
-    let md5_digest = md5::Md5::digest(data);
-    let sha256_digest = sha2::Sha256::digest(data);
+fn compute_checksum(data: &[u8]) -> String {
+    use gxhash::GxHasher;
+    use std::hash::Hasher;
+    let mut hasher = GxHasher::with_seed(0);
+    hasher.write(data);
     let engine = base64::engine::general_purpose::STANDARD;
-    (engine.encode(md5_digest), engine.encode(sha256_digest))
+    engine.encode(hasher.finish().to_le_bytes())
 }
 
 fn now_nanos() -> u64 {
@@ -279,8 +280,7 @@ impl StreamingPutGuard {
             created,
             modified: now,
             size: plaintext_metrics.size,
-            checksum_md5: plaintext_metrics.checksum_md5_b64,
-            checksum_sha256: plaintext_metrics.checksum_sha256_b64,
+            checksum_gxhash: plaintext_metrics.checksum_gxhash_b64,
             bucket: bucket.to_owned(),
             key: key.to_owned(),
             disk_path: self.obj_path.clone(),
@@ -698,16 +698,9 @@ impl Storage for FilesystemStorage {
             let now = now_nanos();
             let created = prior_created.unwrap_or(now);
 
-            let (size, checksum_md5, checksum_sha256) = match &options.plaintext_metrics {
-                Some(p) => (
-                    p.size,
-                    p.checksum_md5_b64.clone(),
-                    p.checksum_sha256_b64.clone(),
-                ),
-                None => {
-                    let (md5, sha) = compute_checksums(data);
-                    (data.len() as u64, md5, sha)
-                }
+            let (size, checksum_gxhash) = match &options.plaintext_metrics {
+                Some(p) => (p.size, p.checksum_gxhash_b64.clone()),
+                None => (data.len() as u64, compute_checksum(data)),
             };
             let (cipher_size, cipher_sha256, kem_alg, aead_alg, envelope_version) =
                 match &options.cipher_metadata {
@@ -725,8 +718,7 @@ impl Storage for FilesystemStorage {
                 created,
                 modified: now,
                 size,
-                checksum_md5,
-                checksum_sha256,
+                checksum_gxhash,
                 bucket: bucket.to_owned(),
                 key: key.to_owned(),
                 disk_path: obj_path.clone(),
@@ -1251,8 +1243,7 @@ mod tests {
         assert_eq!(meta.url_path, "b/k");
         assert!(meta.labels.is_empty());
         assert!(meta.disk_path.is_absolute());
-        assert_eq!(meta.checksum_md5.len(), 24);
-        assert_eq!(meta.checksum_sha256.len(), 44);
+        assert_eq!(meta.checksum_gxhash.len(), 12);
     }
 
     #[tokio::test]

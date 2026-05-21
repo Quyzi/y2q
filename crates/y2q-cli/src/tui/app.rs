@@ -182,8 +182,7 @@ impl App {
                             format!("Size:     {}", fmt_bytes(head.size)),
                             format!("Created:  {}", fmt_ns(head.created)),
                             format!("Modified: {}", fmt_ns(head.modified)),
-                            format!("MD5:      {}", head.checksum_md5),
-                            format!("SHA256:   {}", head.checksum_sha256),
+                            format!("GxHash:   {}", head.checksum_gxhash),
                         ];
                         for (k, v) in &head.labels {
                             lines.push(format!("Label     {k}: {v}"));

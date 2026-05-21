@@ -14,7 +14,8 @@ use bytes::Bytes;
 use crate::{
     CacheRebuildStatus, CipherMetadata, Error, FilesystemStorage, ListOptions, ListPage, Listing,
     Metadata, Object, PlaintextMetrics, PutOptions, StaleLock, Storage, StorageExt,
-    StreamingPutGuard, storage::format::HEADER_SIZE,
+    StreamingPutGuard,
+    storage::{format::HEADER_SIZE, streaming_sink::StreamingSink},
 };
 
 #[cfg(all(target_os = "linux", feature = "uring"))]
@@ -124,21 +125,28 @@ impl AnyStreamingPutGuard {
     /// update the secondary metadata index.
     pub async fn commit(
         self,
-        file: tokio::fs::File,
+        sink: StreamingSink,
         options: PutOptions,
         plaintext_metrics: PlaintextMetrics,
         cipher_metadata: CipherMetadata,
     ) -> Result<bool, Error> {
-        match self {
-            Self::Filesystem(g) => {
+        match (self, sink) {
+            (Self::Filesystem(g), StreamingSink::Tokio(file)) => {
                 g.commit(file, options, plaintext_metrics, cipher_metadata)
                     .await
             }
             #[cfg(all(target_os = "linux", feature = "uring"))]
-            Self::Uring(g) => {
-                g.commit(file, options, plaintext_metrics, cipher_metadata)
+            (Self::Uring(g), StreamingSink::Uring(writer)) => {
+                g.commit(writer, options, plaintext_metrics, cipher_metadata)
                     .await
             }
+            #[cfg(all(target_os = "linux", feature = "uring"))]
+            _ => Err(Error::InternalError {
+                bucket: String::new(),
+                key: String::new(),
+                operation: "commit_streaming_put".to_owned(),
+                message: "streaming sink backend does not match guard backend".to_owned(),
+            }),
         }
     }
 }
@@ -157,18 +165,22 @@ impl AnyStorage {
         &self,
         bucket: &str,
         key: &str,
-    ) -> Result<(AnyStreamingPutGuard, tokio::fs::File, u64), Error> {
+    ) -> Result<(AnyStreamingPutGuard, StreamingSink, u64), Error> {
         match self {
             Self::Filesystem(s) => {
                 let (g, f) = s.begin_streaming_put(bucket, key).await?;
-                Ok((AnyStreamingPutGuard::Filesystem(g), f, HEADER_SIZE as u64))
+                Ok((
+                    AnyStreamingPutGuard::Filesystem(g),
+                    StreamingSink::Tokio(f),
+                    HEADER_SIZE as u64,
+                ))
             }
             #[cfg(all(target_os = "linux", feature = "uring"))]
             Self::Uring(s) => {
-                let (g, f) = s.begin_streaming_put(bucket, key).await?;
+                let (g, w) = s.begin_streaming_put(bucket, key).await?;
                 Ok((
                     AnyStreamingPutGuard::Uring(g),
-                    f,
+                    StreamingSink::Uring(w),
                     URING_STREAMING_WRITE_OFFSET,
                 ))
             }
