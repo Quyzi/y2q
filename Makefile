@@ -117,9 +117,9 @@ images-dev: image-dev image-dev-uring ## Build both dev image variants (Pyroscop
 # ---------------------------------------------------------------------------
 
 install-local: ## Build release binaries and install to ~/.cargo/bin
-	$(CARGO) install --path crates/y2q-cli
-	$(CARGO) install --path crates/y2qd
-	$(CARGO) install --path crates/y2q-warp
+	$(CARGO) install --force --path crates/y2q-cli
+	$(CARGO) install --force --path crates/y2qd
+	$(CARGO) install --force --path crates/y2q-warp
 
 # ---------------------------------------------------------------------------
 # Housekeeping
