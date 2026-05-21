@@ -140,6 +140,77 @@ pub enum Commands {
         #[arg(long, conflicts_with = "after")]
         all: bool,
     },
+    /// Disk usage summary across a remote prefix.
+    Du {
+        path: String,
+        /// Group results by the first N path components after the prefix.
+        #[arg(long, value_name = "N")]
+        depth: Option<u32>,
+    },
+    /// Render a remote prefix as a directory tree.
+    Tree {
+        path: String,
+        /// Maximum tree depth (0 = unlimited).
+        #[arg(long, value_name = "N")]
+        depth: Option<u32>,
+        /// Include leaf files (off by default — directories only).
+        #[arg(long)]
+        files: bool,
+    },
+    /// Filter a remote listing by name, size, and modified time.
+    Find {
+        path: String,
+        /// Glob pattern matched against the object basename.
+        #[arg(long, value_name = "GLOB")]
+        name: Option<String>,
+        /// Size filter: `+N` = ≥, `-N` = ≤, `N` = exact. Suffixes: k/K, m/M, g/G (decimal) or ki/Ki, mi/Mi, gi/Gi (binary).
+        #[arg(long, value_name = "EXPR")]
+        size: Option<String>,
+        /// Only entries older than this duration (e.g. `7d`, `30m`).
+        #[arg(long, value_name = "DUR")]
+        older_than: Option<String>,
+        /// Only entries newer than this duration.
+        #[arg(long, value_name = "DUR")]
+        newer_than: Option<String>,
+    },
+    /// Compare two trees and report what differs.
+    Diff { src: String, dst: String },
+    /// rsync-style one-way sync from src to dst.
+    Mirror {
+        src: String,
+        dst: String,
+        /// Overwrite destination entries when checksums differ.
+        #[arg(long)]
+        overwrite: bool,
+        /// Delete destination entries that are not present in source.
+        #[arg(long)]
+        remove: bool,
+        /// Glob patterns excluded from the sync.
+        #[arg(long, value_name = "GLOB", number_of_values = 1)]
+        exclude: Vec<String>,
+    },
+    /// Stream live PUT/DELETE/GET/HEAD events matching a remote prefix.
+    Watch {
+        path: String,
+        /// Restrict to specific HTTP methods (default: PUT, DELETE, GET, HEAD).
+        #[arg(long, value_name = "METHOD", number_of_values = 1)]
+        event: Vec<String>,
+    },
+    /// Probe liveness of a server alias.
+    Ping {
+        alias: String,
+        /// Number of probes to send.
+        #[arg(long, default_value_t = 4)]
+        count: u32,
+        /// Interval between probes in milliseconds.
+        #[arg(long, default_value_t = 1000)]
+        interval: u64,
+        /// Print only failed probes.
+        #[arg(long)]
+        error_only: bool,
+    },
+    /// Single readiness check; exit status is non-zero if the alias is not ready.
+    Ready { alias: String },
     /// Manage users and admin operations.
     Admin {
         #[command(subcommand)]

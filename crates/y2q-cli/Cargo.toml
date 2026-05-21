@@ -17,6 +17,7 @@ directories         = { workspace = true }
 figment             = { workspace = true }
 futures             = { workspace = true }
 glob                = "0.3"
+humantime           = { workspace = true }
 indexmap            = { workspace = true }
 ratatui             = { workspace = true }
 rpassword           = { workspace = true }
