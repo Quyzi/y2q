@@ -338,7 +338,8 @@ async fn read_meta_blob(
     let buf = unsafe { bufpool::acquire_uninit(header.meta_len as usize) };
     let (res, buf) = file.read_exact_at(buf, header.meta_offset()).await;
     res.map_err(|e| internal(bucket, key, op_name, format!("read meta: {e}")))?;
-    let result = if let Some(mek) = mek {
+
+    if let Some(mek) = mek {
         let plaintext = decrypt_meta(mek, &buf)
             .map_err(|e| internal(bucket, key, op_name, format!("decrypt meta: {e}")))?;
         bufpool::release(buf);
@@ -349,8 +350,7 @@ async fn read_meta_blob(
             .map_err(|e| internal(bucket, key, op_name, format!("decode meta: {e}")));
         bufpool::release(buf);
         r
-    };
-    result
+    }
 }
 
 // ───── operation handlers ────────────────────────────────────────────────────
@@ -406,18 +406,18 @@ async fn do_read_object_meta(path: PathBuf, mek: Option<[u8; 32]>) -> Result<Met
     let (res, meta_buf) = file.read_exact_at(meta_buf, header.meta_offset()).await;
     let _ = file.close().await;
     res.map_err(|e| make_err(format!("read meta: {e}")))?;
-    let result = if let Some(ref mek) = mek {
+
+    if let Some(ref mek) = mek {
         let plaintext =
             decrypt_meta(mek, &meta_buf).map_err(|e| make_err(format!("decrypt meta: {e}")))?;
         bufpool::release(meta_buf);
         serde_json::from_slice(&plaintext).map_err(|e| make_err(format!("decode meta: {e}")))
     } else {
-        let r = serde_json::from_slice(&meta_buf)
-            .map_err(|e| make_err(format!("decode meta: {e}")));
+        let r =
+            serde_json::from_slice(&meta_buf).map_err(|e| make_err(format!("decode meta: {e}")));
         bufpool::release(meta_buf);
         r
-    };
-    result
+    }
 }
 
 async fn do_get(
@@ -890,9 +890,6 @@ async fn finalize_rename_and_dir_fsync(
     Ok(())
 }
 
-/// Read the `created` timestamp from an existing object by parsing its
-/// header + metadata blob. Returns `None` if anything is unreadable; the
-/// caller falls back to "now" in that case.
 // ───── streaming-put op handlers ─────────────────────────────────────────────
 
 fn stream_err(path: &Path, op: &'static str, msg: impl std::fmt::Display) -> Error {

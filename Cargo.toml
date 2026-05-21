@@ -9,10 +9,6 @@ members = [
 ]
 resolver = "2"
 
-[profile.release]
-lto = "thin"
-codegen-units = 1
-
 [workspace.dependencies]
 actix-web                   = "4"
 aes-gcm                     = "0.10"
@@ -54,7 +50,6 @@ ring                        = "0.17"
 rpassword                   = "7"
 rustls                      = { version = "0.23", default-features = false, features = ["aws_lc_rs", "logging", "tls12", "std", "prefer-post-quantum"] }
 rustls-pemfile              = "2"
-webpki-roots                = "0.26"
 serde                       = { version = "1", features = ["derive"] }
 serde_json                  = "1"
 sha2                        = "0.10"
@@ -72,5 +67,10 @@ tracing-subscriber          = { version = "0.3", features = ["env-filter", "json
 utoipa                      = "5"
 utoipa-swagger-ui           = { version = "9", features = ["actix-web"] }
 uuid                        = { version = "1", features = ["v4", "v5"] }
+webpki-roots                = "0.26"
 zeroize                     = { version = "1", features = ["derive"] }
 zstd                        = "0.13"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

@@ -214,7 +214,13 @@ impl UringStorage {
         &self,
         bucket: &str,
         key: &str,
-    ) -> Result<(UringStreamingPutGuard, super::streaming::UringStreamingWriter), Error> {
+    ) -> Result<
+        (
+            UringStreamingPutGuard,
+            super::streaming::UringStreamingWriter,
+        ),
+        Error,
+    > {
         validate_bucket(bucket)?;
         validate_key(key)?;
 
@@ -290,14 +296,12 @@ impl UringStorage {
             operation: "begin_streaming_put".to_owned(),
             message: "worker pool closed".to_owned(),
         })?;
-        reply_rx
-            .await
-            .map_err(|_| Error::InternalError {
-                bucket: bucket.to_owned(),
-                key: key.to_owned(),
-                operation: "begin_streaming_put".to_owned(),
-                message: "worker reply dropped".to_owned(),
-            })??;
+        reply_rx.await.map_err(|_| Error::InternalError {
+            bucket: bucket.to_owned(),
+            key: key.to_owned(),
+            operation: "begin_streaming_put".to_owned(),
+            message: "worker reply dropped".to_owned(),
+        })??;
 
         let writer = super::streaming::UringStreamingWriter::new(
             tx,
@@ -446,7 +450,7 @@ impl Storage for UringStorage {
             reply,
         };
         let dispatch_result = self.dispatch(op, bucket, key, "put", reply_rx).await;
-        let result = dispatch_result.map(|(is_overwrite, metadata)| (is_overwrite, metadata));
+        let result = dispatch_result;
         record_storage_op("put", &result, started.elapsed().as_secs_f64() * 1_000.0);
         let (is_overwrite, metadata) = result?;
 

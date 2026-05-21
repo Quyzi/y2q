@@ -126,11 +126,7 @@ mod tests {
 
     #[test]
     fn rejects_each_reserved_name_case_insensitively() {
-        for header in [
-            "X-Y2Q-Created",
-            "X-Y2Q-Modified",
-            "X-Y2Q-checksum-gxhash",
-        ] {
+        for header in ["X-Y2Q-Created", "X-Y2Q-Modified", "X-Y2Q-checksum-gxhash"] {
             let req = TestRequest::default()
                 .insert_header((header, "1"))
                 .to_http_request();

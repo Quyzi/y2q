@@ -221,8 +221,7 @@ fn rjust(data: &VecDeque<u64>, width: usize) -> Vec<u64> {
     }
     let skip = data.len().saturating_sub(width);
     let zeros = width.saturating_sub(data.len());
-    std::iter::repeat(0)
-        .take(zeros)
+    std::iter::repeat_n(0, zeros)
         .chain(data.iter().skip(skip).copied())
         .collect()
 }
@@ -273,8 +272,8 @@ pub async fn run_display(
                 }
             }
             event = events.next() => {
-                if let Some(Ok(Event::Key(key))) = event {
-                    if key.kind == KeyEventKind::Press {
+                if let Some(Ok(Event::Key(key))) = event
+                    && key.kind == KeyEventKind::Press {
                         match key.code {
                             KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => {
                                 user_quit = true;
@@ -283,7 +282,6 @@ pub async fn run_display(
                             _ => {}
                         }
                     }
-                }
             }
         }
         while let Ok(m) = rx.try_recv() {

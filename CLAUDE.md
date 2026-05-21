@@ -39,6 +39,22 @@ make check                                     # fmt-check + clippy + test (CI g
 | `uring` | yes | Linux io_uring storage backend. Hard `compile_error!` on non-Linux. |
 | `pyroscope` | no | Pyroscope continuous profiling via pprof-rs. Enable for profiling sessions. |
 
+## Required checks after any code change
+
+Before reporting a task complete, run all three and resolve every diagnostic:
+
+```bash
+cargo fmt --all
+cargo clippy --all-targets --all-features -- -D warnings
+cargo build --all-targets --all-features
+```
+
+Rules:
+- `cargo fmt --all` must leave no diff (`cargo fmt --all -- --check` exits 0).
+- `cargo clippy --all-targets --all-features` must emit zero warnings. Fix the cause; do not silence with `#[allow(...)]` unless the lint is genuinely wrong for the call site, and add a one-line comment explaining why when you do.
+- `cargo build --all-targets --all-features` must emit zero warnings (e.g. `empty_line_after_doc_comments`, unused imports, dead code).
+- `make check` is the CI gate (fmt-check + clippy + test) and must pass before any commit or PR.
+
 ## Architecture Notes
 
 - Daemon entry: `crates/y2qd/src/main.rs`

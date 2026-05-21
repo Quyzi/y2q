@@ -14,6 +14,7 @@ use crate::generator::ObjectPool;
 use crate::metrics::OpRecord;
 use crate::ops::{OpKind, delete, get, list, put, stat};
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_worker(
     config: Arc<RunConfig>,
     client: y2q_client::Y2qClient,
@@ -85,10 +86,10 @@ async fn execute_op(
             let key = format!("warp/{run_id}/{seq:08}");
             let size = config.obj_size.sample(rng);
             let rec = put::put_op(client, bucket, &key, size, run_id).await;
-            if rec.error.is_none() {
-                if let Some(p) = pool {
-                    p.on_put_success(key).await;
-                }
+            if rec.error.is_none()
+                && let Some(p) = pool
+            {
+                p.on_put_success(key).await;
             }
             rec
         }
@@ -120,10 +121,10 @@ async fn execute_op(
                 None => return None,
             };
             let rec = delete::delete_op(client, bucket, &key, run_id).await;
-            if rec.error.is_some() {
-                if let Some(p) = pool {
-                    p.return_key(key).await;
-                }
+            if rec.error.is_some()
+                && let Some(p) = pool
+            {
+                p.return_key(key).await;
             }
             rec
         }
@@ -142,13 +143,13 @@ async fn execute_op(
 }
 
 fn pick_op(op: &OpKind, weights: Option<&MixedWeights>, rng: &mut impl Rng) -> OpKind {
-    if *op != OpKind::Put || weights.is_some() {
-        if let Some(w) = weights {
-            let ops = [OpKind::Get, OpKind::Put, OpKind::Delete, OpKind::Stat];
-            let ws = [w.get, w.put, w.delete, w.stat];
-            let dist = WeightedIndex::new(ws).expect("valid weights");
-            return ops[dist.sample(rng)];
-        }
+    if (*op != OpKind::Put || weights.is_some())
+        && let Some(w) = weights
+    {
+        let ops = [OpKind::Get, OpKind::Put, OpKind::Delete, OpKind::Stat];
+        let ws = [w.get, w.put, w.delete, w.stat];
+        let dist = WeightedIndex::new(ws).expect("valid weights");
+        return ops[dist.sample(rng)];
     }
     *op
 }

@@ -132,17 +132,17 @@ impl OpHistograms {
         let throughput_mibps = (self.total_bytes as f64 / (1024.0 * 1024.0)) / duration_s;
         let ops_per_sec = (self.n_ops - self.n_errors) as f64 / duration_s;
 
-        let ttfb_p50 = if self.ttfb.len() > 0 {
+        let ttfb_p50 = if !self.ttfb.is_empty() {
             Some(self.ttfb.value_at_quantile(0.50))
         } else {
             None
         };
-        let ttfb_p90 = if self.ttfb.len() > 0 {
+        let ttfb_p90 = if !self.ttfb.is_empty() {
             Some(self.ttfb.value_at_quantile(0.90))
         } else {
             None
         };
-        let ttfb_p99 = if self.ttfb.len() > 0 {
+        let ttfb_p99 = if !self.ttfb.is_empty() {
             Some(self.ttfb.value_at_quantile(0.99))
         } else {
             None
@@ -178,10 +178,10 @@ pub fn ns_to_ms_str(ns: u64) -> String {
 /// Handles both direct HTTP status strings ("HTTP 404 Not Found") and
 /// ClientError Display variants ("not found: …", "server error (502): …").
 pub fn classify_http_error(error: &str) -> (bool, bool) {
-    if let Some(rest) = error.strip_prefix("HTTP ") {
-        if let Ok(code) = rest.split_whitespace().next().unwrap_or("").parse::<u16>() {
-            return (code >= 400 && code < 500, code >= 500);
-        }
+    if let Some(rest) = error.strip_prefix("HTTP ")
+        && let Ok(code) = rest.split_whitespace().next().unwrap_or("").parse::<u16>()
+    {
+        return ((400..500).contains(&code), code >= 500);
     }
     if error.starts_with("not found:")
         || error.starts_with("bad request:")
@@ -191,7 +191,7 @@ pub fn classify_http_error(error: &str) -> (bool, bool) {
     }
     if let Some(rest) = error.strip_prefix("server error (") {
         if let Ok(code) = rest.split(')').next().unwrap_or("").parse::<u16>() {
-            return (code >= 400 && code < 500, code >= 500);
+            return ((400..500).contains(&code), code >= 500);
         }
         return (false, true);
     }
