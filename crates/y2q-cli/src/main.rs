@@ -121,6 +121,43 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         } => cmd::cp::run(src, dst, label, sync, recursive, mode).await,
         Commands::Get { src, dst } => cmd::cp::run(src, dst, Vec::new(), None, false, mode).await,
         Commands::Pipe { dst, label, sync } => cmd::pipe::run(dst, label, sync, mode).await,
+        Commands::Du { path, depth } => cmd::du::run(path, depth, mode).await,
+        Commands::Tree { path, depth, files } => cmd::tree::run(path, depth, files, mode).await,
+        Commands::Find {
+            path,
+            name,
+            size,
+            older_than,
+            newer_than,
+        } => cmd::find::run(path, name, size, older_than, newer_than, mode).await,
+        Commands::Diff { src, dst } => cmd::diff::run(src, dst, mode).await,
+        Commands::Mirror {
+            src,
+            dst,
+            overwrite,
+            remove,
+            exclude,
+        } => {
+            cmd::mirror::run(
+                src,
+                dst,
+                cmd::mirror::Options {
+                    overwrite,
+                    remove,
+                    exclude,
+                },
+                mode,
+            )
+            .await
+        }
+        Commands::Watch { path, event } => cmd::watch::run(path, event, mode).await,
+        Commands::Ping {
+            alias,
+            count,
+            interval,
+            error_only,
+        } => cmd::health::ping(&alias, count, interval, error_only, mode).await,
+        Commands::Ready { alias } => cmd::health::ready(&alias, mode).await,
         Commands::Completions { shell } => {
             cmd::completions::run(shell);
             Ok(())
