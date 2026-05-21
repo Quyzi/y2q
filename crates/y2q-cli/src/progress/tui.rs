@@ -4,6 +4,7 @@ use std::io::Write;
 use crossterm::{
     cursor, execute,
     style::{Color, Print, ResetColor, SetForegroundColor},
+    terminal::{Clear, ClearType},
 };
 
 use crate::output::fmt_bytes;
@@ -86,11 +87,31 @@ impl TuiProgressReporter {
         let done_str = fmt_bytes(bytes_done);
         let speed_str = fmt_bytes(speed_bps);
 
+        // Build particle empty zone
+        let mut empty_chars: Vec<&str> = vec!["░"; remaining];
+        if remaining > 0 {
+            for &(base_off, ch) in PARTICLES {
+                let pos = (base_off + frame / 2) % remaining;
+                empty_chars[pos] = ch;
+            }
+        }
+
+        // Budget sparkline width to whatever fits after the rest of the line.
+        let label_str = format!("{}: ", self.label);
+        let stats_str = format!("  {done_str}  {speed_str}/s  ");
+        let fixed_visible = label_str.chars().count()
+            + 1 // "["
+            + bar_width
+            + 1 // "]"
+            + pct_str.chars().count()
+            + stats_str.chars().count();
+        let spark_budget = term_width.saturating_sub(fixed_visible + 1);
+        let spark_take = spark_budget.min(20);
         let sparkline: String = self
             .samples
             .iter()
             .rev()
-            .take(20)
+            .take(spark_take)
             .rev()
             .map(|&s| {
                 let max = self.samples.iter().copied().max().unwrap_or(1);
@@ -99,20 +120,17 @@ impl TuiProgressReporter {
             })
             .collect();
 
-        // Build particle empty zone
-        let mut empty_chars: Vec<&str> = vec!["░"; remaining];
-        for &(base_off, ch) in PARTICLES {
-            let pos = (base_off + frame / 2) % remaining.max(1);
-            empty_chars[pos] = ch;
-        }
-
-        let _ = execute!(stderr, cursor::MoveToColumn(0));
+        let _ = execute!(
+            stderr,
+            cursor::MoveToColumn(0),
+            Clear(ClearType::UntilNewLine),
+        );
 
         // Label
         let _ = execute!(
             stderr,
             SetForegroundColor(NEON_PINK),
-            Print(format!("{}: ", self.label)),
+            Print(&label_str),
             ResetColor,
         );
 
@@ -158,27 +176,12 @@ impl TuiProgressReporter {
             Print(&pct_str),
             ResetColor,
             SetForegroundColor(NORMAL),
-            Print(format!("  {done_str}  {speed_str}/s  ")),
+            Print(&stats_str),
             ResetColor,
             SetForegroundColor(NEON_PURPLE),
             Print(&sparkline),
             ResetColor,
         );
-
-        // Pad to overwrite any previously-longer line
-        let visible = self.label.chars().count()
-            + 2  // ": "
-            + 2  // "[ "
-            + bar_width
-            + pct_str.chars().count()
-            + 2 + done_str.chars().count()
-            + 2 + speed_str.chars().count()
-            + 3  // "/s  "
-            + sparkline.chars().count();
-        let pad = term_width.saturating_sub(visible);
-        if pad > 0 {
-            let _ = execute!(stderr, Print(" ".repeat(pad)));
-        }
 
         let _ = stderr.flush();
     }
