@@ -9,7 +9,7 @@ mod progress;
 mod token;
 mod tui;
 
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 use tracing_subscriber::EnvFilter;
 
 use cli::{AdminCmd, Cli, Commands};
@@ -21,11 +21,24 @@ use output::OutputMode;
 async fn main() {
     let cli = Cli::parse();
 
-    let filter = match cli.verbose {
-        0 => "warn",
-        1 => "info",
-        2 => "debug",
-        _ => "trace",
+    if cli.no_color || std::env::var_os("NO_COLOR").is_some() {
+        // Honor NO_COLOR universally for downstream code that consults the env.
+        // SAFETY: single-threaded at startup.
+        unsafe {
+            std::env::set_var("NO_COLOR", "1");
+        }
+    }
+
+    let effective_verbose = if cli.debug { 4 } else { cli.verbose };
+    let filter = if cli.quiet && !cli.debug {
+        "error"
+    } else {
+        match effective_verbose {
+            0 => "warn",
+            1 => "info",
+            2 => "debug",
+            _ => "trace",
+        }
     };
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -47,48 +60,72 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         OutputMode::Human
     };
 
-    match cli.command {
-        None | Some(Commands::Tui) => {
+    let Some(command) = cli.command else {
+        // Bare invocation: print help instead of launching the TUI. Run `y2q tui`
+        // for the interactive explorer.
+        Cli::command().print_help().ok();
+        println!();
+        return Ok(());
+    };
+
+    match command {
+        Commands::Tui => {
             let config_path = cli
                 .config
                 .unwrap_or_else(|| default_config_path().unwrap_or_default());
             let config = CliConfig::load(&config_path)?;
             tui::run_tui(config).await
         }
-        Some(Commands::Config { cmd }) => cmd::config::run(cmd, mode).await,
-        Some(Commands::Login {
+        Commands::Alias { cmd } => cmd::alias::run(cmd, mode).await,
+        Commands::Login {
             alias,
             user,
             password,
             ttl,
-        }) => cmd::auth::login(&alias, user, password, ttl, mode).await,
-        Some(Commands::Logout { alias }) => cmd::auth::logout(&alias, mode).await,
-        Some(Commands::Passwd {
+        } => cmd::auth::login(&alias, user, password, ttl, mode).await,
+        Commands::Logout { alias } => cmd::auth::logout(&alias, mode).await,
+        Commands::Passwd {
             alias,
             current,
             new,
-        }) => cmd::auth::passwd(&alias, current, new, mode).await,
-        Some(Commands::Ls {
+        } => cmd::auth::passwd(&alias, current, new, mode).await,
+        Commands::Ls {
             path,
             limit,
             after,
             all,
-        }) => cmd::listing::run(path, limit, after, all, mode).await,
-        Some(Commands::Rm { path, force }) => cmd::objects::rm(path, force, mode).await,
-        Some(Commands::Stat { path }) => cmd::objects::stat(path, mode).await,
-        Some(Commands::Cat { path }) => cmd::objects::cat(path).await,
-        Some(Commands::Cp {
+        } => cmd::listing::run(path, limit, after, all, mode).await,
+        Commands::Rm { path, force } => cmd::objects::rm(path, force, mode).await,
+        Commands::Stat { path } => cmd::objects::stat(path, mode).await,
+        Commands::Cat { path } => cmd::objects::cat(path).await,
+        Commands::Head { path, bytes } => cmd::head::run(path, bytes).await,
+        Commands::Cp {
             src,
             dst,
             label,
             sync,
             recursive,
-        }) => cmd::cp::run(src, dst, label, sync, recursive, mode).await,
-        Some(Commands::Completions { shell }) => {
+        } => cmd::cp::run(src, dst, label, sync, recursive, mode).await,
+        Commands::Mv {
+            src,
+            dst,
+            label,
+            sync,
+        } => cmd::mv::run(src, dst, label, sync, mode).await,
+        Commands::Put {
+            src,
+            dst,
+            label,
+            sync,
+            recursive,
+        } => cmd::cp::run(src, dst, label, sync, recursive, mode).await,
+        Commands::Get { src, dst } => cmd::cp::run(src, dst, Vec::new(), None, false, mode).await,
+        Commands::Pipe { dst, label, sync } => cmd::pipe::run(dst, label, sync, mode).await,
+        Commands::Completions { shell } => {
             cmd::completions::run(shell);
             Ok(())
         }
-        Some(Commands::Admin { cmd }) => match cmd {
+        Commands::Admin { cmd } => match cmd {
             AdminCmd::User { cmd } => cmd::users::run(cmd, mode).await,
             AdminCmd::Rebuild { cmd } => cmd::admin::rebuild(cmd, mode).await,
             AdminCmd::Locks { cmd } => cmd::admin::locks(cmd, mode).await,

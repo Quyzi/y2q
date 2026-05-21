@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use y2q_client::Y2qClient;
 
-use crate::client_builder::client_from_profile;
+use crate::client_builder::client_from_alias;
 use crate::config::{CliConfig, default_config_path, default_tokens_path};
 use crate::error::CliError;
 use crate::output::{OutputMode, fmt_bytes, print_json};
@@ -337,10 +337,10 @@ async fn download(remote: &RemotePath, local_path: &str, mode: OutputMode) -> Re
 
 async fn make_client(alias: &str) -> Result<Y2qClient, CliError> {
     let config = CliConfig::load(&default_config_path()?)?;
-    let profile = config.get_profile(alias)?;
+    let entry = config.get_alias(alias)?;
     let store = TokenStore::load(&default_tokens_path()?)?;
     let token = store
         .token_for(alias)
         .ok_or(CliError::Client(y2q_client::ClientError::Unauthenticated))?;
-    client_from_profile(profile, Some(token))
+    client_from_alias(entry, Some(token))
 }

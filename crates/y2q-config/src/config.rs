@@ -19,14 +19,14 @@ pub fn default_tokens_path() -> Result<PathBuf, ConfigError> {
     Ok(config_dir()?.join("tokens.toml"))
 }
 
-/// A server profile. Deserializes `password` but never serializes it.
+/// A server alias entry. Deserializes `password` but never serializes it.
 #[derive(Debug, Clone, Deserialize)]
-pub struct Profile {
+pub struct Alias {
     pub url: String,
     pub username: String,
     #[serde(default)]
     pub password: Option<String>,
-    /// Skip TLS certificate verification for this profile. Use only for
+    /// Skip TLS certificate verification for this alias. Use only for
     /// self-signed dev/staging servers.
     #[serde(default)]
     pub insecure: bool,
@@ -42,7 +42,10 @@ pub struct Profile {
     pub client_key_path: Option<String>,
 }
 
-impl Serialize for Profile {
+/// Backwards-compatible alias for code still referencing the pre-rename name.
+pub type Profile = Alias;
+
+impl Serialize for Alias {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
         let mut len = 2;
@@ -58,7 +61,7 @@ impl Serialize for Profile {
         if self.client_key_path.is_some() {
             len += 1;
         }
-        let mut state = s.serialize_struct("Profile", len)?;
+        let mut state = s.serialize_struct("Alias", len)?;
         state.serialize_field("url", &self.url)?;
         state.serialize_field("username", &self.username)?;
         if self.insecure {
@@ -77,10 +80,19 @@ impl Serialize for Profile {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct CliConfig {
+    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
+    pub aliases: IndexMap<String, Alias>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct CliConfigRaw {
     #[serde(default)]
-    pub profiles: IndexMap<String, Profile>,
+    aliases: IndexMap<String, Alias>,
+    /// Legacy field, accepted on load and merged into `aliases`.
+    #[serde(default)]
+    profiles: IndexMap<String, Alias>,
 }
 
 impl CliConfig {
@@ -90,7 +102,20 @@ impl CliConfig {
         }
         check_permissions(path);
         let text = std::fs::read_to_string(path)?;
-        toml::from_str(&text).map_err(|e| ConfigError::Config(e.to_string()))
+        let raw: CliConfigRaw =
+            toml::from_str(&text).map_err(|e| ConfigError::Config(e.to_string()))?;
+        let migrated_from_profiles = !raw.profiles.is_empty();
+        let mut aliases = raw.aliases;
+        for (k, v) in raw.profiles {
+            aliases.entry(k).or_insert(v);
+        }
+        if migrated_from_profiles {
+            eprintln!(
+                "note: migrated legacy [profiles.*] sections to [aliases.*] in {} on next save",
+                path.display()
+            );
+        }
+        Ok(Self { aliases })
     }
 
     pub fn save(&self, path: &Path) -> Result<(), ConfigError> {
@@ -103,18 +128,18 @@ impl CliConfig {
         Ok(())
     }
 
-    pub fn get_profile(&self, alias: &str) -> Result<&Profile, ConfigError> {
-        self.profiles
+    pub fn get_alias(&self, alias: &str) -> Result<&Alias, ConfigError> {
+        self.aliases
             .get(alias)
             .ok_or_else(|| ConfigError::UnknownAlias(alias.to_owned()))
     }
 
-    pub fn add_profile(&mut self, alias: String, profile: Profile) {
-        self.profiles.insert(alias, profile);
+    pub fn add_alias(&mut self, alias: String, entry: Alias) {
+        self.aliases.insert(alias, entry);
     }
 
-    pub fn remove_profile(&mut self, alias: &str) -> bool {
-        self.profiles.shift_remove(alias).is_some()
+    pub fn remove_alias(&mut self, alias: &str) -> bool {
+        self.aliases.shift_remove(alias).is_some()
     }
 }
 
@@ -142,7 +167,7 @@ pub fn check_permissions(path: &Path) {
             let mode = meta.permissions().mode();
             if mode & 0o077 != 0 {
                 eprintln!(
-                    "Warning: {} has permissions {:04o} — set to 0600 to protect your credentials.",
+                    "Warning: {} has permissions {:04o} - set to 0600 to protect your credentials.",
                     path.display(),
                     mode & 0o777
                 );

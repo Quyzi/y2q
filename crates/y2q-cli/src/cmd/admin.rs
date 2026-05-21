@@ -2,7 +2,7 @@ use futures::StreamExt;
 use y2q_client::Y2qClient;
 
 use crate::cli::{LocksCmd, RebuildCmd};
-use crate::client_builder::client_from_profile;
+use crate::client_builder::client_from_alias;
 use crate::config::{CliConfig, default_config_path, default_tokens_path};
 use crate::error::CliError;
 use crate::output::{OutputMode, fmt_bytes, print_json, print_table};
@@ -45,7 +45,7 @@ pub async fn rebuild(cmd: RebuildCmd, mode: OutputMode) -> Result<(), CliError> 
 
 pub async fn locks(cmd: LocksCmd, mode: OutputMode) -> Result<(), CliError> {
     match cmd {
-        LocksCmd::Ls { alias, older_than } => {
+        LocksCmd::List { alias, older_than } => {
             let client = make_client(&alias).await?;
             let locks = client.locks_list(&older_than).await?;
             if mode == OutputMode::Json {
@@ -127,10 +127,10 @@ fn ansi_status(status: u16) -> (&'static str, &'static str) {
 
 async fn make_client(alias: &str) -> Result<Y2qClient, CliError> {
     let config = CliConfig::load(&default_config_path()?)?;
-    let profile = config.get_profile(alias)?;
+    let entry = config.get_alias(alias)?;
     let store = TokenStore::load(&default_tokens_path()?)?;
     let token = store
         .token_for(alias)
         .ok_or(CliError::Client(y2q_client::ClientError::Unauthenticated))?;
-    client_from_profile(profile, Some(token))
+    client_from_alias(entry, Some(token))
 }

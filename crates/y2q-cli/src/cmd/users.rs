@@ -2,7 +2,7 @@ use y2q_client::Y2qClient;
 use zeroize::Zeroizing;
 
 use crate::cli::UserCmd;
-use crate::client_builder::client_from_profile;
+use crate::client_builder::client_from_alias;
 use crate::config::{CliConfig, default_config_path, default_tokens_path};
 use crate::error::CliError;
 use crate::output::{OutputMode, fmt_ns, print_json, print_table};
@@ -32,7 +32,7 @@ pub async fn run(cmd: UserCmd, mode: OutputMode) -> Result<(), CliError> {
             }
         }
 
-        UserCmd::Ls { alias } => {
+        UserCmd::List { alias } => {
             let client = make_client(&alias).await?;
             let users = client.list_users().await?;
             if mode == OutputMode::Json {
@@ -52,7 +52,7 @@ pub async fn run(cmd: UserCmd, mode: OutputMode) -> Result<(), CliError> {
             }
         }
 
-        UserCmd::Rm { alias, username } => {
+        UserCmd::Remove { alias, username } => {
             let client = make_client(&alias).await?;
             client.delete_user(&username).await?;
             if mode == OutputMode::Json {
@@ -67,10 +67,10 @@ pub async fn run(cmd: UserCmd, mode: OutputMode) -> Result<(), CliError> {
 
 async fn make_client(alias: &str) -> Result<Y2qClient, CliError> {
     let config = CliConfig::load(&default_config_path()?)?;
-    let profile = config.get_profile(alias)?;
+    let entry = config.get_alias(alias)?;
     let store = TokenStore::load(&default_tokens_path()?)?;
     let token = store
         .token_for(alias)
         .ok_or(CliError::Client(y2q_client::ClientError::Unauthenticated))?;
-    client_from_profile(profile, Some(token))
+    client_from_alias(entry, Some(token))
 }
