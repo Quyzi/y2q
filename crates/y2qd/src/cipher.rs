@@ -10,7 +10,7 @@
 //! backend stores.
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use gxhash::GxHasher;
 use std::hash::Hasher;
 use y2q_core::crypto::{DecryptedKeystore, envelope};
@@ -22,17 +22,21 @@ use crate::error::AppError;
 /// Decrypt a GET body. If `bytes` is not a recognized y2q envelope (i.e.
 /// a legacy plaintext object written before encryption was wired in), return
 /// it as-is.
+///
+/// Takes an owned [`BytesMut`] so the AEAD open can run in-place on the
+/// input allocation, avoiding a full ciphertext-sized copy that the older
+/// `&[u8]` variant required.
 pub fn decrypt_after_get(
     keystore: &DecryptedKeystore,
     bucket: &str,
     key: &str,
-    bytes: &[u8],
+    bytes: BytesMut,
 ) -> Result<Bytes, AppError> {
-    if !envelope::looks_encrypted(bytes) {
-        return Ok(Bytes::copy_from_slice(bytes));
+    if !envelope::looks_encrypted(&bytes) {
+        return Ok(bytes.freeze());
     }
-    match envelope::decrypt(&keystore.secret_key, bytes) {
-        Ok(pt) => Ok(Bytes::from(pt)),
+    match envelope::decrypt_owned(&keystore.secret_key, bytes) {
+        Ok(pt) => Ok(pt),
         Err(y2q_core::crypto::CryptoError::UnsupportedVersion(v)) => {
             Err(AppError(y2q_core::Error::UnsupportedEnvelopeVersion {
                 version: v,
