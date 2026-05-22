@@ -99,6 +99,18 @@ pub struct ListBucketsResponse {
     pub buckets: Vec<String>,
 }
 
+/// Per-bucket configuration (quota / default-SSE / CORS). Mirrors the daemon's
+/// `BucketConfigBody`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BucketConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_sse: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cors_allow_origin: Option<String>,
+}
+
 // ── Trace ─────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize)]

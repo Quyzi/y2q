@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use actix_web::{HttpRequest, HttpResponse, web};
-use y2q_core::{AnyStorage, PutOptions, SyncLevel};
+use y2q_core::{AnyStorage, Listing, PutOptions, SyncLevel};
 
 use crate::auth::Authenticated;
 use crate::cipher;
@@ -64,6 +64,33 @@ pub async fn handle(
     let (bucket, key) = path.into_inner();
     let labels = extract_labels(&req, limits.get_ref())?;
     let sync = parse_sync_header(&req, *default_sync.get_ref())?;
+
+    // Quota enforcement: only buckets that actually set a quota pay the usage
+    // scan cost. Uses the request Content-Length as the incoming size estimate.
+    let cfg = storage
+        .get_bucket_config(&bucket)
+        .await
+        .map_err(AppError::from)?;
+    if let Some(limit) = cfg.quota_bytes {
+        let incoming = req
+            .headers()
+            .get("content-length")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        let used = storage
+            .bucket_usage(&bucket)
+            .await
+            .map_err(AppError::from)?;
+        if used + incoming > limit {
+            return Err(AppError(y2q_core::Error::QuotaExceeded {
+                bucket: bucket.clone(),
+                limit,
+                used,
+                incoming,
+            }));
+        }
+    }
 
     let (guard, sink, write_offset) = storage
         .begin_streaming_put(&bucket, &key)

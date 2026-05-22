@@ -63,6 +63,11 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             .route(web::delete().to(locks::clear)),
     );
     cfg.service(web::resource("/api/v1/trace").route(web::get().to(crate::trace::stream)));
+    cfg.service(
+        web::resource("/api/v1/buckets/{bucket}/config")
+            .route(web::get().to(buckets::get_config))
+            .route(web::put().to(buckets::set_config)),
+    );
 
     cfg.service(
         web::resource("/{bucket}/{tail}*")

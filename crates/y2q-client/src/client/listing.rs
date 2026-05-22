@@ -31,6 +31,29 @@ impl Y2qClient {
         Ok(body["objects_removed"].as_u64().unwrap_or(0))
     }
 
+    /// Fetch a bucket's configuration (quota / default-SSE / CORS).
+    pub async fn get_bucket_config(
+        &self,
+        bucket: &str,
+    ) -> Result<crate::model::BucketConfig, ClientError> {
+        let url = self.url(&format!("api/v1/buckets/{bucket}/config"));
+        let resp = self.authed(self.inner.get(url)).send().await?;
+        let resp = Self::check_status(resp).await?;
+        Ok(resp.json().await?)
+    }
+
+    /// Replace a bucket's configuration.
+    pub async fn set_bucket_config(
+        &self,
+        bucket: &str,
+        config: &crate::model::BucketConfig,
+    ) -> Result<crate::model::BucketConfig, ClientError> {
+        let url = self.url(&format!("api/v1/buckets/{bucket}/config"));
+        let resp = self.authed(self.inner.put(url)).json(config).send().await?;
+        let resp = Self::check_status(resp).await?;
+        Ok(resp.json().await?)
+    }
+
     pub async fn list_objects(
         &self,
         bucket: &str,

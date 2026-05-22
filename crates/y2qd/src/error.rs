@@ -84,6 +84,7 @@ impl ResponseError for AppError {
             | CoreError::TooManyLabels { .. }
             | CoreError::InvalidStaleLockThreshold { .. } => StatusCode::BAD_REQUEST,
             CoreError::Locked { .. } | CoreError::RebuildAlreadyRunning => StatusCode::CONFLICT,
+            CoreError::QuotaExceeded { .. } => StatusCode::PAYLOAD_TOO_LARGE,
             CoreError::Index { .. }
             | CoreError::InternalError { .. }
             | CoreError::KdfFailed { .. }

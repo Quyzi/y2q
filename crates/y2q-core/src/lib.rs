@@ -322,6 +322,19 @@ pub enum Error {
         value: String,
     },
 
+    /// A PUT would push the bucket's total size past its configured quota.
+    #[error("bucket `{bucket}` quota exceeded: {used} + {incoming} > {limit} bytes")]
+    QuotaExceeded {
+        /// Bucket the quota applies to.
+        bucket: String,
+        /// Configured quota in bytes.
+        limit: u64,
+        /// Bytes currently stored in the bucket.
+        used: u64,
+        /// Bytes the rejected PUT would have added.
+        incoming: u64,
+    },
+
     /// `pubkey.json` is missing — the daemon cannot serve traffic until
     /// first-run setup completes.
     #[error("keystore not found at {path}")]
@@ -457,6 +470,25 @@ pub trait Storage {
     ) -> Result<(), Error>;
 }
 
+/// Per-bucket configuration persisted as a JSON sidecar in the bucket
+/// directory. Every field is optional so the file stays forward-compatible and
+/// an absent file deserializes to all-`None` defaults.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BucketConfig {
+    /// Maximum total size of all objects in the bucket, in bytes. Enforced on
+    /// PUT when set. `None` means unlimited.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_bytes: Option<u64>,
+    /// Requested default server-side-encryption algorithm label. Informational:
+    /// y2q always encrypts objects, so this records operator intent only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_sse: Option<String>,
+    /// CORS allowed-origin value emitted on object responses
+    /// (`Access-Control-Allow-Origin`). `*` or a specific origin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cors_allow_origin: Option<String>,
+}
+
 /// Enumerate buckets and the objects within them.
 ///
 /// Listing is a paginated, sorted view: results come back ordered by key, and
@@ -481,6 +513,17 @@ pub trait Listing: Storage {
     /// objects removed. Returns [`Error::NotFound`] if the bucket neither
     /// exists on disk nor has any indexed objects.
     async fn delete_bucket(&self, bucket: &str) -> Result<u64, Error>;
+
+    /// Read the bucket's configuration sidecar. Returns the default (all-`None`)
+    /// config if no sidecar exists.
+    async fn get_bucket_config(&self, bucket: &str) -> Result<BucketConfig, Error>;
+
+    /// Write the bucket's configuration sidecar, creating the bucket directory
+    /// if needed.
+    async fn set_bucket_config(&self, bucket: &str, config: &BucketConfig) -> Result<(), Error>;
+
+    /// Sum the sizes of all objects currently in `bucket`.
+    async fn bucket_usage(&self, bucket: &str) -> Result<u64, Error>;
 }
 
 /// Reported state of the secondary-index rebuild process.
