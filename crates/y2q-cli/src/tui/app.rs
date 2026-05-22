@@ -12,7 +12,7 @@ use crate::progress::{CountingReader, CountingWriter, ProgressReporter};
 use crate::token::TokenStore;
 
 use super::actions::Action;
-use super::admin::{LocksView, RebuildView, UsersView};
+use super::admin::{EventsView, LocksView, MetricsView, RebuildView, UsersView};
 use super::events::{Event, RemoteFetchPath, RemoteFetchResult};
 use super::pane::{LocalPane, RemotePane};
 use super::state::{AdminTab, ConfirmAction, FocusedPane, InputAction, Mode};
@@ -50,6 +50,8 @@ pub struct App {
     pub rebuild: RebuildView,
     pub locks: LocksView,
     pub users_view: UsersView,
+    pub metrics_view: MetricsView,
+    pub events_view: EventsView,
     pub active_alias: Option<String>,
     pub event_tx: UnboundedSender<Event>,
     pub config: CliConfig,
@@ -71,6 +73,8 @@ impl App {
             rebuild: RebuildView::default(),
             locks: LocksView::default(),
             users_view: UsersView::default(),
+            metrics_view: MetricsView::default(),
+            events_view: EventsView::default(),
             active_alias: None,
             event_tx,
             config,
@@ -172,6 +176,25 @@ impl App {
             Event::LocksLoaded { locks, .. } => {
                 self.locks.locks = locks;
                 self.locks.loading = false;
+                Action::None
+            }
+            Event::MetricsLoaded { result, .. } => {
+                match result {
+                    Ok(raw) => self.metrics_view.set_raw(&raw),
+                    Err(e) => {
+                        self.metrics_view.loading = false;
+                        self.metrics_view.error = Some(e);
+                    }
+                }
+                Action::None
+            }
+            Event::TraceEventArrived { event, .. } => {
+                self.events_view.push(event);
+                Action::None
+            }
+            Event::TraceStreamEnded { error, .. } => {
+                self.events_view.streaming = false;
+                self.events_view.error = error;
                 Action::None
             }
             Event::ObjectStatFetched { path, result } => {
@@ -285,28 +308,27 @@ impl App {
                 }
                 KeyCode::Tab => {
                     let next = tab.next();
-                    match &next {
-                        AdminTab::Users => self.fetch_users(),
-                        AdminTab::Locks => self.fetch_locks(),
-                        _ => {}
-                    }
+                    self.enter_admin_tab(&next);
                     self.mode = Mode::Admin(next);
                     Action::NextTab
                 }
                 KeyCode::BackTab => {
                     let prev = tab.prev();
-                    match &prev {
-                        AdminTab::Users => self.fetch_users(),
-                        AdminTab::Locks => self.fetch_locks(),
-                        _ => {}
-                    }
+                    self.enter_admin_tab(&prev);
                     self.mode = Mode::Admin(prev);
                     Action::PrevTab
+                }
+                KeyCode::Char('r') => {
+                    if matches!(tab, AdminTab::Metrics) {
+                        self.fetch_metrics();
+                    }
+                    Action::Refresh
                 }
                 KeyCode::Up | KeyCode::Char('k') => {
                     match tab {
                         AdminTab::Locks => self.locks.nav_up(),
                         AdminTab::Users => self.users_view.nav_up(),
+                        AdminTab::Metrics => self.metrics_view.nav_up(),
                         _ => {}
                     }
                     Action::NavigateUp
@@ -315,6 +337,7 @@ impl App {
                     match tab {
                         AdminTab::Locks => self.locks.nav_down(),
                         AdminTab::Users => self.users_view.nav_down(),
+                        AdminTab::Metrics => self.metrics_view.nav_down(),
                         _ => {}
                     }
                     Action::NavigateDown
@@ -806,6 +829,109 @@ impl App {
             .await;
             if let Ok(locks) = result {
                 let _ = tx.send(super::events::Event::LocksLoaded { alias, locks });
+            }
+        });
+    }
+
+    /// Kick off the data load for the admin tab the user just switched to.
+    fn enter_admin_tab(&mut self, tab: &AdminTab) {
+        match tab {
+            AdminTab::Users => self.fetch_users(),
+            AdminTab::Locks => self.fetch_locks(),
+            AdminTab::Metrics => self.fetch_metrics(),
+            AdminTab::Events => self.start_trace_stream(),
+            AdminTab::Rebuild => {}
+        }
+    }
+
+    pub fn fetch_metrics(&mut self) {
+        let alias = match &self.active_alias {
+            Some(a) => a.clone(),
+            None => return,
+        };
+        self.metrics_view.loading = true;
+        let tx = self.event_tx.clone();
+        let config = self.config.clone();
+        let tokens_path = default_tokens_path().unwrap_or_default();
+        tokio::spawn(async move {
+            let result = async {
+                let profile = config
+                    .aliases
+                    .get(&alias)
+                    .ok_or_else(|| format!("unknown alias `{alias}`"))?;
+                let store = TokenStore::load(&tokens_path).map_err(|e| e.to_string())?;
+                let token = store
+                    .token_for(&alias)
+                    .ok_or_else(|| "not authenticated".to_string())?;
+                let client = client_from_alias(profile, Some(token)).map_err(|e| e.to_string())?;
+                client.prometheus_metrics().await.map_err(|e| e.to_string())
+            }
+            .await;
+            let _ = tx.send(super::events::Event::MetricsLoaded { alias, result });
+        });
+    }
+
+    /// Start a long-lived trace SSE forwarder. Idempotent: does nothing if a
+    /// stream is already running.
+    pub fn start_trace_stream(&mut self) {
+        if self.events_view.streaming {
+            return;
+        }
+        let alias = match &self.active_alias {
+            Some(a) => a.clone(),
+            None => return,
+        };
+        self.events_view.streaming = true;
+        self.events_view.error = None;
+        let tx = self.event_tx.clone();
+        let config = self.config.clone();
+        let tokens_path = default_tokens_path().unwrap_or_default();
+        tokio::spawn(async move {
+            // Build the client first and keep it alive: the trace stream borrows
+            // it for its whole lifetime, so it must outlive the loop below.
+            let client = match (|| {
+                let profile = config
+                    .aliases
+                    .get(&alias)
+                    .ok_or_else(|| format!("unknown alias `{alias}`"))?;
+                let store = TokenStore::load(&tokens_path).map_err(|e| e.to_string())?;
+                let token = store
+                    .token_for(&alias)
+                    .ok_or_else(|| "not authenticated".to_string())?;
+                client_from_alias(profile, Some(token)).map_err(|e| e.to_string())
+            })() {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = tx.send(super::events::Event::TraceStreamEnded {
+                        alias,
+                        error: Some(e),
+                    });
+                    return;
+                }
+            };
+
+            match client.connect_trace().await {
+                Ok(mut stream) => {
+                    use futures::StreamExt;
+                    while let Some(event) = stream.next().await {
+                        if tx
+                            .send(super::events::Event::TraceEventArrived {
+                                alias: alias.clone(),
+                                event,
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    let _ = tx.send(super::events::Event::TraceStreamEnded { alias, error: None });
+                }
+                Err(e) => {
+                    let _ = tx.send(super::events::Event::TraceStreamEnded {
+                        alias,
+                        error: Some(e.to_string()),
+                    });
+                }
             }
         });
     }

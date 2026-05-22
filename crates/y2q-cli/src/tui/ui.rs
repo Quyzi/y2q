@@ -57,6 +57,13 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             ("d", "del"),
             ("q/Esc", "close"),
         ],
+        Mode::Admin(AdminTab::Metrics) => &[
+            ("Tab", "tab"),
+            ("↑↓/jk", "scroll"),
+            ("r", "refresh"),
+            ("q/Esc", "close"),
+        ],
+        Mode::Admin(AdminTab::Events) => &[("Tab", "tab"), ("(live)", "trace"), ("q/Esc", "close")],
         Mode::Admin(_) => &[
             ("Tab", "tab"),
             ("↑↓/jk", "nav"),
@@ -262,6 +269,8 @@ fn render_admin(frame: &mut Frame, area: Rect, app: &App, tab: AdminTab) {
         ("Rebuild", AdminTab::Rebuild),
         ("Locks", AdminTab::Locks),
         ("Users", AdminTab::Users),
+        ("Metrics", AdminTab::Metrics),
+        ("Events", AdminTab::Events),
     ]
     .into_iter()
     .map(|(name, t)| {
@@ -291,7 +300,108 @@ fn render_admin(frame: &mut Frame, area: Rect, app: &App, tab: AdminTab) {
         AdminTab::Rebuild => render_rebuild_tab(frame, inner, app),
         AdminTab::Locks => render_locks_tab(frame, inner, app),
         AdminTab::Users => render_users_tab(frame, inner, app),
+        AdminTab::Metrics => render_metrics_tab(frame, inner, app),
+        AdminTab::Events => render_events_tab(frame, inner, app),
     }
+}
+
+fn render_metrics_tab(frame: &mut Frame, area: Rect, app: &App) {
+    let m = &app.metrics_view;
+    if let Some(ref e) = m.error {
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                format!("Metrics unavailable: {e}"),
+                Style::default().fg(ERROR_RED),
+            )),
+            area,
+        );
+        return;
+    }
+    if m.loading && m.lines.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                "Loading metrics…",
+                Style::default().fg(NEON_CYAN),
+            )),
+            area,
+        );
+        return;
+    }
+    if m.lines.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                "No metrics. Press 'r' to refresh.",
+                Style::default().fg(DIM_TEXT),
+            )),
+            area,
+        );
+        return;
+    }
+    let visible = area.height as usize;
+    let items: Vec<ListItem> = m
+        .lines
+        .iter()
+        .skip(m.scroll)
+        .take(visible)
+        .map(|l| {
+            // Split "metric_name{labels} value" → name dim, value bright.
+            let (name, value) = l.rsplit_once(' ').unwrap_or((l.as_str(), ""));
+            ListItem::new(Line::from(vec![
+                Span::styled(name.to_owned(), Style::default().fg(NEON_CYAN)),
+                Span::raw("  "),
+                Span::styled(value.to_owned(), Style::default().fg(NEON_GREEN)),
+            ]))
+        })
+        .collect();
+    frame.render_widget(List::new(items), area);
+}
+
+fn render_events_tab(frame: &mut Frame, area: Rect, app: &App) {
+    let v = &app.events_view;
+    if let Some(ref e) = v.error {
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                format!("Trace stream ended: {e}"),
+                Style::default().fg(ERROR_RED),
+            )),
+            area,
+        );
+        return;
+    }
+    if v.events.is_empty() {
+        let msg = if v.streaming {
+            "Streaming… waiting for events."
+        } else {
+            "Not streaming."
+        };
+        frame.render_widget(
+            Paragraph::new(Span::styled(msg, Style::default().fg(DIM_TEXT))),
+            area,
+        );
+        return;
+    }
+    let visible = area.height as usize;
+    // Newest at the bottom: show the last `visible` events.
+    let skip = v.events.len().saturating_sub(visible);
+    let items: Vec<ListItem> = v
+        .events
+        .iter()
+        .skip(skip)
+        .map(|e| {
+            let color = match e.status {
+                200..=299 => NEON_GREEN,
+                300..=399 => NEON_CYAN,
+                400..=499 => NEON_YELLOW,
+                _ => ERROR_RED,
+            };
+            let line = format!(
+                "{:<6} {:<48} {:>3}  {:>7.1}ms",
+                e.method, e.path, e.status, e.latency_ms
+            );
+            ListItem::new(Line::from(Span::styled(line, Style::default().fg(color))))
+        })
+        .collect();
+    frame.render_widget(List::new(items), area);
 }
 
 fn render_rebuild_tab(frame: &mut Frame, area: Rect, app: &App) {

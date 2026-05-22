@@ -39,4 +39,12 @@ impl Y2qClient {
         let body = resp.json::<ClearStaleLocksResponse>().await?;
         Ok(body.removed)
     }
+
+    /// Fetch the raw Prometheus scrape body from `/metrics/prometheus`.
+    pub async fn prometheus_metrics(&self) -> Result<String, ClientError> {
+        let url = self.url("metrics/prometheus");
+        let resp = self.authed(self.inner.get(url)).send().await?;
+        let resp = Self::check_status(resp).await?;
+        Ok(resp.text().await?)
+    }
 }
