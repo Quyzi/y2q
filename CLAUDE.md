@@ -20,10 +20,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Commands
 
 ```bash
-cargo build -p y2qd                           # debug build (uring enabled by default)
+cargo build -p y2qd                           # debug build
 cargo build --release -p y2qd                 # release build
 cargo build -p y2qd --features pyroscope      # with Pyroscope continuous profiling
-cargo build -p y2qd --no-default-features     # without io_uring (non-Linux builds)
 cargo run -p y2qd -- --config config.toml     # run daemon
 cargo test                                     # run all tests
 cargo test <name>                              # run by name or module path
@@ -32,11 +31,14 @@ cargo fmt                                      # format
 make check                                     # fmt-check + clippy + test (CI gate)
 ```
 
+The io_uring storage backend is always compiled on Linux (no feature flag). On
+non-Linux targets it is absent and selecting `storage.backend = "uring"` returns
+a runtime error.
+
 ## Cargo features (`y2qd`)
 
 | Feature | Default | Notes |
 |---|---|---|
-| `uring` | yes | Linux io_uring storage backend. Hard `compile_error!` on non-Linux. |
 | `pyroscope` | no | Pyroscope continuous profiling via pprof-rs. Enable for profiling sessions. |
 
 ## Required checks after any code change
@@ -60,7 +62,7 @@ Rules:
 - Daemon entry: `crates/y2qd/src/main.rs`
 - Config: `figment` (TOML + `Y2QD_*` env vars + `--set` flags); reference: `config.default.toml`
 - Crypto: `pqcrypto` for ML-KEM-768; `ring` for AES-256-GCM
-- Storage: `FilesystemStorage` (default) or `UringStorage` (Linux, `uring` feature)
+- Storage: `FilesystemStorage` (default) or `UringStorage` (Linux only, always compiled in)
 - Errors: `thiserror` typed enums — no `anyhow` or `Box<dyn Error>`
 - Observability: `tracing` spans/events, Prometheus via `metrics` crate, optional Pyroscope profiling
 - Full docs: `docs/` (architecture.md, configuration.md, operations.md, api.md)

@@ -4,15 +4,11 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-default = ["uring"]
+default = []
 # Continuous profiling via Grafana Pyroscope / pprof-rs. Opt-in — enable with
 # `--features pyroscope` for profiling sessions. Requires a running Pyroscope
 # server or Grafana Cloud endpoint.
 pyroscope = ["dep:pyroscope"]
-# Enables the io_uring-backed storage backend (Linux only). Forwards to
-# y2q-core's matching feature so the `UringStorage` type is reachable and
-# the daemon can construct it when `storage.backend = "uring"`.
-uring = ["y2q-core/uring"]
 
 [dependencies]
 actix-web                   = { workspace = true, features = ["rustls-0_23"] }

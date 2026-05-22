@@ -1,21 +1,18 @@
 CARGO  ?= cargo
 PODMAN ?= podman
 
-IMAGE           ?= y2q:latest
-IMAGE_URING     ?= y2q:latest-uring
-IMAGE_DEV       ?= y2q:dev
-IMAGE_DEV_URING ?= y2q:dev-uring
+IMAGE     ?= y2q:latest
+IMAGE_DEV ?= y2q:dev
 
 .PHONY: all \
         build build-y2qd build-y2q build-y2q-warp \
-        release release-y2qd release-y2q release-y2q-warp release-uring \
-        test test-uring \
+        release release-y2qd release-y2q release-y2q-warp \
+        test \
         bench \
-        clippy clippy-uring \
+        clippy \
         fmt fmt-check \
         check \
-        image image-uring images \
-        image-dev image-dev-uring images-dev \
+        image image-dev \
 		install-local \
         clean help
 
@@ -54,18 +51,12 @@ release-y2q: ## Release build -- y2q CLI only
 release-y2q-warp: ## Release build -- y2q-warp only
 	$(CARGO) build --release -p y2q-warp
 
-release-uring: ## Release build -- y2qd with io_uring backend (Linux, kernel >= 5.6)
-	$(CARGO) build --release -p y2qd --features uring
-
 # ---------------------------------------------------------------------------
 # Test
 # ---------------------------------------------------------------------------
 
-test: ## Run all tests (filesystem backend)
+test: ## Run all tests
 	$(CARGO) test
-
-test-uring: ## Run all tests with io_uring feature enabled
-	$(CARGO) test --features y2qd/uring
 
 # ---------------------------------------------------------------------------
 # Bench
@@ -81,9 +72,6 @@ bench: ## Run criterion benchmarks
 clippy: ## Clippy, all crates, warnings as errors
 	$(CARGO) clippy -- -D warnings
 
-clippy-uring: ## Clippy with io_uring feature, warnings as errors
-	$(CARGO) clippy --features y2qd/uring -- -D warnings
-
 fmt: ## Format all source files
 	$(CARGO) fmt
 
@@ -96,21 +84,11 @@ check: fmt-check clippy test ## Full CI gate: fmt-check + clippy + test
 # Container images
 # ---------------------------------------------------------------------------
 
-image: ## Build container image -- y2q:latest (filesystem backend)
+image: ## Build container image -- y2q:latest
 	$(PODMAN) build -t $(IMAGE) .
 
-image-uring: ## Build container image -- y2q:latest-uring (io_uring backend)
-	$(PODMAN) build --build-arg URING=1 -t $(IMAGE_URING) .
-
-images: image image-uring ## Build both container image variants
-
-image-dev: ## Build dev image -- y2q:dev (filesystem + Pyroscope)
+image-dev: ## Build dev image -- y2q:dev (Pyroscope enabled)
 	$(PODMAN) build --build-arg PYROSCOPE=1 -t $(IMAGE_DEV) .
-
-image-dev-uring: ## Build dev image -- y2q:dev-uring (io_uring + Pyroscope)
-	$(PODMAN) build --build-arg URING=1 --build-arg PYROSCOPE=1 -t $(IMAGE_DEV_URING) .
-
-images-dev: image-dev image-dev-uring ## Build both dev image variants (Pyroscope enabled)
 
 # ---------------------------------------------------------------------------
 # Install local binaries

@@ -2,12 +2,11 @@
 #
 # y2q -- post-quantum secure storage
 #
-# Build variants:
-#   Standard (filesystem backend):
-#     podman build -t y2q:latest .
+# Build:
+#   podman build -t y2q:latest .
 #
-#   With io_uring (Linux kernel >= 5.6 required at runtime):
-#     podman build --build-arg URING=1 -t y2q:latest-uring .
+# The io_uring storage backend is always compiled in (the build image is Linux);
+# select it at runtime with `storage.backend = "uring"` (kernel >= 5.6).
 #
 # Runtime configuration (figment env-override convention: Y2QD_SECTION__KEY):
 #   Y2QD_SERVER__HOST         bind address (default: 0.0.0.0, set in image)
@@ -24,7 +23,6 @@
 # Override config file:
 #   podman run ... -v /host/config.toml:/etc/y2q/config.toml:ro y2q:latest
 
-ARG URING=0
 ARG PYROSCOPE=0
 
 # ---------------------------------------------------------------------------
@@ -58,14 +56,10 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates/ ./crates/
 COPY config.default.toml ./
 
-ARG URING
 ARG PYROSCOPE
 
-RUN FEATURES=""; \
-    [ "$URING"     = "1" ] && FEATURES="${FEATURES:+$FEATURES,}uring"; \
-    [ "$PYROSCOPE" = "1" ] && FEATURES="${FEATURES:+$FEATURES,}pyroscope"; \
-    if [ -n "$FEATURES" ]; then \
-        cargo build --release -p y2qd --features "$FEATURES"; \
+RUN if [ "$PYROSCOPE" = "1" ]; then \
+        cargo build --release -p y2qd --features pyroscope; \
     else \
         cargo build --release -p y2qd; \
     fi && \

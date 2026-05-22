@@ -5,9 +5,6 @@
 //! [`MetadataIndex`], and the [`crypto`] layer (ML-KEM-768 + AES-256-GCM
 //! envelope format, Argon2id key wrapping, and the user-store database).
 
-#[cfg(all(feature = "uring", not(target_os = "linux")))]
-compile_error!("feature `uring` is only supported on Linux");
-
 use bytes::Bytes;
 use core::range::RangeInclusive;
 use serde::{Deserialize, Serialize};
@@ -21,7 +18,7 @@ pub use storage::filesystem::{FilesystemStorage, StreamingPutGuard};
 pub use storage::index::MetadataIndex;
 pub use storage::locks::StaleLock;
 
-#[cfg(all(target_os = "linux", feature = "uring"))]
+#[cfg(target_os = "linux")]
 pub use storage::uring::UringStorage;
 
 /// Payload sent on the dirty-write channel after a best-effort PUT commit.
