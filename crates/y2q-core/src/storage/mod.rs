@@ -17,5 +17,5 @@ pub mod index;
 pub mod locks;
 pub mod streaming_sink;
 
-#[cfg(all(target_os = "linux", feature = "uring"))]
+#[cfg(target_os = "linux")]
 pub mod uring;

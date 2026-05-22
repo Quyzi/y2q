@@ -875,7 +875,7 @@ mod tests {
     fn into_file(sink: crate::storage::streaming_sink::StreamingSink) -> tokio::fs::File {
         match sink {
             crate::storage::streaming_sink::StreamingSink::Tokio(f) => f,
-            #[cfg(all(target_os = "linux", feature = "uring"))]
+            #[cfg(target_os = "linux")]
             _ => panic!("envelope tests expect a Tokio sink"),
         }
     }
@@ -892,7 +892,7 @@ mod tests {
     async fn read_file_clone(sink: &crate::storage::streaming_sink::StreamingSink) -> Vec<u8> {
         let f = match sink {
             crate::storage::streaming_sink::StreamingSink::Tokio(f) => f,
-            #[cfg(all(target_os = "linux", feature = "uring"))]
+            #[cfg(target_os = "linux")]
             _ => panic!("envelope tests expect a Tokio sink"),
         };
         use tokio::io::{AsyncReadExt, AsyncSeekExt};

@@ -90,7 +90,7 @@ require_pq_kex = true
 
 # Storage backend implementation.
 #   "filesystem"  — portable tokio::fs backend (default)
-#   "uring"       — Linux io_uring fast path (requires --features uring, kernel ≥ 5.6)
+#   "uring"       — Linux io_uring fast path (Linux only, kernel ≥ 5.6)
 backend = "filesystem"
 
 # Root directory for stored objects. Created on first write if absent.

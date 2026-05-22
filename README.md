@@ -38,11 +38,9 @@ Post-quantum secure object storage. `y2qd` is a REST daemon that encrypts every 
 cargo build --release -p y2qd
 ```
 
-The io_uring backend is included by default (`uring` is a default feature, Linux only). To build without it (e.g. on macOS for tooling):
-
-```sh
-cargo build --release -p y2qd --no-default-features
-```
+The io_uring backend is always compiled on Linux (no feature flag). On non-Linux
+targets it is simply absent, and selecting `storage.backend = "uring"` at runtime
+returns an error — a standard `cargo build` works everywhere.
 
 To enable continuous profiling (Pyroscope/pprof-rs):
 
@@ -345,7 +343,7 @@ shutdown_timeout_secs = 30
 
 [storage]
 base_path = "/var/lib/y2qd/objects"   # required
-backend = "filesystem"                 # "filesystem" or "uring" (Linux, --features uring)
+backend = "filesystem"                 # "filesystem" or "uring" (Linux only)
 # index_path = "/var/lib/y2qd/objects/_y2q_index.redb"
 max_labels = 32
 max_label_name_bytes = 64

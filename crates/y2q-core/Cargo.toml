@@ -3,13 +3,6 @@ name = "y2q-core"
 version = "0.1.0"
 edition = "2024"
 
-[features]
-default = []
-# Enables the io_uring-based UringStorage backend. Linux-only at runtime:
-# the module is `#[cfg(target_os = "linux")]`, so on other targets the
-# feature is accepted but contributes nothing.
-uring = ["dep:tokio-uring", "dep:aligned-vec", "dep:async-channel", "dep:libc"]
-
 [dependencies]
 aes-gcm         = { workspace = true }
 argon2          = { workspace = true }
@@ -38,12 +31,14 @@ tracing         = { workspace = true }
 uuid            = { workspace = true }
 zeroize         = { workspace = true }
 
-# Linux-only fast-path deps; pulled in by the `uring` feature.
+# Linux-only fast-path deps for the io_uring storage backend. Always compiled
+# on Linux; absent on other targets, where `UringStorage` does not exist and
+# selecting it at runtime returns an error.
 [target.'cfg(target_os = "linux")'.dependencies]
-aligned-vec   = { workspace = true, optional = true }
-async-channel = { workspace = true, optional = true }
-libc          = { workspace = true, optional = true }
-tokio-uring   = { workspace = true, optional = true }
+aligned-vec   = { workspace = true }
+async-channel = { workspace = true }
+libc          = { workspace = true }
+tokio-uring   = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }

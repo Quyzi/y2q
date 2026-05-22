@@ -14,7 +14,7 @@
 
 use std::io;
 
-#[cfg(all(target_os = "linux", feature = "uring"))]
+#[cfg(target_os = "linux")]
 pub use crate::storage::uring::streaming::UringStreamingWriter;
 
 /// Sink for encrypted chunk writes during streaming PUT.
@@ -23,7 +23,7 @@ pub enum StreamingSink {
     /// `spawn_blocking` under the hood).
     Tokio(tokio::fs::File),
     /// Backed by io_uring via a dedicated worker thread.
-    #[cfg(all(target_os = "linux", feature = "uring"))]
+    #[cfg(target_os = "linux")]
     Uring(UringStreamingWriter),
 }
 
@@ -35,7 +35,7 @@ impl StreamingSink {
                 use tokio::io::AsyncWriteExt as _;
                 f.write_all(bytes).await
             }
-            #[cfg(all(target_os = "linux", feature = "uring"))]
+            #[cfg(target_os = "linux")]
             Self::Uring(w) => w.write_all(bytes).await,
         }
     }
@@ -50,7 +50,7 @@ impl StreamingSink {
                 f.write_all(bytes).await?;
                 Ok(())
             }
-            #[cfg(all(target_os = "linux", feature = "uring"))]
+            #[cfg(target_os = "linux")]
             Self::Uring(w) => w.write_all_at(bytes, offset).await,
         }
     }
@@ -64,7 +64,7 @@ impl StreamingSink {
                 f.seek(io::SeekFrom::Start(offset)).await?;
                 Ok(())
             }
-            #[cfg(all(target_os = "linux", feature = "uring"))]
+            #[cfg(target_os = "linux")]
             Self::Uring(w) => {
                 w.set_offset(offset);
                 Ok(())
@@ -81,7 +81,7 @@ impl StreamingSink {
                 use tokio::io::AsyncSeekExt as _;
                 f.seek(io::SeekFrom::End(0)).await
             }
-            #[cfg(all(target_os = "linux", feature = "uring"))]
+            #[cfg(target_os = "linux")]
             Self::Uring(w) => {
                 let end = w.end_offset();
                 w.set_offset(end);
@@ -94,7 +94,7 @@ impl StreamingSink {
     pub async fn sync_data(&mut self) -> io::Result<()> {
         match self {
             Self::Tokio(f) => f.sync_data().await,
-            #[cfg(all(target_os = "linux", feature = "uring"))]
+            #[cfg(target_os = "linux")]
             Self::Uring(w) => w.sync_data().await,
         }
     }

@@ -76,7 +76,7 @@ use utoipa_swagger_ui::SwaggerUi;
 use y2q_core::crypto::{Argon2Params, derive_mek, keystore as keystore_mod};
 use y2q_core::{AnyStorage, FilesystemStorage, StorageExt};
 
-#[cfg(all(target_os = "linux", feature = "uring"))]
+#[cfg(target_os = "linux")]
 use y2q_core::{UringStorage, storage::uring::UringConfig};
 
 mod auth;
@@ -344,7 +344,7 @@ async fn main() -> std::io::Result<()> {
                 .with_mek(mek)
                 .with_dirty_channel(dirty_tx, flush_notify.clone(), cfg.storage.sync_flush_limit),
         ),
-        #[cfg(all(target_os = "linux", feature = "uring"))]
+        #[cfg(target_os = "linux")]
         config::StorageBackend::Uring => AnyStorage::Uring(
             UringStorage::new(
                 &cfg.storage.base_path,
@@ -356,10 +356,10 @@ async fn main() -> std::io::Result<()> {
             )
             .map_err(|e| std::io::Error::other(format!("storage init: {e}")))?,
         ),
-        #[cfg(not(all(target_os = "linux", feature = "uring")))]
+        #[cfg(not(target_os = "linux"))]
         config::StorageBackend::Uring => {
             return Err(std::io::Error::other(
-                "storage.backend = \"uring\" requires building with --features y2q-core/uring on Linux",
+                "storage.backend = \"uring\" is only available on Linux; use \"filesystem\" on this platform",
             ));
         }
     });

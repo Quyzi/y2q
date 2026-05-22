@@ -2,21 +2,20 @@
 //! [`y2q_core::UringStorage`].
 //!
 //! Both backends are exercised via `AnyStorage` so the same per-iteration
-//! body works for either. The uring variant is `#[cfg]`-gated on
-//! `target_os = "linux" + feature = "uring"` — without the feature flag,
-//! only the filesystem backend is benched.
+//! body works for either. The uring variant is `#[cfg(target_os = "linux")]`-
+//! gated, so on non-Linux targets only the filesystem backend is benched.
 //!
 //! ## Running
 //!
 //! ```bash
 //! # Default sweep ({1 KiB, 1 MiB, 16 MiB}; ~tens of seconds)
-//! cargo bench --features uring -p y2q-core
+//! cargo bench -p y2q-core
 //!
 //! # Full sweep from the plan ({1 KiB, 1 MiB, 256 MiB, 2 GiB}; minutes)
-//! Y2Q_BENCH_FULL=1 cargo bench --features uring -p y2q-core
+//! Y2Q_BENCH_FULL=1 cargo bench -p y2q-core
 //!
 //! # Point at a specific disk for clean perf numbers
-//! Y2Q_BENCH_PATH=/mnt/nvme/y2q-bench cargo bench --features y2qd/uring -p y2q-core
+//! Y2Q_BENCH_PATH=/mnt/nvme/y2q-bench cargo bench -p y2q-core
 //! ```
 //!
 //! Scratch dirs default to `$WORKSPACE/target/y2q-bench-tmp/<rand>/` and
@@ -34,7 +33,7 @@ use tempfile::TempDir;
 use tokio::runtime::Runtime;
 use y2q_core::{AnyStorage, FilesystemStorage, Object, PutOptions, Storage, SyncLevel};
 
-#[cfg(all(target_os = "linux", feature = "uring"))]
+#[cfg(target_os = "linux")]
 use y2q_core::{UringStorage, storage::uring::UringConfig};
 
 const KIB: usize = 1024;
@@ -102,7 +101,7 @@ fn backends() -> &'static [Backend] {
             _dir: fs_dir,
         });
 
-        #[cfg(all(target_os = "linux", feature = "uring"))]
+        #[cfg(target_os = "linux")]
         {
             let u_dir = scratch_dir();
             let u_base = u_dir.path().to_path_buf();

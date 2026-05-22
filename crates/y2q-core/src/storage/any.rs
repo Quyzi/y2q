@@ -18,21 +18,21 @@ use crate::{
     storage::{format::HEADER_SIZE, streaming_sink::StreamingSink},
 };
 
-#[cfg(all(target_os = "linux", feature = "uring"))]
+#[cfg(target_os = "linux")]
 use crate::UringStorage;
-#[cfg(all(target_os = "linux", feature = "uring"))]
+#[cfg(target_os = "linux")]
 use crate::storage::uring::{URING_STREAMING_WRITE_OFFSET, UringStreamingPutGuard};
 
 /// One of the available storage backends, selected at startup.
 ///
-/// Variants are gated on platform + feature so the daemon binary on macOS
-/// (or any non-Linux target) compiles cleanly with just the filesystem
-/// variant; on Linux with `--features uring` the uring variant is added.
+/// The uring variant is gated on `target_os = "linux"`, so the daemon binary
+/// on macOS (or any non-Linux target) compiles cleanly with just the
+/// filesystem variant; on Linux the uring variant is always present.
 pub enum AnyStorage {
     /// Portable [`tokio::fs`]-based backend.
     Filesystem(FilesystemStorage),
     /// Linux-only `io_uring` backend.
-    #[cfg(all(target_os = "linux", feature = "uring"))]
+    #[cfg(target_os = "linux")]
     Uring(UringStorage),
 }
 
@@ -40,7 +40,7 @@ impl Storage for AnyStorage {
     async fn get(&self, bucket: &str, key: &str) -> Result<Object, Error> {
         match self {
             Self::Filesystem(s) => s.get(bucket, key).await,
-            #[cfg(all(target_os = "linux", feature = "uring"))]
+            #[cfg(target_os = "linux")]
             Self::Uring(s) => s.get(bucket, key).await,
         }
     }
@@ -53,7 +53,7 @@ impl Storage for AnyStorage {
     ) -> Result<Bytes, Error> {
         match self {
             Self::Filesystem(s) => s.get_range(bucket, key, range).await,
-            #[cfg(all(target_os = "linux", feature = "uring"))]
+            #[cfg(target_os = "linux")]
             Self::Uring(s) => s.get_range(bucket, key, range).await,
         }
     }
@@ -67,7 +67,7 @@ impl Storage for AnyStorage {
     ) -> Result<bool, Error> {
         match self {
             Self::Filesystem(s) => s.put(bucket, key, payload, options).await,
-            #[cfg(all(target_os = "linux", feature = "uring"))]
+            #[cfg(target_os = "linux")]
             Self::Uring(s) => s.put(bucket, key, payload, options).await,
         }
     }
@@ -75,7 +75,7 @@ impl Storage for AnyStorage {
     async fn delete(&self, bucket: &str, key: &str) -> Result<Object, Error> {
         match self {
             Self::Filesystem(s) => s.delete(bucket, key).await,
-            #[cfg(all(target_os = "linux", feature = "uring"))]
+            #[cfg(target_os = "linux")]
             Self::Uring(s) => s.delete(bucket, key).await,
         }
     }
@@ -83,7 +83,7 @@ impl Storage for AnyStorage {
     async fn describe(&self, bucket: &str, key: &str) -> Result<Metadata, Error> {
         match self {
             Self::Filesystem(s) => s.describe(bucket, key).await,
-            #[cfg(all(target_os = "linux", feature = "uring"))]
+            #[cfg(target_os = "linux")]
             Self::Uring(s) => s.describe(bucket, key).await,
         }
     }
@@ -96,7 +96,7 @@ impl Storage for AnyStorage {
     ) -> Result<(), Error> {
         match self {
             Self::Filesystem(s) => s.set_labels(bucket, key, labels).await,
-            #[cfg(all(target_os = "linux", feature = "uring"))]
+            #[cfg(target_os = "linux")]
             Self::Uring(s) => s.set_labels(bucket, key, labels).await,
         }
     }
@@ -106,7 +106,7 @@ impl Listing for AnyStorage {
     async fn list_buckets(&self) -> Result<Vec<String>, Error> {
         match self {
             Self::Filesystem(s) => s.list_buckets().await,
-            #[cfg(all(target_os = "linux", feature = "uring"))]
+            #[cfg(target_os = "linux")]
             Self::Uring(s) => s.list_buckets().await,
         }
     }
@@ -114,7 +114,7 @@ impl Listing for AnyStorage {
     async fn list_objects(&self, bucket: &str, options: ListOptions) -> Result<ListPage, Error> {
         match self {
             Self::Filesystem(s) => s.list_objects(bucket, options).await,
-            #[cfg(all(target_os = "linux", feature = "uring"))]
+            #[cfg(target_os = "linux")]
             Self::Uring(s) => s.list_objects(bucket, options).await,
         }
     }
@@ -122,7 +122,7 @@ impl Listing for AnyStorage {
     async fn create_bucket(&self, bucket: &str) -> Result<bool, Error> {
         match self {
             Self::Filesystem(s) => s.create_bucket(bucket).await,
-            #[cfg(all(target_os = "linux", feature = "uring"))]
+            #[cfg(target_os = "linux")]
             Self::Uring(s) => s.create_bucket(bucket).await,
         }
     }
@@ -130,7 +130,7 @@ impl Listing for AnyStorage {
     async fn delete_bucket(&self, bucket: &str) -> Result<u64, Error> {
         match self {
             Self::Filesystem(s) => s.delete_bucket(bucket).await,
-            #[cfg(all(target_os = "linux", feature = "uring"))]
+            #[cfg(target_os = "linux")]
             Self::Uring(s) => s.delete_bucket(bucket).await,
         }
     }
@@ -138,7 +138,7 @@ impl Listing for AnyStorage {
     async fn get_bucket_config(&self, bucket: &str) -> Result<crate::BucketConfig, Error> {
         match self {
             Self::Filesystem(s) => s.get_bucket_config(bucket).await,
-            #[cfg(all(target_os = "linux", feature = "uring"))]
+            #[cfg(target_os = "linux")]
             Self::Uring(s) => s.get_bucket_config(bucket).await,
         }
     }
@@ -150,7 +150,7 @@ impl Listing for AnyStorage {
     ) -> Result<(), Error> {
         match self {
             Self::Filesystem(s) => s.set_bucket_config(bucket, config).await,
-            #[cfg(all(target_os = "linux", feature = "uring"))]
+            #[cfg(target_os = "linux")]
             Self::Uring(s) => s.set_bucket_config(bucket, config).await,
         }
     }
@@ -158,7 +158,7 @@ impl Listing for AnyStorage {
     async fn bucket_usage(&self, bucket: &str) -> Result<u64, Error> {
         match self {
             Self::Filesystem(s) => s.bucket_usage(bucket).await,
-            #[cfg(all(target_os = "linux", feature = "uring"))]
+            #[cfg(target_os = "linux")]
             Self::Uring(s) => s.bucket_usage(bucket).await,
         }
     }
@@ -172,7 +172,7 @@ pub enum AnyStreamingPutGuard {
     /// Guard backed by [`FilesystemStorage`].
     Filesystem(StreamingPutGuard),
     /// Guard backed by [`UringStorage`] (Linux + `uring` feature only).
-    #[cfg(all(target_os = "linux", feature = "uring"))]
+    #[cfg(target_os = "linux")]
     Uring(UringStreamingPutGuard),
 }
 
@@ -192,12 +192,12 @@ impl AnyStreamingPutGuard {
                 g.commit(file, options, plaintext_metrics, cipher_metadata)
                     .await
             }
-            #[cfg(all(target_os = "linux", feature = "uring"))]
+            #[cfg(target_os = "linux")]
             (Self::Uring(g), StreamingSink::Uring(writer)) => {
                 g.commit(writer, options, plaintext_metrics, cipher_metadata)
                     .await
             }
-            #[cfg(all(target_os = "linux", feature = "uring"))]
+            #[cfg(target_os = "linux")]
             _ => Err(Error::InternalError {
                 bucket: String::new(),
                 key: String::new(),
@@ -232,7 +232,7 @@ impl AnyStorage {
                     HEADER_SIZE as u64,
                 ))
             }
-            #[cfg(all(target_os = "linux", feature = "uring"))]
+            #[cfg(target_os = "linux")]
             Self::Uring(s) => {
                 let (g, w) = s.begin_streaming_put(bucket, key).await?;
                 Ok((
@@ -249,7 +249,7 @@ impl StorageExt for AnyStorage {
     async fn rebuild_cache(&self) -> Result<(), Error> {
         match self {
             Self::Filesystem(s) => s.rebuild_cache().await,
-            #[cfg(all(target_os = "linux", feature = "uring"))]
+            #[cfg(target_os = "linux")]
             Self::Uring(s) => s.rebuild_cache().await,
         }
     }
@@ -257,7 +257,7 @@ impl StorageExt for AnyStorage {
     async fn rebuild_progress(&self) -> Result<CacheRebuildStatus, Error> {
         match self {
             Self::Filesystem(s) => s.rebuild_progress().await,
-            #[cfg(all(target_os = "linux", feature = "uring"))]
+            #[cfg(target_os = "linux")]
             Self::Uring(s) => s.rebuild_progress().await,
         }
     }
@@ -265,7 +265,7 @@ impl StorageExt for AnyStorage {
     async fn list_stale_locks(&self, older_than: SystemTime) -> Result<Vec<StaleLock>, Error> {
         match self {
             Self::Filesystem(s) => s.list_stale_locks(older_than).await,
-            #[cfg(all(target_os = "linux", feature = "uring"))]
+            #[cfg(target_os = "linux")]
             Self::Uring(s) => s.list_stale_locks(older_than).await,
         }
     }
@@ -273,7 +273,7 @@ impl StorageExt for AnyStorage {
     async fn clear_stale_locks(&self, older_than: SystemTime) -> Result<u64, Error> {
         match self {
             Self::Filesystem(s) => s.clear_stale_locks(older_than).await,
-            #[cfg(all(target_os = "linux", feature = "uring"))]
+            #[cfg(target_os = "linux")]
             Self::Uring(s) => s.clear_stale_locks(older_than).await,
         }
     }
