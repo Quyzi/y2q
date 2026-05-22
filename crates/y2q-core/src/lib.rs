@@ -445,6 +445,16 @@ pub trait Storage {
     ///
     /// Returns [`Error::NotFound`] if no object exists at that address.
     async fn describe(&self, bucket: &str, key: &str) -> Result<Metadata, Error>;
+
+    /// Replace the user labels on an existing object, preserving its data and
+    /// all envelope/cipher metadata. Updates `modified`. Returns
+    /// [`Error::NotFound`] if no object exists at that address.
+    async fn set_labels(
+        &self,
+        bucket: &str,
+        key: &str,
+        labels: std::collections::BTreeMap<String, String>,
+    ) -> Result<(), Error>;
 }
 
 /// Enumerate buckets and the objects within them.

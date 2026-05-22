@@ -19,6 +19,7 @@ pub(crate) mod list_objects;
 pub(crate) mod locks;
 pub(crate) mod put;
 pub(crate) mod rebuild;
+pub(crate) mod tags;
 
 use crate::auth::handlers as auth_handlers;
 
@@ -67,6 +68,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         web::resource("/{bucket}/{tail}*")
             .route(web::get().to(get::handle))
             .route(web::put().to(put::handle))
+            .route(web::patch().to(tags::handle))
             .route(web::delete().to(delete::handle))
             .route(web::head().to(head::handle)),
     );

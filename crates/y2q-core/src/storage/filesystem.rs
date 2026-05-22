@@ -250,6 +250,132 @@ pub(crate) async fn list_buckets_union(
     Ok(buckets)
 }
 
+/// Canonical `.obj` path for `(bucket, key)` rooted at `base_path`. Mirrors
+/// [`FilesystemStorage::key_path`] / the uring backend so the shared bucket and
+/// label helpers can locate records without a backend instance.
+pub(crate) fn obj_path_for(base_path: &Path, bucket: &str, key: &str) -> PathBuf {
+    let id = Uuid::new_v5(&Y2Q_NAMESPACE, key.as_bytes());
+    let s = id.hyphenated().to_string();
+    let mut p = base_path
+        .join(bucket)
+        .join(&s[0..2])
+        .join(&s[2..4])
+        .join(&s);
+    p.set_extension("obj");
+    p
+}
+
+/// Rewrite an object's `.obj` record, replacing only its user labels and
+/// `modified` timestamp. The data section and all envelope/cipher metadata are
+/// preserved byte-for-byte. Shared by both backends (identical on-disk format).
+///
+/// The write is atomic: a new file is written to a sibling `.tmp` path and
+/// renamed into place. The secondary index is updated afterwards.
+pub(crate) async fn set_labels_impl(
+    base_path: &Path,
+    index: &MetadataIndex,
+    mek: Option<&[u8; 32]>,
+    bucket: &str,
+    key: &str,
+    labels: std::collections::BTreeMap<String, String>,
+) -> Result<(), Error> {
+    validate_bucket(bucket)?;
+    validate_key(key)?;
+
+    let obj_path = obj_path_for(base_path, bucket, key);
+    let bytes = match tokio::fs::read(&obj_path).await {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(Error::NotFound {
+                bucket: bucket.to_owned(),
+                key: key.to_owned(),
+            });
+        }
+        Err(e) => {
+            return Err(Error::InternalError {
+                bucket: bucket.to_owned(),
+                key: key.to_owned(),
+                operation: "set_labels".to_owned(),
+                message: e.to_string(),
+            });
+        }
+    };
+
+    let internal = |message: String| Error::InternalError {
+        bucket: bucket.to_owned(),
+        key: key.to_owned(),
+        operation: "set_labels".to_owned(),
+        message,
+    };
+
+    if bytes.len() < HEADER_SIZE {
+        return Err(internal("object file shorter than header".to_owned()));
+    }
+    let mut header_buf = [0u8; HEADER_SIZE];
+    header_buf.copy_from_slice(&bytes[..HEADER_SIZE]);
+    let header =
+        Header::decode(&header_buf).map_err(|e| internal(format!("decode header: {e}")))?;
+
+    let data_start = header.data_offset as usize;
+    let meta_start = header.meta_offset() as usize;
+    let meta_end = meta_start + header.meta_len as usize;
+    if meta_end > bytes.len() {
+        return Err(internal("meta block extends past end of file".to_owned()));
+    }
+    let data = &bytes[data_start..meta_start];
+    let meta_bytes = &bytes[meta_start..meta_end];
+
+    let meta_json = match mek {
+        Some(k) => {
+            decrypt_meta(k, meta_bytes).map_err(|e| internal(format!("decrypt meta: {e}")))?
+        }
+        None => meta_bytes.to_vec(),
+    };
+    let mut metadata: Metadata =
+        serde_json::from_slice(&meta_json).map_err(|e| internal(format!("parse meta: {e}")))?;
+
+    metadata.labels = labels;
+    metadata.modified = now_nanos();
+
+    let new_json =
+        serde_json::to_vec(&metadata).map_err(|e| internal(format!("encode meta: {e}")))?;
+    let new_meta = match mek {
+        Some(k) => {
+            encrypt_meta(k, &new_json).map_err(|e| internal(format!("encrypt meta: {e}")))?
+        }
+        None => new_json,
+    };
+
+    let new_header = Header {
+        data_len: header.data_len,
+        meta_len: new_meta.len() as u32,
+        data_offset: header.data_offset,
+        flags: header.flags,
+        version: header.version,
+    };
+    let header_enc = new_header.encode();
+
+    let mut out = Vec::with_capacity(data_start + data.len() + new_meta.len() + HEADER_SIZE);
+    out.extend_from_slice(&header_enc);
+    out.resize(data_start, 0); // zero padding up to data_offset (O_DIRECT path)
+    out.extend_from_slice(data);
+    out.extend_from_slice(&new_meta);
+    out.extend_from_slice(&header_enc); // trailer mirrors the header
+
+    let tmp_path = obj_path.with_extension("labels.tmp");
+    tokio::fs::write(&tmp_path, &out)
+        .await
+        .map_err(|e| internal(format!("write tmp: {e}")))?;
+    tokio::fs::rename(&tmp_path, &obj_path)
+        .await
+        .map_err(|e| internal(format!("rename: {e}")))?;
+
+    if let Err(e) = index.upsert(&metadata, SyncLevel::Durable).await {
+        tracing::warn!(bucket, key, error = %e, "metadata index upsert failed after set_labels");
+    }
+    Ok(())
+}
+
 fn validate_key(key: &str) -> Result<(), Error> {
     const MAX_KEY_LEN: usize = 1024;
     if key.is_empty() || key.contains('\0') || key.len() > MAX_KEY_LEN {
@@ -1032,6 +1158,34 @@ impl Storage for FilesystemStorage {
         result
     }
 
+    async fn set_labels(
+        &self,
+        bucket: &str,
+        key: &str,
+        labels: std::collections::BTreeMap<String, String>,
+    ) -> Result<(), Error> {
+        let started = Instant::now();
+        let result = async {
+            self.locks.check_not_locked(bucket, key)?;
+            set_labels_impl(
+                &self.base_path,
+                &self.index,
+                self.mek.as_ref(),
+                bucket,
+                key,
+                labels,
+            )
+            .await
+        }
+        .await;
+        record_storage_op(
+            "set_labels",
+            &result,
+            started.elapsed().as_secs_f64() * 1_000.0,
+        );
+        result
+    }
+
     async fn describe(&self, bucket: &str, key: &str) -> Result<Metadata, Error> {
         let started = Instant::now();
         let result = async {
@@ -1564,6 +1718,51 @@ mod tests {
     async fn delete_bucket_missing_is_not_found() {
         let (s, _dir) = make_storage();
         assert!(s.delete_bucket("ghost").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn set_labels_replaces_labels_and_preserves_data() {
+        let (s, _dir) = make_storage();
+        s.put(
+            "b",
+            "k",
+            make_object(b"hello world"),
+            opts(&[("env", "prod")]),
+        )
+        .await
+        .unwrap();
+
+        let mut new_labels = std::collections::BTreeMap::new();
+        new_labels.insert("env".to_owned(), "staging".to_owned());
+        new_labels.insert("team".to_owned(), "core".to_owned());
+        s.set_labels("b", "k", new_labels.clone()).await.unwrap();
+
+        // Data unchanged.
+        let obj = s.get("b", "k").await.unwrap();
+        assert_eq!(&obj.into_inner()[..], b"hello world");
+        // Labels replaced.
+        let meta = s.describe("b", "k").await.unwrap();
+        assert_eq!(meta.labels, new_labels);
+        // Reverse label index reflects the change.
+        let hits = s.index().lookup_by_label("team", "core").await.unwrap();
+        assert_eq!(hits, vec![("b".to_owned(), "k".to_owned())]);
+        assert!(
+            s.index()
+                .lookup_by_label("env", "prod")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn set_labels_missing_object_is_not_found() {
+        let (s, _dir) = make_storage();
+        assert!(
+            s.set_labels("b", "ghost", std::collections::BTreeMap::new())
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

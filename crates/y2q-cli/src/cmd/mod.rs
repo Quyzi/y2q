@@ -15,6 +15,7 @@ pub mod mv;
 pub mod objects;
 pub mod pipe;
 pub mod stub;
+pub mod tag;
 pub mod tree;
 pub mod users;
 pub mod watch;
