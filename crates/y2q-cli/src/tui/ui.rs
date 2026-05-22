@@ -10,7 +10,7 @@ use super::app::App;
 use super::pane::local::LocalEntry;
 use super::pane::remote::RemoteEntry;
 use super::pane::remote::RemoteLevel;
-use super::state::{AdminTab, ConfirmAction, FocusedPane, Mode};
+use super::state::{AdminTab, ConfirmAction, FocusedPane, InputAction, Mode};
 use super::theme::*;
 use super::widgets::{confirm_dialog, keybindings_bar, transfer_bar};
 
@@ -111,7 +111,14 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             confirm_dialog::render(frame, area, &msg);
         }
         Mode::Error(e) => render_error_popup(frame, area, &e),
-        Mode::Input { prompt, value, .. } => render_input_dialog(frame, area, &prompt, &value),
+        Mode::Input {
+            prompt,
+            value,
+            action,
+        } => {
+            let secret = matches!(action, InputAction::AddUserPassword { .. });
+            render_input_dialog(frame, area, &prompt, &value, secret);
+        }
         Mode::ObjectStat { lines, .. } => render_object_stat_popup(frame, area, &lines),
         _ => {}
     }
@@ -513,7 +520,7 @@ fn render_users_tab(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(List::new(items), area);
 }
 
-fn render_input_dialog(frame: &mut Frame, area: Rect, prompt: &str, value: &str) {
+fn render_input_dialog(frame: &mut Frame, area: Rect, prompt: &str, value: &str, secret: bool) {
     let w = 54u16.min(area.width.saturating_sub(4));
     let h = 5u16;
     let x = area.x + (area.width.saturating_sub(w)) / 2;
@@ -533,7 +540,12 @@ fn render_input_dialog(frame: &mut Frame, area: Rect, prompt: &str, value: &str)
         .borders(Borders::ALL)
         .border_type(BorderType::Double)
         .border_style(Style::default().fg(NEON_CYAN));
-    let cursor_line = format!("{value}_");
+    let shown = if secret {
+        "*".repeat(value.chars().count())
+    } else {
+        value.to_owned()
+    };
+    let cursor_line = format!("{shown}_");
     let text = vec![
         Line::from(Span::styled(cursor_line, Style::default().fg(NEON_GREEN))),
         Line::from(""),
