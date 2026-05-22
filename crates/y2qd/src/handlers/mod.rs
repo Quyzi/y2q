@@ -9,6 +9,7 @@
 
 use actix_web::web;
 
+pub(crate) mod buckets;
 pub(crate) mod delete;
 pub(crate) mod get;
 pub(crate) mod head;
@@ -44,7 +45,12 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
 
     // Object store + admin endpoints.
     cfg.service(web::resource("/").route(web::get().to(list_buckets::handle)));
-    cfg.service(web::resource("/{bucket}/").route(web::get().to(list_objects::handle)));
+    cfg.service(
+        web::resource("/{bucket}/")
+            .route(web::get().to(list_objects::handle))
+            .route(web::put().to(buckets::create))
+            .route(web::delete().to(buckets::remove)),
+    );
     cfg.service(
         web::resource("/api/v1/rebuild")
             .route(web::post().to(rebuild::start))

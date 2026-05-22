@@ -105,6 +105,22 @@ impl Listing for AnyStorage {
             Self::Uring(s) => s.list_objects(bucket, options).await,
         }
     }
+
+    async fn create_bucket(&self, bucket: &str) -> Result<bool, Error> {
+        match self {
+            Self::Filesystem(s) => s.create_bucket(bucket).await,
+            #[cfg(all(target_os = "linux", feature = "uring"))]
+            Self::Uring(s) => s.create_bucket(bucket).await,
+        }
+    }
+
+    async fn delete_bucket(&self, bucket: &str) -> Result<u64, Error> {
+        match self {
+            Self::Filesystem(s) => s.delete_bucket(bucket).await,
+            #[cfg(all(target_os = "linux", feature = "uring"))]
+            Self::Uring(s) => s.delete_bucket(bucket).await,
+        }
+    }
 }
 
 /// Backend-erased streaming PUT guard returned by

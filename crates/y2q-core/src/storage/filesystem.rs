@@ -150,7 +150,7 @@ impl FilesystemStorage {
 /// Reserved bucket names that conflict with the `/api/v1/*` admin namespace.
 const RESERVED_BUCKETS: &[&str] = &["api"];
 
-fn validate_bucket(bucket: &str) -> Result<(), Error> {
+pub(crate) fn validate_bucket(bucket: &str) -> Result<(), Error> {
     let lower = bucket.to_ascii_lowercase();
     if bucket.is_empty()
         || bucket.contains('/')
@@ -166,6 +166,88 @@ fn validate_bucket(bucket: &str) -> Result<(), Error> {
         });
     }
     Ok(())
+}
+
+/// Create the on-disk directory for `bucket`. Returns `true` if it was newly
+/// created, `false` if it already existed. Shared by both storage backends,
+/// which use an identical `<base>/<bucket>/...` layout.
+pub(crate) async fn create_bucket_impl(base_path: &Path, bucket: &str) -> Result<bool, Error> {
+    validate_bucket(bucket)?;
+    let dir = base_path.join(bucket);
+    if tokio::fs::try_exists(&dir).await.unwrap_or(false) {
+        return Ok(false);
+    }
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .map_err(|e| Error::InternalError {
+            bucket: bucket.to_owned(),
+            key: String::new(),
+            operation: "create_bucket".to_owned(),
+            message: e.to_string(),
+        })?;
+    Ok(true)
+}
+
+/// Delete every object in `bucket` from the index and remove the bucket
+/// directory tree from disk. Returns the number of index entries removed.
+pub(crate) async fn delete_bucket_impl(
+    base_path: &Path,
+    index: &MetadataIndex,
+    bucket: &str,
+) -> Result<u64, Error> {
+    validate_bucket(bucket)?;
+    let dir = base_path.join(bucket);
+    let dir_exists = tokio::fs::try_exists(&dir).await.unwrap_or(false);
+
+    let keys = index.list_all_keys().await?;
+    let mut removed = 0u64;
+    for (b, key) in keys {
+        if b == bucket {
+            index.remove(bucket, &key).await?;
+            removed += 1;
+        }
+    }
+
+    if !dir_exists && removed == 0 {
+        return Err(Error::NotFound {
+            bucket: bucket.to_owned(),
+            key: String::new(),
+        });
+    }
+    if dir_exists {
+        tokio::fs::remove_dir_all(&dir)
+            .await
+            .map_err(|e| Error::InternalError {
+                bucket: bucket.to_owned(),
+                key: String::new(),
+                operation: "delete_bucket".to_owned(),
+                message: e.to_string(),
+            })?;
+    }
+    Ok(removed)
+}
+
+/// Union the index-derived bucket list with on-disk bucket directories so that
+/// empty buckets (created via `create_bucket`, no objects yet) are still
+/// reported. Result is sorted and de-duplicated.
+pub(crate) async fn list_buckets_union(
+    base_path: &Path,
+    index: &MetadataIndex,
+) -> Result<Vec<String>, Error> {
+    let mut buckets = index.list_buckets().await?;
+    if let Ok(mut entries) = tokio::fs::read_dir(base_path).await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            if entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false)
+                && let Some(name) = entry.file_name().to_str()
+                && validate_bucket(name).is_ok()
+            {
+                buckets.push(name.to_owned());
+            }
+        }
+    }
+    buckets.sort();
+    buckets.dedup();
+    Ok(buckets)
 }
 
 fn validate_key(key: &str) -> Result<(), Error> {
@@ -987,7 +1069,15 @@ impl Storage for FilesystemStorage {
 
 impl Listing for FilesystemStorage {
     async fn list_buckets(&self) -> Result<Vec<String>, Error> {
-        self.index.list_buckets().await
+        list_buckets_union(&self.base_path, &self.index).await
+    }
+
+    async fn create_bucket(&self, bucket: &str) -> Result<bool, Error> {
+        create_bucket_impl(&self.base_path, bucket).await
+    }
+
+    async fn delete_bucket(&self, bucket: &str) -> Result<u64, Error> {
+        delete_bucket_impl(&self.base_path, &self.index, bucket).await
     }
 
     async fn list_objects(&self, bucket: &str, options: ListOptions) -> Result<ListPage, Error> {
@@ -1426,6 +1516,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_bucket_persists_empty_bucket_in_listing() {
+        let (s, _dir) = make_storage();
+        let created = s.create_bucket("empty").await.unwrap();
+        assert!(created);
+        // Empty bucket has no objects but must still appear via the dir union.
+        let buckets = s.list_buckets().await.unwrap();
+        assert_eq!(buckets, vec!["empty"]);
+        // Idempotent: second create reports already-existed.
+        assert!(!s.create_bucket("empty").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn create_bucket_rejects_invalid_name() {
+        let (s, _dir) = make_storage();
+        assert!(s.create_bucket("bad/name").await.is_err());
+        assert!(s.create_bucket("api").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn delete_bucket_removes_objects_and_dir() {
+        let (s, _dir) = make_storage();
+        s.put("doomed", "a", make_object(b"x"), PutOptions::default())
+            .await
+            .unwrap();
+        s.put(
+            "doomed",
+            "nested/b",
+            make_object(b"y"),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+        s.put("keep", "a", make_object(b"z"), PutOptions::default())
+            .await
+            .unwrap();
+
+        let removed = s.delete_bucket("doomed").await.unwrap();
+        assert_eq!(removed, 2);
+
+        let buckets = s.list_buckets().await.unwrap();
+        assert_eq!(buckets, vec!["keep"]);
+        assert!(s.get("doomed", "a").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn delete_bucket_missing_is_not_found() {
+        let (s, _dir) = make_storage();
+        assert!(s.delete_bucket("ghost").await.is_err());
+    }
+
+    #[tokio::test]
     async fn list_objects_empty_bucket() {
         let (s, _dir) = make_storage();
         let page = s
@@ -1573,7 +1714,9 @@ mod tests {
         }
 
         let s2 = FilesystemStorage::new(&base, &index_b).unwrap();
-        assert!(s2.list_buckets().await.unwrap().is_empty());
+        // The fresh index is empty; the label index proves it. list_buckets now
+        // unions on-disk bucket directories, so it already reflects b1/b2 here
+        // even before the rebuild repopulates the object/label index.
         assert!(
             s2.index()
                 .lookup_by_label("env", "prod")

@@ -7,8 +7,6 @@ const BIN: &str = env!("CARGO_BIN_EXE_y2q");
 
 /// (args) tuples — one representative invocation per stub command.
 const STUB_INVOCATIONS: &[&[&str]] = &[
-    &["mb", "local/bucket"],
-    &["rb", "local/bucket"],
     &["tag", "set", "local/b/k", "k=v"],
     &["attribute", "set", "local/b/k", "k=v"],
     &["version", "enable", "local/b"],

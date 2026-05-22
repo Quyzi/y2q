@@ -1,6 +1,7 @@
 pub mod admin;
 pub mod alias;
 pub mod auth;
+pub mod bucket;
 pub mod completions;
 pub mod cp;
 pub mod diff;
