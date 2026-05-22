@@ -6,6 +6,7 @@ mod error;
 mod output;
 mod path;
 mod progress;
+mod stubs;
 mod token;
 mod tui;
 
@@ -158,6 +159,68 @@ async fn run(cli: Cli) -> Result<(), CliError> {
             error_only,
         } => cmd::health::ping(&alias, count, interval, error_only, mode).await,
         Commands::Ready { alias } => cmd::health::ready(&alias, mode).await,
+
+        // ── Tier 2 stubs ──
+        Commands::Mb { .. } => cmd::stub::not_yet_supported(
+            "mb",
+            "needs a bucket-create endpoint (buckets are implicit on first PUT today)",
+            mode,
+        ),
+        Commands::Rb { .. } => {
+            cmd::stub::not_yet_supported("rb", "needs a bucket-delete endpoint", mode)
+        }
+        Commands::Tag { .. } => cmd::stub::not_yet_supported(
+            "tag",
+            "needs a labels-only PATCH route and a remove-all endpoint",
+            mode,
+        ),
+        Commands::Attribute { .. } => {
+            cmd::stub::not_yet_supported("attribute", "needs a labels-only PATCH route", mode)
+        }
+        Commands::Version { .. } => cmd::stub::not_yet_supported(
+            "version",
+            "needs object versioning in the storage backend",
+            mode,
+        ),
+        Commands::Undo { .. } => {
+            cmd::stub::not_yet_supported("undo", "needs object versioning", mode)
+        }
+        Commands::Retention { .. } => {
+            cmd::stub::not_yet_supported("retention", "needs WORM object-lock metadata", mode)
+        }
+        Commands::Legalhold { .. } => {
+            cmd::stub::not_yet_supported("legalhold", "needs a WORM legal-hold flag", mode)
+        }
+        Commands::Share { .. } => {
+            cmd::stub::not_yet_supported("share", "needs a presigned-URL signing route", mode)
+        }
+        Commands::Anonymous { .. } => {
+            cmd::stub::not_yet_supported("anonymous", "needs per-bucket access policy", mode)
+        }
+        Commands::Cors { .. } => {
+            cmd::stub::not_yet_supported("cors", "needs per-bucket CORS metadata", mode)
+        }
+        Commands::Quota { .. } => {
+            cmd::stub::not_yet_supported("quota", "needs per-bucket quota metadata", mode)
+        }
+        Commands::Inventory { .. } => {
+            cmd::stub::not_yet_supported("inventory", "needs a scheduled inventory generator", mode)
+        }
+        Commands::Ilm { .. } => {
+            cmd::stub::not_yet_supported("ilm", "needs a lifecycle engine", mode)
+        }
+        Commands::Encrypt { .. } => cmd::stub::not_yet_supported(
+            "encrypt",
+            "needs per-bucket default-SSE config (y2q encrypts unconditionally today)",
+            mode,
+        ),
+        Commands::Event { .. } => {
+            cmd::stub::not_yet_supported("event", "needs notification dispatch", mode)
+        }
+        Commands::Batch { .. } => {
+            cmd::stub::not_yet_supported("batch", "needs a server-side YAML batch runner", mode)
+        }
+
         Commands::Completions { shell } => {
             cmd::completions::run(shell);
             Ok(())

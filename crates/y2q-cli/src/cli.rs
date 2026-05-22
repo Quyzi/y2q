@@ -211,6 +211,99 @@ pub enum Commands {
     },
     /// Single readiness check; exit status is non-zero if the alias is not ready.
     Ready { alias: String },
+
+    // ── Tier 2: daemon-gated stubs (parse fully, return not-yet-supported) ──
+    /// Create a bucket. [not yet supported]
+    Mb {
+        target: String,
+        #[arg(long)]
+        ignore_existing: bool,
+    },
+    /// Remove a bucket. [not yet supported]
+    Rb {
+        target: String,
+        #[arg(long)]
+        force: bool,
+    },
+    /// Manage object tags. [not yet supported]
+    Tag {
+        #[command(subcommand)]
+        cmd: crate::stubs::TagCmd,
+    },
+    /// Manage user-defined attributes. [not yet supported]
+    Attribute {
+        #[command(subcommand)]
+        cmd: crate::stubs::AttributeCmd,
+    },
+    /// Manage bucket versioning. [not yet supported]
+    Version {
+        #[command(subcommand)]
+        cmd: crate::stubs::VersionCmd,
+    },
+    /// Reverse recent PUT/DELETE operations. [not yet supported]
+    Undo {
+        target: String,
+        #[arg(long, default_value_t = 1)]
+        last: u32,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Manage WORM object-lock retention. [not yet supported]
+    Retention {
+        #[command(subcommand)]
+        cmd: crate::stubs::RetentionCmd,
+    },
+    /// Manage WORM legal holds. [not yet supported]
+    Legalhold {
+        #[command(subcommand)]
+        cmd: crate::stubs::LegalholdCmd,
+    },
+    /// Manage presigned share URLs. [not yet supported]
+    Share {
+        #[command(subcommand)]
+        cmd: crate::stubs::ShareCmd,
+    },
+    /// Manage anonymous access policy. [not yet supported]
+    Anonymous {
+        #[command(subcommand)]
+        cmd: crate::stubs::AnonymousCmd,
+    },
+    /// Manage bucket CORS rules. [not yet supported]
+    Cors {
+        #[command(subcommand)]
+        cmd: crate::stubs::CorsCmd,
+    },
+    /// Manage bucket size quotas. [not yet supported]
+    Quota {
+        #[command(subcommand)]
+        cmd: crate::stubs::QuotaCmd,
+    },
+    /// Manage bucket inventory reports. [not yet supported]
+    Inventory {
+        #[command(subcommand)]
+        cmd: crate::stubs::InventoryCmd,
+    },
+    /// Manage lifecycle (ILM) rules. [not yet supported]
+    Ilm {
+        #[command(subcommand)]
+        cmd: crate::stubs::IlmCmd,
+    },
+    /// Manage bucket default encryption. [not yet supported]
+    Encrypt {
+        #[command(subcommand)]
+        cmd: crate::stubs::EncryptCmd,
+    },
+    /// Manage bucket event notifications. [not yet supported]
+    Event {
+        #[command(subcommand)]
+        cmd: crate::stubs::EventCmd,
+    },
+    /// Manage server-side batch jobs. [not yet supported]
+    Batch {
+        #[command(subcommand)]
+        cmd: crate::stubs::BatchCmd,
+    },
+
     /// Manage users and admin operations.
     Admin {
         #[command(subcommand)]
