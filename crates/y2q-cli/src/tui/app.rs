@@ -100,39 +100,11 @@ impl App {
                 bytes_done,
                 speed_bps,
             } => {
-                if let Some(entry) = self.transfers.iter_mut().find(|e| e.id == id) {
-                    entry.bytes_done = bytes_done;
-                    if entry.speed_samples.len() >= 60 {
-                        entry.speed_samples.pop_front();
-                    }
-                    entry.speed_samples.push_back(speed_bps);
-                    if entry.started_at.is_none() {
-                        entry.started_at = Some(Instant::now());
-                    }
-                    entry.status = TransferStatus::Running;
-                }
+                self.apply_transfer_update(id, bytes_done, speed_bps);
                 Action::None
             }
             Event::TransferDone { id, result } => {
-                if let Some(entry) = self.transfers.iter_mut().find(|e| e.id == id) {
-                    entry.status = match result {
-                        Ok(n) => {
-                            let elapsed = entry.started_at.map(|t| t.elapsed()).unwrap_or_default();
-                            let avg_bps = if elapsed.as_secs_f64() > 0.0 {
-                                (n as f64 / elapsed.as_secs_f64()) as u64
-                            } else {
-                                entry.speed_samples.back().copied().unwrap_or(0)
-                            };
-                            entry.bytes_done = n;
-                            TransferStatus::Done {
-                                bytes: n,
-                                elapsed,
-                                avg_bps,
-                            }
-                        }
-                        Err(e) => TransferStatus::Failed(e),
-                    };
-                }
+                self.apply_transfer_done(id, result);
                 Action::None
             }
             Event::RemoteFetched {
@@ -140,20 +112,7 @@ impl App {
                 path,
                 result,
             } => {
-                self.remote_throbber.stop();
-                match result {
-                    RemoteFetchResult::Error(e) => {
-                        self.mode = Mode::Error(e);
-                    }
-                    RemoteFetchResult::Buckets(buckets) => {
-                        self.remote.set_buckets(&alias, buckets);
-                    }
-                    RemoteFetchResult::Objects(items, _next) => {
-                        if let RemoteFetchPath::Objects { bucket, .. } = path {
-                            self.remote.set_objects(&alias, &bucket, items);
-                        }
-                    }
-                }
+                self.apply_remote_fetched(alias, path, result);
                 Action::None
             }
             Event::RebuildStatus {
@@ -198,32 +157,146 @@ impl App {
                 Action::None
             }
             Event::ObjectStatFetched { path, result } => {
-                match result {
-                    Ok(head) => {
-                        let mut lines = vec![
-                            format!("Path:     {path}"),
-                            format!("Size:     {}", fmt_bytes(head.size)),
-                            format!("Created:  {}", fmt_ns(head.created)),
-                            format!("Modified: {}", fmt_ns(head.modified)),
-                            format!("GxHash:   {}", head.checksum_gxhash),
-                        ];
-                        for (k, v) in &head.labels {
-                            lines.push(format!("Label     {k}: {v}"));
-                        }
-                        if let Some(ref alg) = head.kem_alg {
-                            lines.push(format!("KEM:      {alg}"));
-                        }
-                        if let Some(ref alg) = head.aead_alg {
-                            lines.push(format!("AEAD:     {alg}"));
-                        }
-                        if let Some(sz) = head.cipher_size {
-                            lines.push(format!("Envelope: {} on disk", fmt_bytes(sz)));
-                        }
-                        self.mode = Mode::ObjectStat { path, lines };
+                self.apply_object_stat(path, result);
+                Action::None
+            }
+            _ => Action::None,
+        }
+    }
+
+    fn apply_transfer_update(&mut self, id: u64, bytes_done: u64, speed_bps: u64) {
+        if let Some(entry) = self.transfers.iter_mut().find(|e| e.id == id) {
+            entry.bytes_done = bytes_done;
+            if entry.speed_samples.len() >= 60 {
+                entry.speed_samples.pop_front();
+            }
+            entry.speed_samples.push_back(speed_bps);
+            if entry.started_at.is_none() {
+                entry.started_at = Some(Instant::now());
+            }
+            entry.status = TransferStatus::Running;
+        }
+    }
+
+    fn apply_transfer_done(&mut self, id: u64, result: Result<u64, String>) {
+        if let Some(entry) = self.transfers.iter_mut().find(|e| e.id == id) {
+            entry.status = match result {
+                Ok(n) => {
+                    let elapsed = entry.started_at.map(|t| t.elapsed()).unwrap_or_default();
+                    let avg_bps = if elapsed.as_secs_f64() > 0.0 {
+                        (n as f64 / elapsed.as_secs_f64()) as u64
+                    } else {
+                        entry.speed_samples.back().copied().unwrap_or(0)
+                    };
+                    entry.bytes_done = n;
+                    TransferStatus::Done {
+                        bytes: n,
+                        elapsed,
+                        avg_bps,
                     }
-                    Err(e) => {
-                        self.mode = Mode::Error(e);
+                }
+                Err(e) => TransferStatus::Failed(e),
+            };
+        }
+    }
+
+    fn apply_remote_fetched(
+        &mut self,
+        alias: String,
+        path: RemoteFetchPath,
+        result: RemoteFetchResult,
+    ) {
+        self.remote_throbber.stop();
+        match result {
+            RemoteFetchResult::Error(e) => {
+                self.mode = Mode::Error(e);
+            }
+            RemoteFetchResult::Buckets(buckets) => {
+                self.remote.set_buckets(&alias, buckets);
+            }
+            RemoteFetchResult::Objects(items, _next) => {
+                if let RemoteFetchPath::Objects { bucket, .. } = path {
+                    self.remote.set_objects(&alias, &bucket, items);
+                }
+            }
+        }
+    }
+
+    fn apply_object_stat(&mut self, path: String, result: Result<y2q_client::ObjectHead, String>) {
+        match result {
+            Ok(head) => {
+                let mut lines = vec![
+                    format!("Path:     {path}"),
+                    format!("Size:     {}", fmt_bytes(head.size)),
+                    format!("Created:  {}", fmt_ns(head.created)),
+                    format!("Modified: {}", fmt_ns(head.modified)),
+                    format!("GxHash:   {}", head.checksum_gxhash),
+                ];
+                for (k, v) in &head.labels {
+                    lines.push(format!("Label     {k}: {v}"));
+                }
+                if let Some(ref alg) = head.kem_alg {
+                    lines.push(format!("KEM:      {alg}"));
+                }
+                if let Some(ref alg) = head.aead_alg {
+                    lines.push(format!("AEAD:     {alg}"));
+                }
+                if let Some(sz) = head.cipher_size {
+                    lines.push(format!("Envelope: {} on disk", fmt_bytes(sz)));
+                }
+                self.mode = Mode::ObjectStat { path, lines };
+            }
+            Err(e) => {
+                self.mode = Mode::Error(e);
+            }
+        }
+    }
+
+    fn handle_key(&mut self, key: crossterm::event::KeyEvent) -> Action {
+        match self.mode.clone() {
+            Mode::Input { value, action, .. } => self.handle_input_key(key, value, action),
+            Mode::Confirm(action) => self.handle_confirm_key(key, action),
+            // Any key dismisses an error or stat popup back to Browse.
+            Mode::Error(_) | Mode::ObjectStat { .. } => {
+                self.mode = Mode::Browse;
+                Action::None
+            }
+            Mode::Admin(tab) => self.handle_admin_key(key, tab),
+            Mode::Browse => self.handle_browse_key(key),
+        }
+    }
+
+    fn handle_input_key(
+        &mut self,
+        key: crossterm::event::KeyEvent,
+        value: String,
+        action: InputAction,
+    ) -> Action {
+        use crossterm::event::KeyCode;
+        match key.code {
+            KeyCode::Esc => {
+                self.mode = match action {
+                    InputAction::AddUserUsername { .. } | InputAction::AddUserPassword { .. } => {
+                        Mode::Admin(AdminTab::Users)
                     }
+                    _ => Mode::Browse,
+                };
+                Action::None
+            }
+            KeyCode::Enter => {
+                self.mode = Mode::Browse;
+                self.handle_input_submit(value, action);
+                Action::Enter
+            }
+            KeyCode::Backspace => {
+                if let Mode::Input { ref mut value, .. } = self.mode {
+                    value.pop();
+                }
+                Action::None
+            }
+            KeyCode::Char(c) => {
+                if let Mode::Input { ref mut value, .. } = self.mode {
+                    value.push(c);
                 }
                 Action::None
             }
@@ -231,145 +304,101 @@ impl App {
         }
     }
 
-    fn handle_key(&mut self, key: crossterm::event::KeyEvent) -> Action {
+    fn handle_confirm_key(
+        &mut self,
+        key: crossterm::event::KeyEvent,
+        action: ConfirmAction,
+    ) -> Action {
         use crossterm::event::KeyCode;
+        let mode_after = match action {
+            ConfirmAction::DeleteUser { .. } => Mode::Admin(AdminTab::Users),
+            _ => Mode::Browse,
+        };
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                self.execute_confirm(action);
+                self.mode = mode_after;
+                Action::ConfirmYes
+            }
+            _ => {
+                self.mode = mode_after;
+                Action::ConfirmNo
+            }
+        }
+    }
 
-        if let Mode::Input {
-            ref value,
-            ref action,
-            ..
-        } = self.mode.clone()
-        {
-            return match key.code {
-                KeyCode::Esc => {
-                    self.mode = match action {
-                        InputAction::AddUserUsername { .. }
-                        | InputAction::AddUserPassword { .. } => Mode::Admin(AdminTab::Users),
-                        _ => Mode::Browse,
+    fn handle_admin_key(&mut self, key: crossterm::event::KeyEvent, tab: AdminTab) -> Action {
+        use crossterm::event::KeyCode;
+        match key.code {
+            KeyCode::Char('q') | KeyCode::Esc => {
+                self.mode = Mode::Browse;
+                Action::None
+            }
+            KeyCode::Tab => {
+                let next = tab.next();
+                self.enter_admin_tab(&next);
+                self.mode = Mode::Admin(next);
+                Action::NextTab
+            }
+            KeyCode::BackTab => {
+                let prev = tab.prev();
+                self.enter_admin_tab(&prev);
+                self.mode = Mode::Admin(prev);
+                Action::PrevTab
+            }
+            KeyCode::Char('r') => {
+                if matches!(tab, AdminTab::Metrics) {
+                    self.fetch_metrics();
+                }
+                Action::Refresh
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                match tab {
+                    AdminTab::Locks => self.locks.nav_up(),
+                    AdminTab::Users => self.users_view.nav_up(),
+                    AdminTab::Metrics => self.metrics_view.nav_up(),
+                    _ => {}
+                }
+                Action::NavigateUp
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                match tab {
+                    AdminTab::Locks => self.locks.nav_down(),
+                    AdminTab::Users => self.users_view.nav_down(),
+                    AdminTab::Metrics => self.metrics_view.nav_down(),
+                    _ => {}
+                }
+                Action::NavigateDown
+            }
+            KeyCode::Char('n') => {
+                if matches!(tab, AdminTab::Users) {
+                    let alias = self.active_alias.clone().unwrap_or_default();
+                    self.mode = Mode::Input {
+                        prompt: "New username:".into(),
+                        value: String::new(),
+                        action: InputAction::AddUserUsername { alias },
                     };
-                    Action::None
                 }
-                KeyCode::Enter => {
-                    let value = value.clone();
-                    let action = action.clone();
-                    self.mode = Mode::Browse;
-                    self.handle_input_submit(value, action);
-                    Action::Enter
+                Action::None
+            }
+            KeyCode::Char('d') => {
+                if matches!(tab, AdminTab::Users)
+                    && let Some(user) = self.users_view.users.get(self.users_view.selected).cloned()
+                {
+                    let alias = self.active_alias.clone().unwrap_or_default();
+                    self.mode = Mode::Confirm(ConfirmAction::DeleteUser {
+                        alias,
+                        username: user.username,
+                    });
                 }
-                KeyCode::Backspace => {
-                    if let Mode::Input { ref mut value, .. } = self.mode {
-                        value.pop();
-                    }
-                    Action::None
-                }
-                KeyCode::Char(c) => {
-                    if let Mode::Input { ref mut value, .. } = self.mode {
-                        value.push(c);
-                    }
-                    Action::None
-                }
-                _ => Action::None,
-            };
+                Action::Delete
+            }
+            _ => Action::None,
         }
+    }
 
-        if let Mode::Confirm(ref action) = self.mode.clone() {
-            let mode_after = match action {
-                ConfirmAction::DeleteUser { .. } => Mode::Admin(AdminTab::Users),
-                _ => Mode::Browse,
-            };
-            return match key.code {
-                KeyCode::Char('y') | KeyCode::Char('Y') => {
-                    self.execute_confirm(action.clone());
-                    self.mode = mode_after;
-                    Action::ConfirmYes
-                }
-                _ => {
-                    self.mode = mode_after;
-                    Action::ConfirmNo
-                }
-            };
-        }
-
-        if let Mode::Error(_) = self.mode {
-            self.mode = Mode::Browse;
-            return Action::None;
-        }
-
-        if let Mode::ObjectStat { .. } = self.mode {
-            self.mode = Mode::Browse;
-            return Action::None;
-        }
-
-        if let Mode::Admin(ref tab) = self.mode.clone() {
-            return match key.code {
-                KeyCode::Char('q') | KeyCode::Esc => {
-                    self.mode = Mode::Browse;
-                    Action::None
-                }
-                KeyCode::Tab => {
-                    let next = tab.next();
-                    self.enter_admin_tab(&next);
-                    self.mode = Mode::Admin(next);
-                    Action::NextTab
-                }
-                KeyCode::BackTab => {
-                    let prev = tab.prev();
-                    self.enter_admin_tab(&prev);
-                    self.mode = Mode::Admin(prev);
-                    Action::PrevTab
-                }
-                KeyCode::Char('r') => {
-                    if matches!(tab, AdminTab::Metrics) {
-                        self.fetch_metrics();
-                    }
-                    Action::Refresh
-                }
-                KeyCode::Up | KeyCode::Char('k') => {
-                    match tab {
-                        AdminTab::Locks => self.locks.nav_up(),
-                        AdminTab::Users => self.users_view.nav_up(),
-                        AdminTab::Metrics => self.metrics_view.nav_up(),
-                        _ => {}
-                    }
-                    Action::NavigateUp
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    match tab {
-                        AdminTab::Locks => self.locks.nav_down(),
-                        AdminTab::Users => self.users_view.nav_down(),
-                        AdminTab::Metrics => self.metrics_view.nav_down(),
-                        _ => {}
-                    }
-                    Action::NavigateDown
-                }
-                KeyCode::Char('n') => {
-                    if matches!(tab, AdminTab::Users) {
-                        let alias = self.active_alias.clone().unwrap_or_default();
-                        self.mode = Mode::Input {
-                            prompt: "New username:".into(),
-                            value: String::new(),
-                            action: InputAction::AddUserUsername { alias },
-                        };
-                    }
-                    Action::None
-                }
-                KeyCode::Char('d') => {
-                    if matches!(tab, AdminTab::Users)
-                        && let Some(user) =
-                            self.users_view.users.get(self.users_view.selected).cloned()
-                    {
-                        let alias = self.active_alias.clone().unwrap_or_default();
-                        self.mode = Mode::Confirm(ConfirmAction::DeleteUser {
-                            alias,
-                            username: user.username,
-                        });
-                    }
-                    Action::Delete
-                }
-                _ => Action::None,
-            };
-        }
-
+    fn handle_browse_key(&mut self, key: crossterm::event::KeyEvent) -> Action {
+        use crossterm::event::KeyCode;
         match key.code {
             KeyCode::Char('q') => {
                 self.should_quit = true;
@@ -1030,5 +1059,556 @@ impl App {
                 self.mode = Mode::Admin(AdminTab::Users);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Alias;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use std::time::Duration;
+    use tokio::sync::mpsc::UnboundedReceiver;
+    use y2q_client::{MetadataView, ObjectHead, StaleLockEntry, TraceEvent, UserView};
+
+    use super::super::pane::remote::RemoteLevel;
+
+    fn test_app() -> (App, UnboundedReceiver<Event>) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut cfg = CliConfig::default();
+        cfg.add_alias(
+            "a".into(),
+            Alias {
+                url: "http://127.0.0.1:1".into(),
+                username: "u".into(),
+                password: None,
+                insecure: false,
+                ca_cert_path: None,
+                client_cert_path: None,
+                client_key_path: None,
+            },
+        );
+        (App::new(cfg, tx), rx)
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn ch(c: char) -> KeyEvent {
+        key(KeyCode::Char(c))
+    }
+
+    fn meta(key: &str) -> MetadataView {
+        MetadataView {
+            created: 0,
+            modified: 0,
+            size: 10,
+            checksum_gxhash: "h".into(),
+            bucket: "b".into(),
+            key: key.into(),
+            disk_path: "/d".into(),
+            url_path: "/u".into(),
+            labels: Default::default(),
+            cipher_size: None,
+            cipher_sha256: None,
+            kem_alg: None,
+            aead_alg: None,
+            envelope_version: None,
+        }
+    }
+
+    fn head_full() -> ObjectHead {
+        let mut labels = std::collections::BTreeMap::new();
+        labels.insert("env".into(), "prod".into());
+        ObjectHead {
+            size: 2048,
+            created: 1,
+            modified: 2,
+            checksum_gxhash: "gx".into(),
+            labels,
+            cipher_size: Some(4096),
+            cipher_sha256: Some("sha".into()),
+            kem_alg: Some("ml-kem-768".into()),
+            aead_alg: Some("aes-256-gcm".into()),
+            envelope_version: Some(1),
+        }
+    }
+
+    // ── Browse-mode keys ────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn browse_quit_and_pane_toggle() {
+        let (mut app, _rx) = test_app();
+        assert_eq!(app.handle_key(ch('q')), Action::Quit);
+        assert!(app.should_quit);
+
+        let (mut app, _rx) = test_app();
+        assert_eq!(app.handle_key(key(KeyCode::Tab)), Action::SwitchPane);
+        assert_eq!(app.focused, FocusedPane::Remote);
+    }
+
+    #[tokio::test]
+    async fn browse_misc_keys() {
+        let (mut app, _rx) = test_app();
+        assert_eq!(app.handle_key(ch('t')), Action::ToggleTransferBar);
+        assert!(!app.transfer_bar_visible);
+        assert_eq!(app.handle_key(ch('a')), Action::ToggleAdmin);
+        assert!(matches!(app.mode, Mode::Admin(_)));
+
+        let (mut app, _rx) = test_app();
+        assert_eq!(app.handle_key(key(KeyCode::Down)), Action::NavigateDown);
+        assert_eq!(app.handle_key(ch('k')), Action::NavigateUp);
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), Action::Enter);
+        assert_eq!(app.handle_key(key(KeyCode::Backspace)), Action::Back);
+        assert_eq!(app.handle_key(ch('n')), Action::None);
+        assert_eq!(app.handle_key(ch('c')), Action::Copy);
+        assert_eq!(app.handle_key(ch('d')), Action::Delete);
+        assert_eq!(app.handle_key(ch('r')), Action::Refresh);
+        assert_eq!(app.handle_key(key(KeyCode::F(1))), Action::None);
+    }
+
+    // ── Admin-mode keys ─────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn admin_tab_cycle_and_exit() {
+        let (mut app, _rx) = test_app();
+        app.mode = Mode::Admin(AdminTab::Rebuild);
+        assert_eq!(app.handle_key(key(KeyCode::Tab)), Action::NextTab);
+        assert_eq!(app.mode, Mode::Admin(AdminTab::Locks));
+        assert_eq!(app.handle_key(key(KeyCode::BackTab)), Action::PrevTab);
+        assert_eq!(app.mode, Mode::Admin(AdminTab::Rebuild));
+        assert_eq!(app.handle_key(ch('q')), Action::None);
+        assert_eq!(app.mode, Mode::Browse);
+    }
+
+    #[tokio::test]
+    async fn admin_nav_and_actions() {
+        for tab in [AdminTab::Locks, AdminTab::Users, AdminTab::Metrics] {
+            let (mut app, _rx) = test_app();
+            app.mode = Mode::Admin(tab.clone());
+            assert_eq!(app.handle_key(key(KeyCode::Up)), Action::NavigateUp);
+            assert_eq!(app.handle_key(key(KeyCode::Down)), Action::NavigateDown);
+        }
+        // 'r' on Metrics tab triggers a refresh; active_alias None -> no spawn.
+        let (mut app, _rx) = test_app();
+        app.mode = Mode::Admin(AdminTab::Metrics);
+        assert_eq!(app.handle_key(ch('r')), Action::Refresh);
+
+        // 'n' on Users opens the new-user input.
+        let (mut app, _rx) = test_app();
+        app.mode = Mode::Admin(AdminTab::Users);
+        assert_eq!(app.handle_key(ch('n')), Action::None);
+        assert!(matches!(app.mode, Mode::Input { .. }));
+
+        // 'd' on Users with a selected user opens a delete confirm.
+        let (mut app, _rx) = test_app();
+        app.mode = Mode::Admin(AdminTab::Users);
+        app.users_view.set_users(vec![UserView {
+            username: "bob".into(),
+            created_at: 0,
+            last_login: None,
+        }]);
+        assert_eq!(app.handle_key(ch('d')), Action::Delete);
+        assert!(matches!(
+            app.mode,
+            Mode::Confirm(ConfirmAction::DeleteUser { .. })
+        ));
+        // Esc while a confirm is open declines it.
+        assert_eq!(app.handle_key(key(KeyCode::Esc)), Action::ConfirmNo);
+    }
+
+    // ── Input-mode keys ─────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn input_typing_and_escape() {
+        let (mut app, _rx) = test_app();
+        app.mode = Mode::Input {
+            prompt: "p".into(),
+            value: String::new(),
+            action: InputAction::CreateBucket { alias: "a".into() },
+        };
+        app.handle_key(ch('h'));
+        app.handle_key(ch('i'));
+        app.handle_key(key(KeyCode::Backspace));
+        match &app.mode {
+            Mode::Input { value, .. } => assert_eq!(value, "h"),
+            _ => panic!("expected input mode"),
+        }
+        assert_eq!(app.handle_key(key(KeyCode::Esc)), Action::None);
+        assert_eq!(app.mode, Mode::Browse);
+
+        // Esc from an add-user input returns to the Users admin tab.
+        let (mut app, _rx) = test_app();
+        app.mode = Mode::Input {
+            prompt: "p".into(),
+            value: String::new(),
+            action: InputAction::AddUserUsername { alias: "a".into() },
+        };
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.mode, Mode::Admin(AdminTab::Users));
+    }
+
+    #[tokio::test]
+    async fn input_submit_create_bucket_and_add_user() {
+        let (mut app, _rx) = test_app();
+        app.mode = Mode::Input {
+            prompt: "p".into(),
+            value: "newbucket".into(),
+            action: InputAction::CreateBucket { alias: "a".into() },
+        };
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), Action::Enter);
+        assert!(matches!(app.remote.level, RemoteLevel::Objects { .. }));
+        assert_eq!(app.focused, FocusedPane::Local);
+
+        // username -> password chained input
+        let (mut app, _rx) = test_app();
+        app.mode = Mode::Input {
+            prompt: "p".into(),
+            value: "alice".into(),
+            action: InputAction::AddUserUsername { alias: "a".into() },
+        };
+        app.handle_key(key(KeyCode::Enter));
+        assert!(matches!(
+            app.mode,
+            Mode::Input {
+                action: InputAction::AddUserPassword { .. },
+                ..
+            }
+        ));
+        // submit password (spawns a network task that fails harmlessly)
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.mode, Mode::Admin(AdminTab::Users));
+        tokio::time::sleep(Duration::from_millis(60)).await;
+    }
+
+    // ── Confirm-mode keys ───────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn confirm_yes_no() {
+        let (mut app, _rx) = test_app();
+        app.mode = Mode::Confirm(ConfirmAction::DeleteRemote {
+            alias: "a".into(),
+            bucket: "b".into(),
+            key: "k".into(),
+        });
+        assert_eq!(app.handle_key(ch('y')), Action::ConfirmYes);
+        assert_eq!(app.mode, Mode::Browse);
+
+        let (mut app, _rx) = test_app();
+        app.mode = Mode::Confirm(ConfirmAction::DeleteUser {
+            alias: "a".into(),
+            username: "bob".into(),
+        });
+        assert_eq!(app.handle_key(ch('n')), Action::ConfirmNo);
+        assert_eq!(app.mode, Mode::Admin(AdminTab::Users));
+
+        let (mut app, _rx) = test_app();
+        app.mode = Mode::Confirm(ConfirmAction::DeleteUser {
+            alias: "a".into(),
+            username: "bob".into(),
+        });
+        assert_eq!(app.handle_key(ch('y')), Action::ConfirmYes);
+        tokio::time::sleep(Duration::from_millis(60)).await;
+    }
+
+    #[tokio::test]
+    async fn error_and_stat_dismiss() {
+        let (mut app, _rx) = test_app();
+        app.mode = Mode::Error("boom".into());
+        assert_eq!(app.handle_key(ch('x')), Action::None);
+        assert_eq!(app.mode, Mode::Browse);
+
+        app.mode = Mode::ObjectStat {
+            path: "p".into(),
+            lines: vec![],
+        };
+        assert_eq!(app.handle_key(ch('x')), Action::None);
+        assert_eq!(app.mode, Mode::Browse);
+    }
+
+    // ── handle_enter (remote pane) ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn handle_enter_remote_levels() {
+        // Alias entry -> fetch buckets
+        let (mut app, _rx) = test_app();
+        app.focused = FocusedPane::Remote;
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), Action::Enter);
+        assert_eq!(app.active_alias.as_deref(), Some("a"));
+
+        // Bucket entry -> fetch objects
+        let (mut app, _rx) = test_app();
+        app.focused = FocusedPane::Remote;
+        app.remote.set_buckets("a", vec!["b".into()]);
+        app.remote.selected = 1; // the bucket
+        app.handle_key(key(KeyCode::Enter));
+
+        // Object entry -> fetch stat
+        let (mut app, _rx) = test_app();
+        app.focused = FocusedPane::Remote;
+        app.remote.set_objects("a", "b", vec![meta("k")]);
+        app.remote.selected = 1;
+        app.handle_key(key(KeyCode::Enter));
+
+        // Back entry -> go back
+        let (mut app, _rx) = test_app();
+        app.focused = FocusedPane::Remote;
+        app.remote.set_objects("a", "b", vec![meta("k")]);
+        app.remote.selected = 0; // Back
+        app.handle_key(key(KeyCode::Enter));
+        tokio::time::sleep(Duration::from_millis(60)).await;
+    }
+
+    // ── start_copy both directions ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn start_copy_remote_to_local() {
+        let (mut app, _rx) = test_app();
+        app.focused = FocusedPane::Remote;
+        app.active_alias = Some("a".into());
+        app.remote.set_objects("a", "b", vec![meta("k")]);
+        app.remote.selected = 1;
+        app.start_copy();
+        assert_eq!(app.transfers.len(), 1);
+        tokio::time::sleep(Duration::from_millis(60)).await;
+    }
+
+    #[tokio::test]
+    async fn start_copy_local_to_remote() {
+        let dir = std::env::temp_dir().join(format!("y2q-tui-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("file.bin");
+        std::fs::write(&f, b"data").unwrap();
+
+        let (mut app, _rx) = test_app();
+        app.focused = FocusedPane::Local;
+        app.local.cwd = dir.clone();
+        app.local.entries = vec![
+            super::super::pane::local::LocalEntry::Dir("..".into()),
+            super::super::pane::local::LocalEntry::File {
+                name: "file.bin".into(),
+                size: 4,
+            },
+        ];
+        app.local.selected = 1;
+        app.remote.level = RemoteLevel::Objects {
+            alias: "a".into(),
+            bucket: "b".into(),
+            prefix: None,
+        };
+        app.start_copy();
+        assert_eq!(app.transfers.len(), 1);
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── request_delete + create_bucket guards ───────────────────────────────
+
+    #[tokio::test]
+    async fn request_delete_and_create_bucket() {
+        let (mut app, _rx) = test_app();
+        app.focused = FocusedPane::Remote;
+        app.active_alias = Some("a".into());
+        app.remote.set_objects("a", "b", vec![meta("k")]);
+        app.remote.selected = 1;
+        app.request_delete();
+        assert!(matches!(
+            app.mode,
+            Mode::Confirm(ConfirmAction::DeleteRemote { .. })
+        ));
+
+        let (mut app, _rx) = test_app();
+        app.focused = FocusedPane::Remote;
+        app.remote.set_buckets("a", vec![]);
+        app.start_create_bucket();
+        assert!(matches!(app.mode, Mode::Input { .. }));
+    }
+
+    // ── update() event handling ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn update_lifecycle_events() {
+        let (mut app, _rx) = test_app();
+        assert_eq!(app.update(Event::Tick), Action::None);
+        assert_eq!(app.update(Event::Render), Action::None);
+        assert_eq!(app.update(Event::Resize(1, 1)), Action::None);
+        assert_eq!(app.update(Event::Quit), Action::Quit);
+        assert!(app.should_quit);
+        // Key event is delegated to handle_key.
+        let (mut app, _rx) = test_app();
+        assert_eq!(app.update(Event::Key(ch('q'))), Action::Quit);
+    }
+
+    #[tokio::test]
+    async fn update_transfer_events() {
+        let (mut app, _rx) = test_app();
+        app.transfers
+            .push_back(TransferEntry::new(1, "t".into(), Some(100)));
+        app.update(Event::TransferUpdate {
+            id: 1,
+            bytes_done: 50,
+            speed_bps: 10,
+        });
+        assert_eq!(app.transfers[0].bytes_done, 50);
+
+        app.update(Event::TransferDone {
+            id: 1,
+            result: Ok(100),
+        });
+        assert!(matches!(
+            app.transfers[0].status,
+            TransferStatus::Done { .. }
+        ));
+
+        app.transfers
+            .push_back(TransferEntry::new(2, "t2".into(), None));
+        app.update(Event::TransferDone {
+            id: 2,
+            result: Err("nope".into()),
+        });
+        assert!(matches!(app.transfers[1].status, TransferStatus::Failed(_)));
+    }
+
+    #[tokio::test]
+    async fn update_remote_fetched() {
+        let (mut app, _rx) = test_app();
+        app.update(Event::RemoteFetched {
+            alias: "a".into(),
+            path: RemoteFetchPath::Buckets,
+            result: RemoteFetchResult::Buckets(vec!["b".into()]),
+        });
+        assert!(matches!(app.remote.level, RemoteLevel::Buckets { .. }));
+
+        app.update(Event::RemoteFetched {
+            alias: "a".into(),
+            path: RemoteFetchPath::Objects {
+                bucket: "b".into(),
+                prefix: None,
+            },
+            result: RemoteFetchResult::Objects(vec![meta("k")], None),
+        });
+        assert!(matches!(app.remote.level, RemoteLevel::Objects { .. }));
+
+        app.update(Event::RemoteFetched {
+            alias: "a".into(),
+            path: RemoteFetchPath::Buckets,
+            result: RemoteFetchResult::Error("err".into()),
+        });
+        assert!(matches!(app.mode, Mode::Error(_)));
+    }
+
+    #[tokio::test]
+    async fn update_admin_data_events() {
+        let (mut app, _rx) = test_app();
+        app.update(Event::RebuildStatus {
+            alias: "a".into(),
+            state: "running".into(),
+            percent: Some(50),
+            reason: None,
+        });
+        assert_eq!(app.rebuild.percent, Some(50));
+
+        app.update(Event::UsersLoaded {
+            alias: "a".into(),
+            users: vec![UserView {
+                username: "u".into(),
+                created_at: 0,
+                last_login: None,
+            }],
+        });
+        assert_eq!(app.users_view.users.len(), 1);
+
+        app.update(Event::LocksLoaded {
+            alias: "a".into(),
+            locks: vec![StaleLockEntry {
+                bucket: "b".into(),
+                uuid: "id".into(),
+                locked_since_nanos: 0,
+                age_seconds: 1,
+            }],
+        });
+        assert_eq!(app.locks.locks.len(), 1);
+
+        app.update(Event::MetricsLoaded {
+            alias: "a".into(),
+            result: Ok("# HELP\n".into()),
+        });
+        app.update(Event::MetricsLoaded {
+            alias: "a".into(),
+            result: Err("bad".into()),
+        });
+        assert!(app.metrics_view.error.is_some());
+
+        app.update(Event::TraceEventArrived {
+            alias: "a".into(),
+            event: TraceEvent {
+                request_id: "r".into(),
+                timestamp_ns: 0,
+                method: "GET".into(),
+                path: "/".into(),
+                status: 200,
+                latency_ms: 1.0,
+                req_bytes: None,
+                resp_bytes: None,
+                remote_addr: None,
+            },
+        });
+        app.update(Event::TraceStreamEnded {
+            alias: "a".into(),
+            error: Some("ended".into()),
+        });
+        assert!(!app.events_view.streaming);
+    }
+
+    #[tokio::test]
+    async fn update_object_stat() {
+        let (mut app, _rx) = test_app();
+        app.update(Event::ObjectStatFetched {
+            path: "a/b/k".into(),
+            result: Ok(head_full()),
+        });
+        match &app.mode {
+            Mode::ObjectStat { lines, .. } => {
+                assert!(lines.iter().any(|l| l.contains("KEM:")));
+                assert!(lines.iter().any(|l| l.contains("Label")));
+            }
+            _ => panic!("expected stat popup"),
+        }
+
+        app.update(Event::ObjectStatFetched {
+            path: "a/b/k".into(),
+            result: Err("missing".into()),
+        });
+        assert!(matches!(app.mode, Mode::Error(_)));
+    }
+
+    #[tokio::test]
+    async fn trigger_refresh_levels() {
+        let (mut app, _rx) = test_app();
+        app.remote.level = RemoteLevel::Buckets { alias: "a".into() };
+        app.trigger_refresh();
+        let (mut app, _rx) = test_app();
+        app.remote.level = RemoteLevel::Objects {
+            alias: "a".into(),
+            bucket: "b".into(),
+            prefix: None,
+        };
+        app.trigger_refresh();
+        tokio::time::sleep(Duration::from_millis(60)).await;
+    }
+
+    #[tokio::test]
+    async fn fetch_helpers_require_active_alias() {
+        // With an active alias set, fetch_* run their sync prelude then spawn.
+        let (mut app, _rx) = test_app();
+        app.active_alias = Some("a".into());
+        app.fetch_users();
+        app.fetch_locks();
+        app.fetch_metrics();
+        app.start_trace_stream();
+        assert!(app.events_view.streaming);
+        // give spawned tasks a chance to run their (failing) bodies
+        tokio::time::sleep(Duration::from_millis(80)).await;
     }
 }

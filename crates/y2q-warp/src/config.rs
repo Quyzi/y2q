@@ -89,3 +89,18 @@ pub fn parse_size(s: &str) -> Result<u64, String> {
     };
     Ok(base * mult)
 }
+
+#[cfg(test)]
+mod parse_size_tests {
+    use super::parse_size;
+
+    #[test]
+    fn units_and_errors() {
+        assert_eq!(parse_size("512").unwrap(), 512);
+        assert_eq!(parse_size("1K").unwrap(), 1024);
+        assert_eq!(parse_size("2 MiB").unwrap(), 2 * 1024 * 1024);
+        assert_eq!(parse_size("1G").unwrap(), 1024 * 1024 * 1024);
+        assert!(parse_size("abc").is_err());
+        assert!(parse_size("10X").is_err());
+    }
+}

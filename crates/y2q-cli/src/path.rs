@@ -54,3 +54,47 @@ impl CpEndpoint {
         matches!(self, Self::Remote(_))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remote_path_variants() {
+        let r = RemotePath::parse("a/b/c").unwrap();
+        assert_eq!(r.alias, "a");
+        assert_eq!(r.bucket.as_deref(), Some("b"));
+        assert_eq!(r.key.as_deref(), Some("c"));
+
+        let r = RemotePath::parse("a/b/").unwrap();
+        assert_eq!(r.bucket.as_deref(), Some("b"));
+        assert_eq!(r.key, None);
+
+        let r = RemotePath::parse("a/b").unwrap();
+        assert_eq!(r.bucket.as_deref(), Some("b"));
+        assert_eq!(r.key, None);
+
+        // key may itself contain slashes (splitn(3))
+        let r = RemotePath::parse("a/b/c/d").unwrap();
+        assert_eq!(r.key.as_deref(), Some("c/d"));
+    }
+
+    #[test]
+    fn remote_path_rejects_bad_input() {
+        assert!(RemotePath::parse("noslash").is_err());
+        assert!(RemotePath::parse("/bucket/key").is_err());
+    }
+
+    #[test]
+    fn cp_endpoint_classification() {
+        assert!(matches!(CpEndpoint::parse("-"), CpEndpoint::Local(_)));
+        assert!(matches!(
+            CpEndpoint::parse("local.txt"),
+            CpEndpoint::Local(_)
+        ));
+        assert!(matches!(CpEndpoint::parse("a/*.txt"), CpEndpoint::Local(_)));
+        assert!(matches!(CpEndpoint::parse("a/b/c"), CpEndpoint::Remote(_)));
+        assert!(CpEndpoint::parse("a/b/c").is_remote());
+        assert!(!CpEndpoint::parse("local.txt").is_remote());
+    }
+}

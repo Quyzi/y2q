@@ -152,3 +152,48 @@ impl RemotePane {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn obj(key: &str) -> MetadataView {
+        MetadataView {
+            created: 0,
+            modified: 0,
+            size: 0,
+            checksum_gxhash: String::new(),
+            bucket: "b".into(),
+            key: key.into(),
+            disk_path: String::new(),
+            url_path: String::new(),
+            labels: Default::default(),
+            cipher_size: None,
+            cipher_sha256: None,
+            kem_alg: None,
+            aead_alg: None,
+            envelope_version: None,
+        }
+    }
+
+    #[test]
+    fn display_name_per_variant() {
+        assert_eq!(RemoteEntry::Alias("a".into()).display_name(), "a/");
+        assert_eq!(RemoteEntry::Bucket("b".into()).display_name(), "b/");
+        assert_eq!(RemoteEntry::Dir("d".into()).display_name(), "d/");
+        assert_eq!(
+            RemoteEntry::Object(Box::new(obj("k.txt"))).display_name(),
+            "k.txt"
+        );
+        assert_eq!(RemoteEntry::Back.display_name(), "..");
+    }
+
+    #[test]
+    fn is_dir_like_classification() {
+        assert!(RemoteEntry::Alias("a".into()).is_dir_like());
+        assert!(RemoteEntry::Bucket("b".into()).is_dir_like());
+        assert!(RemoteEntry::Dir("d".into()).is_dir_like());
+        assert!(RemoteEntry::Back.is_dir_like());
+        assert!(!RemoteEntry::Object(Box::new(obj("k"))).is_dir_like());
+    }
+}

@@ -197,3 +197,33 @@ pub fn classify_http_error(error: &str) -> (bool, bool) {
     }
     (false, false)
 }
+
+#[cfg(test)]
+mod classify_tests {
+    use super::classify_http_error;
+
+    #[test]
+    fn http_status_strings() {
+        assert_eq!(classify_http_error("HTTP 404 Not Found"), (true, false));
+        assert_eq!(classify_http_error("HTTP 500 Internal"), (false, true));
+        assert_eq!(classify_http_error("HTTP 200 OK"), (false, false));
+    }
+
+    #[test]
+    fn client_error_display_strings() {
+        assert_eq!(classify_http_error("not found: x"), (true, false));
+        assert_eq!(classify_http_error("bad request: x"), (true, false));
+        assert_eq!(classify_http_error("conflict: x"), (true, false));
+        assert_eq!(classify_http_error("server error (502): x"), (false, true));
+        assert_eq!(classify_http_error("server error (404): x"), (true, false));
+        assert_eq!(classify_http_error("server error (oops): x"), (false, true));
+    }
+
+    #[test]
+    fn unknown_is_neither() {
+        assert_eq!(
+            classify_http_error("i/o error: broken pipe"),
+            (false, false)
+        );
+    }
+}

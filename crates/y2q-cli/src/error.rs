@@ -40,3 +40,51 @@ impl CliError {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn msg(s: &str) -> String {
+        s.to_owned()
+    }
+
+    #[test]
+    fn exit_codes_per_variant() {
+        let cases = [
+            (CliError::Client(ClientError::Unauthenticated), 2),
+            (
+                CliError::Client(ClientError::NotFound { message: msg("x") }),
+                3,
+            ),
+            (
+                CliError::Client(ClientError::Conflict { message: msg("x") }),
+                4,
+            ),
+            (
+                CliError::Client(ClientError::BadRequest { message: msg("x") }),
+                5,
+            ),
+            (
+                CliError::Client(ClientError::ServerError {
+                    status: 500,
+                    message: msg("x"),
+                }),
+                6,
+            ),
+            (
+                CliError::Client(ClientError::Io(std::io::Error::other("io"))),
+                1,
+            ),
+            (CliError::Config(ConfigError::UnknownAlias(msg("a"))), 9),
+            (CliError::Config(ConfigError::Config(msg("c"))), 8),
+            (CliError::Io(std::io::Error::other("io")), 7),
+            (CliError::InvalidPath(msg("p"), msg("why")), 5),
+            (CliError::RemoteToRemote, 5),
+            (CliError::Other(msg("o")), 1),
+        ];
+        for (err, code) in cases {
+            assert_eq!(err.exit_code(), code, "{err:?}");
+        }
+    }
+}

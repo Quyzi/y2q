@@ -2183,4 +2183,112 @@ mod tests {
             body
         );
     }
+
+    fn plaintext_metrics(size: u64) -> crate::PlaintextMetrics {
+        crate::PlaintextMetrics {
+            size,
+            checksum_gxhash_b64: "AAAAAAAAAAA=".to_owned(),
+        }
+    }
+
+    fn cipher_metadata(cipher_size: u64) -> crate::CipherMetadata {
+        crate::CipherMetadata {
+            cipher_size,
+            cipher_sha256_b64: "x".to_owned(),
+            kem_alg: "ml-kem-768".to_owned(),
+            aead_alg: "aes-256-gcm".to_owned(),
+            envelope_version: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn streaming_put_then_get_and_overwrite() {
+        use tokio::io::AsyncWriteExt;
+        let (s, _dir) = make_storage();
+
+        let (guard, mut file) = s.begin_streaming_put("sb", "sk").await.unwrap();
+        let body = b"ciphertext-ish bytes";
+        file.write_all(body).await.unwrap();
+        let overwrite = guard
+            .commit(
+                file,
+                PutOptions {
+                    sync: SyncLevel::Durable,
+                    ..Default::default()
+                },
+                plaintext_metrics(body.len() as u64),
+                cipher_metadata(body.len() as u64),
+            )
+            .await
+            .unwrap();
+        assert!(!overwrite);
+
+        let got = s.get("sb", "sk").await.unwrap();
+        assert_eq!(&got[..], body);
+        let meta = s.describe("sb", "sk").await.unwrap();
+        assert_eq!(meta.size, body.len() as u64);
+        assert_eq!(meta.kem_alg.as_deref(), Some("ml-kem-768"));
+        assert_eq!(meta.aead_alg.as_deref(), Some("aes-256-gcm"));
+
+        // Second streaming PUT to the same key reports an overwrite.
+        let (guard2, mut f2) = s.begin_streaming_put("sb", "sk").await.unwrap();
+        f2.write_all(b"new").await.unwrap();
+        let ow = guard2
+            .commit(
+                f2,
+                PutOptions::default(),
+                plaintext_metrics(3),
+                cipher_metadata(3),
+            )
+            .await
+            .unwrap();
+        assert!(ow);
+        assert_eq!(&s.get("sb", "sk").await.unwrap()[..], b"new");
+    }
+
+    #[tokio::test]
+    async fn streaming_put_guard_drop_cleans_tmp() {
+        let (s, _dir) = make_storage();
+        let (guard, _file) = s.begin_streaming_put("b", "k").await.unwrap();
+        drop(guard); // no commit -> tmp removed, lock released
+        // The key must not exist and a fresh streaming put must succeed.
+        assert!(s.get("b", "k").await.is_err());
+        let (g2, _f2) = s.begin_streaming_put("b", "k").await.unwrap();
+        drop(g2);
+    }
+
+    #[tokio::test]
+    async fn durable_put_and_range_edges() {
+        let (s, _dir) = make_storage();
+        s.put(
+            "b",
+            "k",
+            make_object(b"0123456789"),
+            PutOptions {
+                sync: SyncLevel::Durable,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            &s.get_range("b", "k", (0u64..=0u64).into()).await.unwrap()[..],
+            b"0"
+        );
+        assert_eq!(
+            &s.get_range("b", "k", (3u64..=6u64).into()).await.unwrap()[..],
+            b"3456"
+        );
+        assert_eq!(
+            &s.get_range("b", "k", (7u64..=9u64).into()).await.unwrap()[..],
+            b"789"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_missing_key_errors() {
+        let (s, _dir) = make_storage();
+        let err = s.delete("b", "absent").await.unwrap_err();
+        assert!(matches!(err, crate::Error::NotFound { .. }));
+    }
 }

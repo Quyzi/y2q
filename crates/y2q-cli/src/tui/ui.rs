@@ -632,3 +632,87 @@ fn render_error_popup(frame: &mut Frame, area: Rect, message: &str) {
         popup,
     );
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::CliConfig;
+    use crate::tui::widgets::transfer_bar::{TransferEntry, TransferStatus};
+    use ratatui::{Terminal, backend::TestBackend};
+    use std::time::Duration;
+
+    fn app() -> App {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        App::new(CliConfig::default(), tx)
+    }
+
+    fn draw(app: &mut App) {
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(f, app)).unwrap();
+    }
+
+    #[test]
+    fn renders_every_mode() {
+        // Browse, both panes focused.
+        let mut a = app();
+        draw(&mut a);
+        a.focused = FocusedPane::Remote;
+        draw(&mut a);
+
+        // Each admin tab.
+        for tab in [
+            AdminTab::Rebuild,
+            AdminTab::Locks,
+            AdminTab::Users,
+            AdminTab::Metrics,
+            AdminTab::Events,
+        ] {
+            a.mode = Mode::Admin(tab);
+            draw(&mut a);
+        }
+
+        // Confirm / Input / Error / ObjectStat popups.
+        a.mode = Mode::Confirm(ConfirmAction::DeleteRemote {
+            alias: "x".into(),
+            bucket: "b".into(),
+            key: "k".into(),
+        });
+        draw(&mut a);
+        a.mode = Mode::Input {
+            prompt: "Name:".into(),
+            value: "typed".into(),
+            action: InputAction::CreateBucket { alias: "x".into() },
+        };
+        draw(&mut a);
+        a.mode = Mode::Error("something broke".into());
+        draw(&mut a);
+        a.mode = Mode::ObjectStat {
+            path: "a/b/c".into(),
+            lines: vec!["Size: 10".into(), "KEM: ml-kem".into()],
+        };
+        draw(&mut a);
+    }
+
+    #[test]
+    fn renders_transfer_bar_states() {
+        let mut a = app();
+        a.transfer_bar_visible = true;
+        let mut running = TransferEntry::new(1, "up".into(), Some(100));
+        running.status = TransferStatus::Running;
+        running.bytes_done = 40;
+        let mut done = TransferEntry::new(2, "done".into(), Some(100));
+        done.status = TransferStatus::Done {
+            bytes: 100,
+            elapsed: Duration::from_secs(1),
+            avg_bps: 100,
+        };
+        let failed = {
+            let mut e = TransferEntry::new(3, "bad".into(), None);
+            e.status = TransferStatus::Failed("nope".into());
+            e
+        };
+        a.transfers.extend([running, done, failed]);
+        draw(&mut a);
+    }
+}
