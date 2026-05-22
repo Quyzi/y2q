@@ -6,7 +6,6 @@ mod error;
 mod output;
 mod path;
 mod progress;
-mod stubs;
 mod token;
 mod tui;
 
@@ -165,47 +164,10 @@ async fn run(cli: Cli) -> Result<(), CliError> {
             ignore_existing,
         } => cmd::bucket::make(target, ignore_existing, mode).await,
         Commands::Rb { target, force } => cmd::bucket::remove(target, force, mode).await,
-
-        // ── Tier 2 stubs ──
         Commands::Tag { cmd } => cmd::tag::run_tag(cmd, mode).await,
         Commands::Attribute { cmd } => cmd::tag::run_attribute(cmd, mode).await,
-        Commands::Version { .. } => cmd::stub::not_yet_supported(
-            "version",
-            "needs object versioning in the storage backend",
-            mode,
-        ),
-        Commands::Undo { .. } => {
-            cmd::stub::not_yet_supported("undo", "needs object versioning", mode)
-        }
-        Commands::Retention { .. } => {
-            cmd::stub::not_yet_supported("retention", "needs WORM object-lock metadata", mode)
-        }
-        Commands::Legalhold { .. } => {
-            cmd::stub::not_yet_supported("legalhold", "needs a WORM legal-hold flag", mode)
-        }
-        Commands::Share { .. } => {
-            cmd::stub::not_yet_supported("share", "needs a presigned-URL signing route", mode)
-        }
-        Commands::Anonymous { .. } => {
-            cmd::stub::not_yet_supported("anonymous", "needs per-bucket access policy", mode)
-        }
-        Commands::Cors { .. } => {
-            cmd::stub::not_yet_supported("cors", "needs per-bucket CORS metadata", mode)
-        }
         Commands::Quota { cmd } => cmd::bucketcfg::run_quota(cmd, mode).await,
-        Commands::Inventory { .. } => {
-            cmd::stub::not_yet_supported("inventory", "needs a scheduled inventory generator", mode)
-        }
-        Commands::Ilm { .. } => {
-            cmd::stub::not_yet_supported("ilm", "needs a lifecycle engine", mode)
-        }
         Commands::Encrypt { cmd } => cmd::bucketcfg::run_encrypt(cmd, mode).await,
-        Commands::Event { .. } => {
-            cmd::stub::not_yet_supported("event", "needs notification dispatch", mode)
-        }
-        Commands::Batch { .. } => {
-            cmd::stub::not_yet_supported("batch", "needs a server-side YAML batch runner", mode)
-        }
 
         Commands::Completions { shell } => {
             cmd::completions::run(shell);

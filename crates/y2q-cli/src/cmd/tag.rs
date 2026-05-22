@@ -3,11 +3,11 @@
 
 use std::collections::BTreeMap;
 
+use crate::cli::{AttributeCmd, TagCmd};
 use crate::cmd::objects::make_client;
 use crate::error::CliError;
 use crate::output::{OutputMode, print_json};
 use crate::path::RemotePath;
-use crate::stubs::{AttributeCmd, TagCmd};
 
 fn split_target(target: &str) -> Result<(RemotePath, String, String), CliError> {
     let remote = RemotePath::parse(target)?;

@@ -212,96 +212,37 @@ pub enum Commands {
     /// Single readiness check; exit status is non-zero if the alias is not ready.
     Ready { alias: String },
 
-    // ── Tier 2: daemon-gated stubs (parse fully, return not-yet-supported) ──
-    /// Create a bucket. [not yet supported]
+    /// Create a bucket.
     Mb {
         target: String,
         #[arg(long)]
         ignore_existing: bool,
     },
-    /// Remove a bucket. [not yet supported]
+    /// Remove a bucket and all its objects.
     Rb {
         target: String,
         #[arg(long)]
         force: bool,
     },
-    /// Manage object tags. [not yet supported]
+    /// Manage object tags (labels).
     Tag {
         #[command(subcommand)]
-        cmd: crate::stubs::TagCmd,
+        cmd: TagCmd,
     },
-    /// Manage user-defined attributes. [not yet supported]
+    /// Manage object attributes (labels; same store as tags).
     Attribute {
         #[command(subcommand)]
-        cmd: crate::stubs::AttributeCmd,
+        cmd: AttributeCmd,
     },
-    /// Manage bucket versioning. [not yet supported]
-    Version {
-        #[command(subcommand)]
-        cmd: crate::stubs::VersionCmd,
-    },
-    /// Reverse recent PUT/DELETE operations. [not yet supported]
-    Undo {
-        target: String,
-        #[arg(long, default_value_t = 1)]
-        last: u32,
-        #[arg(long)]
-        dry_run: bool,
-    },
-    /// Manage WORM object-lock retention. [not yet supported]
-    Retention {
-        #[command(subcommand)]
-        cmd: crate::stubs::RetentionCmd,
-    },
-    /// Manage WORM legal holds. [not yet supported]
-    Legalhold {
-        #[command(subcommand)]
-        cmd: crate::stubs::LegalholdCmd,
-    },
-    /// Manage presigned share URLs. [not yet supported]
-    Share {
-        #[command(subcommand)]
-        cmd: crate::stubs::ShareCmd,
-    },
-    /// Manage anonymous access policy. [not yet supported]
-    Anonymous {
-        #[command(subcommand)]
-        cmd: crate::stubs::AnonymousCmd,
-    },
-    /// Manage bucket CORS rules. [not yet supported]
-    Cors {
-        #[command(subcommand)]
-        cmd: crate::stubs::CorsCmd,
-    },
-    /// Manage bucket size quotas. [not yet supported]
+    /// Manage per-bucket size quotas.
     Quota {
         #[command(subcommand)]
-        cmd: crate::stubs::QuotaCmd,
+        cmd: QuotaCmd,
     },
-    /// Manage bucket inventory reports. [not yet supported]
-    Inventory {
-        #[command(subcommand)]
-        cmd: crate::stubs::InventoryCmd,
-    },
-    /// Manage lifecycle (ILM) rules. [not yet supported]
-    Ilm {
-        #[command(subcommand)]
-        cmd: crate::stubs::IlmCmd,
-    },
-    /// Manage bucket default encryption. [not yet supported]
+    /// Manage a bucket's recorded default encryption (informational).
     Encrypt {
         #[command(subcommand)]
-        cmd: crate::stubs::EncryptCmd,
-    },
-    /// Manage bucket event notifications. [not yet supported]
-    Event {
-        #[command(subcommand)]
-        cmd: crate::stubs::EventCmd,
-    },
-    /// Manage server-side batch jobs. [not yet supported]
-    Batch {
-        #[command(subcommand)]
-        cmd: crate::stubs::BatchCmd,
+        cmd: EncryptCmd,
     },
 
     /// Manage users and admin operations.
@@ -318,6 +259,65 @@ pub enum Commands {
         #[arg(value_name = "SHELL")]
         shell: Shell,
     },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum TagCmd {
+    /// Set tags on an object (KEY=VALUE pairs; merges into existing).
+    Set {
+        target: String,
+        #[arg(value_name = "KEY=VALUE")]
+        tags: Vec<String>,
+    },
+    /// List tags on an object.
+    #[command(alias = "ls")]
+    List { target: String },
+    /// Remove all tags from an object.
+    #[command(alias = "rm")]
+    Remove { target: String },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum AttributeCmd {
+    /// Set attributes (KEY=VALUE pairs; merges into existing).
+    Set {
+        target: String,
+        #[arg(value_name = "KEY=VALUE")]
+        attrs: Vec<String>,
+    },
+    /// List attributes.
+    #[command(alias = "ls")]
+    List { target: String },
+    /// Remove all attributes.
+    #[command(alias = "rm")]
+    Remove { target: String },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum QuotaCmd {
+    /// Set a bucket size quota (e.g. 500m, 2g).
+    Set {
+        target: String,
+        #[arg(long)]
+        size: String,
+    },
+    /// Clear a bucket quota.
+    Clear { target: String },
+    /// Show a bucket quota.
+    Info { target: String },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum EncryptCmd {
+    /// Record a bucket's default SSE algorithm (informational).
+    Set {
+        target: String,
+        algo: Option<String>,
+    },
+    /// Show the bucket's recorded default SSE.
+    Info { target: String },
+    /// Clear the bucket's recorded default SSE.
+    Clear { target: String },
 }
 
 #[derive(Subcommand, Debug)]

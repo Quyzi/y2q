@@ -1,11 +1,11 @@
 //! `quota` and `encrypt` — per-bucket configuration via read-modify-write of
 //! the bucket config endpoint.
 
+use crate::cli::{EncryptCmd, QuotaCmd};
 use crate::cmd::objects::make_client;
 use crate::error::CliError;
 use crate::output::{OutputMode, fmt_bytes, print_json};
 use crate::path::RemotePath;
-use crate::stubs::{EncryptCmd, QuotaCmd};
 
 fn bucket_of(target: &str) -> Result<(RemotePath, String), CliError> {
     let remote = RemotePath::parse(target)?;

@@ -19,12 +19,6 @@ pub enum CliError {
     #[error("remote-to-remote copy is not supported")]
     RemoteToRemote,
 
-    #[error("`{command}`: not yet supported - {daemon_gate}")]
-    NotYetSupported {
-        command: String,
-        daemon_gate: String,
-    },
-
     #[error("{0}")]
     Other(String),
 }
@@ -42,7 +36,6 @@ impl CliError {
             Self::Config(_) => 8,
             Self::Io(_) => 7,
             Self::InvalidPath(_, _) | Self::RemoteToRemote => 5,
-            Self::NotYetSupported { .. } => 64,
             Self::Other(_) => 1,
         }
     }
