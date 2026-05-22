@@ -522,7 +522,15 @@ impl Storage for UringStorage {
 
 impl Listing for UringStorage {
     async fn list_buckets(&self) -> Result<Vec<String>, Error> {
-        self.index.list_buckets().await
+        crate::storage::filesystem::list_buckets_union(&self.base_path, &self.index).await
+    }
+
+    async fn create_bucket(&self, bucket: &str) -> Result<bool, Error> {
+        crate::storage::filesystem::create_bucket_impl(&self.base_path, bucket).await
+    }
+
+    async fn delete_bucket(&self, bucket: &str) -> Result<u64, Error> {
+        crate::storage::filesystem::delete_bucket_impl(&self.base_path, &self.index, bucket).await
     }
 
     async fn list_objects(&self, bucket: &str, options: ListOptions) -> Result<ListPage, Error> {

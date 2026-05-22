@@ -11,6 +11,26 @@ impl Y2qClient {
         Ok(body.buckets)
     }
 
+    /// Create a bucket. Returns `true` if newly created, `false` if it already
+    /// existed.
+    pub async fn create_bucket(&self, bucket: &str) -> Result<bool, ClientError> {
+        let url = self.url(&format!("{bucket}/"));
+        let resp = self.authed(self.inner.put(url)).send().await?;
+        let resp = Self::check_status(resp).await?;
+        let body = resp.json::<serde_json::Value>().await?;
+        Ok(body["created"].as_bool().unwrap_or(false))
+    }
+
+    /// Delete a bucket and all of its objects. Returns the number of objects
+    /// removed.
+    pub async fn delete_bucket(&self, bucket: &str) -> Result<u64, ClientError> {
+        let url = self.url(&format!("{bucket}/"));
+        let resp = self.authed(self.inner.delete(url)).send().await?;
+        let resp = Self::check_status(resp).await?;
+        let body = resp.json::<serde_json::Value>().await?;
+        Ok(body["objects_removed"].as_u64().unwrap_or(0))
+    }
+
     pub async fn list_objects(
         &self,
         bucket: &str,

@@ -453,13 +453,24 @@ pub trait Storage {
 /// callers resume with the `next` cursor returned in [`ListPage`].
 #[allow(async_fn_in_trait)]
 pub trait Listing: Storage {
-    /// Return the names of every bucket that contains at least one object,
-    /// sorted ascending.
+    /// Return the names of every bucket, sorted ascending. Includes buckets
+    /// that contain at least one object as well as empty buckets created
+    /// explicitly via [`create_bucket`](Listing::create_bucket).
     async fn list_buckets(&self) -> Result<Vec<String>, Error>;
 
     /// Return one page of objects in `bucket`, filtered and paginated by
     /// `options`. Results are sorted ascending by key.
     async fn list_objects(&self, bucket: &str, options: ListOptions) -> Result<ListPage, Error>;
+
+    /// Create `bucket`. Returns `true` if it was newly created, `false` if it
+    /// already existed. Empty buckets are persisted on disk so they appear in
+    /// [`list_buckets`](Listing::list_buckets) before any object is written.
+    async fn create_bucket(&self, bucket: &str) -> Result<bool, Error>;
+
+    /// Delete `bucket` and every object within it. Returns the number of
+    /// objects removed. Returns [`Error::NotFound`] if the bucket neither
+    /// exists on disk nor has any indexed objects.
+    async fn delete_bucket(&self, bucket: &str) -> Result<u64, Error>;
 }
 
 /// Reported state of the secondary-index rebuild process.

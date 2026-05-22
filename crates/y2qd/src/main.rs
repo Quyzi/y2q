@@ -126,6 +126,8 @@ impl<W: std::io::Write> std::io::Write for IgnoreBrokenPipe<W> {
         handlers::head::handle,
         handlers::list_buckets::handle,
         handlers::list_objects::handle,
+        handlers::buckets::create,
+        handlers::buckets::remove,
         handlers::rebuild::start,
         handlers::rebuild::status,
         handlers::locks::list,
@@ -141,6 +143,8 @@ impl<W: std::io::Write> std::io::Write for IgnoreBrokenPipe<W> {
     components(schemas(
         error::ErrorBody,
         handlers::list_buckets::ListBucketsResponse,
+        handlers::buckets::CreateBucketResponse,
+        handlers::buckets::DeleteBucketResponse,
         handlers::list_objects::ListObjectsResponse,
         handlers::list_objects::MetadataView,
         handlers::rebuild::RebuildStartResponse,
@@ -158,6 +162,7 @@ impl<W: std::io::Write> std::io::Write for IgnoreBrokenPipe<W> {
     tags(
         (name = "objects", description = "Object storage — read, write, and delete objects addressed by bucket/key"),
         (name = "listing", description = "Enumerate buckets and the objects within them"),
+        (name = "buckets", description = "Explicit bucket lifecycle — create and delete buckets"),
         (name = "admin", description = "Administrative operations — secondary-index rebuild, stale-lock cleanup"),
         (name = "auth", description = "Session login/refresh/logout and password change"),
         (name = "users", description = "Add, list, and delete users authorized to log in"),

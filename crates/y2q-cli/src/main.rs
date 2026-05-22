@@ -160,15 +160,13 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         } => cmd::health::ping(&alias, count, interval, error_only, mode).await,
         Commands::Ready { alias } => cmd::health::ready(&alias, mode).await,
 
+        Commands::Mb {
+            target,
+            ignore_existing,
+        } => cmd::bucket::make(target, ignore_existing, mode).await,
+        Commands::Rb { target, force } => cmd::bucket::remove(target, force, mode).await,
+
         // ── Tier 2 stubs ──
-        Commands::Mb { .. } => cmd::stub::not_yet_supported(
-            "mb",
-            "needs a bucket-create endpoint (buckets are implicit on first PUT today)",
-            mode,
-        ),
-        Commands::Rb { .. } => {
-            cmd::stub::not_yet_supported("rb", "needs a bucket-delete endpoint", mode)
-        }
         Commands::Tag { .. } => cmd::stub::not_yet_supported(
             "tag",
             "needs a labels-only PATCH route and a remove-all endpoint",
