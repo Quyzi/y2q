@@ -70,6 +70,35 @@ impl Y2qClient {
         Ok(())
     }
 
+    /// Mutate an object's labels via PATCH. `op` is `set`, `remove`, or
+    /// `replace`. `labels` are sent as `X-Y2Q-<name>` headers. Returns the full
+    /// label set after the operation.
+    pub async fn set_labels(
+        &self,
+        bucket: &str,
+        key: &str,
+        op: &str,
+        labels: &BTreeMap<String, String>,
+    ) -> Result<BTreeMap<String, String>, ClientError> {
+        let url = self.url(&format!("{bucket}/{key}"));
+        let mut rb = self.authed(self.inner.patch(url)).query(&[("op", op)]);
+        for (k, v) in labels {
+            rb = rb.header(format!("X-Y2Q-{k}"), v);
+        }
+        let resp = rb.send().await?;
+        let resp = Self::check_status(resp).await?;
+        let body = resp.json::<serde_json::Value>().await?;
+        let out = body["labels"]
+            .as_object()
+            .map(|m| {
+                m.iter()
+                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_owned())))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(out)
+    }
+
     pub async fn head(&self, bucket: &str, key: &str) -> Result<ObjectHead, ClientError> {
         let url = self.url(&format!("{bucket}/{key}"));
         let resp = self.authed(self.inner.head(url)).send().await?;

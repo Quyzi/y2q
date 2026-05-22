@@ -167,14 +167,8 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         Commands::Rb { target, force } => cmd::bucket::remove(target, force, mode).await,
 
         // ── Tier 2 stubs ──
-        Commands::Tag { .. } => cmd::stub::not_yet_supported(
-            "tag",
-            "needs a labels-only PATCH route and a remove-all endpoint",
-            mode,
-        ),
-        Commands::Attribute { .. } => {
-            cmd::stub::not_yet_supported("attribute", "needs a labels-only PATCH route", mode)
-        }
+        Commands::Tag { cmd } => cmd::tag::run_tag(cmd, mode).await,
+        Commands::Attribute { cmd } => cmd::tag::run_attribute(cmd, mode).await,
         Commands::Version { .. } => cmd::stub::not_yet_supported(
             "version",
             "needs object versioning in the storage backend",

@@ -87,6 +87,19 @@ impl Storage for AnyStorage {
             Self::Uring(s) => s.describe(bucket, key).await,
         }
     }
+
+    async fn set_labels(
+        &self,
+        bucket: &str,
+        key: &str,
+        labels: std::collections::BTreeMap<String, String>,
+    ) -> Result<(), Error> {
+        match self {
+            Self::Filesystem(s) => s.set_labels(bucket, key, labels).await,
+            #[cfg(all(target_os = "linux", feature = "uring"))]
+            Self::Uring(s) => s.set_labels(bucket, key, labels).await,
+        }
+    }
 }
 
 impl Listing for AnyStorage {

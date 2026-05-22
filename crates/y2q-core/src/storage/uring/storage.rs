@@ -518,6 +518,36 @@ impl Storage for UringStorage {
         );
         result
     }
+
+    async fn set_labels(
+        &self,
+        bucket: &str,
+        key: &str,
+        labels: std::collections::BTreeMap<String, String>,
+    ) -> Result<(), Error> {
+        let started = Instant::now();
+        // Label-only metadata rewrite; uses the shared tokio-fs helper rather
+        // than the io_uring data path — this is an infrequent, small write.
+        let result = async {
+            self.locks.check_not_locked(bucket, key)?;
+            crate::storage::filesystem::set_labels_impl(
+                &self.base_path,
+                &self.index,
+                self.config.mek.as_ref(),
+                bucket,
+                key,
+                labels,
+            )
+            .await
+        }
+        .await;
+        record_storage_op(
+            "set_labels",
+            &result,
+            started.elapsed().as_secs_f64() * 1_000.0,
+        );
+        result
+    }
 }
 
 impl Listing for UringStorage {
