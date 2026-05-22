@@ -192,20 +192,14 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         Commands::Cors { .. } => {
             cmd::stub::not_yet_supported("cors", "needs per-bucket CORS metadata", mode)
         }
-        Commands::Quota { .. } => {
-            cmd::stub::not_yet_supported("quota", "needs per-bucket quota metadata", mode)
-        }
+        Commands::Quota { cmd } => cmd::bucketcfg::run_quota(cmd, mode).await,
         Commands::Inventory { .. } => {
             cmd::stub::not_yet_supported("inventory", "needs a scheduled inventory generator", mode)
         }
         Commands::Ilm { .. } => {
             cmd::stub::not_yet_supported("ilm", "needs a lifecycle engine", mode)
         }
-        Commands::Encrypt { .. } => cmd::stub::not_yet_supported(
-            "encrypt",
-            "needs per-bucket default-SSE config (y2q encrypts unconditionally today)",
-            mode,
-        ),
+        Commands::Encrypt { cmd } => cmd::bucketcfg::run_encrypt(cmd, mode).await,
         Commands::Event { .. } => {
             cmd::stub::not_yet_supported("event", "needs notification dispatch", mode)
         }

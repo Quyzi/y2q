@@ -14,10 +14,8 @@ const STUB_INVOCATIONS: &[&[&str]] = &[
     &["share", "download", "local/b/k"],
     &["anonymous", "get", "local/b"],
     &["cors", "get", "local/b"],
-    &["quota", "info", "local/b"],
     &["inventory", "ls", "local/b"],
     &["ilm", "rule", "ls", "local/b"],
-    &["encrypt", "info", "local/b"],
     &["event", "ls", "local/b"],
     &["batch", "ls", "local"],
 ];

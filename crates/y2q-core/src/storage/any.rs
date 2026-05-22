@@ -134,6 +134,34 @@ impl Listing for AnyStorage {
             Self::Uring(s) => s.delete_bucket(bucket).await,
         }
     }
+
+    async fn get_bucket_config(&self, bucket: &str) -> Result<crate::BucketConfig, Error> {
+        match self {
+            Self::Filesystem(s) => s.get_bucket_config(bucket).await,
+            #[cfg(all(target_os = "linux", feature = "uring"))]
+            Self::Uring(s) => s.get_bucket_config(bucket).await,
+        }
+    }
+
+    async fn set_bucket_config(
+        &self,
+        bucket: &str,
+        config: &crate::BucketConfig,
+    ) -> Result<(), Error> {
+        match self {
+            Self::Filesystem(s) => s.set_bucket_config(bucket, config).await,
+            #[cfg(all(target_os = "linux", feature = "uring"))]
+            Self::Uring(s) => s.set_bucket_config(bucket, config).await,
+        }
+    }
+
+    async fn bucket_usage(&self, bucket: &str) -> Result<u64, Error> {
+        match self {
+            Self::Filesystem(s) => s.bucket_usage(bucket).await,
+            #[cfg(all(target_os = "linux", feature = "uring"))]
+            Self::Uring(s) => s.bucket_usage(bucket).await,
+        }
+    }
 }
 
 /// Backend-erased streaming PUT guard returned by

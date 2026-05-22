@@ -376,6 +376,95 @@ pub(crate) async fn set_labels_impl(
     Ok(())
 }
 
+/// Filename of the per-bucket JSON config sidecar, stored at the bucket root
+/// (`<base>/<bucket>/.y2q-bucket.json`). It is a plain file, not a sharded
+/// `.obj`, so it never appears in object listings.
+const BUCKET_CONFIG_FILE: &str = ".y2q-bucket.json";
+
+pub(crate) async fn get_bucket_config_impl(
+    base_path: &Path,
+    bucket: &str,
+) -> Result<crate::BucketConfig, Error> {
+    validate_bucket(bucket)?;
+    let path = base_path.join(bucket).join(BUCKET_CONFIG_FILE);
+    match tokio::fs::read(&path).await {
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| Error::InternalError {
+            bucket: bucket.to_owned(),
+            key: String::new(),
+            operation: "get_bucket_config".to_owned(),
+            message: format!("parse config: {e}"),
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(crate::BucketConfig::default()),
+        Err(e) => Err(Error::InternalError {
+            bucket: bucket.to_owned(),
+            key: String::new(),
+            operation: "get_bucket_config".to_owned(),
+            message: e.to_string(),
+        }),
+    }
+}
+
+pub(crate) async fn set_bucket_config_impl(
+    base_path: &Path,
+    bucket: &str,
+    config: &crate::BucketConfig,
+) -> Result<(), Error> {
+    validate_bucket(bucket)?;
+    let dir = base_path.join(bucket);
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .map_err(|e| Error::InternalError {
+            bucket: bucket.to_owned(),
+            key: String::new(),
+            operation: "set_bucket_config".to_owned(),
+            message: format!("create bucket dir: {e}"),
+        })?;
+    let json = serde_json::to_vec_pretty(config).map_err(|e| Error::InternalError {
+        bucket: bucket.to_owned(),
+        key: String::new(),
+        operation: "set_bucket_config".to_owned(),
+        message: format!("encode config: {e}"),
+    })?;
+    let path = dir.join(BUCKET_CONFIG_FILE);
+    let tmp = dir.join(".y2q-bucket.json.tmp");
+    tokio::fs::write(&tmp, &json)
+        .await
+        .map_err(|e| Error::InternalError {
+            bucket: bucket.to_owned(),
+            key: String::new(),
+            operation: "set_bucket_config".to_owned(),
+            message: format!("write config: {e}"),
+        })?;
+    tokio::fs::rename(&tmp, &path)
+        .await
+        .map_err(|e| Error::InternalError {
+            bucket: bucket.to_owned(),
+            key: String::new(),
+            operation: "set_bucket_config".to_owned(),
+            message: format!("rename config: {e}"),
+        })?;
+    Ok(())
+}
+
+pub(crate) async fn bucket_usage_impl(index: &MetadataIndex, bucket: &str) -> Result<u64, Error> {
+    validate_bucket(bucket)?;
+    let mut total = 0u64;
+    let mut after: Option<String> = None;
+    loop {
+        let page = index
+            .scan_objects(bucket, None, after.as_deref(), 1000)
+            .await?;
+        for item in &page.items {
+            total += item.size;
+        }
+        match page.next {
+            Some(c) => after = Some(c),
+            None => break,
+        }
+    }
+    Ok(total)
+}
+
 fn validate_key(key: &str) -> Result<(), Error> {
     const MAX_KEY_LEN: usize = 1024;
     if key.is_empty() || key.contains('\0') || key.len() > MAX_KEY_LEN {
@@ -1234,6 +1323,22 @@ impl Listing for FilesystemStorage {
         delete_bucket_impl(&self.base_path, &self.index, bucket).await
     }
 
+    async fn get_bucket_config(&self, bucket: &str) -> Result<crate::BucketConfig, Error> {
+        get_bucket_config_impl(&self.base_path, bucket).await
+    }
+
+    async fn set_bucket_config(
+        &self,
+        bucket: &str,
+        config: &crate::BucketConfig,
+    ) -> Result<(), Error> {
+        set_bucket_config_impl(&self.base_path, bucket, config).await
+    }
+
+    async fn bucket_usage(&self, bucket: &str) -> Result<u64, Error> {
+        bucket_usage_impl(&self.index, bucket).await
+    }
+
     async fn list_objects(&self, bucket: &str, options: ListOptions) -> Result<ListPage, Error> {
         validate_bucket(bucket)?;
         let limit = options
@@ -1753,6 +1858,35 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn bucket_config_round_trips_and_defaults_empty() {
+        let (s, _dir) = make_storage();
+        // Absent sidecar → default config.
+        let cfg = s.get_bucket_config("b").await.unwrap();
+        assert_eq!(cfg, crate::BucketConfig::default());
+
+        let want = crate::BucketConfig {
+            quota_bytes: Some(4096),
+            default_sse: Some("aes256-gcm".to_owned()),
+            cors_allow_origin: None,
+        };
+        s.set_bucket_config("b", &want).await.unwrap();
+        assert_eq!(s.get_bucket_config("b").await.unwrap(), want);
+    }
+
+    #[tokio::test]
+    async fn bucket_usage_sums_object_sizes() {
+        let (s, _dir) = make_storage();
+        s.put("b", "a", make_object(b"12345"), PutOptions::default())
+            .await
+            .unwrap();
+        s.put("b", "c", make_object(b"678"), PutOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(s.bucket_usage("b").await.unwrap(), 8);
+        assert_eq!(s.bucket_usage("empty").await.unwrap(), 0);
     }
 
     #[tokio::test]

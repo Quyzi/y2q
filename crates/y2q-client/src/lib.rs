@@ -6,6 +6,6 @@ mod client;
 pub use client::{ClientConfig, TlsOptions, Y2qClient};
 pub use error::ClientError;
 pub use model::{
-    ListOptions, ListPage, MetadataView, ObjectHead, RebuildStatus, StaleLockEntry, TokenResponse,
-    TraceEvent, UserView,
+    BucketConfig, ListOptions, ListPage, MetadataView, ObjectHead, RebuildStatus, StaleLockEntry,
+    TokenResponse, TraceEvent, UserView,
 };

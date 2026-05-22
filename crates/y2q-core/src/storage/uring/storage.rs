@@ -563,6 +563,22 @@ impl Listing for UringStorage {
         crate::storage::filesystem::delete_bucket_impl(&self.base_path, &self.index, bucket).await
     }
 
+    async fn get_bucket_config(&self, bucket: &str) -> Result<crate::BucketConfig, Error> {
+        crate::storage::filesystem::get_bucket_config_impl(&self.base_path, bucket).await
+    }
+
+    async fn set_bucket_config(
+        &self,
+        bucket: &str,
+        config: &crate::BucketConfig,
+    ) -> Result<(), Error> {
+        crate::storage::filesystem::set_bucket_config_impl(&self.base_path, bucket, config).await
+    }
+
+    async fn bucket_usage(&self, bucket: &str) -> Result<u64, Error> {
+        crate::storage::filesystem::bucket_usage_impl(&self.index, bucket).await
+    }
+
     async fn list_objects(&self, bucket: &str, options: ListOptions) -> Result<ListPage, Error> {
         validate_bucket(bucket)?;
         let limit = options
