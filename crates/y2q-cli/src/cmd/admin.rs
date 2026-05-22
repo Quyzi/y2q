@@ -112,17 +112,23 @@ fn format_trace_ts(ns: u64) -> String {
         .to_string()
 }
 
-fn ansi_status(status: u16) -> (&'static str, &'static str) {
-    use std::io::IsTerminal;
-    if !std::io::stdout().is_terminal() {
-        return ("", "");
-    }
+/// ANSI color codes for an HTTP status class. Pure; the tty gate lives in
+/// [`ansi_status`].
+fn status_color(status: u16) -> (&'static str, &'static str) {
     match status {
         200..=299 => ("\x1b[32m", "\x1b[0m"),
         300..=399 => ("\x1b[36m", "\x1b[0m"),
         400..=499 => ("\x1b[33m", "\x1b[0m"),
         _ => ("\x1b[31m", "\x1b[0m"),
     }
+}
+
+fn ansi_status(status: u16) -> (&'static str, &'static str) {
+    use std::io::IsTerminal;
+    if !std::io::stdout().is_terminal() {
+        return ("", "");
+    }
+    status_color(status)
 }
 
 async fn make_client(alias: &str) -> Result<Y2qClient, CliError> {
@@ -133,4 +139,19 @@ async fn make_client(alias: &str) -> Result<Y2qClient, CliError> {
         .token_for(alias)
         .ok_or(CliError::Client(y2q_client::ClientError::Unauthenticated))?;
     client_from_alias(entry, Some(token))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::status_color;
+
+    #[test]
+    fn status_color_classes() {
+        assert_eq!(status_color(200).0, "\x1b[32m");
+        assert_eq!(status_color(301).0, "\x1b[36m");
+        assert_eq!(status_color(404).0, "\x1b[33m");
+        assert_eq!(status_color(500).0, "\x1b[31m");
+        // reset code is consistent
+        assert_eq!(status_color(200).1, "\x1b[0m");
+    }
 }

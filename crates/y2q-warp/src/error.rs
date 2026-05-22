@@ -34,3 +34,26 @@ impl WarpError {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exit_codes() {
+        assert_eq!(
+            WarpError::Config(ConfigError::UnknownAlias("a".into())).exit_code(),
+            9
+        );
+        assert_eq!(
+            WarpError::Config(ConfigError::Config("c".into())).exit_code(),
+            8
+        );
+        assert_eq!(
+            WarpError::Client(y2q_client::ClientError::Unauthenticated).exit_code(),
+            2
+        );
+        assert_eq!(WarpError::Io(std::io::Error::other("io")).exit_code(), 1);
+        assert_eq!(WarpError::Other("x".into()).exit_code(), 1);
+    }
+}

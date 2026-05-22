@@ -30,3 +30,22 @@ impl std::fmt::Display for OpKind {
         f.write_str(self.as_str())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn op_kind_labels() {
+        for (op, s) in [
+            (OpKind::Put, "PUT"),
+            (OpKind::Get, "GET"),
+            (OpKind::Delete, "DELETE"),
+            (OpKind::Stat, "STAT"),
+            (OpKind::List, "LIST"),
+        ] {
+            assert_eq!(op.as_str(), s);
+            assert_eq!(op.to_string(), s);
+        }
+    }
+}

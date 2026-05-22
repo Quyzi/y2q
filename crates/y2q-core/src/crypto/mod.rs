@@ -115,3 +115,57 @@ impl CryptoError {
         }
     }
 }
+
+#[cfg(test)]
+mod into_storage_error_tests {
+    use super::*;
+    use crate::Error;
+
+    #[test]
+    fn maps_each_variant() {
+        assert!(matches!(
+            CryptoError::AuthFailed.into_storage_error("b", "k"),
+            Error::DecryptionFailed { .. }
+        ));
+        assert!(matches!(
+            CryptoError::Aead("x").into_storage_error("b", "k"),
+            Error::DecryptionFailed { .. }
+        ));
+        assert!(matches!(
+            CryptoError::KemDecode("x").into_storage_error("b", "k"),
+            Error::DecryptionFailed { .. }
+        ));
+        assert!(matches!(
+            CryptoError::Envelope("x").into_storage_error("b", "k"),
+            Error::EnvelopeMalformed { .. }
+        ));
+        assert!(matches!(
+            CryptoError::UnsupportedVersion(9).into_storage_error("b", "k"),
+            Error::UnsupportedEnvelopeVersion { version: 9 }
+        ));
+        assert!(matches!(
+            CryptoError::Kdf("x".into()).into_storage_error("b", "k"),
+            Error::KdfFailed { .. }
+        ));
+        assert!(matches!(
+            CryptoError::KeystoreIo("x".into()).into_storage_error("b", "k"),
+            Error::InternalError { .. }
+        ));
+        assert!(matches!(
+            CryptoError::KeystoreMissing("p".into()).into_storage_error("b", "k"),
+            Error::KeystoreNotFound { .. }
+        ));
+        assert!(matches!(
+            CryptoError::KeystoreCorrupt {
+                path: "p".into(),
+                reason: "r".into()
+            }
+            .into_storage_error("b", "k"),
+            Error::KeystoreCorrupt { .. }
+        ));
+        assert!(matches!(
+            CryptoError::UserStore("x".into()).into_storage_error("b", "k"),
+            Error::Index { .. }
+        ));
+    }
+}

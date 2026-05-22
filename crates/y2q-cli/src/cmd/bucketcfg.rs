@@ -144,3 +144,49 @@ pub async fn run_encrypt(cmd: EncryptCmd, mode: OutputMode) -> Result<(), CliErr
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_size_units() {
+        assert_eq!(parse_size("100").unwrap(), 100);
+        assert_eq!(parse_size("100B").unwrap(), 100);
+        assert_eq!(parse_size("1K").unwrap(), 1_000);
+        assert_eq!(parse_size("1KiB").unwrap(), 1_024);
+        assert_eq!(parse_size("2 MB").unwrap(), 2_000_000);
+        assert_eq!(parse_size("1Mi").unwrap(), 1_048_576);
+        assert_eq!(parse_size("3GB").unwrap(), 3_000_000_000);
+        assert_eq!(parse_size("1GiB").unwrap(), 1_073_741_824);
+        assert_eq!(parse_size("1TB").unwrap(), 1_000_000_000_000);
+        assert_eq!(parse_size("1TiB").unwrap(), 1_024u64.pow(4));
+    }
+
+    #[test]
+    fn parse_size_rejects_bad() {
+        assert!(parse_size("abc").is_err());
+        assert!(parse_size("12XY").is_err());
+        assert!(parse_size("").is_err());
+    }
+
+    #[test]
+    fn parse_size_saturates_on_overflow() {
+        // 1e19 fits in u64 but * 1 TiB overflows -> saturates to u64::MAX.
+        assert_eq!(parse_size("10000000000000000000TiB").unwrap(), u64::MAX);
+        // A value too large for u64 itself is a parse error, not a saturation.
+        assert!(parse_size("99999999999999999999").is_err());
+    }
+
+    #[test]
+    fn bucket_of_parses_alias_bucket() {
+        let (_, bucket) = bucket_of("alias/mybucket").unwrap();
+        assert_eq!(bucket, "mybucket");
+    }
+
+    #[test]
+    fn bucket_of_rejects_missing_bucket_or_with_key() {
+        assert!(bucket_of("alias").is_err());
+        assert!(bucket_of("alias/bucket/key").is_err());
+    }
+}

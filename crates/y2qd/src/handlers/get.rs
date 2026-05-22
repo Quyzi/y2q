@@ -117,3 +117,22 @@ fn parse_byte_range(s: &str) -> Option<(u64, u64)> {
         None
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::parse_byte_range;
+
+    #[test]
+    fn parses_valid_ranges() {
+        assert_eq!(parse_byte_range("bytes=0-99"), Some((0, 99)));
+        assert_eq!(parse_byte_range("  bytes=10-10 "), Some((10, 10)));
+    }
+
+    #[test]
+    fn rejects_bad_ranges() {
+        assert_eq!(parse_byte_range("0-99"), None); // no bytes= prefix
+        assert_eq!(parse_byte_range("bytes=99-0"), None); // start > end
+        assert_eq!(parse_byte_range("bytes=abc-1"), None);
+        assert_eq!(parse_byte_range("bytes=5"), None); // no dash
+    }
+}

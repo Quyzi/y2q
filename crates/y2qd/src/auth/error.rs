@@ -106,3 +106,50 @@ impl ResponseError for AuthError {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn status_code_mapping() {
+        use StatusCode as S;
+        let cases: Vec<(AuthError, S)> = vec![
+            (AuthError::InvalidCredentials, S::UNAUTHORIZED),
+            (AuthError::TokenMissing, S::UNAUTHORIZED),
+            (AuthError::TokenInvalid, S::UNAUTHORIZED),
+            (AuthError::TokenExpired, S::UNAUTHORIZED),
+            (
+                AuthError::LockedOut {
+                    until: SystemTime::now(),
+                },
+                S::TOO_MANY_REQUESTS,
+            ),
+            (AuthError::TtlOutOfRange { max: 10 }, S::BAD_REQUEST),
+            (AuthError::InvalidUsername { reason: "bad" }, S::BAD_REQUEST),
+            (
+                AuthError::InvalidBody { reason: "x".into() },
+                S::BAD_REQUEST,
+            ),
+            (
+                AuthError::UserExists {
+                    username: "u".into(),
+                },
+                S::CONFLICT,
+            ),
+            (AuthError::CannotDeleteLastUser, S::CONFLICT),
+            (
+                AuthError::UserNotFound {
+                    username: "u".into(),
+                },
+                S::NOT_FOUND,
+            ),
+            (AuthError::KeystoreUnavailable, S::SERVICE_UNAVAILABLE),
+            (AuthError::Backend("e".into()), S::INTERNAL_SERVER_ERROR),
+            (AuthError::InternalState, S::INTERNAL_SERVER_ERROR),
+        ];
+        for (err, code) in cases {
+            assert_eq!(err.status_code(), code, "{err:?}");
+        }
+    }
+}

@@ -83,3 +83,44 @@ pub fn print_table(headers: &[&str], rows: &[Vec<String>]) {
         println!("{line}");
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fmt_bytes_scales() {
+        assert_eq!(fmt_bytes(512), "512 B");
+        assert_eq!(fmt_bytes(1024), "1.00 KiB");
+        assert_eq!(fmt_bytes(1024 * 1024), "1.00 MiB");
+        assert_eq!(fmt_bytes(1024 * 1024 * 1024), "1.00 GiB");
+    }
+
+    #[test]
+    fn fmt_speed_appends_per_sec() {
+        assert_eq!(fmt_speed(1024), "1.00 KiB/s");
+    }
+
+    #[test]
+    fn fmt_ns_formats_timestamp() {
+        // epoch renders as a Y-m-d H:M:S string (local tz), not raw digits.
+        let s = fmt_ns(0);
+        assert!(s.contains('-') && s.contains(':'), "{s}");
+        // A large but in-range value still formats as a date, not raw digits.
+        let s = fmt_ns(1_700_000_000_000_000_000);
+        assert!(s.starts_with("2023") || s.starts_with("2024"), "{s}");
+    }
+
+    #[test]
+    fn print_table_empty_is_noop() {
+        // Just exercises the empty + populated branches without panicking.
+        print_table(&["a", "b"], &[]);
+        print_table(
+            &["name", "size"],
+            &[
+                vec!["x".to_owned(), "10".to_owned()],
+                vec!["longer-name".to_owned(), "2000".to_owned()],
+            ],
+        );
+    }
+}
