@@ -1,5 +1,5 @@
 use crossterm::event::{KeyEvent, MouseEvent};
-use y2q_client::{MetadataView, ObjectHead, StaleLockEntry, UserView};
+use y2q_client::{MetadataView, ObjectHead, StaleLockEntry, TraceEvent, UserView};
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -47,6 +47,21 @@ pub enum Event {
     ObjectStatFetched {
         path: String,
         result: Result<ObjectHead, String>,
+    },
+    /// Prometheus scrape body (or error) for the Metrics tab.
+    MetricsLoaded {
+        alias: String,
+        result: Result<String, String>,
+    },
+    /// A live trace event arrived for the Events tab.
+    TraceEventArrived {
+        alias: String,
+        event: TraceEvent,
+    },
+    /// The trace stream ended (network drop or error).
+    TraceStreamEnded {
+        alias: String,
+        error: Option<String>,
     },
     Quit,
 }

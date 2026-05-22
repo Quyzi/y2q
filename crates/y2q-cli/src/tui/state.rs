@@ -34,6 +34,8 @@ pub enum AdminTab {
     Rebuild,
     Locks,
     Users,
+    Metrics,
+    Events,
 }
 
 impl AdminTab {
@@ -41,14 +43,18 @@ impl AdminTab {
         match self {
             Self::Rebuild => Self::Locks,
             Self::Locks => Self::Users,
-            Self::Users => Self::Rebuild,
+            Self::Users => Self::Metrics,
+            Self::Metrics => Self::Events,
+            Self::Events => Self::Rebuild,
         }
     }
     pub fn prev(&self) -> Self {
         match self {
-            Self::Rebuild => Self::Users,
+            Self::Rebuild => Self::Events,
             Self::Locks => Self::Rebuild,
             Self::Users => Self::Locks,
+            Self::Metrics => Self::Users,
+            Self::Events => Self::Metrics,
         }
     }
 }
