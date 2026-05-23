@@ -10,6 +10,7 @@ Post-quantum secure object storage. `y2qd` is a REST daemon that encrypts every 
 - [docs/configuration.md](docs/configuration.md) - full config reference with all fields, defaults, and override syntax
 - [docs/operations.md](docs/operations.md) - first run, user management, backup/recovery, runbook
 - [docs/api.md](docs/api.md) - complete HTTP API reference: routes, schemas, error codes, examples
+- [docs/search.md](docs/search.md) - label search query language: operators, regex, grammar, examples
 
 ## Features
 
@@ -183,6 +184,21 @@ y2q ls prod/documents/ --all    # auto-paginate
 y2q stat prod/documents/reports/q1.pdf
 ```
 
+### Searching by label
+
+Find objects by their labels with a boolean query. Operators: `==` `!=`
+`=~` (regex) `^=` (prefix) `$=` (suffix); combine with `and`/`or`/`not` and
+parentheses.
+
+```sh
+y2q search prod/photos --query 'env == prod and tier != test'
+y2q search prod/ --query 'team =~ "infra|sre" and name ^= log-'   # all buckets
+y2q --json search prod/photos --query 'owner == alice'             # JSON output
+```
+
+A trailing-slash-only path (`prod/`) searches every bucket; `prod/bucket/prefix`
+narrows by bucket and key prefix. Full reference: [docs/search.md](docs/search.md).
+
 ### Deleting objects
 
 Delete a single object:
@@ -216,7 +232,7 @@ y2q admin locks clear prod --older-than 30m
 
 ### Live trace
 
-Stream every request hitting the server in real time, similar to `mc admin trace`:
+Stream every request hitting the server in real time:
 
 ```sh
 y2q admin trace prod
@@ -274,7 +290,7 @@ y2q         # same
 
 ## Load Benchmarking (`y2q-warp`)
 
-`y2q-warp` is a dedicated load benchmarking tool modelled after MinIO's `warp`. It runs timed workloads against a live `y2qd` server and records per-operation latencies to a compressed CSV file for offline analysis.
+`y2q-warp` is a dedicated load benchmarking tool. It runs timed workloads against a live `y2qd` server and records per-operation latencies to a compressed CSV file for offline analysis.
 
 Build:
 
@@ -423,8 +439,11 @@ Object keys may contain `/`. Use `/{bucket}/{key}` where `{key}` is the full pat
 |---|---|---|---|
 | `GET` | `/` | Yes | List all non-empty buckets |
 | `GET` | `/{bucket}/` | Yes | List objects in a bucket |
+| `GET` | `/api/v1/search` | Yes | Find objects by a label query |
 
 Listing query parameters: `?prefix=<str>`, `?after=<cursor>`, `?limit=<n>`.
+Search adds `?q=<query>` (required) and an optional `?bucket=<name>`; see
+[docs/search.md](docs/search.md).
 
 ### Admin
 
