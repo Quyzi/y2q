@@ -13,7 +13,7 @@ use clap::{CommandFactory, Parser};
 use tracing_subscriber::EnvFilter;
 
 use cli::{AdminCmd, Cli, Commands};
-use config::{CliConfig, default_config_path};
+use config::CliConfig;
 use error::CliError;
 use output::OutputMode;
 
@@ -70,6 +70,9 @@ async fn run(cli: Cli) -> Result<(), CliError> {
             .map(|p| p.to_string_lossy().into_owned()),
     });
 
+    // A global --config path overrides the default location for every command.
+    client_builder::set_config_path_override(cli.config.clone());
+
     let Some(command) = cli.command else {
         // Bare invocation: print help instead of launching the TUI. Run `y2q tui`
         // for the interactive explorer.
@@ -80,9 +83,7 @@ async fn run(cli: Cli) -> Result<(), CliError> {
 
     match command {
         Commands::Tui => {
-            let config_path = cli
-                .config
-                .unwrap_or_else(|| default_config_path().unwrap_or_default());
+            let config_path = client_builder::resolve_config_path()?;
             let config = CliConfig::load(&config_path)?;
             tui::run_tui(config).await
         }

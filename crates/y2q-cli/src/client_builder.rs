@@ -2,13 +2,14 @@
 //! including reading TLS material from disk.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use y2q_client::{ClientConfig, TlsOptions, Y2qClient};
 use y2q_config::Alias;
 use zeroize::Zeroizing;
 
+use crate::config::default_config_path;
 use crate::error::CliError;
 
 /// Per-invocation TLS overrides sourced from global CLI flags (e.g.
@@ -32,6 +33,28 @@ pub fn set_tls_override(ov: TlsOverride) {
 
 fn tls_override() -> &'static TlsOverride {
     TLS_OVERRIDE.get_or_init(TlsOverride::default)
+}
+
+/// Per-invocation config-file path sourced from the global `--config` flag.
+/// When set, every command reads this path instead of the default location.
+static CONFIG_PATH_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
+
+/// Record the global `--config` override for this process. Called once at
+/// startup, before any command loads config; `None` leaves the default in
+/// effect and later calls are ignored.
+pub fn set_config_path_override(path: Option<PathBuf>) {
+    if let Some(path) = path {
+        let _ = CONFIG_PATH_OVERRIDE.set(path);
+    }
+}
+
+/// Resolve the config-file path: the `--config` override if one was set,
+/// otherwise the platform default.
+pub fn resolve_config_path() -> Result<PathBuf, CliError> {
+    match CONFIG_PATH_OVERRIDE.get() {
+        Some(path) => Ok(path.clone()),
+        None => default_config_path().map_err(CliError::from),
+    }
 }
 
 /// Build a [`ClientConfig`] from an alias entry, attaching the optional bearer

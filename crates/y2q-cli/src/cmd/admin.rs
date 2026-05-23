@@ -2,8 +2,8 @@ use futures::StreamExt;
 use y2q_client::Y2qClient;
 
 use crate::cli::{LocksCmd, RebuildCmd};
-use crate::client_builder::client_from_alias;
-use crate::config::{CliConfig, default_config_path, default_tokens_path};
+use crate::client_builder::{client_from_alias, resolve_config_path};
+use crate::config::{CliConfig, default_tokens_path};
 use crate::error::CliError;
 use crate::output::{OutputMode, fmt_bytes, print_json, print_table};
 use crate::token::TokenStore;
@@ -132,7 +132,7 @@ fn ansi_status(status: u16) -> (&'static str, &'static str) {
 }
 
 async fn make_client(alias: &str) -> Result<Y2qClient, CliError> {
-    let config = CliConfig::load(&default_config_path()?)?;
+    let config = CliConfig::load(&resolve_config_path()?)?;
     let entry = config.get_alias(alias)?;
     let store = TokenStore::load(&default_tokens_path()?)?;
     let token = store

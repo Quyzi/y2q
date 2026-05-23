@@ -1,7 +1,7 @@
 use zeroize::Zeroizing;
 
-use crate::client_builder::client_from_alias;
-use crate::config::{CliConfig, default_config_path, default_tokens_path};
+use crate::client_builder::{client_from_alias, resolve_config_path};
+use crate::config::{CliConfig, default_tokens_path};
 use crate::error::CliError;
 use crate::output::{OutputMode, print_json};
 use crate::token::{TokenEntry, TokenStore};
@@ -19,7 +19,7 @@ pub async fn login(
     ttl: Option<u64>,
     mode: OutputMode,
 ) -> Result<(), CliError> {
-    let config_path = default_config_path()?;
+    let config_path = resolve_config_path()?;
     let tokens_path = default_tokens_path()?;
     let config = CliConfig::load(&config_path)?;
     let entry = config.get_alias(alias)?;
@@ -70,7 +70,7 @@ pub async fn login(
 }
 
 pub async fn logout(alias: &str, mode: OutputMode) -> Result<(), CliError> {
-    let config_path = default_config_path()?;
+    let config_path = resolve_config_path()?;
     let tokens_path = default_tokens_path()?;
     let config = CliConfig::load(&config_path)?;
     let entry = config.get_alias(alias)?;
@@ -97,7 +97,7 @@ pub async fn passwd(
     new: Option<String>,
     mode: OutputMode,
 ) -> Result<(), CliError> {
-    let config_path = default_config_path()?;
+    let config_path = resolve_config_path()?;
     let tokens_path = default_tokens_path()?;
     let config = CliConfig::load(&config_path)?;
     let entry = config.get_alias(alias)?;
