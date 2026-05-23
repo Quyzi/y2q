@@ -1,4 +1,4 @@
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 
 use crate::cmd::objects::make_client;
 use crate::error::CliError;
@@ -13,32 +13,20 @@ pub async fn run(path: String, bytes: u64) -> Result<(), CliError> {
         CliError::InvalidPath(format!("{}/{bucket}/", remote.alias), "missing key".into())
     })?;
 
+    let mut stdout = tokio::io::stdout();
+    if bytes == 0 {
+        stdout.flush().await.map_err(CliError::Io)?;
+        return Ok(());
+    }
+
     let client = make_client(&remote.alias).await?;
 
-    // GET into a duplex pipe, then read up to `bytes` from the read side. When
-    // the writer is dropped after the limit is reached the GET task aborts.
-    let (mut reader, mut writer) = tokio::io::duplex(64 * 1024);
-    let bucket = bucket.to_owned();
-    let key = key.to_owned();
-    let task = tokio::spawn(async move {
-        // Ignore broken-pipe errors when the reader drops early.
-        let _ = client.get_to_writer(&bucket, &key, &mut writer).await;
-    });
-
-    let mut stdout = tokio::io::stdout();
-    let mut buf = vec![0u8; 8 * 1024];
-    let mut remaining = bytes;
-    while remaining > 0 {
-        let cap = std::cmp::min(buf.len() as u64, remaining) as usize;
-        let n = reader.read(&mut buf[..cap]).await.map_err(CliError::Io)?;
-        if n == 0 {
-            break;
-        }
-        stdout.write_all(&buf[..n]).await.map_err(CliError::Io)?;
-        remaining -= n as u64;
-    }
-    drop(reader);
-    let _ = task.await;
+    // Ranged GET for the first `bytes` octets only (HTTP byte ranges are
+    // inclusive). The server decrypts just the requested range instead of
+    // streaming the whole object.
+    client
+        .get_range_to_writer(bucket, key, 0, bytes - 1, &mut stdout)
+        .await?;
     stdout.flush().await.map_err(CliError::Io)?;
     Ok(())
 }
