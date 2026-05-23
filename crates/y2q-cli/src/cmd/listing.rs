@@ -1,8 +1,8 @@
 use serde_json::json;
 use y2q_client::ListOptions;
 
-use crate::client_builder::client_from_alias;
-use crate::config::{CliConfig, default_config_path, default_tokens_path};
+use crate::client_builder::{client_from_alias, resolve_config_path};
+use crate::config::{CliConfig, default_tokens_path};
 use crate::error::CliError;
 use crate::output::{OutputMode, fmt_bytes, fmt_ns, print_json, print_table};
 use crate::path::RemotePath;
@@ -15,7 +15,7 @@ pub async fn run(
     all: bool,
     mode: OutputMode,
 ) -> Result<(), CliError> {
-    let config_path = default_config_path()?;
+    let config_path = resolve_config_path()?;
     let tokens_path = default_tokens_path()?;
     let config = CliConfig::load(&config_path)?;
     let store = TokenStore::load(&tokens_path)?;

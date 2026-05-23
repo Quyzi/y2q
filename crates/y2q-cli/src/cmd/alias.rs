@@ -1,12 +1,13 @@
 use std::io::Read;
 
 use crate::cli::AliasCmd;
-use crate::config::{Alias, CliConfig, default_config_path};
+use crate::client_builder::resolve_config_path;
+use crate::config::{Alias, CliConfig};
 use crate::error::CliError;
 use crate::output::{OutputMode, print_json, print_table};
 
 pub async fn run(cmd: AliasCmd, mode: OutputMode) -> Result<(), CliError> {
-    let config_path = default_config_path()?;
+    let config_path = resolve_config_path()?;
     let mut config = CliConfig::load(&config_path)?;
 
     match cmd {
