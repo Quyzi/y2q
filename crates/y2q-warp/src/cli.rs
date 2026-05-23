@@ -9,6 +9,15 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "PATH")]
     pub config: Option<std::path::PathBuf>,
 
+    /// Override TLS certificate verification for this invocation.
+    /// Use only against self-signed dev/staging endpoints.
+    #[arg(long, global = true)]
+    pub insecure: bool,
+
+    /// Trust this PEM CA bundle for this invocation, overriding the alias's CA.
+    #[arg(long, global = true, value_name = "PATH")]
+    pub ca_cert: Option<std::path::PathBuf>,
+
     #[command(subcommand)]
     pub command: Commands,
 }

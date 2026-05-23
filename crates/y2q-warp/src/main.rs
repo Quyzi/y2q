@@ -20,7 +20,7 @@ use tracing_subscriber::{EnvFilter, fmt};
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
-use auth::{build_client, resolve_token, spawn_refresh_task};
+use auth::{build_client, build_tls_options, resolve_token, spawn_refresh_task};
 use cli::{Cli, Commands, WorkloadArgs};
 use config::{MixedWeights, ObjSize, RunConfig, WorkloadConfig, parse_size};
 use display::DisplayMsg;
@@ -44,7 +44,19 @@ async fn main() {
     }
 }
 
+/// Per-invocation client options sourced from the global CLI flags.
+struct ClientArgs {
+    config_path: Option<std::path::PathBuf>,
+    insecure: bool,
+    ca_cert: Option<std::path::PathBuf>,
+}
+
 async fn run(cli: Cli) -> Result<(), WarpError> {
+    let tls = ClientArgs {
+        config_path: cli.config.clone(),
+        insecure: cli.insecure,
+        ca_cert: cli.ca_cert.clone(),
+    };
     match cli.command {
         Commands::Analyze(args) => {
             let skip_ns = parse_duration_ns(&args.skip)?;
@@ -54,8 +66,7 @@ async fn run(cli: Cli) -> Result<(), WarpError> {
 
         Commands::Prepare(args) => {
             let alias = require_alias(&cli.alias)?;
-            let (_, client, _, _) =
-                init_client(&alias, &cli.config, args.password.as_deref()).await?;
+            let (_, client, _, _) = init_client(&alias, &tls, args.password.as_deref()).await?;
             let obj_size = resolve_obj_size(
                 &args.obj_size,
                 args.obj_size_min.as_deref(),
@@ -78,8 +89,7 @@ async fn run(cli: Cli) -> Result<(), WarpError> {
 
         Commands::Cleanup(args) => {
             let alias = require_alias(&cli.alias)?;
-            let (_, client, _, _) =
-                init_client(&alias, &cli.config, args.password.as_deref()).await?;
+            let (_, client, _, _) = init_client(&alias, &tls, args.password.as_deref()).await?;
             let prefix = match &args.run_id {
                 Some(id) => format!("warp/{id}/"),
                 None => "warp/".to_owned(),
@@ -90,23 +100,23 @@ async fn run(cli: Cli) -> Result<(), WarpError> {
 
         Commands::Put(args) => {
             let alias = require_alias(&cli.alias)?;
-            bench(&alias, &cli.config, OpKind::Put, args, None).await
+            bench(&alias, &tls, OpKind::Put, args, None).await
         }
         Commands::Get(args) => {
             let alias = require_alias(&cli.alias)?;
-            bench(&alias, &cli.config, OpKind::Get, args, None).await
+            bench(&alias, &tls, OpKind::Get, args, None).await
         }
         Commands::Delete(args) => {
             let alias = require_alias(&cli.alias)?;
-            bench(&alias, &cli.config, OpKind::Delete, args, None).await
+            bench(&alias, &tls, OpKind::Delete, args, None).await
         }
         Commands::Stat(args) => {
             let alias = require_alias(&cli.alias)?;
-            bench(&alias, &cli.config, OpKind::Stat, args, None).await
+            bench(&alias, &tls, OpKind::Stat, args, None).await
         }
         Commands::List(args) => {
             let alias = require_alias(&cli.alias)?;
-            bench(&alias, &cli.config, OpKind::List, args, None).await
+            bench(&alias, &tls, OpKind::List, args, None).await
         }
 
         Commands::Mixed(args) => {
@@ -117,20 +127,20 @@ async fn run(cli: Cli) -> Result<(), WarpError> {
                 delete: args.delete_weight,
                 stat: args.stat_weight,
             };
-            bench(&alias, &cli.config, OpKind::Put, args.common, Some(weights)).await
+            bench(&alias, &tls, OpKind::Put, args.common, Some(weights)).await
         }
     }
 }
 
 async fn bench(
     alias: &str,
-    config_path: &Option<std::path::PathBuf>,
+    tls: &ClientArgs,
     op: OpKind,
     args: WorkloadArgs,
     mixed_weights: Option<MixedWeights>,
 ) -> Result<(), WarpError> {
     let (profile, client, expires_at, initial_token) =
-        init_client(alias, config_path, args.password.as_deref()).await?;
+        init_client(alias, tls, args.password.as_deref()).await?;
 
     let duration = parse_duration(&args.duration)?;
     let obj_size = resolve_obj_size(
@@ -271,7 +281,7 @@ async fn bench(
 /// Returns: (alias entry, authed client, token expiry secs, token string)
 async fn init_client(
     alias: &str,
-    config_path: &Option<std::path::PathBuf>,
+    tls: &ClientArgs,
     password: Option<&str>,
 ) -> Result<
     (
@@ -282,22 +292,27 @@ async fn init_client(
     ),
     WarpError,
 > {
-    let cfg_path = match config_path {
+    let cfg_path = match &tls.config_path {
         Some(p) => p.clone(),
         None => y2q_config::default_config_path()?,
     };
     let cfg = y2q_config::CliConfig::load(&cfg_path)?;
     let profile = cfg.get_alias(alias)?.clone();
 
-    // Build an unauthenticated client solely for the login call if needed
-    let base_client =
-        y2q_client::Y2qClient::new(y2q_client::ClientConfig::new(profile.url.clone()))?;
+    let tls_opts = build_tls_options(&profile, tls.insecure, tls.ca_cert.as_deref())?;
+
+    // Build an unauthenticated client solely for the login call if needed.
+    let base_client = y2q_client::Y2qClient::new(y2q_client::ClientConfig {
+        base_url: profile.url.clone(),
+        token: None,
+        tls: tls_opts.clone(),
+    })?;
 
     let effective_pw = password.or(profile.password.as_deref());
     let (token, expires_at) =
         resolve_token(&base_client, alias, &profile.username, effective_pw).await?;
 
-    let client = build_client(&profile.url, &token)?;
+    let client = build_client(&profile.url, &token, tls_opts)?;
     Ok((profile, client, expires_at, token))
 }
 
