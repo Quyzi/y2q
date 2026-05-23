@@ -29,6 +29,35 @@ impl Y2qClient {
         Ok(n)
     }
 
+    /// Stream the byte range `[start, end]` (inclusive) to `writer` via a
+    /// `Range: bytes=start-end` header. Returns total bytes written. The server
+    /// answers 206 Partial Content; an out-of-bounds range yields 416 (surfaced
+    /// as [`ClientError::ServerError`]).
+    pub async fn get_range_to_writer<W>(
+        &self,
+        bucket: &str,
+        key: &str,
+        start: u64,
+        end: u64,
+        writer: &mut W,
+    ) -> Result<u64, ClientError>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        let url = self.url(&format!("{bucket}/{key}"));
+        let resp = self
+            .authed(self.inner.get(url))
+            .header(reqwest::header::RANGE, format!("bytes={start}-{end}"))
+            .send()
+            .await?;
+        let resp = Self::check_status(resp).await?;
+
+        let stream = resp.bytes_stream().map_err(std::io::Error::other);
+        let mut reader = StreamReader::new(stream);
+        let n = tokio::io::copy(&mut reader, writer).await?;
+        Ok(n)
+    }
+
     /// Stream `reader` as PUT body. Returns `true` if object was newly created (201).
     pub async fn put_from_reader<R>(
         &self,

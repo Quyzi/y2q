@@ -305,7 +305,22 @@ pub struct CryptoConfig {
     /// Argon2id parameters for new user records.
     #[serde(default)]
     pub argon2: Argon2Config,
+    /// Plaintext chunk size (bytes) for v2 streaming encryption. Default 4 MiB.
+    /// Stored per-object in the envelope header, so changing this only affects
+    /// objects written afterwards; existing objects keep decrypting with their
+    /// own stored chunk size. Bounds enforced at load: 64 KiB ..= 256 MiB.
+    #[serde(default = "default_envelope_chunk_size_bytes")]
+    pub envelope_chunk_size_bytes: usize,
 }
+
+fn default_envelope_chunk_size_bytes() -> usize {
+    4 * 1024 * 1024
+}
+
+/// Minimum and maximum accepted `envelope_chunk_size_bytes`. The ceiling keeps
+/// the value inside the envelope's `u32` header field and bounds per-chunk RAM.
+const ENVELOPE_CHUNK_SIZE_MIN: usize = 64 * 1024;
+const ENVELOPE_CHUNK_SIZE_MAX: usize = 256 * 1024 * 1024;
 
 fn default_session_ttl_seconds() -> u64 {
     3600
@@ -486,8 +501,32 @@ impl Config {
             figment = figment.merge(Serialized::globals(serde_json::Value::Object(map)));
         }
 
-        figment.extract().map_err(Box::new)
+        let cfg: Config = figment.extract().map_err(Box::new)?;
+
+        validate_envelope_chunk_size(cfg.crypto.envelope_chunk_size_bytes)
+            .map_err(|msg| Box::new(figment::Error::from(msg)))?;
+
+        Ok(cfg)
     }
+}
+
+/// Enforce the accepted bounds for `crypto.envelope_chunk_size_bytes`.
+fn validate_envelope_chunk_size(chunk: usize) -> Result<(), String> {
+    if (ENVELOPE_CHUNK_SIZE_MIN..=ENVELOPE_CHUNK_SIZE_MAX).contains(&chunk) {
+        Ok(())
+    } else {
+        Err(format!(
+            "crypto.envelope_chunk_size_bytes = {chunk} is out of range; \
+             must be between {ENVELOPE_CHUNK_SIZE_MIN} and {ENVELOPE_CHUNK_SIZE_MAX} bytes"
+        ))
+    }
+}
+
+/// Encryption parameters registered as actix `web::Data` so the PUT handler can
+/// read the configured v2 chunk size without touching the whole [`Config`].
+#[derive(Debug, Clone, Copy)]
+pub struct EncryptionParams {
+    pub chunk_size_bytes: usize,
 }
 
 /// Parse a CLI string value as an integer, boolean, or string in that order.
@@ -520,5 +559,21 @@ fn insert_nested(
         .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
     if let serde_json::Value::Object(nested) = entry {
         insert_nested(nested, &keys[1..], value);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn envelope_chunk_size_bounds() {
+        assert!(validate_envelope_chunk_size(default_envelope_chunk_size_bytes()).is_ok());
+        assert!(validate_envelope_chunk_size(ENVELOPE_CHUNK_SIZE_MIN).is_ok());
+        assert!(validate_envelope_chunk_size(ENVELOPE_CHUNK_SIZE_MAX).is_ok());
+        // Below the floor, above the ceiling, and zero are rejected.
+        assert!(validate_envelope_chunk_size(ENVELOPE_CHUNK_SIZE_MIN - 1).is_err());
+        assert!(validate_envelope_chunk_size(ENVELOPE_CHUNK_SIZE_MAX + 1).is_err());
+        assert!(validate_envelope_chunk_size(0).is_err());
     }
 }

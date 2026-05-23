@@ -237,20 +237,23 @@ Retrieve and decrypt an object.
 
 | Header | Effect |
 |---|---|
-| `Range: bytes=N-M` | Closed-range byte slice. **Supported only on plaintext objects.** For encrypted objects (the default), returns 501. |
+| `Range: bytes=N-M` | Closed inclusive byte range over the plaintext. For v2-chunked encrypted objects (the default) only the covering ciphertext chunks are read and decrypted (206). Legacy plaintext objects are sliced directly (206). v1 whole-object encrypted objects cannot be partially decrypted and return 501. The range must be well-formed (`N <= M`) and lie within the object, else 416. |
 
 **Response (200):** raw object bytes, `Content-Type: application/octet-stream`. The full set of metadata headers from `HEAD` is also present.
+
+**Response (206):** the requested byte range, with `Content-Range: bytes N-M/<size>`.
 
 | Code | Meaning |
 |---|---|
 | 200 | Full object |
-| 206 | Partial Content (Range, plaintext only) |
+| 206 | Partial Content (Range; v2-encrypted or plaintext) |
 | 400 | Invalid bucket or key |
 | 401 | Token missing or invalid |
 | 404 | Not found |
 | 409 | Object locked |
+| 416 | Range not satisfiable (inverted or out of bounds); `Content-Range: bytes */<size>` |
 | 500 | Decryption or storage failure (intentionally generic message) |
-| 501 | `Range` on an encrypted object |
+| 501 | `Range` on a v1 whole-object encrypted object |
 
 ### `HEAD /{bucket}/{key}`
 
@@ -533,14 +536,15 @@ These are usually auth-gated. Set `[server] unauthenticated_metrics = true` to e
 | 201 | New object or user created |
 | 202 | Rebuild kicked off |
 | 204 | Successful mutation with no body (logout, password change, delete) |
-| 206 | Partial Content (Range on plaintext) |
+| 206 | Partial Content (Range on a v2-encrypted or plaintext object) |
 | 400 | Bad bucket name, key, label, request body, or query parameter |
 | 401 | Auth missing/invalid, or login credentials wrong |
 | 404 | Object or user not found |
 | 409 | Conflict - object locked, rebuild already running, username taken, last-user deletion |
+| 416 | `Range` not satisfiable (inverted or out of bounds) |
 | 429 | Login lockout - see `Retry-After` |
 | 500 | Internal failure: encryption, decryption, index, or storage |
-| 501 | `Range` request on an encrypted object |
+| 501 | `Range` request on a v1 whole-object encrypted object |
 | 503 | `KeystoreUnavailable` - daemon has no SK in memory (idle-dropped). Log in to install it. |
 
 ## Source

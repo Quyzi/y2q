@@ -52,6 +52,9 @@ use crate::handlers::labels::extract_labels;
     security(("bearer" = [])),
     tag = "objects",
 )]
+// Args are actix extractors (one per injected dependency), not a refactorable
+// signature; the count is dictated by the framework.
+#[allow(clippy::too_many_arguments)]
 pub async fn handle(
     path: web::Path<(String, String)>,
     req: HttpRequest,
@@ -59,6 +62,7 @@ pub async fn handle(
     storage: web::Data<Arc<AnyStorage>>,
     limits: web::Data<LabelLimits>,
     default_sync: web::Data<SyncLevel>,
+    encryption: web::Data<crate::config::EncryptionParams>,
     auth: Authenticated,
 ) -> Result<HttpResponse, AppError> {
     let (bucket, key) = path.into_inner();
@@ -97,9 +101,16 @@ pub async fn handle(
         .await
         .map_err(AppError::from)?;
 
-    let (sink, plaintext_metrics, cipher_metadata) =
-        cipher::stream_encrypt_for_put(&auth.keystore, payload, sink, &bucket, &key, write_offset)
-            .await?;
+    let (sink, plaintext_metrics, cipher_metadata) = cipher::stream_encrypt_for_put(
+        &auth.keystore,
+        payload,
+        sink,
+        &bucket,
+        &key,
+        write_offset,
+        encryption.chunk_size_bytes,
+    )
+    .await?;
 
     let was_overwrite = guard
         .commit(

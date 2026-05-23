@@ -8,5 +8,5 @@ pub async fn run(
     sync: Option<String>,
     mode: OutputMode,
 ) -> Result<(), CliError> {
-    cp::run("-".to_owned(), dst, labels, sync, false, mode).await
+    cp::run("-".to_owned(), dst, labels, sync, false, None, mode).await
 }

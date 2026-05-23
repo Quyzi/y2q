@@ -97,7 +97,15 @@ The reserved bucket name `"api"` (case-insensitive) is rejected - it would colli
 | Field | Type | Default | Notes |
 |---|---|---|---|
 | `keystore_dir` | string | *required* | Directory holding `pubkey.json`, `users.redb`, and the daemon's `.lock`. Should be on a path you back up; should *not* live under `storage.base_path` so a `cp -r` of the storage tree can't accidentally copy authentication state. |
+| `envelope_chunk_size_bytes` | usize | `4194304` (4 MiB) | Plaintext chunk size for v2 streaming encryption. Bounds: `65536` (64 KiB) .. `268435456` (256 MiB); out-of-range values are rejected at startup. Smaller chunks make ranged GETs finer-grained but add per-chunk AEAD overhead. **Recorded per-object in the envelope header** - see note below. |
 | `argon2` | table | *(see below)* | Argon2id parameters used when writing *new* user records (existing users keep their stored parameters). |
+
+The chunk size is stored in each object's envelope header, and decryption always
+reads it from there. Changing `envelope_chunk_size_bytes` therefore only affects
+objects written *after* the change - existing objects keep decrypting (and serving
+ranged reads) with their own stored size. There is no global re-chunking and no
+risk to already-stored data; the "don't change it" caution you may expect from
+fixed-block formats does not apply here.
 
 ### `[crypto.argon2]`
 
@@ -175,6 +183,7 @@ sync_flush_limit = 128
 
 [crypto]
 keystore_dir = "/var/lib/y2qd/keystore"
+envelope_chunk_size_bytes = 4194304   # 4 MiB plaintext chunks
 
 [crypto.argon2]
 m_cost_kib = 131072                    # 128 MiB - doubled from default

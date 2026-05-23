@@ -130,6 +130,13 @@ default_sync = "durable"
 # Must NOT be located under storage.base_path — keep keys and data separate.
 keystore_dir = "/var/lib/y2q/keys"  # required
 
+# Plaintext chunk size (bytes) for v2 streaming encryption. Default 4 MiB.
+# Recorded per-object in the envelope header, so changing it only affects objects
+# written AFTER the change — existing objects keep decrypting with their own stored
+# size. Smaller chunks make ranged reads finer-grained but add per-chunk overhead.
+# Bounds: 65536 (64 KiB) .. 268435456 (256 MiB).
+envelope_chunk_size_bytes = 4194304
+
 [crypto.argon2]
 # Argon2id parameters used when hashing passwords for new user records.
 m_cost_kib = 65536  # memory cost — 64 MiB

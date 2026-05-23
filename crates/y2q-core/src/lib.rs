@@ -400,9 +400,9 @@ pub enum Error {
         version: u16,
     },
 
-    /// Range read attempted against an encrypted object — the on-disk
-    /// envelope is whole-object AEAD, so partial reads aren't possible.
-    #[error("range reads are not supported on encrypted objects")]
+    /// Range read attempted against a v1 whole-object AEAD envelope, where
+    /// partial decryption isn't possible. v2 chunked envelopes support ranges.
+    #[error("range reads are not supported on v1 whole-object encrypted objects")]
     RangeReadOnEncrypted,
 
     /// A label search query failed to parse, or contained an invalid regex.

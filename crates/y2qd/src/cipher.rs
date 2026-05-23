@@ -56,6 +56,41 @@ pub fn decrypt_after_get(
     }
 }
 
+/// Decrypt a contiguous run of v2 chunks for a ranged GET.
+///
+/// `preamble` is the first [`envelope::v2_preamble_len`] bytes of the object,
+/// `chunks_ct` the ciphertext window starting at chunk `first_chunk_idx`.
+/// Returns the plaintext of those whole chunks; the caller trims to the exact
+/// requested byte range. Maps crypto errors to the same [`AppError`] variants
+/// as [`decrypt_after_get`].
+pub fn decrypt_v2_chunks(
+    keystore: &DecryptedKeystore,
+    bucket: &str,
+    key: &str,
+    preamble: &[u8],
+    chunks_ct: &[u8],
+    first_chunk_idx: u64,
+) -> Result<Vec<u8>, AppError> {
+    envelope::decrypt_v2_chunks(&keystore.secret_key, preamble, chunks_ct, first_chunk_idx).map_err(
+        |e| match e {
+            y2q_core::crypto::CryptoError::UnsupportedVersion(v) => {
+                AppError(y2q_core::Error::UnsupportedEnvelopeVersion { version: v })
+            }
+            y2q_core::crypto::CryptoError::Envelope(reason) => {
+                AppError(y2q_core::Error::EnvelopeMalformed {
+                    bucket: bucket.to_owned(),
+                    key: key.to_owned(),
+                    reason: reason.to_owned(),
+                })
+            }
+            _ => AppError(y2q_core::Error::DecryptionFailed {
+                bucket: bucket.to_owned(),
+                key: key.to_owned(),
+            }),
+        },
+    )
+}
+
 /// True if the bytes on disk are a y2q envelope. Used by GET to decide
 /// whether a `Range` request can be answered (it cannot for encrypted
 /// objects — whole-object AEAD).
@@ -67,8 +102,8 @@ pub fn is_encrypted_envelope(bytes: &[u8]) -> bool {
 /// envelope format, computing plaintext checksums along the way.
 ///
 /// Consumes chunks from `stream` (an `actix_web::web::Payload`), feeds them
-/// through AES-256-GCM 1 MiB chunks, and writes each encrypted chunk to
-/// `file`. Returns the file handle (for the caller to pass to
+/// through AES-256-GCM in `chunk_size`-byte plaintext chunks, and writes each
+/// encrypted chunk to `file`. Returns the file handle (for the caller to pass to
 /// [`AnyStreamingPutGuard::commit`]), plus the plaintext metrics and cipher
 /// metadata for the metadata sidecar.
 ///
@@ -83,11 +118,12 @@ pub async fn stream_encrypt_for_put(
     bucket: &str,
     key: &str,
     write_offset: u64,
+    chunk_size: usize,
 ) -> Result<(StreamingSink, PlaintextMetrics, CipherMetadata), AppError> {
     use futures::StreamExt;
 
     let mut session =
-        envelope::EncryptSession::new(sink, &keystore.public.public_key, write_offset)
+        envelope::EncryptSession::new(sink, &keystore.public.public_key, write_offset, chunk_size)
             .await
             .map_err(|_| {
                 AppError(y2q_core::Error::EncryptionFailed {
