@@ -373,6 +373,59 @@ while :; do
 done
 ```
 
+### `GET /api/v1/search`
+
+Find objects whose labels satisfy a boolean query. Results are sorted by
+`(bucket, key)` and paginated like `GET /{bucket}/`.
+
+**Query parameters:**
+
+| Name | Type | Default | Notes |
+|---|---|---|---|
+| `q` | string | *(required)* | Label query (see below) |
+| `bucket` | string | all buckets | Restrict the search to one bucket |
+| `prefix` | string | - | Only return keys with this prefix |
+| `after` | string | - | Opaque pagination cursor from a previous `next` |
+| `limit` | integer | 1000 | Page size. Capped at 10 000. |
+
+**Query language.** A leaf condition is `name OP value`, where `value` may be
+bare or `"quoted"`:
+
+| Operator | Meaning |
+|---|---|
+| `name == value` | label present and value equal |
+| `name != value` | NOT (present and equal) - also true when the label is absent |
+| `name =~ value`  | value matches the regex `value` |
+| `name ^= value`  | value starts with `value` |
+| `name $= value`  | value ends with `value` |
+
+Leaves combine with `and` / `&&`, `or` / `||`, `not` / `!`, and parentheses.
+Precedence, lowest to highest: `or` < `and` < `not`. Example:
+`env == prod and (tier =~ "web.*" or not region $= -dev)`
+
+**Response (200):** identical shape to `GET /{bucket}/` (an `items` array of
+object metadata plus an opaque `next` cursor).
+
+| Code | Meaning |
+|---|---|
+| 200 | Page returned |
+| 400 | Invalid query (parse error or bad regex) or invalid bucket |
+| 401 | Token missing or invalid |
+| 500 | Index or storage failure |
+
+```sh
+curl -s -H "Authorization: Bearer $TOKEN" \
+  --get "https://y2qd.example/api/v1/search" \
+  --data-urlencode 'q=env == prod and tier != test' \
+  --data-urlencode 'bucket=photos'
+```
+
+CLI equivalent (`alias/` searches all buckets):
+```sh
+y2q search myalias/photos --query 'env == prod and tier != test'
+y2q search myalias/ --query 'name ^= "log-" or env =~ "prod|stage"'
+```
+
 ## Admin
 
 ### `POST /api/v1/rebuild`

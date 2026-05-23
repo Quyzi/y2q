@@ -16,10 +16,13 @@ hkdf            = { workspace = true }
 hmac            = { workspace = true }
 metrics         = { workspace = true }
 papaya          = { workspace = true }
+pest            = { workspace = true }
+pest_derive     = { workspace = true }
 pqcrypto        = { workspace = true }
 pqcrypto-traits = { workspace = true }
 rand            = { workspace = true }
 redb            = { workspace = true }
+regex           = { workspace = true }
 ring            = { workspace = true }
 serde           = { workspace = true }
 serde_json      = { workspace = true }

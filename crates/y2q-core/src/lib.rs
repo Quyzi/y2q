@@ -11,6 +11,9 @@ use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, ops::Deref, path::PathBuf, time::SystemTime};
 
 pub mod crypto;
+/// Label search query language: a small boolean grammar over object labels.
+pub mod query;
+pub use query::{LabelQuery, MatchOp};
 /// Storage backends (filesystem and io_uring), metadata index, and lock management.
 pub mod storage;
 pub use storage::any::{AnyStorage, AnyStreamingPutGuard};
@@ -401,6 +404,13 @@ pub enum Error {
     /// envelope is whole-object AEAD, so partial reads aren't possible.
     #[error("range reads are not supported on encrypted objects")]
     RangeReadOnEncrypted,
+
+    /// A label search query failed to parse, or contained an invalid regex.
+    #[error("invalid query: {message}")]
+    Query {
+        /// Human-readable parse or regex-compilation error.
+        message: String,
+    },
 }
 
 /// Async interface for object storage backends.
@@ -500,6 +510,18 @@ pub trait Listing: Storage {
     /// Return one page of objects in `bucket`, filtered and paginated by
     /// `options`. Results are sorted ascending by key.
     async fn list_objects(&self, bucket: &str, options: ListOptions) -> Result<ListPage, Error>;
+
+    /// Find objects whose labels satisfy `query`. When `bucket` is `Some`, only
+    /// that bucket is searched; when `None`, every bucket is searched. The
+    /// `prefix`, `after`, and `limit` fields of `options` apply as in
+    /// [`list_objects`](Listing::list_objects); `after` is the opaque cursor
+    /// returned in a previous [`ListPage::next`].
+    async fn search_objects(
+        &self,
+        query: &LabelQuery,
+        bucket: Option<&str>,
+        options: ListOptions,
+    ) -> Result<ListPage, Error>;
 
     /// Create `bucket`. Returns `true` if it was newly created, `false` if it
     /// already existed. Empty buckets are persisted on disk so they appear in

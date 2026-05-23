@@ -1,0 +1,36 @@
+// Label search query grammar.
+//
+// A query is a boolean expression over label conditions. Precedence, lowest to
+// highest: `or` < `and` < `not`. Parentheses override. Operator/keyword tokens
+// generally need surrounding whitespace unless adjacent to `(` / `)`.
+
+WHITESPACE = _{ " " | "\t" | "\r" | "\n" }
+
+query = { SOI ~ expr ~ EOI }
+
+expr = { prefix* ~ primary ~ (infix ~ prefix* ~ primary)* }
+
+infix = _{ and | or }
+and   =  { ^"and" | "&&" }
+or    =  { ^"or" | "||" }
+
+prefix = _{ not }
+not    =  { ^"not" | "!" }
+
+primary = _{ condition | "(" ~ expr ~ ")" }
+
+condition = { ident ~ op ~ value }
+
+op  = _{ eq | ne | re | pre | suf }
+eq  =  { "==" }
+ne  =  { "!=" }
+re  =  { "=~" }
+pre =  { "^=" }
+suf =  { "$=" }
+
+ident = @{ (ASCII_ALPHANUMERIC | "-" | "_" | ".")+ }
+
+value  = _{ string | bare }
+string = ${ "\"" ~ inner ~ "\"" }
+inner  = @{ (!"\"" ~ ANY)* }
+bare   = @{ (!(WHITESPACE | ")") ~ ANY)+ }

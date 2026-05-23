@@ -38,7 +38,7 @@ use std::sync::{Arc, OnceLock};
 use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinition};
 
 use crate::{
-    Error, ListPage, Metadata, SyncLevel,
+    Error, LabelQuery, ListPage, Metadata, SyncLevel,
     crypto::{decrypt_meta, encrypt_meta, metadata_key::derive_index_key, metadata_key::prf},
 };
 
@@ -509,6 +509,94 @@ impl MetadataIndex {
             message: format!("join: {e}"),
         })?
     }
+
+    /// Find objects whose labels satisfy `query`.
+    ///
+    /// Scans the `objects` table once, deserializing each [`Metadata`] (works
+    /// for both the encrypted and plaintext index layouts), and keeps rows that
+    /// satisfy `query` and the optional `bucket` / key-`prefix` filters. Results
+    /// are sorted by `(bucket, key)` and paginated.
+    ///
+    /// `after` is an opaque continuation cursor: pass back [`ListPage::next`]
+    /// from a previous call to resume. `limit` caps the page size.
+    pub async fn search_labels(
+        &self,
+        query: &LabelQuery,
+        bucket: Option<&str>,
+        prefix: Option<&str>,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<ListPage, Error> {
+        let db = self.db.clone();
+        let mek = self.mek.get().copied();
+        let query = query.clone();
+        let bucket = bucket.map(str::to_owned);
+        let prefix = prefix.map(str::to_owned);
+        let after = after.map(str::to_owned);
+
+        tokio::task::spawn_blocking(move || -> Result<ListPage, Error> {
+            let txn = db.begin_read().map_err(map_redb)?;
+            let table = txn.open_table(OBJECTS).map_err(map_redb)?;
+
+            let mut matched: Vec<Metadata> = Vec::new();
+            for entry in table.iter().map_err(map_redb)? {
+                let (_k, v) = entry.map_err(map_redb)?;
+                let json = decrypt_blob(mek.as_ref(), v.value())?;
+                let m: Metadata = serde_json::from_slice(&json).map_err(|e| Error::Index {
+                    message: format!("deserialize metadata: {e}"),
+                })?;
+                if let Some(ref b) = bucket
+                    && &m.bucket != b
+                {
+                    continue;
+                }
+                if let Some(ref p) = prefix
+                    && !m.key.starts_with(p)
+                {
+                    continue;
+                }
+                if query.matches(&m.labels) {
+                    matched.push(m);
+                }
+            }
+
+            // Sort and paginate on a composite `bucket\0key` cursor so listings
+            // remain stable across buckets.
+            matched.sort_by(|a, b| (a.bucket.as_str(), a.key.as_str()).cmp(&(&b.bucket, &b.key)));
+            let after_ref = after.as_deref();
+            let mut page: Vec<Metadata> = Vec::with_capacity(limit);
+            let mut overflowed = false;
+            for m in matched {
+                if let Some(a) = after_ref
+                    && cursor(&m).as_str() <= a
+                {
+                    continue;
+                }
+                if page.len() == limit {
+                    overflowed = true;
+                    break;
+                }
+                page.push(m);
+            }
+
+            let next = if overflowed {
+                page.last().map(cursor)
+            } else {
+                None
+            };
+            Ok(ListPage { items: page, next })
+        })
+        .await
+        .map_err(|e| Error::Index {
+            message: format!("join: {e}"),
+        })?
+    }
+}
+
+/// Opaque pagination cursor for cross-bucket searches: `bucket` and `key`
+/// joined by a NUL so ordering matches the `(bucket, key)` sort.
+fn cursor(m: &Metadata) -> String {
+    format!("{}\u{0}{}", m.bucket, m.key)
 }
 
 fn map_redb<E: std::fmt::Display>(e: E) -> Error {

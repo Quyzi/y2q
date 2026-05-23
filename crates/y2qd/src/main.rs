@@ -126,6 +126,7 @@ impl<W: std::io::Write> std::io::Write for IgnoreBrokenPipe<W> {
         handlers::head::handle,
         handlers::list_buckets::handle,
         handlers::list_objects::handle,
+        handlers::search::handle,
         handlers::buckets::create,
         handlers::buckets::remove,
         handlers::buckets::get_config,

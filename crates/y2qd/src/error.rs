@@ -41,6 +41,7 @@ pub struct ErrorBody {
 /// | `KeystoreNotFound`            | 503         |
 /// | `KeystoreCorrupt`             | 500         |
 /// | `RangeReadOnEncrypted`        | 501         |
+/// | `Query`                       | 400         |
 #[derive(Debug)]
 pub struct AppError(pub CoreError);
 
@@ -82,6 +83,7 @@ impl ResponseError for AppError {
             | CoreError::LabelNameTooLong { .. }
             | CoreError::LabelValueTooLong { .. }
             | CoreError::TooManyLabels { .. }
+            | CoreError::Query { .. }
             | CoreError::InvalidStaleLockThreshold { .. } => StatusCode::BAD_REQUEST,
             CoreError::Locked { .. } | CoreError::RebuildAlreadyRunning => StatusCode::CONFLICT,
             CoreError::QuotaExceeded { .. } => StatusCode::PAYLOAD_TOO_LARGE,

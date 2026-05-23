@@ -119,6 +119,19 @@ impl Listing for AnyStorage {
         }
     }
 
+    async fn search_objects(
+        &self,
+        query: &crate::LabelQuery,
+        bucket: Option<&str>,
+        options: ListOptions,
+    ) -> Result<ListPage, Error> {
+        match self {
+            Self::Filesystem(s) => s.search_objects(query, bucket, options).await,
+            #[cfg(target_os = "linux")]
+            Self::Uring(s) => s.search_objects(query, bucket, options).await,
+        }
+    }
+
     async fn create_bucket(&self, bucket: &str) -> Result<bool, Error> {
         match self {
             Self::Filesystem(s) => s.create_bucket(bucket).await,

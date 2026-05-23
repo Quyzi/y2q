@@ -94,6 +94,20 @@ pub struct ListOptions {
     pub limit: Option<u32>,
 }
 
+/// Options for a label search (`GET /api/v1/search`). The query string itself
+/// is passed separately to [`crate::Y2qClient::search_labels`].
+#[derive(Debug, Default, Clone)]
+pub struct SearchOptions {
+    /// Restrict to a single bucket. `None` searches every bucket.
+    pub bucket: Option<String>,
+    /// Return only keys with this prefix.
+    pub prefix: Option<String>,
+    /// Opaque continuation cursor from a previous response's `next`.
+    pub after: Option<String>,
+    /// Maximum number of items per page.
+    pub limit: Option<u32>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ListBucketsResponse {
     pub buckets: Vec<String>,
