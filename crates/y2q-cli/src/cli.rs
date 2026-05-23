@@ -29,10 +29,6 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub insecure: bool,
 
-    /// Reserved for compatibility with mc-style API negotiation. Currently a no-op.
-    #[arg(long, global = true, value_name = "API")]
-    pub api: Option<String>,
-
     /// Config file path [default: ~/.config/y2q/config.toml].
     #[arg(long, global = true, value_name = "PATH")]
     pub config: Option<std::path::PathBuf>,
@@ -384,7 +380,7 @@ pub enum AdminCmd {
         #[command(subcommand)]
         cmd: LocksCmd,
     },
-    /// Stream live request/response trace from a server (like `mc admin trace`).
+    /// Stream live request/response trace from a server.
     Trace {
         alias: String,
         /// Show only requests with status 400 or above.

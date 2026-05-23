@@ -403,6 +403,10 @@ Leaves combine with `and` / `&&`, `or` / `||`, `not` / `!`, and parentheses.
 Precedence, lowest to highest: `or` < `and` < `not`. Example:
 `env == prod and (tier =~ "web.*" or not region $= -dev)`
 
+See [search.md](search.md) for the complete query-language reference: value
+quoting, missing-label semantics, regex behavior, tokenization rules, and a
+formal grammar.
+
 **Response (200):** identical shape to `GET /{bucket}/` (an `items` array of
 object metadata plus an opaque `next` cursor).
 
