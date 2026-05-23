@@ -367,6 +367,9 @@ async fn main() -> std::io::Result<()> {
     let storage_data = web::Data::new(storage);
     let label_limits = web::Data::new(config::LabelLimits::from(&cfg.storage));
     let default_sync = web::Data::new(cfg.storage.default_sync);
+    let encryption_params = web::Data::new(config::EncryptionParams {
+        chunk_size_bytes: cfg.crypto.envelope_chunk_size_bytes,
+    });
 
     // Background dirty flusher: drains best-effort PUT paths and fsyncs them.
     {
@@ -471,6 +474,7 @@ async fn main() -> std::io::Result<()> {
             .app_data(storage_data.clone())
             .app_data(label_limits.clone())
             .app_data(default_sync.clone())
+            .app_data(encryption_params.clone())
             .app_data(auth_state.clone())
             .app_data(web::PayloadConfig::new(max_body_bytes));
         // Swagger UI and metrics dashboard are unauthenticated (actix doesn't

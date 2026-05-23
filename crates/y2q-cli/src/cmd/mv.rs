@@ -13,7 +13,7 @@ pub async fn run(
     let src_ep = CpEndpoint::parse(&src);
 
     // Copy first; only delete the source if the copy succeeded.
-    cp::run(src.clone(), dst.clone(), labels, sync, false, mode).await?;
+    cp::run(src.clone(), dst.clone(), labels, sync, false, None, mode).await?;
 
     match src_ep {
         CpEndpoint::Remote(_) => objects::rm(src, true, mode).await,

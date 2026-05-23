@@ -21,6 +21,7 @@ pub async fn run(
     labels: Vec<String>,
     sync: Option<String>,
     recursive: bool,
+    range: Option<String>,
     mode: OutputMode,
 ) -> Result<(), CliError> {
     let src_ep = CpEndpoint::parse(&src);
@@ -44,8 +45,15 @@ pub async fn run(
         label_map.insert(k.to_lowercase(), v.to_owned());
     }
 
+    let range = range.as_deref().map(parse_range).transpose()?;
+
     match (&src_ep, &dst_ep) {
         (CpEndpoint::Local(local_path), CpEndpoint::Remote(remote)) => {
+            if range.is_some() {
+                return Err(CliError::Other(
+                    "--range is only valid for downloads".into(),
+                ));
+            }
             if local_path == "-" {
                 if recursive {
                     return Err(CliError::Other("-r cannot be used with stdin".into()));
@@ -81,10 +89,28 @@ pub async fn run(
             if recursive {
                 return Err(CliError::Other("-r is only valid for uploads".into()));
             }
-            download(remote, local_path, mode).await
+            download(remote, local_path, range, mode).await
         }
         _ => unreachable!(),
     }
+}
+
+/// Parse a CLI `START-END` inclusive byte range.
+pub(crate) fn parse_range(s: &str) -> Result<(u64, u64), CliError> {
+    let invalid = || {
+        CliError::Other(format!(
+            "invalid --range '{s}'; expected START-END, e.g. 0-1023"
+        ))
+    };
+    let (a, b) = s.split_once('-').ok_or_else(invalid)?;
+    let start: u64 = a.trim().parse().map_err(|_| invalid())?;
+    let end: u64 = b.trim().parse().map_err(|_| invalid())?;
+    if start > end {
+        return Err(CliError::Other(format!(
+            "invalid --range '{s}'; start must not exceed end"
+        )));
+    }
+    Ok((start, end))
 }
 
 async fn upload_single(
@@ -301,7 +327,12 @@ async fn upload_file(path: &Path, key: &str, ctx: &UploadCtx<'_>) -> Result<(), 
     Ok(())
 }
 
-async fn download(remote: &RemotePath, local_path: &str, mode: OutputMode) -> Result<(), CliError> {
+async fn download(
+    remote: &RemotePath,
+    local_path: &str,
+    range: Option<(u64, u64)>,
+    mode: OutputMode,
+) -> Result<(), CliError> {
     let bucket = remote.bucket.as_deref().ok_or_else(|| {
         CliError::InvalidPath(format!("{}/", remote.alias), "missing bucket".into())
     })?;
@@ -313,10 +344,24 @@ async fn download(remote: &RemotePath, local_path: &str, mode: OutputMode) -> Re
 
     let n = if local_path == "-" {
         let mut stdout = tokio::io::stdout();
-        client.get_to_writer(bucket, key, &mut stdout).await?
+        match range {
+            Some((start, end)) => {
+                client
+                    .get_range_to_writer(bucket, key, start, end, &mut stdout)
+                    .await?
+            }
+            None => client.get_to_writer(bucket, key, &mut stdout).await?,
+        }
     } else {
         let mut file = tokio::fs::File::create(local_path).await?;
-        let n = client.get_to_writer(bucket, key, &mut file).await?;
+        let n = match range {
+            Some((start, end)) => {
+                client
+                    .get_range_to_writer(bucket, key, start, end, &mut file)
+                    .await?
+            }
+            None => client.get_to_writer(bucket, key, &mut file).await?,
+        };
         eprintln!(
             "Downloaded {} ← {}/{bucket}/{key}",
             fmt_bytes(n),

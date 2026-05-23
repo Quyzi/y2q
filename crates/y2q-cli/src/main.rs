@@ -107,7 +107,10 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         } => cmd::listing::run(path, limit, after, all, mode).await,
         Commands::Rm { path, force } => cmd::objects::rm(path, force, mode).await,
         Commands::Stat { path } => cmd::objects::stat(path, mode).await,
-        Commands::Cat { path } => cmd::objects::cat(path).await,
+        Commands::Cat { path, range } => {
+            let range = range.as_deref().map(cmd::cp::parse_range).transpose()?;
+            cmd::objects::cat(path, range).await
+        }
         Commands::Head { path, bytes } => cmd::head::run(path, bytes).await,
         Commands::Cp {
             src,
@@ -115,7 +118,7 @@ async fn run(cli: Cli) -> Result<(), CliError> {
             label,
             sync,
             recursive,
-        } => cmd::cp::run(src, dst, label, sync, recursive, mode).await,
+        } => cmd::cp::run(src, dst, label, sync, recursive, None, mode).await,
         Commands::Mv {
             src,
             dst,
@@ -128,8 +131,10 @@ async fn run(cli: Cli) -> Result<(), CliError> {
             label,
             sync,
             recursive,
-        } => cmd::cp::run(src, dst, label, sync, recursive, mode).await,
-        Commands::Get { src, dst } => cmd::cp::run(src, dst, Vec::new(), None, false, mode).await,
+        } => cmd::cp::run(src, dst, label, sync, recursive, None, mode).await,
+        Commands::Get { src, dst, range } => {
+            cmd::cp::run(src, dst, Vec::new(), None, false, range, mode).await
+        }
         Commands::Pipe { dst, label, sync } => cmd::pipe::run(dst, label, sync, mode).await,
         // Listing analytics, bucket/meta, health, and admin commands are routed
         // through a second dispatcher to keep each match small.

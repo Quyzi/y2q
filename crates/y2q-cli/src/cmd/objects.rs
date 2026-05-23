@@ -182,13 +182,22 @@ pub async fn stat(path: String, mode: OutputMode) -> Result<(), CliError> {
     Ok(())
 }
 
-pub async fn cat(path: String) -> Result<(), CliError> {
+pub async fn cat(path: String, range: Option<(u64, u64)>) -> Result<(), CliError> {
     let remote = RemotePath::parse(&path)?;
     let (bucket, key) = require_bucket_key(&remote)?;
 
     let client = make_client(&remote.alias).await?;
 
     let mut stdout = tokio::io::stdout();
-    client.get_to_writer(bucket, key, &mut stdout).await?;
+    match range {
+        Some((start, end)) => {
+            client
+                .get_range_to_writer(bucket, key, start, end, &mut stdout)
+                .await?;
+        }
+        None => {
+            client.get_to_writer(bucket, key, &mut stdout).await?;
+        }
+    }
     Ok(())
 }

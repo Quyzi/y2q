@@ -100,7 +100,13 @@ pub enum Commands {
         recursive: bool,
     },
     /// Explicit download (alias of `cp REMOTE LOCAL`).
-    Get { src: String, dst: String },
+    Get {
+        src: String,
+        dst: String,
+        /// Download only an inclusive byte range, e.g. `--range 0-1023`.
+        #[arg(long, value_name = "START-END")]
+        range: Option<String>,
+    },
     /// Read from stdin and PUT to a remote path.
     Pipe {
         dst: String,
@@ -122,7 +128,12 @@ pub enum Commands {
     /// Show metadata for a remote object.
     Stat { path: String },
     /// Stream a remote object to stdout.
-    Cat { path: String },
+    Cat {
+        path: String,
+        /// Output only an inclusive byte range, e.g. `--range 0-1023`.
+        #[arg(long, value_name = "START-END")]
+        range: Option<String>,
+    },
     /// Print the first N bytes of a remote object to stdout.
     Head {
         path: String,
