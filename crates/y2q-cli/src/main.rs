@@ -60,6 +60,16 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         OutputMode::Human
     };
 
+    // Apply global TLS flags (e.g. --insecure, --ca-cert) for this invocation.
+    // These layer over each alias's stored TLS settings at client-build time.
+    client_builder::set_tls_override(client_builder::TlsOverride {
+        insecure: cli.insecure,
+        ca_cert_path: cli
+            .ca_cert
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned()),
+    });
+
     let Some(command) = cli.command else {
         // Bare invocation: print help instead of launching the TUI. Run `y2q tui`
         // for the interactive explorer.
