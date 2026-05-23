@@ -14,7 +14,13 @@
 //! Leaves combine with `and` / `&&`, `or` / `||`, `not` / `!`, and parentheses.
 //! Precedence, lowest to highest: `or` < `and` < `not`.
 //!
-//! ```
+//! This example is `text`-fenced rather than a runnable doctest on purpose: on
+//! the current toolchain, `cargo test --doc` builds one merged harness binary
+//! for the whole crate, and that binary crashes at startup when it links the
+//! `target-cpu=native` `gxhash` rlib (a rustdoc/cargo bug, not a fault in this
+//! code). The example is instead verified by the `doc_example` unit test below.
+//!
+//! ```text
 //! use std::collections::BTreeMap;
 //! use y2q_core::LabelQuery;
 //!
@@ -268,6 +274,17 @@ mod tests {
             LabelQuery::parse("== prod"),
             Err(Error::Query { .. })
         ));
+    }
+
+    /// Verifies the worked example shown in the module-level docs. The doc
+    /// block is `text`-fenced (see the note there) so it cannot run as a
+    /// doctest; this test is its executable stand-in - keep the two in sync.
+    #[test]
+    fn doc_example() {
+        let q = LabelQuery::parse(r#"env == prod and (tier =~ "web.*" or not region $= -dev)"#)
+            .unwrap();
+        let labels = labels(&[("env", "prod"), ("tier", "web1"), ("region", "us-east")]);
+        assert!(q.matches(&labels));
     }
 
     #[test]
