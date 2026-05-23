@@ -15,6 +15,7 @@ pub mod mirror;
 pub mod mv;
 pub mod objects;
 pub mod pipe;
+pub mod search;
 pub mod tag;
 pub mod tree;
 pub mod users;

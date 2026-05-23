@@ -595,6 +595,31 @@ impl Listing for UringStorage {
             )
             .await
     }
+
+    async fn search_objects(
+        &self,
+        query: &crate::LabelQuery,
+        bucket: Option<&str>,
+        options: ListOptions,
+    ) -> Result<ListPage, Error> {
+        if let Some(b) = bucket {
+            validate_bucket(b)?;
+        }
+        let limit = options
+            .limit
+            .filter(|&n| n > 0)
+            .unwrap_or(DEFAULT_LIST_LIMIT)
+            .min(MAX_LIST_LIMIT);
+        self.index
+            .search_labels(
+                query,
+                bucket,
+                options.prefix.as_deref(),
+                options.after.as_deref(),
+                limit,
+            )
+            .await
+    }
 }
 
 impl StorageExt for UringStorage {

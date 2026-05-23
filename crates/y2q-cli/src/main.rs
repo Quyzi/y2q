@@ -140,6 +140,7 @@ async fn dispatch_rest(command: Commands, mode: OutputMode) -> Result<(), CliErr
             older_than,
             newer_than,
         } => cmd::find::run(path, name, size, older_than, newer_than, mode).await,
+        Commands::Search { path, query } => cmd::search::run(path, query, mode).await,
         Commands::Diff { src, dst } => cmd::diff::run(src, dst, mode).await,
         Commands::Mirror {
             src,

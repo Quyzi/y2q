@@ -173,6 +173,16 @@ pub enum Commands {
         #[arg(long, value_name = "DUR")]
         newer_than: Option<String>,
     },
+    /// Search objects by a label query: `alias/`, `alias/bucket`, or
+    /// `alias/bucket/prefix`. Operators: `==` `!=` `=~` (regex) `^=` (prefix)
+    /// `$=` (suffix); combine with `and`/`or`/`not` and parentheses.
+    Search {
+        /// Remote scope: `alias/` (all buckets), `alias/bucket`, or `alias/bucket/prefix`.
+        path: String,
+        /// Label query, e.g. `env == prod and tier != test`.
+        #[arg(long, value_name = "EXPR")]
+        query: String,
+    },
     /// Compare two trees and report what differs.
     Diff { src: String, dst: String },
     /// rsync-style one-way sync from src to dst.

@@ -341,6 +341,36 @@ fn e2e_full_cli_flow() {
     server.ok(&["find", "test/bucket", "--name", "*.txt"]);
     server.ok(&["find", "test/bucket", "--size", "+1"]);
 
+    // ── label search (server-side query language) ─────────────────────────────
+    // hello.txt was uploaded with label env=test.
+    let s = server.y2q(&["--json", "search", "test/bucket", "--query", "env == test"]);
+    assert!(
+        s.status.success(),
+        "search failed: {}",
+        String::from_utf8_lossy(&s.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&s.stdout).contains("hello.txt"),
+        "search did not match the labeled object: {}",
+        String::from_utf8_lossy(&s.stdout)
+    );
+    // Cross-bucket (alias-only) with regex/prefix combiners.
+    server.ok(&[
+        "search",
+        "test/",
+        "--query",
+        "env =~ \"te.*\" or env ^= prod",
+    ]);
+    // Non-matching query still succeeds (empty result).
+    server.ok(&["search", "test/bucket", "--query", "env == nope"]);
+    // Malformed query -> daemon 400 -> non-zero CLI exit.
+    assert!(!ok(&server.y2q(&[
+        "search",
+        "test/bucket",
+        "--query",
+        "env =="
+    ])));
+
     // ── tags / attributes ─────────────────────────────────────────────────────
     server.ok(&["tag", "set", "test/bucket/hello.txt", "team=infra"]);
     server.ok(&["tag", "list", "test/bucket/hello.txt"]);

@@ -19,6 +19,7 @@ pub(crate) mod list_objects;
 pub(crate) mod locks;
 pub(crate) mod put;
 pub(crate) mod rebuild;
+pub(crate) mod search;
 pub(crate) mod tags;
 
 use crate::auth::handlers as auth_handlers;
@@ -62,6 +63,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             .route(web::get().to(locks::list))
             .route(web::delete().to(locks::clear)),
     );
+    cfg.service(web::resource("/api/v1/search").route(web::get().to(search::handle)));
     cfg.service(web::resource("/api/v1/trace").route(web::get().to(crate::trace::stream)));
     cfg.service(
         web::resource("/api/v1/buckets/{bucket}/config")

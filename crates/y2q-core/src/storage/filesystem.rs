@@ -1355,6 +1355,31 @@ impl Listing for FilesystemStorage {
             )
             .await
     }
+
+    async fn search_objects(
+        &self,
+        query: &crate::LabelQuery,
+        bucket: Option<&str>,
+        options: ListOptions,
+    ) -> Result<ListPage, Error> {
+        if let Some(b) = bucket {
+            validate_bucket(b)?;
+        }
+        let limit = options
+            .limit
+            .filter(|&n| n > 0)
+            .unwrap_or(DEFAULT_LIST_LIMIT)
+            .min(MAX_LIST_LIMIT);
+        self.index
+            .search_labels(
+                query,
+                bucket,
+                options.prefix.as_deref(),
+                options.after.as_deref(),
+                limit,
+            )
+            .await
+    }
 }
 
 impl StorageExt for FilesystemStorage {
@@ -1702,6 +1727,79 @@ mod tests {
         );
         let devs = s.index().lookup_by_label("env", "dev").await.unwrap();
         assert_eq!(devs, vec![("b".to_owned(), "k3".to_owned())]);
+    }
+
+    #[tokio::test]
+    async fn search_objects_by_label_query() {
+        let (s, _dir) = make_storage();
+        s.put(
+            "b1",
+            "web-1",
+            make_object(b"a"),
+            opts(&[("env", "prod"), ("tier", "web")]),
+        )
+        .await
+        .unwrap();
+        s.put(
+            "b1",
+            "db-1",
+            make_object(b"b"),
+            opts(&[("env", "prod"), ("tier", "db")]),
+        )
+        .await
+        .unwrap();
+        s.put(
+            "b2",
+            "web-2",
+            make_object(b"c"),
+            opts(&[("env", "dev"), ("tier", "web")]),
+        )
+        .await
+        .unwrap();
+
+        let hits = |page: ListPage| {
+            let mut v: Vec<(String, String)> =
+                page.items.into_iter().map(|m| (m.bucket, m.key)).collect();
+            v.sort();
+            v
+        };
+
+        // Cross-bucket conjunction.
+        let q = crate::LabelQuery::parse("env == prod and tier == web").unwrap();
+        let page = s
+            .search_objects(&q, None, ListOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(hits(page), vec![("b1".to_owned(), "web-1".to_owned())]);
+
+        // Disjunction with prefix + regex, all buckets.
+        let q = crate::LabelQuery::parse(r#"tier ^= web or env =~ "de.*""#).unwrap();
+        let page = s
+            .search_objects(&q, None, ListOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            hits(page),
+            vec![
+                ("b1".to_owned(), "web-1".to_owned()),
+                ("b2".to_owned(), "web-2".to_owned()),
+            ]
+        );
+
+        // Bucket-scoped: same query, only b1.
+        let page = s
+            .search_objects(&q, Some("b1"), ListOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(hits(page), vec![("b1".to_owned(), "web-1".to_owned())]);
+
+        // Inequality matches the absent-label and differing-value rows.
+        let q = crate::LabelQuery::parse("tier != web").unwrap();
+        let page = s
+            .search_objects(&q, None, ListOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(hits(page), vec![("b1".to_owned(), "db-1".to_owned())]);
     }
 
     #[tokio::test]
