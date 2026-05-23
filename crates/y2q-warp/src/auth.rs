@@ -1,9 +1,11 @@
+use std::fs;
+use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::watch;
 use tracing::warn;
-use y2q_client::{ClientConfig, Y2qClient};
-use y2q_config::{TokenEntry, TokenStore, default_tokens_path};
+use y2q_client::{ClientConfig, TlsOptions, Y2qClient};
+use y2q_config::{Alias, TokenEntry, TokenStore, default_tokens_path};
 use zeroize::Zeroizing;
 
 use crate::error::WarpError;
@@ -102,10 +104,57 @@ pub fn spawn_refresh_task(
     });
 }
 
-/// Build a Y2qClient for an alias, using the given token.
-pub fn build_client(base_url: &str, token: &Zeroizing<String>) -> Result<Y2qClient, WarpError> {
-    let mut cfg = ClientConfig::new(base_url.to_owned());
-    cfg.token = Some(token.clone());
+/// Build a Y2qClient for an alias, using the given token and TLS options.
+pub fn build_client(
+    base_url: &str,
+    token: &Zeroizing<String>,
+    tls: TlsOptions,
+) -> Result<Y2qClient, WarpError> {
+    let cfg = ClientConfig {
+        base_url: base_url.to_owned(),
+        token: Some(token.clone()),
+        tls,
+    };
     let client = Y2qClient::new(cfg)?;
     Ok(client)
+}
+
+/// Resolve TLS options for an alias, layering the per-invocation `--insecure`
+/// and `--ca-cert` overrides on top of whatever the alias specifies.
+pub fn build_tls_options(
+    alias: &Alias,
+    insecure: bool,
+    ca_cert: Option<&Path>,
+) -> Result<TlsOptions, WarpError> {
+    let mut tls = TlsOptions {
+        insecure: alias.insecure || insecure,
+        ..TlsOptions::default()
+    };
+    // A global --ca-cert wins over the alias's CA; otherwise fall back to it.
+    let ca_path = ca_cert
+        .map(|p| p.to_string_lossy().into_owned())
+        .or_else(|| alias.ca_cert_path.clone());
+    if let Some(path) = ca_path {
+        tls.ca_cert_pem = Some(read_pem(&path, "CA certificate")?);
+    }
+    match (&alias.client_cert_path, &alias.client_key_path) {
+        (Some(cert), Some(key)) => {
+            let mut bundle = read_pem(cert, "client certificate")?;
+            bundle.push(b'\n');
+            bundle.extend_from_slice(&read_pem(key, "client key")?);
+            tls.client_identity_pem = Some(Zeroizing::new(bundle));
+        }
+        (None, None) => {}
+        _ => {
+            return Err(WarpError::Other(
+                "client_cert_path and client_key_path must both be set or both unset".to_owned(),
+            ));
+        }
+    }
+    Ok(tls)
+}
+
+fn read_pem(path: &str, label: &str) -> Result<Vec<u8>, WarpError> {
+    fs::read(Path::new(path))
+        .map_err(|e| WarpError::Other(format!("read {label} from {path}: {e}")))
 }
