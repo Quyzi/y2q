@@ -29,6 +29,10 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub insecure: bool,
 
+    /// Trust this PEM CA bundle for this invocation, overriding the alias's CA.
+    #[arg(long, global = true, value_name = "PATH")]
+    pub ca_cert: Option<std::path::PathBuf>,
+
     /// Config file path [default: ~/.config/y2q/config.toml].
     #[arg(long, global = true, value_name = "PATH")]
     pub config: Option<std::path::PathBuf>,
