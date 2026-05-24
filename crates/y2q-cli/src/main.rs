@@ -3,6 +3,7 @@ mod client_builder;
 mod cmd;
 mod config;
 mod error;
+mod ops;
 mod output;
 mod path;
 mod progress;

@@ -1,4 +1,4 @@
-use y2q_client::{ListOptions, Y2qClient};
+use y2q_client::Y2qClient;
 
 use crate::client_builder::{client_from_alias, resolve_config_path};
 use crate::config::{CliConfig, default_tokens_path};
@@ -44,7 +44,7 @@ pub async fn rm(path: String, force: bool, mode: OutputMode) -> Result<(), CliEr
 
     if !has_glob(key_pattern) {
         // Single object delete — original behaviour
-        client.delete(bucket, key_pattern).await?;
+        crate::ops::objects::delete(&client, bucket, key_pattern).await?;
         if mode == OutputMode::Json {
             print_json(&serde_json::json!({ "deleted": path }));
         } else {
@@ -54,44 +54,7 @@ pub async fn rm(path: String, force: bool, mode: OutputMode) -> Result<(), CliEr
     }
 
     // Glob delete: list all matching keys, confirm, then delete each
-    let glob_prefix = key_pattern
-        .find(['*', '?', '['])
-        .map(|i| &key_pattern[..i])
-        .unwrap_or("")
-        .to_owned();
-
-    let pattern = glob::Pattern::new(key_pattern)
-        .map_err(|e| CliError::Other(format!("invalid glob pattern: {e}")))?;
-
-    let mut matching_keys: Vec<String> = Vec::new();
-    let mut after: Option<String> = None;
-    loop {
-        let page = client
-            .list_objects(
-                bucket,
-                &ListOptions {
-                    prefix: if glob_prefix.is_empty() {
-                        None
-                    } else {
-                        Some(glob_prefix.clone())
-                    },
-                    after: after.clone(),
-                    limit: Some(1000),
-                },
-            )
-            .await?;
-
-        for item in &page.items {
-            if pattern.matches(&item.key) {
-                matching_keys.push(item.key.clone());
-            }
-        }
-
-        match page.next {
-            Some(cursor) => after = Some(cursor),
-            None => break,
-        }
-    }
+    let matching_keys = crate::ops::objects::glob_keys(&client, bucket, key_pattern).await?;
 
     if matching_keys.is_empty() {
         eprintln!("No objects matched: {key_pattern}");

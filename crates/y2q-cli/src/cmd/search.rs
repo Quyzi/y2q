@@ -1,7 +1,5 @@
 //! `search` - find objects by a label query (server-side).
 
-use y2q_client::{MetadataView, SearchOptions};
-
 use crate::cmd::objects::make_client;
 use crate::error::CliError;
 use crate::output::{OutputMode, fmt_bytes, fmt_ns, print_json, print_table};
@@ -15,27 +13,9 @@ pub async fn run(path: String, query: String, mode: OutputMode) -> Result<(), Cl
     let remote = RemotePath::parse(&path)?;
     let client = make_client(&remote.alias).await?;
 
-    let mut after: Option<String> = None;
-    let mut hits: Vec<MetadataView> = Vec::new();
-
-    loop {
-        let page = client
-            .search_labels(
-                &query,
-                &SearchOptions {
-                    bucket: remote.bucket.clone(),
-                    prefix: remote.key.clone(),
-                    after: after.clone(),
-                    limit: Some(1000),
-                },
-            )
+    let hits =
+        crate::ops::listing::search(&client, remote.bucket.clone(), remote.key.clone(), &query)
             .await?;
-        hits.extend(page.items);
-        match page.next {
-            Some(c) => after = Some(c),
-            None => break,
-        }
-    }
 
     if mode == OutputMode::Json {
         print_json(&hits);

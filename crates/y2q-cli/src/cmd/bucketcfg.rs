@@ -23,28 +23,7 @@ fn bucket_of(target: &str) -> Result<(RemotePath, String), CliError> {
 }
 
 fn parse_size(s: &str) -> Result<u64, CliError> {
-    let s = s.trim();
-    let (num, suffix) = s
-        .find(|c: char| c.is_ascii_alphabetic())
-        .map(|i| s.split_at(i))
-        .unwrap_or((s, ""));
-    let n: u64 = num
-        .trim()
-        .parse()
-        .map_err(|e| CliError::Other(format!("invalid size `{s}`: {e}")))?;
-    let mult = match suffix.trim().to_ascii_uppercase().as_str() {
-        "" | "B" => 1u64,
-        "K" | "KB" => 1_000,
-        "KI" | "KIB" => 1_024,
-        "M" | "MB" => 1_000_000,
-        "MI" | "MIB" => 1_024 * 1_024,
-        "G" | "GB" => 1_000_000_000,
-        "GI" | "GIB" => 1_024 * 1_024 * 1_024,
-        "T" | "TB" => 1_000_000_000_000,
-        "TI" | "TIB" => 1_024u64.pow(4),
-        other => return Err(CliError::Other(format!("unknown size unit `{other}`"))),
-    };
-    Ok(n.saturating_mul(mult))
+    crate::ops::buckets::parse_size(s).map_err(CliError::Other)
 }
 
 pub async fn run_quota(cmd: QuotaCmd, mode: OutputMode) -> Result<(), CliError> {
@@ -53,9 +32,9 @@ pub async fn run_quota(cmd: QuotaCmd, mode: OutputMode) -> Result<(), CliError> 
             let (remote, bucket) = bucket_of(&target)?;
             let bytes = parse_size(&size)?;
             let client = make_client(&remote.alias).await?;
-            let mut cfg = client.get_bucket_config(&bucket).await?;
+            let mut cfg = crate::ops::buckets::get_config(&client, &bucket).await?;
             cfg.quota_bytes = Some(bytes);
-            let cfg = client.set_bucket_config(&bucket, &cfg).await?;
+            let cfg = crate::ops::buckets::set_config(&client, &bucket, &cfg).await?;
             if mode == OutputMode::Json {
                 print_json(
                     &serde_json::json!({ "bucket": target, "quota_bytes": cfg.quota_bytes }),
@@ -67,9 +46,9 @@ pub async fn run_quota(cmd: QuotaCmd, mode: OutputMode) -> Result<(), CliError> 
         QuotaCmd::Clear { target } => {
             let (remote, bucket) = bucket_of(&target)?;
             let client = make_client(&remote.alias).await?;
-            let mut cfg = client.get_bucket_config(&bucket).await?;
+            let mut cfg = crate::ops::buckets::get_config(&client, &bucket).await?;
             cfg.quota_bytes = None;
-            client.set_bucket_config(&bucket, &cfg).await?;
+            crate::ops::buckets::set_config(&client, &bucket, &cfg).await?;
             if mode == OutputMode::Json {
                 print_json(&serde_json::json!({ "bucket": target, "quota_bytes": null }));
             } else {
@@ -79,7 +58,7 @@ pub async fn run_quota(cmd: QuotaCmd, mode: OutputMode) -> Result<(), CliError> 
         QuotaCmd::Info { target } => {
             let (remote, bucket) = bucket_of(&target)?;
             let client = make_client(&remote.alias).await?;
-            let cfg = client.get_bucket_config(&bucket).await?;
+            let cfg = crate::ops::buckets::get_config(&client, &bucket).await?;
             if mode == OutputMode::Json {
                 print_json(
                     &serde_json::json!({ "bucket": target, "quota_bytes": cfg.quota_bytes }),
@@ -101,9 +80,9 @@ pub async fn run_encrypt(cmd: EncryptCmd, mode: OutputMode) -> Result<(), CliErr
             let (remote, bucket) = bucket_of(&target)?;
             let algo = algo.unwrap_or_else(|| "aes256-gcm".to_owned());
             let client = make_client(&remote.alias).await?;
-            let mut cfg = client.get_bucket_config(&bucket).await?;
+            let mut cfg = crate::ops::buckets::get_config(&client, &bucket).await?;
             cfg.default_sse = Some(algo.clone());
-            client.set_bucket_config(&bucket, &cfg).await?;
+            crate::ops::buckets::set_config(&client, &bucket, &cfg).await?;
             if mode == OutputMode::Json {
                 print_json(&serde_json::json!({ "bucket": target, "default_sse": algo }));
             } else {
@@ -115,7 +94,7 @@ pub async fn run_encrypt(cmd: EncryptCmd, mode: OutputMode) -> Result<(), CliErr
         EncryptCmd::Info { target } => {
             let (remote, bucket) = bucket_of(&target)?;
             let client = make_client(&remote.alias).await?;
-            let cfg = client.get_bucket_config(&bucket).await?;
+            let cfg = crate::ops::buckets::get_config(&client, &bucket).await?;
             if mode == OutputMode::Json {
                 print_json(
                     &serde_json::json!({ "bucket": target, "default_sse": cfg.default_sse }),
@@ -132,9 +111,9 @@ pub async fn run_encrypt(cmd: EncryptCmd, mode: OutputMode) -> Result<(), CliErr
         EncryptCmd::Clear { target } => {
             let (remote, bucket) = bucket_of(&target)?;
             let client = make_client(&remote.alias).await?;
-            let mut cfg = client.get_bucket_config(&bucket).await?;
+            let mut cfg = crate::ops::buckets::get_config(&client, &bucket).await?;
             cfg.default_sse = None;
-            client.set_bucket_config(&bucket, &cfg).await?;
+            crate::ops::buckets::set_config(&client, &bucket, &cfg).await?;
             if mode == OutputMode::Json {
                 print_json(&serde_json::json!({ "bucket": target, "default_sse": null }));
             } else {

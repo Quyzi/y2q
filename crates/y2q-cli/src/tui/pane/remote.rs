@@ -73,6 +73,14 @@ impl RemotePane {
         self.entries.get(self.selected)
     }
 
+    /// The active object-listing prefix, if currently browsing objects.
+    pub fn objects_prefix(&self) -> Option<String> {
+        match &self.level {
+            RemoteLevel::Objects { prefix, .. } => prefix.clone(),
+            _ => None,
+        }
+    }
+
     pub fn nav_up(&mut self) {
         if self.selected > 0 {
             self.selected -= 1;
