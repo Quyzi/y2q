@@ -73,6 +73,19 @@ impl RemotePane {
         self.entries.get(self.selected)
     }
 
+    /// Reset to the top-level alias list.
+    pub fn go_to_aliases(&mut self) {
+        self.level = RemoteLevel::Aliases;
+        self.entries = self
+            .aliases
+            .iter()
+            .map(|a| RemoteEntry::Alias(a.clone()))
+            .collect();
+        self.selected = 0;
+        self.scroll = 0;
+        self.loading = false;
+    }
+
     /// The active object-listing prefix, if currently browsing objects.
     pub fn objects_prefix(&self) -> Option<String> {
         match &self.level {
