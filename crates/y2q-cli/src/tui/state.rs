@@ -34,6 +34,9 @@ pub enum ConfirmAction {
         alias: String,
         older_than: String,
     },
+    RemoveAlias {
+        alias: String,
+    },
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -120,6 +123,14 @@ pub enum InputAction {
     PasswdNew {
         alias: String,
         current: String,
+    },
+    NewAliasName,
+    NewAliasUrl {
+        name: String,
+    },
+    NewAliasUser {
+        name: String,
+        url: String,
     },
 }
 

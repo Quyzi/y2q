@@ -542,7 +542,12 @@ impl App {
                 Action::Back
             }
             KeyCode::Char('n') => {
-                self.start_create_bucket();
+                use super::pane::remote::RemoteLevel;
+                if matches!(self.remote.level, RemoteLevel::Aliases) {
+                    self.start_create_alias();
+                } else {
+                    self.start_create_bucket();
+                }
                 Action::None
             }
             KeyCode::Char('c') => {
@@ -599,6 +604,10 @@ impl App {
             }
             KeyCode::Char('P') => {
                 self.start_passwd();
+                Action::None
+            }
+            KeyCode::Char('p') => {
+                self.start_health();
                 Action::None
             }
             KeyCode::Char('r') => {
@@ -892,8 +901,39 @@ impl App {
                     });
                 }
             }
+            Some(RemoteEntry::Alias(alias)) => {
+                if matches!(self.remote.level, RemoteLevel::Aliases) {
+                    self.mode = Mode::Confirm(ConfirmAction::RemoveAlias { alias });
+                }
+            }
             _ => {}
         }
+    }
+
+    fn start_create_alias(&mut self) {
+        self.mode = Mode::Input {
+            prompt: "New alias name:".into(),
+            value: String::new(),
+            action: InputAction::NewAliasName,
+        };
+    }
+
+    /// Persist the in-memory config to disk, surfacing any error as a popup.
+    fn save_config(&mut self) {
+        let path = match crate::client_builder::resolve_config_path() {
+            Ok(p) => p,
+            Err(e) => {
+                self.mode = Mode::Error(e.to_string());
+                return;
+            }
+        };
+        if let Err(e) = self.config.save(&path) {
+            self.mode = Mode::Error(e.to_string());
+            return;
+        }
+        // Reflect the updated alias set in the remote pane.
+        self.remote.aliases = self.config.aliases.keys().cloned().collect();
+        self.remote.go_to_aliases();
     }
 
     fn start_rename(&mut self) {
@@ -1007,6 +1047,38 @@ impl App {
             .await;
             if let Err(message) = result {
                 let _ = tx.send(Event::ActionFailed { message });
+            }
+        });
+    }
+
+    /// Probe readiness of the selected/active alias and show the result.
+    fn start_health(&mut self) {
+        let Some(alias) = self.target_alias() else {
+            return;
+        };
+        let config = self.config.clone();
+        let tokens_path = default_tokens_path().unwrap_or_default();
+        let tx = self.event_tx.clone();
+        tokio::spawn(async move {
+            let result = async {
+                let client = build_client(&config, &tokens_path, &alias)?;
+                crate::ops::health::probe(&client)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+            .await;
+            match result {
+                Ok(latency) => {
+                    let _ = tx.send(Event::ResultsLoaded {
+                        title: format!("ping {alias}"),
+                        lines: vec![format!("ready ({:.2}ms)", latency.as_secs_f64() * 1000.0)],
+                    });
+                }
+                Err(message) => {
+                    let _ = tx.send(Event::ActionFailed {
+                        message: format!("{alias}: NOT ready - {message}"),
+                    });
+                }
             }
         });
     }
@@ -1783,6 +1855,10 @@ impl App {
                     }
                 });
             }
+            ConfirmAction::RemoveAlias { alias } => {
+                self.config.remove_alias(&alias);
+                self.save_config();
+            }
         }
     }
 
@@ -2295,6 +2371,44 @@ impl App {
                 }
                 self.spawn_passwd(alias, current, value);
             }
+            InputAction::NewAliasName => {
+                let name = value.trim().to_owned();
+                if name.is_empty() {
+                    return;
+                }
+                self.mode = Mode::Input {
+                    prompt: format!("Server URL for `{name}` (e.g. https://host:8443):"),
+                    value: String::new(),
+                    action: InputAction::NewAliasUrl { name },
+                };
+            }
+            InputAction::NewAliasUrl { name } => {
+                let url = value.trim().to_owned();
+                if url.is_empty() {
+                    return;
+                }
+                self.mode = Mode::Input {
+                    prompt: format!("Username for `{name}`:"),
+                    value: String::new(),
+                    action: InputAction::NewAliasUser { name, url },
+                };
+            }
+            InputAction::NewAliasUser { name, url } => {
+                let username = value.trim().to_owned();
+                self.config.add_alias(
+                    name,
+                    crate::config::Alias {
+                        url,
+                        username,
+                        password: None,
+                        insecure: false,
+                        ca_cert_path: None,
+                        client_cert_path: None,
+                        client_key_path: None,
+                    },
+                );
+                self.save_config();
+            }
             InputAction::AddUserUsername { alias } => {
                 let username = value.trim().to_owned();
                 if username.is_empty() {
@@ -2448,7 +2562,10 @@ mod tests {
         assert_eq!(app.handle_key(ch('k')), Action::NavigateUp);
         assert_eq!(app.handle_key(key(KeyCode::Enter)), Action::Enter);
         assert_eq!(app.handle_key(key(KeyCode::Backspace)), Action::Back);
+        // `n` at the alias level opens the new-alias input; dismiss it first.
         assert_eq!(app.handle_key(ch('n')), Action::None);
+        assert!(matches!(app.mode, Mode::Input { .. }));
+        assert_eq!(app.handle_key(key(KeyCode::Esc)), Action::None);
         assert_eq!(app.handle_key(ch('c')), Action::Copy);
         assert_eq!(app.handle_key(ch('d')), Action::Delete);
         assert_eq!(app.handle_key(ch('r')), Action::Refresh);

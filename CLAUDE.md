@@ -2,6 +2,17 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Tool usage (strict)
+
+Use the built-in tools for all file work - never shell out via Bash for these:
+
+- Read files with the **Read** tool (not `cat`/`head`/`tail`/`sed`).
+- Search with the **Grep** and **Glob** tools (not `grep`/`rg`/`find`/`ls` pipelines).
+- Edit with the **Edit**/**Write** tools (not `sed`/`awk`/`echo >`/`cat <<EOF`).
+
+Bash is only for shell-only operations: `cargo`, `git`, `make`, running test
+binaries. Do not use it to read, search, or mutate source.
+
 ## Project
 
 `y2q` is a post-quantum secure storage system written in Rust (edition 2024). It is early in development.
