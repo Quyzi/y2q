@@ -581,6 +581,14 @@ impl App {
                 self.start_tree();
                 Action::None
             }
+            KeyCode::Char('D') => {
+                self.start_diff();
+                Action::None
+            }
+            KeyCode::Char('M') => {
+                self.start_mirror_preview();
+                Action::None
+            }
             KeyCode::Char('L') => {
                 self.start_login();
                 Action::None
@@ -1409,6 +1417,123 @@ impl App {
                     let _ = tx.send(Event::ResultsLoaded {
                         title: format!("tree {alias}/{bucket}"),
                         lines: root.render_lines(false, 0),
+                    });
+                }
+                Err(message) => {
+                    let _ = tx.send(Event::ActionFailed { message });
+                }
+            }
+        });
+    }
+
+    /// Diff the local working directory against the current remote prefix.
+    fn start_diff(&mut self) {
+        use super::pane::remote::RemoteLevel;
+        let RemoteLevel::Objects {
+            alias,
+            bucket,
+            prefix,
+        } = self.remote.level.clone()
+        else {
+            return;
+        };
+        let local = self.local.cwd.clone();
+        let config = self.config.clone();
+        let tokens_path = default_tokens_path().unwrap_or_default();
+        let tx = self.event_tx.clone();
+        self.remote_throbber.start();
+        tokio::spawn(async move {
+            let result = async {
+                let local_entries = crate::ops::listing::collect_local_entries(&local)?;
+                let client = build_client(&config, &tokens_path, &alias)?;
+                let remote_entries = crate::ops::listing::collect_remote_entries(
+                    &client,
+                    &bucket,
+                    prefix.as_deref(),
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+                Ok::<_, String>(crate::ops::listing::diff_entries(
+                    &local_entries,
+                    &remote_entries,
+                ))
+            }
+            .await;
+            match result {
+                Ok(rows) => {
+                    let lines = rows
+                        .iter()
+                        .map(|r| {
+                            let s = r.src_size.map(fmt_bytes).unwrap_or_else(|| "-".into());
+                            let d = r.dst_size.map(fmt_bytes).unwrap_or_else(|| "-".into());
+                            format!("{:1}  {:>10}  {:>10}  {}", r.op, s, d, r.key)
+                        })
+                        .collect();
+                    let _ = tx.send(Event::ResultsLoaded {
+                        title: format!("diff {} <-> {alias}/{bucket}", local.display()),
+                        lines,
+                    });
+                }
+                Err(message) => {
+                    let _ = tx.send(Event::ActionFailed { message });
+                }
+            }
+        });
+    }
+
+    /// Preview a one-way mirror of the local working directory onto the current
+    /// remote prefix. Read-only: shows the plan, does not execute (use the CLI
+    /// `mirror` to apply).
+    fn start_mirror_preview(&mut self) {
+        use super::pane::remote::RemoteLevel;
+        let RemoteLevel::Objects {
+            alias,
+            bucket,
+            prefix,
+        } = self.remote.level.clone()
+        else {
+            return;
+        };
+        let local = self.local.cwd.clone();
+        let config = self.config.clone();
+        let tokens_path = default_tokens_path().unwrap_or_default();
+        let tx = self.event_tx.clone();
+        self.remote_throbber.start();
+        tokio::spawn(async move {
+            let result = async {
+                let src = crate::ops::listing::collect_local_entries(&local)?;
+                let client = build_client(&config, &tokens_path, &alias)?;
+                let dst = crate::ops::listing::collect_remote_entries(
+                    &client,
+                    &bucket,
+                    prefix.as_deref(),
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+                Ok::<_, String>(crate::ops::listing::mirror_plan(&src, &dst, false))
+            }
+            .await;
+            match result {
+                Ok(plan) => {
+                    let mut lines: Vec<String> = plan
+                        .actions
+                        .iter()
+                        .map(|(key, action)| format!("{:<7} {key}", action.label()))
+                        .collect();
+                    for key in &plan.deletions {
+                        lines.push(format!("{:<7} {key}", "delete?"));
+                    }
+                    lines.push(String::new());
+                    lines.push(format!(
+                        "{} to copy/update, {} dst-only (delete with --remove), {} unchanged",
+                        plan.actions.len(),
+                        plan.deletions.len(),
+                        plan.skipped
+                    ));
+                    lines.push("Run `y2q mirror` from the CLI to apply.".into());
+                    let _ = tx.send(Event::ResultsLoaded {
+                        title: format!("mirror {} -> {alias}/{bucket} (preview)", local.display()),
+                        lines,
                     });
                 }
                 Err(message) => {

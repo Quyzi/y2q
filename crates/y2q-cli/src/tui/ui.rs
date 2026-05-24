@@ -116,6 +116,8 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             ("f", "find"),
             ("u", "du"),
             ("T", "tree"),
+            ("D", "diff"),
+            ("M", "mirror"),
             ("d", "del"),
             ("L", "login"),
             ("a", "admin"),

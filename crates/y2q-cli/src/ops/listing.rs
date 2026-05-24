@@ -2,6 +2,7 @@
 //! attribute-filtered find.
 
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use y2q_client::{ClientError, ListOptions, MetadataView, SearchOptions, Y2qClient};
@@ -376,4 +377,225 @@ pub async fn build_tree(
         }
     }
     Ok(root)
+}
+
+// ── Diff ────────────────────────────────────────────────────────────────────
+
+/// One side of a tree comparison: relative key -> (size, optional checksum).
+#[derive(Debug, Clone)]
+pub struct DiffEntry {
+    pub size: u64,
+    pub checksum: Option<String>,
+}
+
+pub type DiffEntries = BTreeMap<String, DiffEntry>;
+
+/// A single difference between two trees. `op` is `<` (only in src), `>` (only
+/// in dst), or `!` (present in both but differing).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DiffRow {
+    pub op: &'static str,
+    pub key: String,
+    pub src_size: Option<u64>,
+    pub dst_size: Option<u64>,
+}
+
+/// Collect a local file tree rooted at `root`, keyed by relative path.
+pub fn collect_local_entries(root: &Path) -> Result<DiffEntries, String> {
+    let mut entries: DiffEntries = BTreeMap::new();
+    if !root.exists() {
+        return Ok(entries);
+    }
+    if root.is_file() {
+        let meta = std::fs::metadata(root).map_err(|e| e.to_string())?;
+        let key = root
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        entries.insert(
+            key,
+            DiffEntry {
+                size: meta.len(),
+                checksum: None,
+            },
+        );
+        return Ok(entries);
+    }
+    for entry in walkdir::WalkDir::new(root)
+        .into_iter()
+        .filter_map(Result::ok)
+    {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let rel: PathBuf = entry
+            .path()
+            .strip_prefix(root)
+            .unwrap_or(entry.path())
+            .to_owned();
+        let key = rel.to_string_lossy().replace('\\', "/");
+        let meta = entry.metadata().map_err(|e| format!("metadata: {e}"))?;
+        entries.insert(
+            key,
+            DiffEntry {
+                size: meta.len(),
+                checksum: None,
+            },
+        );
+    }
+    Ok(entries)
+}
+
+/// Collect a remote object tree under `bucket`/`prefix`, keyed by the path
+/// relative to the prefix.
+pub async fn collect_remote_entries(
+    client: &Y2qClient,
+    bucket: &str,
+    prefix: Option<&str>,
+) -> Result<DiffEntries, ClientError> {
+    let prefix_trim = prefix.map(|p| p.trim_end_matches('/').to_owned());
+    let mut entries: DiffEntries = BTreeMap::new();
+    let mut after: Option<String> = None;
+    loop {
+        let page = client
+            .list_objects(
+                bucket,
+                &ListOptions {
+                    prefix: prefix.map(str::to_owned),
+                    after: after.clone(),
+                    limit: Some(1000),
+                },
+            )
+            .await?;
+        for item in page.items {
+            let key = match &prefix_trim {
+                Some(p) if !p.is_empty() => item
+                    .key
+                    .strip_prefix(p)
+                    .map(|s| s.trim_start_matches('/').to_owned())
+                    .unwrap_or(item.key.clone()),
+                _ => item.key.clone(),
+            };
+            entries.insert(
+                key,
+                DiffEntry {
+                    size: item.size,
+                    checksum: if item.checksum_gxhash.is_empty() {
+                        None
+                    } else {
+                        Some(item.checksum_gxhash)
+                    },
+                },
+            );
+        }
+        match page.next {
+            Some(c) => after = Some(c),
+            None => break,
+        }
+    }
+    Ok(entries)
+}
+
+/// Compare two collected trees, returning the sorted list of differences.
+pub fn diff_entries(src: &DiffEntries, dst: &DiffEntries) -> Vec<DiffRow> {
+    let mut rows: Vec<DiffRow> = Vec::new();
+    for (key, s) in src {
+        match dst.get(key) {
+            Some(d) if d.size != s.size => rows.push(DiffRow {
+                op: "!",
+                key: key.clone(),
+                src_size: Some(s.size),
+                dst_size: Some(d.size),
+            }),
+            Some(d) if s.checksum.is_some() && d.checksum.is_some() && s.checksum != d.checksum => {
+                rows.push(DiffRow {
+                    op: "!",
+                    key: key.clone(),
+                    src_size: Some(s.size),
+                    dst_size: Some(d.size),
+                });
+            }
+            Some(_) => {}
+            None => rows.push(DiffRow {
+                op: "<",
+                key: key.clone(),
+                src_size: Some(s.size),
+                dst_size: None,
+            }),
+        }
+    }
+    for (key, d) in dst {
+        if !src.contains_key(key) {
+            rows.push(DiffRow {
+                op: ">",
+                key: key.clone(),
+                src_size: None,
+                dst_size: Some(d.size),
+            });
+        }
+    }
+    rows.sort_by(|a, b| a.key.cmp(&b.key));
+    rows
+}
+
+// ── Mirror ──────────────────────────────────────────────────────────────────
+
+/// What a mirror would do to a given key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MirrorAction {
+    /// Key missing from the destination.
+    Copy,
+    /// Key present but differing.
+    Update,
+}
+
+impl MirrorAction {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Copy => "copy",
+            Self::Update => "update",
+        }
+    }
+}
+
+/// A one-way mirror plan derived from two collected trees.
+#[derive(Debug, Default)]
+pub struct MirrorPlan {
+    /// Keys to copy/update, in source order.
+    pub actions: Vec<(String, MirrorAction)>,
+    /// Destination-only keys (applied only when `--remove`), in dst order.
+    pub deletions: Vec<String>,
+    /// Count of keys present and identical (left untouched).
+    pub skipped: u64,
+}
+
+/// Compute the actions needed to make `dst` match `src`. When `overwrite` is
+/// set, equal-size entries with differing checksums are also updated.
+pub fn mirror_plan(src: &DiffEntries, dst: &DiffEntries, overwrite: bool) -> MirrorPlan {
+    let mut plan = MirrorPlan::default();
+    for (key, s) in src {
+        let action = match dst.get(key) {
+            None => MirrorAction::Copy,
+            Some(d) if d.size != s.size => MirrorAction::Update,
+            Some(d)
+                if overwrite
+                    && s.checksum.is_some()
+                    && d.checksum.is_some()
+                    && s.checksum != d.checksum =>
+            {
+                MirrorAction::Update
+            }
+            Some(_) => {
+                plan.skipped += 1;
+                continue;
+            }
+        };
+        plan.actions.push((key.clone(), action));
+    }
+    for key in dst.keys() {
+        if !src.contains_key(key) {
+            plan.deletions.push(key.clone());
+        }
+    }
+    plan
 }
