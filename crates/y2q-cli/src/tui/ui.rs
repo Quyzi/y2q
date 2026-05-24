@@ -142,6 +142,9 @@ pub fn render(frame: &mut Frame, app: &mut App) {
                 ConfirmAction::ClearLocks { older_than, .. } => {
                     format!("Clear stale locks older than {older_than}?")
                 }
+                ConfirmAction::RemoveAlias { alias } => {
+                    format!("Remove alias `{alias}` from local config?")
+                }
             };
             confirm_dialog::render(frame, area, &msg);
         }
