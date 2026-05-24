@@ -37,7 +37,7 @@ pub async fn login(
     };
 
     let client = client_from_alias(entry, None)?;
-    let token_resp = client.login(&username, pw.as_str(), ttl).await?;
+    let token_resp = crate::ops::auth::login(&client, &username, pw.as_str(), ttl).await?;
 
     let token_entry = TokenEntry {
         token: token_resp.token,
@@ -78,7 +78,7 @@ pub async fn logout(alias: &str, mode: OutputMode) -> Result<(), CliError> {
     let mut store = TokenStore::load(&tokens_path)?;
     if let Some(tok) = store.get_valid(alias) {
         let client = client_from_alias(entry, Some(Zeroizing::new(tok.token.clone())))?;
-        let _ = client.logout().await;
+        let _ = crate::ops::auth::logout(&client).await;
     }
     store.clear(alias);
     store.save(&tokens_path)?;
@@ -119,9 +119,7 @@ pub async fn passwd(
     };
 
     let client = client_from_alias(entry, Some(token))?;
-    client
-        .change_password(current_pw.as_str(), new_pw.as_str())
-        .await?;
+    crate::ops::auth::change_password(&client, current_pw.as_str(), new_pw.as_str()).await?;
 
     if mode == OutputMode::Json {
         print_json(&serde_json::json!({ "alias": alias, "changed": true }));

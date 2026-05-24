@@ -6,6 +6,8 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragraph},
 };
 
+use crate::output::fmt_bytes;
+
 use super::app::App;
 use super::pane::local::LocalEntry;
 use super::pane::remote::RemoteEntry;
@@ -64,23 +66,43 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             ("q/Esc", "close"),
         ],
         Mode::Admin(AdminTab::Events) => &[("Tab", "tab"), ("(live)", "trace"), ("q/Esc", "close")],
-        Mode::Admin(_) => &[
+        Mode::Admin(AdminTab::Rebuild) => &[
+            ("Tab", "tab"),
+            ("s", "start"),
+            ("r", "refresh"),
+            ("q/Esc", "close"),
+        ],
+        Mode::Admin(AdminTab::Locks) => &[
             ("Tab", "tab"),
             ("↑↓/jk", "nav"),
-            ("d", "delete"),
+            ("c", "clear stale"),
+            ("r", "refresh"),
             ("q/Esc", "close"),
         ],
         Mode::Input { .. } => &[("Enter", "confirm"), ("Esc", "cancel")],
+        Mode::Labels { .. } => &[
+            ("↑↓/jk", "nav"),
+            ("a", "add"),
+            ("d", "remove"),
+            ("q/Esc", "close"),
+        ],
+        Mode::BucketConfig { .. } => &[
+            ("↑↓/jk", "field"),
+            ("Enter", "edit"),
+            ("d", "clear"),
+            ("q/Esc", "close"),
+        ],
+        Mode::Results { .. } => &[("↑↓/jk", "scroll"), ("q/Esc", "close")],
         _ if show_new_bucket => &[
             ("Tab", "pane"),
             ("↑↓/jk", "nav"),
             ("Enter", "open"),
             ("n", "new bucket"),
-            ("c", "copy"),
+            ("g", "config"),
             ("d", "del"),
+            ("L", "login"),
             ("r", "refresh"),
             ("a", "admin"),
-            ("t", "transfers"),
             ("q", "quit"),
         ],
         _ => &[
@@ -88,10 +110,15 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             ("↑↓/jk", "nav"),
             ("Enter", "open"),
             ("c", "copy"),
+            ("m", "rename"),
+            ("l", "labels"),
+            ("s", "search"),
+            ("f", "find"),
+            ("u", "du"),
+            ("T", "tree"),
             ("d", "del"),
-            ("r", "refresh"),
+            ("L", "login"),
             ("a", "admin"),
-            ("t", "transfers"),
             ("q", "quit"),
         ],
     };
@@ -104,8 +131,14 @@ pub fn render(frame: &mut Frame, app: &mut App) {
                 ConfirmAction::DeleteRemote { bucket, key, .. } => {
                     format!("Delete {bucket}/{key}?")
                 }
+                ConfirmAction::DeleteBucket { bucket, .. } => {
+                    format!("Delete bucket `{bucket}` and ALL its objects?")
+                }
                 ConfirmAction::DeleteUser { username, .. } => {
                     format!("Delete user `{username}`?")
+                }
+                ConfirmAction::ClearLocks { older_than, .. } => {
+                    format!("Clear stale locks older than {older_than}?")
                 }
             };
             confirm_dialog::render(frame, area, &msg);
@@ -116,12 +149,180 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             value,
             action,
         } => {
-            let secret = matches!(action, InputAction::AddUserPassword { .. });
+            let secret = matches!(
+                action,
+                InputAction::AddUserPassword { .. } | InputAction::LoginPassword { .. }
+            );
             render_input_dialog(frame, area, &prompt, &value, secret);
         }
         Mode::ObjectStat { lines, .. } => render_object_stat_popup(frame, area, &lines),
+        Mode::Labels {
+            bucket,
+            key,
+            labels,
+            selected,
+            ..
+        } => render_labels_popup(frame, area, &bucket, &key, &labels, selected),
+        Mode::BucketConfig {
+            bucket,
+            quota_bytes,
+            default_sse,
+            selected,
+            ..
+        } => render_bucket_config_popup(frame, area, &bucket, quota_bytes, &default_sse, selected),
+        Mode::Results {
+            title,
+            lines,
+            selected,
+        } => render_results_popup(frame, area, &title, &lines, selected),
         _ => {}
     }
+}
+
+fn render_results_popup(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    lines: &[String],
+    selected: usize,
+) {
+    let w = area.width.saturating_sub(8).max(40);
+    let h = area.height.saturating_sub(6).max(6);
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    let popup = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .title(Span::styled(
+            format!(" {title} "),
+            Style::default().fg(NEON_CYAN).add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Double)
+        .border_style(Style::default().fg(NEON_CYAN));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    if lines.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Span::styled("(no results)", Style::default().fg(DIM_TEXT))),
+            inner,
+        );
+        return;
+    }
+    let visible = inner.height as usize;
+    let start = if selected >= visible {
+        selected - visible + 1
+    } else {
+        0
+    };
+    let items: Vec<ListItem> = lines
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(visible)
+        .map(|(i, l)| {
+            let style = if i == selected {
+                Style::default().fg(Color::Black).bg(NEON_PINK)
+            } else {
+                Style::default().fg(NORMAL_TEXT)
+            };
+            ListItem::new(Line::from(Span::styled(l.clone(), style)))
+        })
+        .collect();
+    frame.render_widget(List::new(items), inner);
+}
+
+fn render_labels_popup(
+    frame: &mut Frame,
+    area: Rect,
+    bucket: &str,
+    key: &str,
+    labels: &[(String, String)],
+    selected: usize,
+) {
+    let title = format!(" Labels — {bucket}/{key} ");
+    let mut lines: Vec<Line> = Vec::new();
+    if labels.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "(no labels — press 'a' to add)",
+            Style::default().fg(DIM_TEXT),
+        )));
+    } else {
+        for (i, (k, v)) in labels.iter().enumerate() {
+            let style = if i == selected {
+                Style::default().fg(Color::Black).bg(NEON_PINK)
+            } else {
+                Style::default().fg(NORMAL_TEXT)
+            };
+            lines.push(Line::from(Span::styled(format!("{k} = {v}"), style)));
+        }
+    }
+    render_lines_popup(frame, area, &title, lines);
+}
+
+fn render_bucket_config_popup(
+    frame: &mut Frame,
+    area: Rect,
+    bucket: &str,
+    quota_bytes: Option<u64>,
+    default_sse: &Option<String>,
+    selected: usize,
+) {
+    let title = format!(" Config — {bucket} ");
+    let quota = quota_bytes
+        .map(fmt_bytes)
+        .unwrap_or_else(|| "(none)".into());
+    let sse = default_sse.clone().unwrap_or_else(|| "(none)".into());
+    let rows = [format!("Quota:  {quota}"), format!("SSE:    {sse}")];
+    let lines: Vec<Line> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            let style = if i == selected {
+                Style::default().fg(Color::Black).bg(NEON_PINK)
+            } else {
+                Style::default().fg(NORMAL_TEXT)
+            };
+            Line::from(Span::styled(r.clone(), style))
+        })
+        .collect();
+    render_lines_popup(frame, area, &title, lines);
+}
+
+/// Render a centered popup box containing pre-built lines.
+fn render_lines_popup(frame: &mut Frame, area: Rect, title: &str, lines: Vec<Line>) {
+    let content_w = lines
+        .iter()
+        .map(|l| l.width())
+        .max()
+        .unwrap_or(20)
+        .max(title.len()) as u16;
+    let w = (content_w + 4).max(40).min(area.width.saturating_sub(4));
+    let h = ((lines.len() as u16) + 4).min(area.height.saturating_sub(4));
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    let popup = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .title(Span::styled(
+            title.to_owned(),
+            Style::default().fg(NEON_CYAN).add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Double)
+        .border_style(Style::default().fg(NEON_CYAN));
+    frame.render_widget(Paragraph::new(lines).block(block), popup);
 }
 
 fn render_header(frame: &mut Frame, area: Rect) {

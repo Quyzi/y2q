@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
@@ -9,7 +9,7 @@ use crate::client_builder::client_from_alias;
 use crate::config::{CliConfig, default_tokens_path};
 use crate::output::{fmt_bytes, fmt_ns};
 use crate::progress::{CountingReader, CountingWriter, ProgressReporter};
-use crate::token::TokenStore;
+use crate::token::{TokenEntry, TokenStore};
 
 use super::actions::Action;
 use super::admin::{EventsView, LocksView, MetricsView, RebuildView, UsersView};
@@ -37,6 +37,24 @@ impl ProgressReporter for TuiTransferReporter {
         });
     }
     fn finish(&mut self, _: u64) {}
+}
+
+/// Build an authenticated client for `alias` from owned config + tokens path,
+/// for use inside spawned tasks. Returns a display string on failure.
+fn build_client(
+    config: &CliConfig,
+    tokens_path: &std::path::Path,
+    alias: &str,
+) -> Result<y2q_client::Y2qClient, String> {
+    let profile = config
+        .aliases
+        .get(alias)
+        .ok_or_else(|| format!("unknown alias `{alias}`"))?;
+    let store = TokenStore::load(tokens_path).map_err(|e| e.to_string())?;
+    let token = store
+        .token_for(alias)
+        .ok_or_else(|| "not authenticated — press 'L' to log in".to_string())?;
+    client_from_alias(profile, Some(token)).map_err(|e| e.to_string())
 }
 
 pub struct App {
@@ -160,6 +178,59 @@ impl App {
                 self.apply_object_stat(path, result);
                 Action::None
             }
+            Event::ActionFailed { message } => {
+                self.mode = Mode::Error(message);
+                Action::None
+            }
+            Event::LabelsLoaded {
+                alias,
+                bucket,
+                key,
+                labels,
+            } => {
+                let entries: Vec<(String, String)> = labels.into_iter().collect();
+                // Preserve the cursor position across refreshes when possible.
+                let prev = match &self.mode {
+                    Mode::Labels { selected, .. } => *selected,
+                    _ => 0,
+                };
+                let selected = prev.min(entries.len().saturating_sub(1));
+                self.mode = Mode::Labels {
+                    alias,
+                    bucket,
+                    key,
+                    labels: entries,
+                    selected,
+                };
+                Action::None
+            }
+            Event::BucketConfigLoaded {
+                alias,
+                bucket,
+                quota_bytes,
+                default_sse,
+            } => {
+                let selected = match &self.mode {
+                    Mode::BucketConfig { selected, .. } => *selected,
+                    _ => 0,
+                };
+                self.mode = Mode::BucketConfig {
+                    alias,
+                    bucket,
+                    quota_bytes,
+                    default_sse,
+                    selected,
+                };
+                Action::None
+            }
+            Event::ResultsLoaded { title, lines } => {
+                self.mode = Mode::Results {
+                    title,
+                    lines,
+                    selected: 0,
+                };
+                Action::None
+            }
             _ => Action::None,
         }
     }
@@ -262,6 +333,9 @@ impl App {
                 Action::None
             }
             Mode::Admin(tab) => self.handle_admin_key(key, tab),
+            Mode::Labels { .. } => self.handle_labels_key(key),
+            Mode::BucketConfig { .. } => self.handle_bucketconfig_key(key),
+            Mode::Results { .. } => self.handle_results_key(key),
             Mode::Browse => self.handle_browse_key(key),
         }
     }
@@ -312,6 +386,7 @@ impl App {
         use crossterm::event::KeyCode;
         let mode_after = match action {
             ConfirmAction::DeleteUser { .. } => Mode::Admin(AdminTab::Users),
+            ConfirmAction::ClearLocks { .. } => Mode::Admin(AdminTab::Locks),
             _ => Mode::Browse,
         };
         match key.code {
@@ -347,10 +422,30 @@ impl App {
                 Action::PrevTab
             }
             KeyCode::Char('r') => {
-                if matches!(tab, AdminTab::Metrics) {
-                    self.fetch_metrics();
+                match tab {
+                    AdminTab::Metrics => self.fetch_metrics(),
+                    AdminTab::Users => self.fetch_users(),
+                    AdminTab::Locks => self.fetch_locks(),
+                    AdminTab::Rebuild => self.fetch_rebuild_status(),
+                    AdminTab::Events => {}
                 }
                 Action::Refresh
+            }
+            KeyCode::Char('s') => {
+                if matches!(tab, AdminTab::Rebuild) {
+                    self.start_rebuild();
+                }
+                Action::None
+            }
+            KeyCode::Char('c') => {
+                if matches!(tab, AdminTab::Locks) {
+                    let alias = self.active_alias.clone().unwrap_or_default();
+                    self.mode = Mode::Confirm(ConfirmAction::ClearLocks {
+                        alias,
+                        older_than: "5m".into(),
+                    });
+                }
+                Action::None
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 match tab {
@@ -410,6 +505,7 @@ impl App {
             }
             KeyCode::Char('a') => {
                 self.mode = Mode::Admin(AdminTab::default());
+                self.fetch_rebuild_status();
                 self.fetch_users();
                 self.fetch_locks();
                 Action::ToggleAdmin
@@ -456,6 +552,38 @@ impl App {
             KeyCode::Char('d') => {
                 self.request_delete();
                 Action::Delete
+            }
+            KeyCode::Char('m') => {
+                self.start_rename();
+                Action::None
+            }
+            KeyCode::Char('l') => {
+                self.open_labels();
+                Action::None
+            }
+            KeyCode::Char('g') => {
+                self.open_bucket_config();
+                Action::None
+            }
+            KeyCode::Char('s') => {
+                self.start_search();
+                Action::None
+            }
+            KeyCode::Char('f') => {
+                self.start_find();
+                Action::None
+            }
+            KeyCode::Char('u') => {
+                self.start_du();
+                Action::None
+            }
+            KeyCode::Char('T') => {
+                self.start_tree();
+                Action::None
+            }
+            KeyCode::Char('L') => {
+                self.start_login();
+                Action::None
             }
             KeyCode::Char('r') => {
                 self.trigger_refresh();
@@ -695,17 +823,599 @@ impl App {
     }
 
     fn request_delete(&mut self) {
+        use super::pane::remote::{RemoteEntry, RemoteLevel};
+        if self.focused != FocusedPane::Remote {
+            return;
+        }
+        match self.remote.selected_entry().cloned() {
+            Some(RemoteEntry::Object(m)) => {
+                let alias = self.active_alias.clone().unwrap_or_default();
+                self.mode = Mode::Confirm(ConfirmAction::DeleteRemote {
+                    alias,
+                    bucket: m.bucket.clone(),
+                    key: m.key.clone(),
+                });
+            }
+            Some(RemoteEntry::Bucket(bucket)) => {
+                if let RemoteLevel::Buckets { ref alias } = self.remote.level.clone() {
+                    self.mode = Mode::Confirm(ConfirmAction::DeleteBucket {
+                        alias: alias.clone(),
+                        bucket,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn start_rename(&mut self) {
         use super::pane::remote::RemoteEntry;
         if let FocusedPane::Remote = self.focused
             && let Some(RemoteEntry::Object(m)) = self.remote.selected_entry().cloned()
         {
             let alias = self.active_alias.clone().unwrap_or_default();
-            self.mode = Mode::Confirm(ConfirmAction::DeleteRemote {
-                alias,
-                bucket: m.bucket.clone(),
-                key: m.key.clone(),
-            });
+            self.mode = Mode::Input {
+                prompt: format!("Rename {} to:", m.key),
+                value: m.key.clone(),
+                action: InputAction::RenameObject {
+                    alias,
+                    bucket: m.bucket.clone(),
+                    key: m.key.clone(),
+                },
+            };
         }
+    }
+
+    fn start_login(&mut self) {
+        use super::pane::remote::{RemoteEntry, RemoteLevel};
+        // Determine which alias to authenticate: the selected alias entry, or
+        // the currently open one.
+        let alias = match self.remote.level.clone() {
+            RemoteLevel::Aliases => match self.remote.selected_entry().cloned() {
+                Some(RemoteEntry::Alias(a)) => Some(a),
+                _ => None,
+            },
+            _ => self.active_alias.clone(),
+        };
+        let Some(alias) = alias else {
+            return;
+        };
+        let default_user = self
+            .config
+            .aliases
+            .get(&alias)
+            .map(|a| a.username.clone())
+            .unwrap_or_default();
+        self.mode = Mode::Input {
+            prompt: format!("Username for `{alias}`:"),
+            value: default_user,
+            action: InputAction::LoginUsername { alias },
+        };
+    }
+
+    // ── Labels (Phase 2) ────────────────────────────────────────────────────
+
+    fn open_labels(&mut self) {
+        use super::pane::remote::RemoteEntry;
+        if self.focused != FocusedPane::Remote {
+            return;
+        }
+        if let Some(RemoteEntry::Object(m)) = self.remote.selected_entry().cloned() {
+            let alias = self.active_alias.clone().unwrap_or_default();
+            self.fetch_labels(alias, m.bucket.clone(), m.key.clone());
+        }
+    }
+
+    fn fetch_labels(&mut self, alias: String, bucket: String, key: String) {
+        let config = self.config.clone();
+        let tokens_path = default_tokens_path().unwrap_or_default();
+        let tx = self.event_tx.clone();
+        tokio::spawn(async move {
+            let result = async {
+                let client = build_client(&config, &tokens_path, &alias)?;
+                crate::ops::objects::head(&client, &bucket, &key)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+            .await;
+            match result {
+                Ok(head) => {
+                    let _ = tx.send(Event::LabelsLoaded {
+                        alias,
+                        bucket,
+                        key,
+                        labels: head.labels,
+                    });
+                }
+                Err(message) => {
+                    let _ = tx.send(Event::ActionFailed { message });
+                }
+            }
+        });
+    }
+
+    fn spawn_label_mutation(
+        &mut self,
+        alias: String,
+        bucket: String,
+        key: String,
+        op: &'static str,
+        labels: BTreeMap<String, String>,
+    ) {
+        let config = self.config.clone();
+        let tokens_path = default_tokens_path().unwrap_or_default();
+        let tx = self.event_tx.clone();
+        tokio::spawn(async move {
+            let result = async {
+                let client = build_client(&config, &tokens_path, &alias)?;
+                crate::ops::objects::set_labels(&client, &bucket, &key, op, &labels)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+            .await;
+            match result {
+                Ok(updated) => {
+                    let _ = tx.send(Event::LabelsLoaded {
+                        alias,
+                        bucket,
+                        key,
+                        labels: updated,
+                    });
+                }
+                Err(message) => {
+                    let _ = tx.send(Event::ActionFailed { message });
+                }
+            }
+        });
+    }
+
+    fn handle_labels_key(&mut self, key: crossterm::event::KeyEvent) -> Action {
+        use crossterm::event::KeyCode;
+        let (alias, bucket, okey, labels, selected) = match &self.mode {
+            Mode::Labels {
+                alias,
+                bucket,
+                key,
+                labels,
+                selected,
+            } => (
+                alias.clone(),
+                bucket.clone(),
+                key.clone(),
+                labels.clone(),
+                *selected,
+            ),
+            _ => return Action::None,
+        };
+        match key.code {
+            KeyCode::Char('q') | KeyCode::Esc => self.mode = Mode::Browse,
+            KeyCode::Up | KeyCode::Char('k') => {
+                if selected > 0
+                    && let Mode::Labels { selected, .. } = &mut self.mode
+                {
+                    *selected -= 1;
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if selected + 1 < labels.len()
+                    && let Mode::Labels { selected, .. } = &mut self.mode
+                {
+                    *selected += 1;
+                }
+            }
+            KeyCode::Char('a') => {
+                self.mode = Mode::Input {
+                    prompt: "Add label (key=value):".into(),
+                    value: String::new(),
+                    action: InputAction::SetLabel {
+                        alias,
+                        bucket,
+                        key: okey,
+                    },
+                };
+            }
+            KeyCode::Char('d') => {
+                if let Some((k, _)) = labels.get(selected).cloned() {
+                    let mut map = BTreeMap::new();
+                    map.insert(k, String::new());
+                    self.spawn_label_mutation(alias, bucket, okey, "remove", map);
+                }
+            }
+            _ => {}
+        }
+        Action::None
+    }
+
+    // ── Bucket config (Phase 2) ─────────────────────────────────────────────
+
+    fn open_bucket_config(&mut self) {
+        use super::pane::remote::{RemoteEntry, RemoteLevel};
+        if self.focused != FocusedPane::Remote {
+            return;
+        }
+        if let (Some(RemoteEntry::Bucket(bucket)), RemoteLevel::Buckets { alias }) = (
+            self.remote.selected_entry().cloned(),
+            self.remote.level.clone(),
+        ) {
+            self.fetch_bucket_config(alias, bucket);
+        }
+    }
+
+    fn fetch_bucket_config(&mut self, alias: String, bucket: String) {
+        let config = self.config.clone();
+        let tokens_path = default_tokens_path().unwrap_or_default();
+        let tx = self.event_tx.clone();
+        tokio::spawn(async move {
+            let result = async {
+                let client = build_client(&config, &tokens_path, &alias)?;
+                crate::ops::buckets::get_config(&client, &bucket)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+            .await;
+            match result {
+                Ok(cfg) => {
+                    let _ = tx.send(Event::BucketConfigLoaded {
+                        alias,
+                        bucket,
+                        quota_bytes: cfg.quota_bytes,
+                        default_sse: cfg.default_sse,
+                    });
+                }
+                Err(message) => {
+                    let _ = tx.send(Event::ActionFailed { message });
+                }
+            }
+        });
+    }
+
+    /// Read-modify-write a bucket's config. `set_quota`/`set_sse` of `Some(v)`
+    /// assign that value (where `v` may itself be `None` to clear); `None` leaves
+    /// the field unchanged.
+    fn spawn_set_bucket_config(
+        &mut self,
+        alias: String,
+        bucket: String,
+        set_quota: Option<Option<u64>>,
+        set_sse: Option<Option<String>>,
+    ) {
+        let config = self.config.clone();
+        let tokens_path = default_tokens_path().unwrap_or_default();
+        let tx = self.event_tx.clone();
+        tokio::spawn(async move {
+            let result = async {
+                let client = build_client(&config, &tokens_path, &alias)?;
+                let mut cfg = crate::ops::buckets::get_config(&client, &bucket)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                if let Some(q) = set_quota {
+                    cfg.quota_bytes = q;
+                }
+                if let Some(s) = set_sse {
+                    cfg.default_sse = s;
+                }
+                crate::ops::buckets::set_config(&client, &bucket, &cfg)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+            .await;
+            match result {
+                Ok(cfg) => {
+                    let _ = tx.send(Event::BucketConfigLoaded {
+                        alias,
+                        bucket,
+                        quota_bytes: cfg.quota_bytes,
+                        default_sse: cfg.default_sse,
+                    });
+                }
+                Err(message) => {
+                    let _ = tx.send(Event::ActionFailed { message });
+                }
+            }
+        });
+    }
+
+    fn handle_bucketconfig_key(&mut self, key: crossterm::event::KeyEvent) -> Action {
+        use crossterm::event::KeyCode;
+        let (alias, bucket, selected) = match &self.mode {
+            Mode::BucketConfig {
+                alias,
+                bucket,
+                selected,
+                ..
+            } => (alias.clone(), bucket.clone(), *selected),
+            _ => return Action::None,
+        };
+        match key.code {
+            KeyCode::Char('q') | KeyCode::Esc => self.mode = Mode::Browse,
+            KeyCode::Up | KeyCode::Char('k') => {
+                if let Mode::BucketConfig { selected, .. } = &mut self.mode {
+                    *selected = selected.saturating_sub(1);
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if let Mode::BucketConfig { selected, .. } = &mut self.mode {
+                    *selected = (*selected + 1).min(1);
+                }
+            }
+            KeyCode::Enter => {
+                let (prompt, action) = if selected == 0 {
+                    (
+                        "Set quota (e.g. 500m, 2g):".to_string(),
+                        InputAction::SetQuota { alias, bucket },
+                    )
+                } else {
+                    (
+                        "Set default SSE algorithm:".to_string(),
+                        InputAction::SetSse { alias, bucket },
+                    )
+                };
+                self.mode = Mode::Input {
+                    prompt,
+                    value: String::new(),
+                    action,
+                };
+            }
+            KeyCode::Char('d') => {
+                if selected == 0 {
+                    self.spawn_set_bucket_config(alias, bucket, Some(None), None);
+                } else {
+                    self.spawn_set_bucket_config(alias, bucket, None, Some(None));
+                }
+            }
+            _ => {}
+        }
+        Action::None
+    }
+
+    // ── Query views: search / find (Phase 3) ────────────────────────────────
+
+    /// The current remote scope as `(alias, bucket, prefix)`, if resolvable.
+    fn remote_scope(&self) -> Option<(String, Option<String>, Option<String>)> {
+        use super::pane::remote::RemoteLevel;
+        match self.remote.level.clone() {
+            RemoteLevel::Aliases => self.active_alias.clone().map(|a| (a, None, None)),
+            RemoteLevel::Buckets { alias } => Some((alias, None, None)),
+            RemoteLevel::Objects {
+                alias,
+                bucket,
+                prefix,
+            } => Some((alias, Some(bucket), prefix)),
+        }
+    }
+
+    fn start_search(&mut self) {
+        let Some((alias, bucket, prefix)) = self.remote_scope() else {
+            return;
+        };
+        self.mode = Mode::Input {
+            prompt: "Label query (e.g. env == prod):".into(),
+            value: String::new(),
+            action: InputAction::SearchQuery {
+                alias,
+                bucket,
+                prefix,
+            },
+        };
+    }
+
+    fn start_find(&mut self) {
+        use super::pane::remote::RemoteLevel;
+        if let RemoteLevel::Objects {
+            alias,
+            bucket,
+            prefix,
+        } = self.remote.level.clone()
+        {
+            self.mode = Mode::Input {
+                prompt: "Find name glob (e.g. *.log):".into(),
+                value: "*".into(),
+                action: InputAction::FindName {
+                    alias,
+                    bucket,
+                    prefix,
+                },
+            };
+        }
+    }
+
+    fn spawn_search(
+        &mut self,
+        alias: String,
+        bucket: Option<String>,
+        prefix: Option<String>,
+        query: String,
+    ) {
+        let config = self.config.clone();
+        let tokens_path = default_tokens_path().unwrap_or_default();
+        let tx = self.event_tx.clone();
+        tokio::spawn(async move {
+            let result = async {
+                let client = build_client(&config, &tokens_path, &alias)?;
+                crate::ops::listing::search(&client, bucket, prefix, &query)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+            .await;
+            match result {
+                Ok(hits) => {
+                    let lines = hits
+                        .iter()
+                        .map(|m| {
+                            format!(
+                                "{alias}/{}/{}  {}  {}",
+                                m.bucket,
+                                m.key,
+                                fmt_bytes(m.size),
+                                fmt_ns(m.modified)
+                            )
+                        })
+                        .collect();
+                    let _ = tx.send(Event::ResultsLoaded {
+                        title: format!("Search: {query} ({} hit(s))", hits.len()),
+                        lines,
+                    });
+                }
+                Err(message) => {
+                    let _ = tx.send(Event::ActionFailed { message });
+                }
+            }
+        });
+    }
+
+    fn spawn_find(&mut self, alias: String, bucket: String, prefix: Option<String>, name: String) {
+        let config = self.config.clone();
+        let tokens_path = default_tokens_path().unwrap_or_default();
+        let tx = self.event_tx.clone();
+        tokio::spawn(async move {
+            let result = async {
+                let filter = crate::ops::listing::FindFilter::build(Some(&name), None, None, None)?;
+                let client = build_client(&config, &tokens_path, &alias)?;
+                crate::ops::listing::find(&client, &bucket, prefix, &filter)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+            .await;
+            match result {
+                Ok(hits) => {
+                    let lines = hits
+                        .iter()
+                        .map(|m| {
+                            format!(
+                                "{alias}/{bucket}/{}  {}  {}",
+                                m.key,
+                                fmt_bytes(m.size),
+                                fmt_ns(m.modified)
+                            )
+                        })
+                        .collect();
+                    let _ = tx.send(Event::ResultsLoaded {
+                        title: format!("Find {name} ({} match(es))", hits.len()),
+                        lines,
+                    });
+                }
+                Err(message) => {
+                    let _ = tx.send(Event::ActionFailed { message });
+                }
+            }
+        });
+    }
+
+    fn handle_results_key(&mut self, key: crossterm::event::KeyEvent) -> Action {
+        use crossterm::event::KeyCode;
+        let (len, selected) = match &self.mode {
+            Mode::Results {
+                lines, selected, ..
+            } => (lines.len(), *selected),
+            _ => return Action::None,
+        };
+        match key.code {
+            KeyCode::Char('q') | KeyCode::Esc => self.mode = Mode::Browse,
+            KeyCode::Up | KeyCode::Char('k') => {
+                if selected > 0
+                    && let Mode::Results { selected, .. } = &mut self.mode
+                {
+                    *selected -= 1;
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if selected + 1 < len
+                    && let Mode::Results { selected, .. } = &mut self.mode
+                {
+                    *selected += 1;
+                }
+            }
+            _ => {}
+        }
+        Action::None
+    }
+
+    fn start_du(&mut self) {
+        let Some((alias, bucket, prefix)) = self.remote_scope() else {
+            return;
+        };
+        let config = self.config.clone();
+        let tokens_path = default_tokens_path().unwrap_or_default();
+        let tx = self.event_tx.clone();
+        self.remote_throbber.start();
+        tokio::spawn(async move {
+            let result = async {
+                let client = build_client(&config, &tokens_path, &alias)?;
+                match &bucket {
+                    Some(b) => {
+                        let (total, count, groups) =
+                            crate::ops::listing::du(&client, b, prefix.as_deref(), 1)
+                                .await
+                                .map_err(|e| e.to_string())?;
+                        let mut lines: Vec<String> = groups
+                            .iter()
+                            .map(|(g, (bytes, c))| {
+                                format!("{:>10}  {:>6}  {b}/{g}", fmt_bytes(*bytes), c)
+                            })
+                            .collect();
+                        lines.push(format!("{:>10}  {:>6}  TOTAL", fmt_bytes(total), count));
+                        Ok::<_, String>((format!("du {alias}/{b}"), lines))
+                    }
+                    None => {
+                        let summary = crate::ops::listing::du_buckets(&client)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        let lines = summary
+                            .iter()
+                            .map(|(b, bytes, c)| {
+                                format!("{:>10}  {:>6}  {b}/", fmt_bytes(*bytes), c)
+                            })
+                            .collect();
+                        Ok((format!("du {alias}"), lines))
+                    }
+                }
+            }
+            .await;
+            match result {
+                Ok((title, lines)) => {
+                    let _ = tx.send(Event::ResultsLoaded { title, lines });
+                }
+                Err(message) => {
+                    let _ = tx.send(Event::ActionFailed { message });
+                }
+            }
+        });
+    }
+
+    fn start_tree(&mut self) {
+        use super::pane::remote::RemoteLevel;
+        let RemoteLevel::Objects {
+            alias,
+            bucket,
+            prefix,
+        } = self.remote.level.clone()
+        else {
+            return;
+        };
+        let config = self.config.clone();
+        let tokens_path = default_tokens_path().unwrap_or_default();
+        let tx = self.event_tx.clone();
+        self.remote_throbber.start();
+        tokio::spawn(async move {
+            let result = async {
+                let client = build_client(&config, &tokens_path, &alias)?;
+                crate::ops::listing::build_tree(&client, &bucket, prefix.as_deref())
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+            .await;
+            match result {
+                Ok(root) => {
+                    let _ = tx.send(Event::ResultsLoaded {
+                        title: format!("tree {alias}/{bucket}"),
+                        lines: root.render_lines(false, 0),
+                    });
+                }
+                Err(message) => {
+                    let _ = tx.send(Event::ActionFailed { message });
+                }
+            }
+        });
     }
 
     fn execute_confirm(&mut self, action: ConfirmAction) {
@@ -713,15 +1423,97 @@ impl App {
             ConfirmAction::DeleteRemote { alias, bucket, key } => {
                 let config = self.config.clone();
                 let tokens_path = default_tokens_path().unwrap_or_default();
+                let tx = self.event_tx.clone();
+                let prefix = self.remote.objects_prefix();
                 tokio::spawn(async move {
-                    let _ = async {
-                        let profile = config.aliases.get(&alias)?;
-                        let store = TokenStore::load(&tokens_path).ok()?;
-                        let token = store.token_for(&alias)?;
-                        let client = client_from_alias(profile, Some(token)).ok()?;
-                        client.delete(&bucket, &key).await.ok()
+                    let result = async {
+                        let client = build_client(&config, &tokens_path, &alias)?;
+                        crate::ops::objects::delete(&client, &bucket, &key)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        let page = client
+                            .list_objects(
+                                &bucket,
+                                &ListOptions {
+                                    prefix: prefix.clone(),
+                                    after: None,
+                                    limit: Some(500),
+                                },
+                            )
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        Ok::<_, String>((page.items, page.next))
                     }
                     .await;
+                    match result {
+                        Ok((items, next)) => {
+                            let _ = tx.send(Event::RemoteFetched {
+                                alias,
+                                path: RemoteFetchPath::Objects { bucket, prefix },
+                                result: RemoteFetchResult::Objects(items, next),
+                            });
+                        }
+                        Err(message) => {
+                            let _ = tx.send(Event::ActionFailed { message });
+                        }
+                    }
+                });
+            }
+            ConfirmAction::DeleteBucket { alias, bucket } => {
+                let config = self.config.clone();
+                let tokens_path = default_tokens_path().unwrap_or_default();
+                let tx = self.event_tx.clone();
+                let alias_clone = alias.clone();
+                tokio::spawn(async move {
+                    let result = async {
+                        let client = build_client(&config, &tokens_path, &alias_clone)?;
+                        crate::ops::buckets::delete(&client, &bucket)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        client.list_buckets().await.map_err(|e| e.to_string())
+                    }
+                    .await;
+                    match result {
+                        Ok(buckets) => {
+                            let _ = tx.send(Event::RemoteFetched {
+                                alias: alias_clone,
+                                path: RemoteFetchPath::Buckets,
+                                result: RemoteFetchResult::Buckets(buckets),
+                            });
+                        }
+                        Err(message) => {
+                            let _ = tx.send(Event::ActionFailed { message });
+                        }
+                    }
+                });
+            }
+            ConfirmAction::ClearLocks { alias, older_than } => {
+                let config = self.config.clone();
+                let tokens_path = default_tokens_path().unwrap_or_default();
+                let tx = self.event_tx.clone();
+                let alias_clone = alias.clone();
+                tokio::spawn(async move {
+                    let result = async {
+                        let client = build_client(&config, &tokens_path, &alias_clone)?;
+                        crate::ops::admin::locks_clear(&client, &older_than)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        crate::ops::admin::locks_list(&client, &older_than)
+                            .await
+                            .map_err(|e| e.to_string())
+                    }
+                    .await;
+                    match result {
+                        Ok(locks) => {
+                            let _ = tx.send(Event::LocksLoaded {
+                                alias: alias_clone,
+                                locks,
+                            });
+                        }
+                        Err(message) => {
+                            let _ = tx.send(Event::ActionFailed { message });
+                        }
+                    }
                 });
             }
             ConfirmAction::DeleteUser { alias, username } => {
@@ -869,8 +1661,75 @@ impl App {
             AdminTab::Locks => self.fetch_locks(),
             AdminTab::Metrics => self.fetch_metrics(),
             AdminTab::Events => self.start_trace_stream(),
-            AdminTab::Rebuild => {}
+            AdminTab::Rebuild => self.fetch_rebuild_status(),
         }
+    }
+
+    pub fn fetch_rebuild_status(&mut self) {
+        let alias = match &self.active_alias {
+            Some(a) => a.clone(),
+            None => return,
+        };
+        let tx = self.event_tx.clone();
+        let config = self.config.clone();
+        let tokens_path = default_tokens_path().unwrap_or_default();
+        tokio::spawn(async move {
+            let result = async {
+                let client = build_client(&config, &tokens_path, &alias)?;
+                crate::ops::admin::rebuild_status(&client)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+            .await;
+            match result {
+                Ok(status) => {
+                    let _ = tx.send(Event::RebuildStatus {
+                        alias,
+                        state: status.state,
+                        percent: status.percent,
+                        reason: status.reason,
+                    });
+                }
+                Err(message) => {
+                    let _ = tx.send(Event::ActionFailed { message });
+                }
+            }
+        });
+    }
+
+    fn start_rebuild(&mut self) {
+        let alias = match &self.active_alias {
+            Some(a) => a.clone(),
+            None => return,
+        };
+        let tx = self.event_tx.clone();
+        let config = self.config.clone();
+        let tokens_path = default_tokens_path().unwrap_or_default();
+        tokio::spawn(async move {
+            let result = async {
+                let client = build_client(&config, &tokens_path, &alias)?;
+                crate::ops::admin::rebuild_start(&client)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                crate::ops::admin::rebuild_status(&client)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+            .await;
+            match result {
+                Ok(status) => {
+                    let _ = tx.send(Event::RebuildStatus {
+                        alias,
+                        state: status.state,
+                        percent: status.percent,
+                        reason: status.reason,
+                    });
+                }
+                Err(message) => {
+                    let _ = tx.send(Event::ActionFailed { message });
+                }
+            }
+        });
     }
 
     pub fn fetch_metrics(&mut self) {
@@ -893,7 +1752,9 @@ impl App {
                     .token_for(&alias)
                     .ok_or_else(|| "not authenticated".to_string())?;
                 let client = client_from_alias(profile, Some(token)).map_err(|e| e.to_string())?;
-                client.prometheus_metrics().await.map_err(|e| e.to_string())
+                crate::ops::admin::prometheus_metrics(&client)
+                    .await
+                    .map_err(|e| e.to_string())
             }
             .await;
             let _ = tx.send(super::events::Event::MetricsLoaded { alias, result });
@@ -965,6 +1826,53 @@ impl App {
         });
     }
 
+    /// Authenticate against `alias`, persist the token, then refresh buckets.
+    fn spawn_login(&mut self, alias: String, username: String, password: String) {
+        let config = self.config.clone();
+        let tokens_path = default_tokens_path().unwrap_or_default();
+        let tx = self.event_tx.clone();
+        let alias_clone = alias.clone();
+        self.active_alias = Some(alias);
+        self.remote_throbber.start();
+        tokio::spawn(async move {
+            let result = async {
+                let profile = config
+                    .aliases
+                    .get(&alias_clone)
+                    .ok_or_else(|| format!("unknown alias `{alias_clone}`"))?;
+                let client = client_from_alias(profile, None).map_err(|e| e.to_string())?;
+                let resp = crate::ops::auth::login(&client, &username, &password, None)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let mut store = TokenStore::load(&tokens_path).map_err(|e| e.to_string())?;
+                store.set(
+                    &alias_clone,
+                    TokenEntry {
+                        token: resp.token,
+                        expires_at: resp.expires_at,
+                        username: resp.username,
+                    },
+                );
+                store.save(&tokens_path).map_err(|e| e.to_string())?;
+                let authed = build_client(&config, &tokens_path, &alias_clone)?;
+                authed.list_buckets().await.map_err(|e| e.to_string())
+            }
+            .await;
+            match result {
+                Ok(buckets) => {
+                    let _ = tx.send(Event::RemoteFetched {
+                        alias: alias_clone,
+                        path: RemoteFetchPath::Buckets,
+                        result: RemoteFetchResult::Buckets(buckets),
+                    });
+                }
+                Err(message) => {
+                    let _ = tx.send(Event::ActionFailed { message });
+                }
+            }
+        });
+    }
+
     fn push_transfer(&mut self, entry: TransferEntry) {
         if self.transfers.len() >= 50 {
             self.transfers.pop_front();
@@ -988,25 +1896,150 @@ impl App {
     }
 
     fn handle_input_submit(&mut self, value: String, action: InputAction) {
-        use super::pane::remote::{RemoteEntry, RemoteLevel};
         match action {
             InputAction::CreateBucket { alias } => {
                 let bucket = value.trim().to_owned();
                 if bucket.is_empty() {
                     return;
                 }
-                self.remote.level = RemoteLevel::Objects {
-                    alias,
-                    bucket,
-                    prefix: None,
+                let config = self.config.clone();
+                let tokens_path = default_tokens_path().unwrap_or_default();
+                let tx = self.event_tx.clone();
+                let alias_clone = alias.clone();
+                self.remote_throbber.start();
+                tokio::spawn(async move {
+                    let result = async {
+                        let client = build_client(&config, &tokens_path, &alias_clone)?;
+                        crate::ops::buckets::create(&client, &bucket)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        client.list_buckets().await.map_err(|e| e.to_string())
+                    }
+                    .await;
+                    match result {
+                        Ok(buckets) => {
+                            let _ = tx.send(Event::RemoteFetched {
+                                alias: alias_clone,
+                                path: RemoteFetchPath::Buckets,
+                                result: RemoteFetchResult::Buckets(buckets),
+                            });
+                        }
+                        Err(message) => {
+                            let _ = tx.send(Event::ActionFailed { message });
+                        }
+                    }
+                });
+            }
+            InputAction::RenameObject { alias, bucket, key } => {
+                let dst = value.trim().to_owned();
+                if dst.is_empty() || dst == key {
+                    return;
+                }
+                let config = self.config.clone();
+                let tokens_path = default_tokens_path().unwrap_or_default();
+                let tx = self.event_tx.clone();
+                let alias_clone = alias.clone();
+                let prefix = self.remote.objects_prefix();
+                self.remote_throbber.start();
+                tokio::spawn(async move {
+                    let result = async {
+                        let client = build_client(&config, &tokens_path, &alias_clone)?;
+                        crate::ops::objects::rename(&client, &bucket, &key, &dst)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        let page = client
+                            .list_objects(
+                                &bucket,
+                                &ListOptions {
+                                    prefix: prefix.clone(),
+                                    after: None,
+                                    limit: Some(500),
+                                },
+                            )
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        Ok::<_, String>((page.items, page.next))
+                    }
+                    .await;
+                    match result {
+                        Ok((items, next)) => {
+                            let _ = tx.send(Event::RemoteFetched {
+                                alias: alias_clone,
+                                path: RemoteFetchPath::Objects { bucket, prefix },
+                                result: RemoteFetchResult::Objects(items, next),
+                            });
+                        }
+                        Err(message) => {
+                            let _ = tx.send(Event::ActionFailed { message });
+                        }
+                    }
+                });
+            }
+            InputAction::SetLabel { alias, bucket, key } => {
+                let raw = value.trim();
+                let Some((k, v)) = raw.split_once('=') else {
+                    self.mode = Mode::Error(format!("expected key=value, got `{raw}`"));
+                    return;
                 };
-                self.remote.entries = vec![RemoteEntry::Back];
-                self.remote.selected = 0;
-                self.remote.scroll = 0;
-                self.remote.loading = false;
-                // Switch to local so the user can immediately select a file and press 'c'.
-                // The bucket is only created on the backend once a file is uploaded to it.
-                self.focused = FocusedPane::Local;
+                if k.is_empty() {
+                    self.mode = Mode::Error("label key must not be empty".into());
+                    return;
+                }
+                let mut map = BTreeMap::new();
+                map.insert(k.to_lowercase(), v.to_owned());
+                self.spawn_label_mutation(alias, bucket, key, "set", map);
+            }
+            InputAction::SetQuota { alias, bucket } => {
+                match crate::ops::buckets::parse_size(value.trim()) {
+                    Ok(bytes) => {
+                        self.spawn_set_bucket_config(alias, bucket, Some(Some(bytes)), None)
+                    }
+                    Err(e) => self.mode = Mode::Error(e),
+                }
+            }
+            InputAction::SetSse { alias, bucket } => {
+                let algo = value.trim().to_owned();
+                if algo.is_empty() {
+                    return;
+                }
+                self.spawn_set_bucket_config(alias, bucket, None, Some(Some(algo)));
+            }
+            InputAction::SearchQuery {
+                alias,
+                bucket,
+                prefix,
+            } => {
+                let query = value.trim().to_owned();
+                if query.is_empty() {
+                    return;
+                }
+                self.spawn_search(alias, bucket, prefix, query);
+            }
+            InputAction::FindName {
+                alias,
+                bucket,
+                prefix,
+            } => {
+                let name = value.trim().to_owned();
+                let name = if name.is_empty() { "*".into() } else { name };
+                self.spawn_find(alias, bucket, prefix, name);
+            }
+            InputAction::LoginUsername { alias } => {
+                let username = value.trim().to_owned();
+                if username.is_empty() {
+                    return;
+                }
+                self.mode = Mode::Input {
+                    prompt: format!("Password for {username}:"),
+                    value: String::new(),
+                    action: InputAction::LoginPassword { alias, username },
+                };
+            }
+            InputAction::LoginPassword { alias, username } => {
+                if value.is_empty() {
+                    return;
+                }
+                self.spawn_login(alias, username, value);
             }
             InputAction::AddUserUsername { alias } => {
                 let username = value.trim().to_owned();
@@ -1258,8 +2291,10 @@ mod tests {
             action: InputAction::CreateBucket { alias: "a".into() },
         };
         assert_eq!(app.handle_key(key(KeyCode::Enter)), Action::Enter);
-        assert!(matches!(app.remote.level, RemoteLevel::Objects { .. }));
-        assert_eq!(app.focused, FocusedPane::Local);
+        // Create now issues a real server call in the background; the pane refreshes
+        // via a RemoteFetched event on success. Input mode closes back to Browse.
+        assert_eq!(app.mode, Mode::Browse);
+        tokio::time::sleep(Duration::from_millis(60)).await;
 
         // username -> password chained input
         let (mut app, _rx) = test_app();

@@ -63,6 +63,29 @@ pub enum Event {
         alias: String,
         error: Option<String>,
     },
+    /// A background action failed; surface the message as an error popup.
+    ActionFailed {
+        message: String,
+    },
+    /// An object's labels were fetched or updated; opens/refreshes the editor.
+    LabelsLoaded {
+        alias: String,
+        bucket: String,
+        key: String,
+        labels: std::collections::BTreeMap<String, String>,
+    },
+    /// A bucket's configuration was fetched; opens the config editor.
+    BucketConfigLoaded {
+        alias: String,
+        bucket: String,
+        quota_bytes: Option<u64>,
+        default_sse: Option<String>,
+    },
+    /// A read-only result list (search / find) is ready to display.
+    ResultsLoaded {
+        title: String,
+        lines: Vec<String>,
+    },
     Quit,
 }
 

@@ -22,9 +22,17 @@ pub enum ConfirmAction {
         bucket: String,
         key: String,
     },
+    DeleteBucket {
+        alias: String,
+        bucket: String,
+    },
     DeleteUser {
         alias: String,
         username: String,
+    },
+    ClearLocks {
+        alias: String,
+        older_than: String,
     },
 }
 
@@ -61,9 +69,51 @@ impl AdminTab {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InputAction {
-    CreateBucket { alias: String },
-    AddUserUsername { alias: String },
-    AddUserPassword { alias: String, username: String },
+    CreateBucket {
+        alias: String,
+    },
+    RenameObject {
+        alias: String,
+        bucket: String,
+        key: String,
+    },
+    SetLabel {
+        alias: String,
+        bucket: String,
+        key: String,
+    },
+    SetQuota {
+        alias: String,
+        bucket: String,
+    },
+    SetSse {
+        alias: String,
+        bucket: String,
+    },
+    SearchQuery {
+        alias: String,
+        bucket: Option<String>,
+        prefix: Option<String>,
+    },
+    FindName {
+        alias: String,
+        bucket: String,
+        prefix: Option<String>,
+    },
+    AddUserUsername {
+        alias: String,
+    },
+    AddUserPassword {
+        alias: String,
+        username: String,
+    },
+    LoginUsername {
+        alias: String,
+    },
+    LoginPassword {
+        alias: String,
+        username: String,
+    },
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -82,5 +132,27 @@ pub enum Mode {
     ObjectStat {
         path: String,
         lines: Vec<String>,
+    },
+    /// Interactive label editor for a single object.
+    Labels {
+        alias: String,
+        bucket: String,
+        key: String,
+        labels: Vec<(String, String)>,
+        selected: usize,
+    },
+    /// Per-bucket configuration editor (quota + default SSE).
+    BucketConfig {
+        alias: String,
+        bucket: String,
+        quota_bytes: Option<u64>,
+        default_sse: Option<String>,
+        selected: usize,
+    },
+    /// Read-only result list (search / find), scrollable.
+    Results {
+        title: String,
+        lines: Vec<String>,
+        selected: usize,
     },
 }

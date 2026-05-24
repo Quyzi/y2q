@@ -12,7 +12,7 @@ pub async fn rebuild(cmd: RebuildCmd, mode: OutputMode) -> Result<(), CliError> 
     match cmd {
         RebuildCmd::Start { alias } => {
             let client = make_client(&alias).await?;
-            client.rebuild_start().await?;
+            crate::ops::admin::rebuild_start(&client).await?;
             if mode == OutputMode::Json {
                 print_json(&serde_json::json!({ "status": "running" }));
             } else {
@@ -21,7 +21,7 @@ pub async fn rebuild(cmd: RebuildCmd, mode: OutputMode) -> Result<(), CliError> 
         }
         RebuildCmd::Status { alias } => {
             let client = make_client(&alias).await?;
-            let status = client.rebuild_status().await?;
+            let status = crate::ops::admin::rebuild_status(&client).await?;
             if mode == OutputMode::Json {
                 print_json(&serde_json::json!({
                     "state": status.state,
@@ -47,7 +47,7 @@ pub async fn locks(cmd: LocksCmd, mode: OutputMode) -> Result<(), CliError> {
     match cmd {
         LocksCmd::List { alias, older_than } => {
             let client = make_client(&alias).await?;
-            let locks = client.locks_list(&older_than).await?;
+            let locks = crate::ops::admin::locks_list(&client, &older_than).await?;
             if mode == OutputMode::Json {
                 print_json(&locks);
             } else if locks.is_empty() {
@@ -68,7 +68,7 @@ pub async fn locks(cmd: LocksCmd, mode: OutputMode) -> Result<(), CliError> {
         }
         LocksCmd::Clear { alias, older_than } => {
             let client = make_client(&alias).await?;
-            let removed = client.locks_clear(&older_than).await?;
+            let removed = crate::ops::admin::locks_clear(&client, &older_than).await?;
             if mode == OutputMode::Json {
                 print_json(&serde_json::json!({ "removed": removed }));
             } else {

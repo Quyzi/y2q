@@ -19,7 +19,7 @@ pub async fn make(target: String, ignore_existing: bool, mode: OutputMode) -> Re
     }
 
     let client = make_client(&remote.alias).await?;
-    let created = client.create_bucket(bucket).await?;
+    let created = crate::ops::buckets::create(&client, bucket).await?;
 
     if !created && !ignore_existing {
         return Err(CliError::Other(format!("bucket already exists: {target}")));
@@ -59,7 +59,7 @@ pub async fn remove(target: String, force: bool, mode: OutputMode) -> Result<(),
     }
 
     let client = make_client(&remote.alias).await?;
-    let removed = client.delete_bucket(bucket).await?;
+    let removed = crate::ops::buckets::delete(&client, bucket).await?;
 
     if mode == OutputMode::Json {
         print_json(&serde_json::json!({ "bucket": target, "objects_removed": removed }));

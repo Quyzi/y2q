@@ -94,12 +94,9 @@ pub async fn ping(
 
 pub async fn ready(alias: &str, mode: OutputMode) -> Result<(), CliError> {
     let client = make_client(alias).await?;
-    let start = Instant::now();
-    let result = client.list_buckets().await;
-    let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
-
-    match result {
-        Ok(_) => {
+    match crate::ops::health::probe(&client).await {
+        Ok(latency) => {
+            let latency_ms = latency.as_secs_f64() * 1000.0;
             if mode == OutputMode::Json {
                 print_json(&serde_json::json!({
                     "alias": alias,

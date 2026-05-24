@@ -24,7 +24,7 @@ pub async fn run(cmd: UserCmd, mode: OutputMode) -> Result<(), CliError> {
                 )
             };
             let client = make_client(&alias).await?;
-            client.add_user(&username, pw.as_str()).await?;
+            crate::ops::admin::add_user(&client, &username, pw.as_str()).await?;
             if mode == OutputMode::Json {
                 print_json(&serde_json::json!({ "created": username }));
             } else {
@@ -34,7 +34,7 @@ pub async fn run(cmd: UserCmd, mode: OutputMode) -> Result<(), CliError> {
 
         UserCmd::List { alias } => {
             let client = make_client(&alias).await?;
-            let users = client.list_users().await?;
+            let users = crate::ops::admin::list_users(&client).await?;
             if mode == OutputMode::Json {
                 print_json(&users);
             } else {
@@ -54,7 +54,7 @@ pub async fn run(cmd: UserCmd, mode: OutputMode) -> Result<(), CliError> {
 
         UserCmd::Remove { alias, username } => {
             let client = make_client(&alias).await?;
-            client.delete_user(&username).await?;
+            crate::ops::admin::delete_user(&client, &username).await?;
             if mode == OutputMode::Json {
                 print_json(&serde_json::json!({ "deleted": username }));
             } else {

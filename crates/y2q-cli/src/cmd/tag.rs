@@ -40,7 +40,7 @@ async fn set(target: &str, pairs: &[String], mode: OutputMode) -> Result<(), Cli
     let (remote, bucket, key) = split_target(target)?;
     let labels = parse_kv(pairs)?;
     let client = make_client(&remote.alias).await?;
-    let result = client.set_labels(&bucket, &key, "set", &labels).await?;
+    let result = crate::ops::objects::set_labels(&client, &bucket, &key, "set", &labels).await?;
     if mode == OutputMode::Json {
         print_json(&serde_json::json!({ "target": target, "labels": result }));
     } else {
@@ -52,7 +52,7 @@ async fn set(target: &str, pairs: &[String], mode: OutputMode) -> Result<(), Cli
 async fn list(target: &str, mode: OutputMode) -> Result<(), CliError> {
     let (remote, bucket, key) = split_target(target)?;
     let client = make_client(&remote.alias).await?;
-    let head = client.head(&bucket, &key).await?;
+    let head = crate::ops::objects::head(&client, &bucket, &key).await?;
     if mode == OutputMode::Json {
         print_json(&serde_json::json!({ "target": target, "labels": head.labels }));
     } else if head.labels.is_empty() {
@@ -73,7 +73,7 @@ async fn remove(target: &str, keys: &[String], mode: OutputMode) -> Result<(), C
         .map(|k| (k.to_lowercase(), String::new()))
         .collect();
     let client = make_client(&remote.alias).await?;
-    let result = client.set_labels(&bucket, &key, "remove", &labels).await?;
+    let result = crate::ops::objects::set_labels(&client, &bucket, &key, "remove", &labels).await?;
     if mode == OutputMode::Json {
         print_json(&serde_json::json!({ "target": target, "labels": result }));
     } else if keys.is_empty() {
