@@ -593,6 +593,14 @@ impl App {
                 self.start_login();
                 Action::None
             }
+            KeyCode::Char('O') => {
+                self.start_logout();
+                Action::None
+            }
+            KeyCode::Char('P') => {
+                self.start_passwd();
+                Action::None
+            }
             KeyCode::Char('r') => {
                 self.trigger_refresh();
                 Action::Refresh
@@ -717,6 +725,38 @@ impl App {
         });
     }
 
+    /// Upload one local file to `bucket/key`, reporting progress under `id`.
+    fn spawn_upload(
+        &self,
+        alias: String,
+        bucket: String,
+        key: String,
+        local_path: std::path::PathBuf,
+        id: u64,
+    ) {
+        let tx = self.event_tx.clone();
+        let config = self.config.clone();
+        let tokens_path = default_tokens_path().unwrap_or_default();
+        tokio::spawn(async move {
+            let result = async {
+                let client = build_client(&config, &tokens_path, &alias)?;
+                let file = tokio::fs::File::open(&local_path)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let len = file.metadata().await.map_err(|e| e.to_string())?.len();
+                let reporter = Box::new(TuiTransferReporter { id, tx: tx.clone() });
+                let reader = CountingReader::new(file, reporter);
+                client
+                    .put_from_reader(&bucket, &key, reader, Some(len), &Default::default(), None)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok::<u64, String>(len)
+            }
+            .await;
+            let _ = tx.send(Event::TransferDone { id, result });
+        });
+    }
+
     fn start_copy(&mut self) {
         // Copy from focused pane to other pane
         use super::pane::remote::{RemoteEntry, RemoteLevel};
@@ -735,53 +775,53 @@ impl App {
                 {
                     let alias = alias.clone();
                     let bucket = bucket.clone();
-                    let key = local_path
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_default();
-                    let id = TRANSFER_ID.fetch_add(1, Ordering::Relaxed);
-                    let label = format!("{} → {alias}/{bucket}/{key}", local_path.display());
-                    let size = std::fs::metadata(&local_path).ok().map(|m| m.len());
-                    self.push_transfer(TransferEntry::new(id, label, size));
-                    let tx = self.event_tx.clone();
-                    let config = self.config.clone();
-                    let tokens_path = default_tokens_path().unwrap_or_default();
-                    tokio::spawn(async move {
-                        let result = async {
-                            let profile = config
-                                .aliases
-                                .get(&alias)
-                                .ok_or_else(|| "unknown alias".to_string())?;
-                            let store =
-                                TokenStore::load(&tokens_path).map_err(|e| e.to_string())?;
-                            let token = store
-                                .token_for(&alias)
-                                .ok_or_else(|| "unauthenticated".to_string())?;
-                            let client = client_from_alias(profile, Some(token))
-                                .map_err(|e| e.to_string())?;
-                            let file = tokio::fs::File::open(&local_path)
-                                .await
-                                .map_err(|e| e.to_string())?;
-                            let meta = file.metadata().await.map_err(|e| e.to_string())?;
-                            let len = meta.len();
-                            let reporter = Box::new(TuiTransferReporter { id, tx: tx.clone() });
-                            let reader = CountingReader::new(file, reporter);
-                            client
-                                .put_from_reader(
-                                    &bucket,
-                                    &key,
-                                    reader,
-                                    Some(len),
-                                    &Default::default(),
-                                    None,
-                                )
-                                .await
-                                .map_err(|e| e.to_string())?;
-                            Ok::<u64, String>(len)
+                    if local_path.is_dir() {
+                        // Recursive upload: each file under the directory becomes
+                        // an object keyed <dirname>/<relative-path>.
+                        let base = local_path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        for entry in walkdir::WalkDir::new(&local_path)
+                            .into_iter()
+                            .filter_map(Result::ok)
+                            .filter(|e| e.file_type().is_file())
+                        {
+                            let rel = entry
+                                .path()
+                                .strip_prefix(&local_path)
+                                .unwrap_or(entry.path())
+                                .to_string_lossy()
+                                .replace('\\', "/");
+                            let key = if base.is_empty() {
+                                rel
+                            } else {
+                                format!("{base}/{rel}")
+                            };
+                            let id = TRANSFER_ID.fetch_add(1, Ordering::Relaxed);
+                            let label =
+                                format!("{} → {alias}/{bucket}/{key}", entry.path().display());
+                            let size = entry.metadata().ok().map(|m| m.len());
+                            self.push_transfer(TransferEntry::new(id, label, size));
+                            self.spawn_upload(
+                                alias.clone(),
+                                bucket.clone(),
+                                key,
+                                entry.path().to_path_buf(),
+                                id,
+                            );
                         }
-                        .await;
-                        let _ = tx.send(Event::TransferDone { id, result });
-                    });
+                    } else {
+                        let key = local_path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        let id = TRANSFER_ID.fetch_add(1, Ordering::Relaxed);
+                        let label = format!("{} → {alias}/{bucket}/{key}", local_path.display());
+                        let size = std::fs::metadata(&local_path).ok().map(|m| m.len());
+                        self.push_transfer(TransferEntry::new(id, label, size));
+                        self.spawn_upload(alias, bucket, key, local_path, id);
+                    }
                 }
             }
             FocusedPane::Remote => {
@@ -899,6 +939,76 @@ impl App {
             value: default_user,
             action: InputAction::LoginUsername { alias },
         };
+    }
+
+    /// Selected alias entry, or the currently open one.
+    fn target_alias(&self) -> Option<String> {
+        use super::pane::remote::{RemoteEntry, RemoteLevel};
+        match self.remote.level.clone() {
+            RemoteLevel::Aliases => match self.remote.selected_entry().cloned() {
+                Some(RemoteEntry::Alias(a)) => Some(a),
+                _ => None,
+            },
+            _ => self.active_alias.clone(),
+        }
+    }
+
+    fn start_logout(&mut self) {
+        let Some(alias) = self.target_alias() else {
+            return;
+        };
+        let config = self.config.clone();
+        let tokens_path = default_tokens_path().unwrap_or_default();
+        let tx = self.event_tx.clone();
+        let alias_clone = alias.clone();
+        // Optimistically reset the UI to the alias list; the token is cleared
+        // in the background.
+        self.remote.go_to_aliases();
+        self.active_alias = None;
+        tokio::spawn(async move {
+            let result = async {
+                // Best-effort server-side revoke before clearing the local token.
+                if let Ok(client) = build_client(&config, &tokens_path, &alias_clone) {
+                    let _ = crate::ops::auth::logout(&client).await;
+                }
+                let mut store = TokenStore::load(&tokens_path).map_err(|e| e.to_string())?;
+                store.clear(&alias_clone);
+                store.save(&tokens_path).map_err(|e| e.to_string())
+            }
+            .await;
+            if let Err(message) = result {
+                let _ = tx.send(Event::ActionFailed { message });
+            }
+        });
+    }
+
+    fn start_passwd(&mut self) {
+        let Some(alias) = self.target_alias() else {
+            return;
+        };
+        self.mode = Mode::Input {
+            prompt: format!("Current password for `{alias}`:"),
+            value: String::new(),
+            action: InputAction::PasswdCurrent { alias },
+        };
+    }
+
+    fn spawn_passwd(&mut self, alias: String, current: String, new: String) {
+        let config = self.config.clone();
+        let tokens_path = default_tokens_path().unwrap_or_default();
+        let tx = self.event_tx.clone();
+        tokio::spawn(async move {
+            let result = async {
+                let client = build_client(&config, &tokens_path, &alias)?;
+                crate::ops::auth::change_password(&client, &current, &new)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+            .await;
+            if let Err(message) = result {
+                let _ = tx.send(Event::ActionFailed { message });
+            }
+        });
     }
 
     // ── Labels (Phase 2) ────────────────────────────────────────────────────
@@ -2165,6 +2275,25 @@ impl App {
                     return;
                 }
                 self.spawn_login(alias, username, value);
+            }
+            InputAction::PasswdCurrent { alias } => {
+                if value.is_empty() {
+                    return;
+                }
+                self.mode = Mode::Input {
+                    prompt: format!("New password for `{alias}`:"),
+                    value: String::new(),
+                    action: InputAction::PasswdNew {
+                        alias,
+                        current: value,
+                    },
+                };
+            }
+            InputAction::PasswdNew { alias, current } => {
+                if value.is_empty() {
+                    return;
+                }
+                self.spawn_passwd(alias, current, value);
             }
             InputAction::AddUserUsername { alias } => {
                 let username = value.trim().to_owned();

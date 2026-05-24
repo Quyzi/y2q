@@ -114,6 +114,13 @@ pub enum InputAction {
         alias: String,
         username: String,
     },
+    PasswdCurrent {
+        alias: String,
+    },
+    PasswdNew {
+        alias: String,
+        current: String,
+    },
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

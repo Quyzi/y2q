@@ -153,7 +153,10 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         } => {
             let secret = matches!(
                 action,
-                InputAction::AddUserPassword { .. } | InputAction::LoginPassword { .. }
+                InputAction::AddUserPassword { .. }
+                    | InputAction::LoginPassword { .. }
+                    | InputAction::PasswdCurrent { .. }
+                    | InputAction::PasswdNew { .. }
             );
             render_input_dialog(frame, area, &prompt, &value, secret);
         }
