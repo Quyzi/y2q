@@ -20,32 +20,6 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
 
     let transfer_height = if app.transfer_bar_visible { 5u16 } else { 0u16 };
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Min(3),
-            Constraint::Length(transfer_height),
-            Constraint::Length(1),
-        ])
-        .split(area);
-
-    let header_area = chunks[0];
-    let pane_area = chunks[1];
-    let transfer_area = chunks[2];
-    let kb_area = chunks[3];
-
-    render_header(frame, header_area);
-
-    match app.mode.clone() {
-        Mode::Admin(tab) => render_admin(frame, pane_area, app, tab),
-        _ => render_panes(frame, pane_area, app),
-    }
-
-    if app.transfer_bar_visible && transfer_height > 0 {
-        let entries: Vec<_> = app.transfers.iter().cloned().collect();
-        transfer_bar::render(frame, transfer_area, &entries);
-    }
 
     let show_new_bucket = matches!(&app.mode, Mode::Browse | Mode::Input { .. })
         && app.focused == FocusedPane::Remote
@@ -65,7 +39,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             ("r", "refresh"),
             ("q/Esc", "close"),
         ],
-        Mode::Admin(AdminTab::Events) => &[("Tab", "tab"), ("(live)", "trace"), ("q/Esc", "close")],
+        Mode::Admin(AdminTab::Events) => &[("Tab", "tab"), ("/", "filter"), ("q/Esc", "close")],
         Mode::Admin(AdminTab::Rebuild) => &[
             ("Tab", "tab"),
             ("s", "start"),
@@ -93,16 +67,15 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             ("q/Esc", "close"),
         ],
         Mode::Results { .. } => &[("↑↓/jk", "scroll"), ("q/Esc", "close")],
+        Mode::Help { .. } => &[("↑↓/jk", "scroll"), ("q/Esc", "close")],
         _ if show_new_bucket => &[
             ("Tab", "pane"),
             ("↑↓/jk", "nav"),
             ("Enter", "open"),
-            ("n", "new bucket"),
-            ("g", "config"),
+            ("n", "new"),
             ("d", "del"),
-            ("L", "login"),
-            ("r", "refresh"),
             ("a", "admin"),
+            ("?", "more"),
             ("q", "quit"),
         ],
         _ => &[
@@ -110,20 +83,48 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             ("↑↓/jk", "nav"),
             ("Enter", "open"),
             ("c", "copy"),
-            ("m", "rename"),
-            ("l", "labels"),
-            ("s", "search"),
-            ("f", "find"),
-            ("u", "du"),
-            ("T", "tree"),
-            ("D", "diff"),
-            ("M", "mirror"),
             ("d", "del"),
-            ("L", "login"),
+            ("s", "search"),
             ("a", "admin"),
+            ("?", "more"),
             ("q", "quit"),
         ],
     };
+
+    // Reserve a second row for the bindings bar only when it would overflow.
+    let kb_height = if keybindings_bar::width(bindings) > area.width as usize {
+        2
+    } else {
+        1
+    };
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(3),
+            Constraint::Length(transfer_height),
+            Constraint::Length(kb_height),
+        ])
+        .split(area);
+
+    let header_area = chunks[0];
+    let pane_area = chunks[1];
+    let transfer_area = chunks[2];
+    let kb_area = chunks[3];
+
+    render_header(frame, header_area);
+
+    match app.mode.clone() {
+        Mode::Admin(tab) => render_admin(frame, pane_area, app, tab),
+        _ => render_panes(frame, pane_area, app),
+    }
+
+    if app.transfer_bar_visible && transfer_height > 0 {
+        let entries: Vec<_> = app.transfers.iter().cloned().collect();
+        transfer_bar::render(frame, transfer_area, &entries);
+    }
+
     keybindings_bar::render(frame, kb_area, bindings);
 
     // Modal overlays — rendered last so they appear on top
@@ -144,6 +145,14 @@ pub fn render(frame: &mut Frame, app: &mut App) {
                 }
                 ConfirmAction::RemoveAlias { alias } => {
                     format!("Remove alias `{alias}` from local config?")
+                }
+                ConfirmAction::ApplyMirror { uploads, deletions } => {
+                    let note = if deletions > 0 {
+                        format!(" ({deletions} dst-only kept; use CLI --remove to delete)")
+                    } else {
+                        String::new()
+                    };
+                    format!("Mirror: upload {uploads} file(s)?{note}")
                 }
             };
             confirm_dialog::render(frame, area, &msg);
@@ -183,6 +192,9 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             lines,
             selected,
         } => render_results_popup(frame, area, &title, &lines, selected),
+        Mode::Help { lines, selected } => {
+            render_results_popup(frame, area, "Keybindings", &lines, selected)
+        }
         _ => {}
     }
 }
@@ -584,11 +596,13 @@ fn render_events_tab(frame: &mut Frame, area: Rect, app: &App) {
         );
         return;
     }
-    if v.events.is_empty() {
-        let msg = if v.streaming {
-            "Streaming… waiting for events."
-        } else {
-            "Not streaming."
+    // Apply the optional path-prefix filter (the `watch` view).
+    let filtered: Vec<&y2q_client::TraceEvent> = v.events.iter().filter(|e| v.matches(e)).collect();
+    if filtered.is_empty() {
+        let msg = match (&v.filter, v.streaming) {
+            (Some(p), _) if !p.is_empty() => format!("No events matching `{p}`."),
+            (_, true) => "Streaming… waiting for events.".to_string(),
+            _ => "Not streaming.".to_string(),
         };
         frame.render_widget(
             Paragraph::new(Span::styled(msg, Style::default().fg(DIM_TEXT))),
@@ -598,9 +612,8 @@ fn render_events_tab(frame: &mut Frame, area: Rect, app: &App) {
     }
     let visible = area.height as usize;
     // Newest at the bottom: show the last `visible` events.
-    let skip = v.events.len().saturating_sub(visible);
-    let items: Vec<ListItem> = v
-        .events
+    let skip = filtered.len().saturating_sub(visible);
+    let items: Vec<ListItem> = filtered
         .iter()
         .skip(skip)
         .map(|e| {

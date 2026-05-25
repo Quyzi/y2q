@@ -86,6 +86,15 @@ pub enum Event {
         title: String,
         lines: Vec<String>,
     },
+    /// A mirror plan was computed and awaits confirmation.
+    MirrorPlanned {
+        alias: String,
+        bucket: String,
+        local_root: std::path::PathBuf,
+        keys: Vec<String>,
+        deletions: usize,
+        skipped: u64,
+    },
     Quit,
 }
 

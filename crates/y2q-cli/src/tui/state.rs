@@ -37,6 +37,11 @@ pub enum ConfirmAction {
     RemoveAlias {
         alias: String,
     },
+    /// Apply a pending local->remote mirror (uploads only).
+    ApplyMirror {
+        uploads: usize,
+        deletions: usize,
+    },
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -76,6 +81,11 @@ pub enum InputAction {
         alias: String,
     },
     RenameObject {
+        alias: String,
+        bucket: String,
+        key: String,
+    },
+    RangeGet {
         alias: String,
         bucket: String,
         key: String,
@@ -124,6 +134,8 @@ pub enum InputAction {
         alias: String,
         current: String,
     },
+    SetEventFilter,
+    ImportAliases,
     NewAliasName,
     NewAliasUrl {
         name: String,
@@ -170,6 +182,11 @@ pub enum Mode {
     /// Read-only result list (search / find), scrollable.
     Results {
         title: String,
+        lines: Vec<String>,
+        selected: usize,
+    },
+    /// Full keybinding reference, scrollable.
+    Help {
         lines: Vec<String>,
         selected: usize,
     },

@@ -44,6 +44,8 @@ pub struct EventsView {
     pub events: VecDeque<TraceEvent>,
     pub streaming: bool,
     pub error: Option<String>,
+    /// Optional path-prefix filter applied at render time (the `watch` view).
+    pub filter: Option<String>,
 }
 
 impl EventsView {
@@ -52,6 +54,14 @@ impl EventsView {
             self.events.pop_front();
         }
         self.events.push_back(event);
+    }
+
+    /// Whether an event passes the current prefix filter.
+    pub fn matches(&self, event: &TraceEvent) -> bool {
+        match &self.filter {
+            Some(p) if !p.is_empty() => event.path.starts_with(p.as_str()),
+            _ => true,
+        }
     }
 }
 
