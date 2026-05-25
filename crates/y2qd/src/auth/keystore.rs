@@ -56,7 +56,10 @@ impl KeystoreSlot {
     /// Reconcile against the live session count. Should be called from the
     /// session sweeper periodically. If sessions == 0 and the grace period
     /// has elapsed, the SK is dropped.
-    pub fn reconcile(&self, sessions: &SessionStore) {
+    ///
+    /// Returns `true` exactly on the sweep that drops the SK, so the caller can
+    /// zeroize the MEK in the same step.
+    pub fn reconcile(&self, sessions: &SessionStore) -> bool {
         let active = sessions.len();
         let mut s = self.inner.write();
         if active == 0 {
@@ -65,14 +68,16 @@ impl KeystoreSlot {
                     s.empty_since = Some(Instant::now());
                 }
                 Some(t) if t.elapsed() >= self.idle_drop => {
-                    s.keystore = None;
+                    let dropped = s.keystore.take().is_some();
                     s.empty_since = None;
+                    return dropped;
                 }
                 _ => {}
             }
         } else {
             s.empty_since = None;
         }
+        false
     }
 }
 

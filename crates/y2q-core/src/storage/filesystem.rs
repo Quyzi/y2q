@@ -14,7 +14,7 @@ use crate::{
     CacheRebuildStatus, CipherMetadata, DEFAULT_LIST_LIMIT, Error, ListOptions, ListPage, Listing,
     MAX_LIST_LIMIT, Metadata, MetadataIndex, Object, PlaintextMetrics, PutOptions, StaleLock,
     Storage, StorageExt, SyncLevel,
-    crypto::{decrypt_meta, encrypt_meta},
+    crypto::{decrypt_meta, encrypt_meta, metadata_key::MekSlot},
     storage::{
         format::{self, HEADER_SIZE, Header},
         locks::LockRegistry,
@@ -53,7 +53,10 @@ pub struct FilesystemStorage {
     base_path: PathBuf,
     index: Arc<MetadataIndex>,
     rebuild_state: Arc<tokio::sync::Mutex<CacheRebuildStatus>>,
-    mek: Option<[u8; 32]>,
+    /// Shared MEK slot, also held by `index`. Empty until a login installs the
+    /// key derived from the deployment secret key; zeroized on idle; never read
+    /// from disk.
+    mek: Arc<MekSlot>,
     dirty_tx: Option<flume::Sender<crate::DirtyEntry>>,
     flush_notify: Option<Arc<tokio::sync::Notify>>,
     flush_limit: usize,
@@ -87,11 +90,12 @@ impl FilesystemStorage {
             })?;
         }
         let index = MetadataIndex::open(index_path)?;
+        let mek = index.mek_slot();
         Ok(Self {
             base_path,
             index: Arc::new(index),
             rebuild_state: Arc::new(tokio::sync::Mutex::new(CacheRebuildStatus::Idle)),
-            mek: None,
+            mek,
             dirty_tx: None,
             flush_notify: None,
             flush_limit: 0,
@@ -104,13 +108,19 @@ impl FilesystemStorage {
         &self.index
     }
 
-    /// Set the Metadata Encryption Key. All subsequent metadata writes will be
+    /// Install the Metadata Encryption Key (derived from the deployment secret
+    /// key when a login unwraps it). All subsequent metadata writes are
     /// encrypted; reads transparently decrypt or pass through legacy plaintext.
-    /// Also enables encrypted key blinding on the metadata index.
-    pub fn with_mek(mut self, mek: [u8; 32]) -> Self {
+    /// Also enables encrypted key blinding on the metadata index. Idempotent -
+    /// only the first install takes effect (the slot is a `OnceLock`).
+    pub fn install_mek(&self, mek: [u8; 32]) {
         self.index.set_mek(mek);
-        self.mek = Some(mek);
-        self
+    }
+
+    /// Shared handle to the MEK slot, so the daemon can install or clear the key
+    /// in step with login / idle-drop.
+    pub fn mek_slot(&self) -> Arc<MekSlot> {
+        Arc::clone(&self.mek)
     }
 
     /// Attach a dirty-write channel for best-effort PUT flushing.
@@ -339,11 +349,16 @@ pub(crate) async fn set_labels_impl(
 
     let new_json =
         serde_json::to_vec(&metadata).map_err(|e| internal(format!("encode meta: {e}")))?;
+    // Writes require an installed MEK; refuse rather than persisting plaintext.
     let new_meta = match mek {
         Some(k) => {
             encrypt_meta(k, &new_json).map_err(|e| internal(format!("encrypt meta: {e}")))?
         }
-        None => new_json,
+        None => {
+            return Err(internal(
+                "metadata write attempted without an installed MEK".to_owned(),
+            ));
+        }
     };
 
     let new_header = Header {
@@ -549,7 +564,7 @@ pub struct StreamingPutGuard {
     is_overwrite: bool,
     prior_created: Option<u64>,
     index: Arc<MetadataIndex>,
-    mek: Option<[u8; 32]>,
+    mek: Arc<MekSlot>,
     dirty_tx: Option<flume::Sender<crate::DirtyEntry>>,
     flush_notify: Option<Arc<tokio::sync::Notify>>,
     flush_limit: usize,
@@ -596,15 +611,21 @@ impl StreamingPutGuard {
             operation: "put".to_owned(),
             message: format!("encode meta: {e}"),
         })?;
-        let meta_bytes = if let Some(ref mek) = self.mek {
-            encrypt_meta(mek, &meta_json).map_err(|e| Error::InternalError {
+        let meta_bytes = match self.mek.mek() {
+            Some(mek) => encrypt_meta(&mek, &meta_json).map_err(|e| Error::InternalError {
                 bucket: bucket.to_owned(),
                 key: key.to_owned(),
                 operation: "put".to_owned(),
                 message: format!("encrypt meta: {e}"),
-            })?
-        } else {
-            meta_json
+            })?,
+            None => {
+                return Err(Error::InternalError {
+                    bucket: bucket.to_owned(),
+                    key: key.to_owned(),
+                    operation: "put".to_owned(),
+                    message: "metadata write attempted without an installed MEK".to_owned(),
+                });
+            }
         };
 
         let mut flags = 0u16;
@@ -744,7 +765,7 @@ impl FilesystemStorage {
 
         let (is_overwrite, prior_created) = match tokio::fs::metadata(&obj_path).await {
             Ok(_) => {
-                let created = read_obj_created(&obj_path, self.mek.as_ref()).await;
+                let created = read_obj_created(&obj_path, self.mek.mek().as_ref()).await;
                 (true, created)
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => (false, None),
@@ -791,7 +812,7 @@ impl FilesystemStorage {
             key: key.to_owned(),
             is_overwrite,
             prior_created,
-            mek: self.mek,
+            mek: Arc::clone(&self.mek),
             index: self.index.clone(),
             dirty_tx: self.dirty_tx.clone(),
             flush_notify: self.flush_notify.clone(),
@@ -977,7 +998,7 @@ impl Storage for FilesystemStorage {
 
             let (is_overwrite, prior_created) = match tokio::fs::metadata(&obj_path).await {
                 Ok(_) => {
-                    let created = read_obj_created(&obj_path, self.mek.as_ref()).await;
+                    let created = read_obj_created(&obj_path, self.mek.mek().as_ref()).await;
                     (true, created)
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => (false, None),
@@ -1034,15 +1055,21 @@ impl Storage for FilesystemStorage {
                 operation: "put".to_owned(),
                 message: e.to_string(),
             })?;
-            let meta_bytes = if let Some(mek) = &self.mek {
-                encrypt_meta(mek, &meta_json).map_err(|e| Error::InternalError {
+            let meta_bytes = match self.mek.mek() {
+                Some(mek) => encrypt_meta(&mek, &meta_json).map_err(|e| Error::InternalError {
                     bucket: bucket.to_owned(),
                     key: key.to_owned(),
                     operation: "put".to_owned(),
                     message: e.to_string(),
-                })?
-            } else {
-                meta_json
+                })?,
+                None => {
+                    return Err(Error::InternalError {
+                        bucket: bucket.to_owned(),
+                        key: key.to_owned(),
+                        operation: "put".to_owned(),
+                        message: "metadata write attempted without an installed MEK".to_owned(),
+                    });
+                }
             };
 
             let mut header_flags = 0u16;
@@ -1259,7 +1286,7 @@ impl Storage for FilesystemStorage {
             set_labels_impl(
                 &self.base_path,
                 &self.index,
-                self.mek.as_ref(),
+                self.mek.mek().as_ref(),
                 bucket,
                 key,
                 labels,
@@ -1291,7 +1318,7 @@ impl Storage for FilesystemStorage {
                 });
             }
 
-            read_obj_metadata(&obj_path, self.mek.as_ref())
+            read_obj_metadata(&obj_path, self.mek.mek().as_ref())
                 .await
                 .map_err(|e| Error::InternalError {
                     bucket: bucket.to_owned(),
@@ -1395,7 +1422,7 @@ impl StorageExt for FilesystemStorage {
         let base_path = self.base_path.clone();
         let index = self.index.clone();
         let state = self.rebuild_state.clone();
-        let mek = self.mek;
+        let mek = self.mek.mek();
         tokio::spawn(async move {
             let result = run_rebuild(base_path, index, state.clone(), mek).await;
             let mut s = state.lock().await;
@@ -1548,11 +1575,15 @@ mod tests {
     use std::collections::BTreeMap;
     use tempfile::TempDir;
 
+    /// Stand-in for the login-derived MEK; metadata writes require one.
+    const TEST_MEK: [u8; 32] = [7u8; 32];
+
     fn make_storage() -> (FilesystemStorage, TempDir) {
         let dir = TempDir::new().unwrap();
         let base = dir.path().join("data");
         let index = dir.path().join("index.redb");
         let storage = FilesystemStorage::new(base, index).unwrap();
+        storage.install_mek(TEST_MEK);
         (storage, dir)
     }
 
@@ -1837,11 +1868,13 @@ mod tests {
         let index = dir.path().join("index.redb");
         {
             let s = FilesystemStorage::new(&base, &index).unwrap();
+            s.install_mek(TEST_MEK);
             s.put("b", "k", make_object(b"v"), opts(&[("env", "prod")]))
                 .await
                 .unwrap();
         }
         let s2 = FilesystemStorage::new(&base, &index).unwrap();
+        s2.install_mek(TEST_MEK);
         let hits = s2.index().lookup_by_label("env", "prod").await.unwrap();
         assert_eq!(hits, vec![("b".to_owned(), "k".to_owned())]);
     }
@@ -2133,6 +2166,7 @@ mod tests {
 
         {
             let s = FilesystemStorage::new(&base, &index_a).unwrap();
+            s.install_mek(TEST_MEK);
             s.put("b1", "k1", make_object(b"v1"), opts(&[("env", "prod")]))
                 .await
                 .unwrap();
@@ -2145,6 +2179,7 @@ mod tests {
         }
 
         let s2 = FilesystemStorage::new(&base, &index_b).unwrap();
+        s2.install_mek(TEST_MEK);
         // The fresh index is empty; the label index proves it. list_buckets now
         // unions on-disk bucket directories, so it already reflects b1/b2 here
         // even before the rebuild repopulates the object/label index.

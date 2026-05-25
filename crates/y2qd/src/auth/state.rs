@@ -1,9 +1,11 @@
 //! Shared state passed via `actix_web::web::Data<AuthState>`.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use y2q_core::AnyStorage;
 use y2q_core::crypto::{Argon2Params, Keystore, UserStore};
 
 use super::keystore::KeystoreSlot;
@@ -28,6 +30,15 @@ pub struct AuthState {
     /// Snapshot of `[crypto.argon2]` config used to derive new user-record
     /// KDF params (each new record gets a fresh random salt + these costs).
     pub argon2_config: Argon2Config,
+    /// Active storage backend, so a login can install the MEK (and the derived
+    /// index key) the moment it unwraps the deployment secret key.
+    pub storage: Arc<AnyStorage>,
+    /// Fired once, the first time the MEK is installed, to release the deferred
+    /// startup index rebuild.
+    pub mek_ready: Arc<tokio::sync::Notify>,
+    /// Set once the deferred startup rebuild has been triggered, so later
+    /// idle-clear / re-login cycles don't fire it again.
+    rebuild_triggered: AtomicBool,
 }
 
 impl AuthState {
@@ -36,6 +47,8 @@ impl AuthState {
         user_store: UserStore,
         config: AuthConfig,
         argon2_config: Argon2Config,
+        storage: Arc<AnyStorage>,
+        mek_ready: Arc<tokio::sync::Notify>,
     ) -> Self {
         Self {
             public_keystore,
@@ -45,6 +58,22 @@ impl AuthState {
             login_attempts: Arc::new(Mutex::new(LoginAttempts::default())),
             config,
             argon2_config,
+            storage,
+            mek_ready,
+            rebuild_triggered: AtomicBool::new(false),
+        }
+    }
+
+    /// Derive the MEK from the just-unwrapped deployment secret key and install
+    /// it (plus the derived index key) into the storage backend. Re-derives the
+    /// same deterministic value on every login, so it also restores the MEK
+    /// after an idle clear. The deferred startup index rebuild is released
+    /// exactly once, on the first install of the daemon's lifetime.
+    pub fn install_mek_from_sk(&self, sk_bytes: &[u8]) {
+        let mek = y2q_core::crypto::derive_mek(sk_bytes);
+        self.storage.install_mek(mek);
+        if !self.rebuild_triggered.swap(true, Ordering::Relaxed) {
+            self.mek_ready.notify_one();
         }
     }
 

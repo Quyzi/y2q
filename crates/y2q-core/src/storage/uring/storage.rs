@@ -11,6 +11,8 @@ use std::{
     sync::Arc,
 };
 
+use crate::crypto::metadata_key::MekSlot;
+
 use bytes::Bytes;
 use uuid::Uuid;
 
@@ -44,6 +46,10 @@ pub struct UringStorage {
     index: Arc<MetadataIndex>,
     rebuild_state: Arc<tokio::sync::Mutex<CacheRebuildStatus>>,
     config: UringConfig,
+    /// Shared MEK slot, also held by `index`. Empty until a login installs the
+    /// key derived from the deployment secret key; zeroized on idle; never read
+    /// from disk.
+    mek: Arc<MekSlot>,
     /// `Arc` so a spawned rebuild task can share dispatch without making
     /// `WorkerPool` cloneable (the `JoinHandle`s aren't).
     pool: Arc<WorkerPool>,
@@ -51,7 +57,11 @@ pub struct UringStorage {
 }
 
 /// Tunables for [`UringStorage`].
-#[derive(Clone)]
+///
+/// Note: the Metadata Encryption Key is no longer a construction-time config
+/// field. It is installed at runtime via [`UringStorage::install_mek`] once a
+/// login unwraps the deployment secret key.
+#[derive(Clone, Debug)]
 pub struct UringConfig {
     /// Number of dedicated tokio-uring worker threads. Defaults to the number
     /// of logical CPUs.
@@ -59,20 +69,6 @@ pub struct UringConfig {
     /// Object size at or above which writes switch to the `O_DIRECT` path
     /// with aligned buffers. Below this, buffered uring writes are used.
     pub large_object_bytes: u64,
-    /// Metadata Encryption Key. When set, all metadata blobs are encrypted
-    /// with AES-256-GCM on write and decrypted on read. Legacy plaintext
-    /// metadata is read transparently for backward compatibility.
-    pub mek: Option<[u8; 32]>,
-}
-
-impl std::fmt::Debug for UringConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("UringConfig")
-            .field("workers", &self.workers)
-            .field("large_object_bytes", &self.large_object_bytes)
-            .field("mek", &self.mek.map(|_| "[redacted]"))
-            .finish()
-    }
 }
 
 impl Default for UringConfig {
@@ -82,7 +78,6 @@ impl Default for UringConfig {
                 .map(|n| n.get())
                 .unwrap_or(4),
             large_object_bytes: 4 * 1024 * 1024,
-            mek: None,
         }
     }
 }
@@ -121,9 +116,7 @@ impl UringStorage {
             })?;
         }
         let index = MetadataIndex::open(index_path)?;
-        if let Some(mek) = config.mek {
-            index.set_mek(mek);
-        }
+        let mek = index.mek_slot();
         let pool = Arc::new(
             WorkerPool::spawn(&config).map_err(|msg| Error::InternalError {
                 bucket: String::new(),
@@ -137,18 +130,25 @@ impl UringStorage {
             index: Arc::new(index),
             rebuild_state: Arc::new(tokio::sync::Mutex::new(CacheRebuildStatus::Idle)),
             config,
+            mek,
             pool,
             locks: LockRegistry::new(),
         })
     }
 
-    /// Set the Metadata Encryption Key. All subsequent metadata writes will be
+    /// Install the Metadata Encryption Key (derived from the deployment secret
+    /// key when a login unwraps it). All subsequent metadata writes are
     /// encrypted; reads transparently decrypt or pass through legacy plaintext.
-    /// Also enables encrypted key blinding on the metadata index.
-    pub fn with_mek(mut self, mek: [u8; 32]) -> Self {
+    /// Also enables encrypted key blinding on the metadata index. Idempotent -
+    /// only the first install takes effect (the slot is a `OnceLock`).
+    pub fn install_mek(&self, mek: [u8; 32]) {
         self.index.set_mek(mek);
-        self.config.mek = Some(mek);
-        self
+    }
+
+    /// Shared handle to the MEK slot, so the daemon can install or clear the key
+    /// in step with login / idle-drop.
+    pub fn mek_slot(&self) -> Arc<MekSlot> {
+        Arc::clone(&self.mek)
     }
 
     /// Access the underlying metadata index, e.g. for `lookup_by_label`.
@@ -245,7 +245,7 @@ impl UringStorage {
                 let (reply, reply_rx) = tokio::sync::oneshot::channel();
                 let op = UringOp::ReadObjectMeta {
                     path: obj_path.clone(),
-                    mek: self.config.mek,
+                    mek: self.mek.mek(),
                     reply,
                 };
                 self.pool
@@ -317,7 +317,7 @@ impl UringStorage {
             key.to_owned(),
             is_overwrite,
             prior_created,
-            self.config.mek,
+            self.mek.mek(),
             self.index.clone(),
         );
 
@@ -446,7 +446,7 @@ impl Storage for UringStorage {
             crypto,
             large_object_bytes: self.config.large_object_bytes,
             sync: options.sync,
-            mek: self.config.mek,
+            mek: self.mek.mek(),
             reply,
         };
         let dispatch_result = self.dispatch(op, bucket, key, "put", reply_rx).await;
@@ -507,7 +507,7 @@ impl Storage for UringStorage {
             locks: self.locks.clone(),
             bucket: bucket.to_owned(),
             key: key.to_owned(),
-            mek: self.config.mek,
+            mek: self.mek.mek(),
             reply,
         };
         let result = self.dispatch(op, bucket, key, "describe", reply_rx).await;
@@ -533,7 +533,7 @@ impl Storage for UringStorage {
             crate::storage::filesystem::set_labels_impl(
                 &self.base_path,
                 &self.index,
-                self.config.mek.as_ref(),
+                self.mek.mek().as_ref(),
                 bucket,
                 key,
                 labels,
@@ -644,7 +644,7 @@ impl StorageExt for UringStorage {
         let index = self.index.clone();
         let state = self.rebuild_state.clone();
         let pool = Arc::clone(&self.pool);
-        let mek = self.config.mek;
+        let mek = self.mek.mek();
         tokio::spawn(async move {
             let result = run_rebuild(base_path, index, state.clone(), pool, mek).await;
             let mut s = state.lock().await;
@@ -823,8 +823,11 @@ mod tests {
     use std::collections::BTreeMap;
     use tempfile::TempDir;
 
+    /// Stand-in for the login-derived MEK; metadata writes require one.
+    const TEST_MEK: [u8; 32] = [7u8; 32];
+
     fn make_storage(dir: &TempDir, workers: usize) -> UringStorage {
-        UringStorage::new(
+        let s = UringStorage::new(
             dir.path(),
             dir.path().join("idx.redb"),
             UringConfig {
@@ -832,7 +835,9 @@ mod tests {
                 ..UringConfig::default()
             },
         )
-        .unwrap()
+        .unwrap();
+        s.install_mek(TEST_MEK);
+        s
     }
 
     /// Build a UringStorage with a custom large-object threshold so tests can
@@ -842,16 +847,17 @@ mod tests {
         workers: usize,
         large_object_bytes: u64,
     ) -> UringStorage {
-        UringStorage::new(
+        let s = UringStorage::new(
             dir.path(),
             dir.path().join("idx.redb"),
             UringConfig {
                 workers,
                 large_object_bytes,
-                ..UringConfig::default()
             },
         )
-        .unwrap()
+        .unwrap();
+        s.install_mek(TEST_MEK);
+        s
     }
 
     /// A TempDir on a disk-backed filesystem so tests actually exercise
@@ -1260,6 +1266,7 @@ mod tests {
             },
         )
         .unwrap();
+        storage.install_mek(TEST_MEK);
         // Index is empty right now.
         let page = storage
             .list_objects("b", ListOptions::default())

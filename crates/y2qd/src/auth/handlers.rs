@@ -149,7 +149,10 @@ pub async fn login(
 
     match result {
         Ok((rec, sk)) => {
-            // Successful auth — install SK if absent and mint session.
+            // Successful auth — derive and install the MEK from the unwrapped
+            // secret key (gates metadata encryption on login), then install SK
+            // if absent and mint session.
+            state.install_mek_from_sk(&sk);
             let pk = state.public_keystore.clone();
             let ks = Arc::new(DecryptedKeystore::new(pk, sk));
             state.keystore.install(ks);

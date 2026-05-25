@@ -133,15 +133,22 @@ impl UringStreamingPutGuard {
             operation: "put".to_owned(),
             message: format!("encode meta: {e}"),
         })?;
-        let meta_bytes = if let Some(ref mek) = self.mek {
-            encrypt_meta(mek, &meta_json).map_err(|e| Error::InternalError {
+        // Writes require an installed MEK; refuse rather than persisting plaintext.
+        let meta_bytes = match self.mek {
+            Some(ref mek) => encrypt_meta(mek, &meta_json).map_err(|e| Error::InternalError {
                 bucket: bucket.to_owned(),
                 key: key.to_owned(),
                 operation: "put".to_owned(),
                 message: format!("encrypt meta: {e}"),
-            })?
-        } else {
-            meta_json
+            })?,
+            None => {
+                return Err(Error::InternalError {
+                    bucket: bucket.to_owned(),
+                    key: key.to_owned(),
+                    operation: "put".to_owned(),
+                    message: "metadata write attempted without an installed MEK".to_owned(),
+                });
+            }
         };
 
         let mut flags = 0u16;
