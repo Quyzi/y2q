@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/y2q-cli",
+    "crates/y2q-behavior",
     "crates/y2q-client",
     "crates/y2q-config",
     "crates/y2q-core",
@@ -15,6 +16,7 @@ aes-gcm                     = "0.10"
 aligned-vec                 = "0.6"
 argon2                      = "0.5"
 async-channel               = "2"
+async-trait                 = "0.1"
 base64                      = "0.22"
 bytes                       = { version = "1.11.1", features = ["serde"] }
 chrono                      = "0.4"
