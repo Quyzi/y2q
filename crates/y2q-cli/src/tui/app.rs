@@ -74,6 +74,17 @@ pub struct App {
     pub event_tx: UnboundedSender<Event>,
     pub config: CliConfig,
     pub should_quit: bool,
+    /// A mirror plan awaiting confirmation before execution.
+    pub pending_mirror: Option<PendingMirror>,
+}
+
+/// A computed local->remote mirror, held between planning and execution.
+pub struct PendingMirror {
+    pub alias: String,
+    pub bucket: String,
+    pub local_root: std::path::PathBuf,
+    /// Relative keys to upload (copy + update).
+    pub keys: Vec<String>,
 }
 
 impl App {
@@ -97,6 +108,7 @@ impl App {
             event_tx,
             config,
             should_quit: false,
+            pending_mirror: None,
         }
     }
 
@@ -231,6 +243,29 @@ impl App {
                 };
                 Action::None
             }
+            Event::MirrorPlanned {
+                alias,
+                bucket,
+                local_root,
+                keys,
+                deletions,
+                skipped: _,
+            } => {
+                self.remote_throbber.stop();
+                if keys.is_empty() {
+                    self.mode = Mode::Error("Mirror: nothing to upload (already in sync)".into());
+                } else {
+                    let uploads = keys.len();
+                    self.pending_mirror = Some(PendingMirror {
+                        alias,
+                        bucket,
+                        local_root,
+                        keys,
+                    });
+                    self.mode = Mode::Confirm(ConfirmAction::ApplyMirror { uploads, deletions });
+                }
+                Action::None
+            }
             _ => Action::None,
         }
     }
@@ -336,6 +371,7 @@ impl App {
             Mode::Labels { .. } => self.handle_labels_key(key),
             Mode::BucketConfig { .. } => self.handle_bucketconfig_key(key),
             Mode::Results { .. } => self.handle_results_key(key),
+            Mode::Help { .. } => self.handle_help_key(key),
             Mode::Browse => self.handle_browse_key(key),
         }
     }
@@ -353,6 +389,7 @@ impl App {
                     InputAction::AddUserUsername { .. } | InputAction::AddUserPassword { .. } => {
                         Mode::Admin(AdminTab::Users)
                     }
+                    InputAction::SetEventFilter => Mode::Admin(AdminTab::Events),
                     _ => Mode::Browse,
                 };
                 Action::None
@@ -444,6 +481,17 @@ impl App {
                         alias,
                         older_than: "5m".into(),
                     });
+                }
+                Action::None
+            }
+            KeyCode::Char('/') => {
+                if matches!(tab, AdminTab::Events) {
+                    let current = self.events_view.filter.clone().unwrap_or_default();
+                    self.mode = Mode::Input {
+                        prompt: "Filter events by path prefix (empty = all):".into(),
+                        value: current,
+                        action: InputAction::SetEventFilter,
+                    };
                 }
                 Action::None
             }
@@ -562,6 +610,10 @@ impl App {
                 self.start_rename();
                 Action::None
             }
+            KeyCode::Char('R') => {
+                self.start_range_get();
+                Action::None
+            }
             KeyCode::Char('l') => {
                 self.open_labels();
                 Action::None
@@ -591,7 +643,7 @@ impl App {
                 Action::None
             }
             KeyCode::Char('M') => {
-                self.start_mirror_preview();
+                self.start_mirror();
                 Action::None
             }
             KeyCode::Char('L') => {
@@ -614,8 +666,95 @@ impl App {
                 self.trigger_refresh();
                 Action::Refresh
             }
+            KeyCode::Char('e') => {
+                self.start_edit_alias();
+                Action::None
+            }
+            KeyCode::Char('x') => {
+                self.export_aliases();
+                Action::None
+            }
+            KeyCode::Char('I') => {
+                self.start_import_aliases();
+                Action::None
+            }
+            KeyCode::Char('?') => {
+                self.show_help();
+                Action::None
+            }
             _ => Action::None,
         }
+    }
+
+    fn show_help(&mut self) {
+        let lines: Vec<String> = [
+            "NAVIGATION",
+            "  Tab          switch local/remote pane",
+            "  ↑↓ / j k     move selection",
+            "  Enter        open dir/alias/bucket/object",
+            "  Backspace/b  go up a level",
+            "  q            quit",
+            "",
+            "OBJECTS & BUCKETS",
+            "  c            copy (recursive for local dirs)",
+            "  R            ranged download (remote object)",
+            "  m            rename object",
+            "  l            edit labels",
+            "  d            delete object / bucket / alias",
+            "  n            new bucket / new alias (alias level)",
+            "  g            bucket config (quota / SSE)",
+            "",
+            "QUERY",
+            "  s            label search",
+            "  f            find by name",
+            "  u            disk usage",
+            "  T            tree",
+            "  D            diff local cwd vs remote",
+            "  M            mirror (preview + apply)",
+            "",
+            "ALIASES & AUTH",
+            "  L            login        O  logout",
+            "  P            change password   p  ping",
+            "  e            edit alias    x  export   I  import",
+            "",
+            "ADMIN (a)",
+            "  Tab          cycle tabs",
+            "  Rebuild: s start, r refresh",
+            "  Locks:   c clear stale, r refresh",
+            "  Users:   n add, d delete",
+            "  Events:  / filter by prefix",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        self.mode = Mode::Help { lines, selected: 0 };
+    }
+
+    fn handle_help_key(&mut self, key: crossterm::event::KeyEvent) -> Action {
+        use crossterm::event::KeyCode;
+        let (len, selected) = match &self.mode {
+            Mode::Help { lines, selected } => (lines.len(), *selected),
+            _ => return Action::None,
+        };
+        match key.code {
+            KeyCode::Char('q') | KeyCode::Esc => self.mode = Mode::Browse,
+            KeyCode::Up | KeyCode::Char('k') => {
+                if selected > 0
+                    && let Mode::Help { selected, .. } = &mut self.mode
+                {
+                    *selected -= 1;
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if selected + 1 < len
+                    && let Mode::Help { selected, .. } = &mut self.mode
+                {
+                    *selected += 1;
+                }
+            }
+            _ => {}
+        }
+        Action::None
     }
 
     fn handle_enter(&mut self) {
@@ -918,6 +1057,95 @@ impl App {
         };
     }
 
+    /// Edit the selected alias: re-run the URL/user prompts pre-filled. Saving
+    /// overwrites the existing entry (same name).
+    fn start_edit_alias(&mut self) {
+        use super::pane::remote::RemoteLevel;
+        if !matches!(self.remote.level, RemoteLevel::Aliases) {
+            return;
+        }
+        let Some(name) = self.target_alias() else {
+            return;
+        };
+        let Some(entry) = self.config.aliases.get(&name) else {
+            return;
+        };
+        let url = entry.url.clone();
+        self.mode = Mode::Input {
+            prompt: format!("Edit URL for `{name}`:"),
+            value: url,
+            action: InputAction::NewAliasUrl { name },
+        };
+    }
+
+    /// Write all aliases to `y2q-aliases.toml` in the local working directory.
+    fn export_aliases(&mut self) {
+        use super::pane::remote::RemoteLevel;
+        if !matches!(self.remote.level, RemoteLevel::Aliases) {
+            return;
+        }
+        let path = self.local.cwd.join("y2q-aliases.toml");
+        match toml::to_string_pretty(&self.config) {
+            Ok(text) => match std::fs::write(&path, text) {
+                Ok(()) => {
+                    self.mode = Mode::Results {
+                        title: "Exported aliases".into(),
+                        lines: vec![format!("Wrote {}", path.display())],
+                        selected: 0,
+                    }
+                }
+                Err(e) => self.mode = Mode::Error(e.to_string()),
+            },
+            Err(e) => self.mode = Mode::Error(format!("serialize: {e}")),
+        }
+    }
+
+    fn start_import_aliases(&mut self) {
+        use super::pane::remote::RemoteLevel;
+        if !matches!(self.remote.level, RemoteLevel::Aliases) {
+            return;
+        }
+        self.mode = Mode::Input {
+            prompt: "Import aliases from TOML file:".into(),
+            value: self
+                .local
+                .cwd
+                .join("y2q-aliases.toml")
+                .to_string_lossy()
+                .into_owned(),
+            action: InputAction::ImportAliases,
+        };
+    }
+
+    /// Read a TOML alias file and merge its entries into the config.
+    fn import_aliases(&mut self, path: &str) {
+        #[derive(serde::Deserialize)]
+        struct Imported {
+            #[serde(default)]
+            aliases: indexmap::IndexMap<String, crate::config::Alias>,
+            #[serde(default)]
+            profiles: indexmap::IndexMap<String, crate::config::Alias>,
+        }
+        let buf = match std::fs::read_to_string(path) {
+            Ok(b) => b,
+            Err(e) => {
+                self.mode = Mode::Error(e.to_string());
+                return;
+            }
+        };
+        let imported: Imported = match toml::from_str(&buf) {
+            Ok(i) => i,
+            Err(e) => {
+                self.mode = Mode::Error(format!("parse: {e}"));
+                return;
+            }
+        };
+        for (name, entry) in imported.aliases.into_iter().chain(imported.profiles) {
+            self.config.aliases.insert(name, entry);
+        }
+        self.save_config();
+    }
+
     /// Persist the in-memory config to disk, surfacing any error as a popup.
     fn save_config(&mut self) {
         let path = match crate::client_builder::resolve_config_path() {
@@ -952,6 +1180,61 @@ impl App {
                 },
             };
         }
+    }
+
+    fn start_range_get(&mut self) {
+        use super::pane::remote::RemoteEntry;
+        if let FocusedPane::Remote = self.focused
+            && let Some(RemoteEntry::Object(m)) = self.remote.selected_entry().cloned()
+        {
+            let alias = self.active_alias.clone().unwrap_or_default();
+            self.mode = Mode::Input {
+                prompt: format!("Byte range for {} (start-end):", m.key),
+                value: String::new(),
+                action: InputAction::RangeGet {
+                    alias,
+                    bucket: m.bucket.clone(),
+                    key: m.key.clone(),
+                },
+            };
+        }
+    }
+
+    /// Download an inclusive byte range of a remote object into the local cwd.
+    fn spawn_range_download(
+        &mut self,
+        alias: String,
+        bucket: String,
+        key: String,
+        start: u64,
+        end: u64,
+    ) {
+        let local_dst = self.local.cwd.join(key.rsplit('/').next().unwrap_or(&key));
+        let id = TRANSFER_ID.fetch_add(1, Ordering::Relaxed);
+        let label = format!(
+            "{alias}/{bucket}/{key} [{start}-{end}] → {}",
+            local_dst.display()
+        );
+        self.push_transfer(TransferEntry::new(id, label, Some(end - start + 1)));
+        let tx = self.event_tx.clone();
+        let config = self.config.clone();
+        let tokens_path = default_tokens_path().unwrap_or_default();
+        tokio::spawn(async move {
+            let result = async {
+                let client = build_client(&config, &tokens_path, &alias)?;
+                let file = tokio::fs::File::create(&local_dst)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let reporter = Box::new(TuiTransferReporter { id, tx: tx.clone() });
+                let mut writer = CountingWriter::new(file, reporter);
+                client
+                    .get_range_to_writer(&bucket, &key, start, end, &mut writer)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+            .await;
+            let _ = tx.send(Event::TransferDone { id, result });
+        });
     }
 
     fn start_login(&mut self) {
@@ -1663,10 +1946,9 @@ impl App {
         });
     }
 
-    /// Preview a one-way mirror of the local working directory onto the current
-    /// remote prefix. Read-only: shows the plan, does not execute (use the CLI
-    /// `mirror` to apply).
-    fn start_mirror_preview(&mut self) {
+    /// Plan a one-way mirror of the local working directory onto the current
+    /// remote prefix, then prompt for confirmation. Uploads only (no deletes).
+    fn start_mirror(&mut self) {
         use super::pane::remote::RemoteLevel;
         let RemoteLevel::Objects {
             alias,
@@ -1697,25 +1979,14 @@ impl App {
             .await;
             match result {
                 Ok(plan) => {
-                    let mut lines: Vec<String> = plan
-                        .actions
-                        .iter()
-                        .map(|(key, action)| format!("{:<7} {key}", action.label()))
-                        .collect();
-                    for key in &plan.deletions {
-                        lines.push(format!("{:<7} {key}", "delete?"));
-                    }
-                    lines.push(String::new());
-                    lines.push(format!(
-                        "{} to copy/update, {} dst-only (delete with --remove), {} unchanged",
-                        plan.actions.len(),
-                        plan.deletions.len(),
-                        plan.skipped
-                    ));
-                    lines.push("Run `y2q mirror` from the CLI to apply.".into());
-                    let _ = tx.send(Event::ResultsLoaded {
-                        title: format!("mirror {} -> {alias}/{bucket} (preview)", local.display()),
-                        lines,
+                    let keys: Vec<String> = plan.actions.into_iter().map(|(key, _)| key).collect();
+                    let _ = tx.send(Event::MirrorPlanned {
+                        alias,
+                        bucket,
+                        local_root: local,
+                        keys,
+                        deletions: plan.deletions.len(),
+                        skipped: plan.skipped,
                     });
                 }
                 Err(message) => {
@@ -1723,6 +1994,26 @@ impl App {
                 }
             }
         });
+    }
+
+    /// Execute a confirmed mirror: upload each planned key via the transfer bar.
+    fn apply_mirror(&mut self) {
+        let Some(plan) = self.pending_mirror.take() else {
+            return;
+        };
+        for key in plan.keys {
+            let mut path = plan.local_root.clone();
+            for part in key.split('/') {
+                if !part.is_empty() {
+                    path.push(part);
+                }
+            }
+            let id = TRANSFER_ID.fetch_add(1, Ordering::Relaxed);
+            let label = format!("{} → {}/{}/{key}", path.display(), plan.alias, plan.bucket);
+            let size = std::fs::metadata(&path).ok().map(|m| m.len());
+            self.push_transfer(TransferEntry::new(id, label, size));
+            self.spawn_upload(plan.alias.clone(), plan.bucket.clone(), key, path, id);
+        }
     }
 
     fn execute_confirm(&mut self, action: ConfirmAction) {
@@ -1858,6 +2149,9 @@ impl App {
             ConfirmAction::RemoveAlias { alias } => {
                 self.config.remove_alias(&alias);
                 self.save_config();
+            }
+            ConfirmAction::ApplyMirror { .. } => {
+                self.apply_mirror();
             }
         }
     }
@@ -2286,6 +2580,12 @@ impl App {
                     }
                 });
             }
+            InputAction::RangeGet { alias, bucket, key } => {
+                match crate::cmd::cp::parse_range(value.trim()) {
+                    Ok((start, end)) => self.spawn_range_download(alias, bucket, key, start, end),
+                    Err(e) => self.mode = Mode::Error(e.to_string()),
+                }
+            }
             InputAction::SetLabel { alias, bucket, key } => {
                 let raw = value.trim();
                 let Some((k, v)) = raw.split_once('=') else {
@@ -2371,6 +2671,15 @@ impl App {
                 }
                 self.spawn_passwd(alias, current, value);
             }
+            InputAction::SetEventFilter => {
+                let prefix = value.trim().to_owned();
+                self.events_view.filter = if prefix.is_empty() {
+                    None
+                } else {
+                    Some(prefix)
+                };
+                self.mode = Mode::Admin(AdminTab::Events);
+            }
             InputAction::NewAliasName => {
                 let name = value.trim().to_owned();
                 if name.is_empty() {
@@ -2382,14 +2691,28 @@ impl App {
                     action: InputAction::NewAliasUrl { name },
                 };
             }
+            InputAction::ImportAliases => {
+                let path = value.trim().to_owned();
+                if path.is_empty() {
+                    return;
+                }
+                self.import_aliases(&path);
+            }
             InputAction::NewAliasUrl { name } => {
                 let url = value.trim().to_owned();
                 if url.is_empty() {
                     return;
                 }
+                // Pre-fill the username when editing an existing alias.
+                let user_default = self
+                    .config
+                    .aliases
+                    .get(&name)
+                    .map(|a| a.username.clone())
+                    .unwrap_or_default();
                 self.mode = Mode::Input {
                     prompt: format!("Username for `{name}`:"),
-                    value: String::new(),
+                    value: user_default,
                     action: InputAction::NewAliasUser { name, url },
                 };
             }
