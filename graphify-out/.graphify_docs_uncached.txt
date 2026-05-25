@@ -1,0 +1,7 @@
+/home/digbick/Documents/code/y2q/README.md
+/home/digbick/Documents/code/y2q/CLAUDE.md
+/home/digbick/Documents/code/y2q/docs/operations.md
+/home/digbick/Documents/code/y2q/docs/architecture.md
+/home/digbick/Documents/code/y2q/docs/search.md
+/home/digbick/Documents/code/y2q/docs/api.md
+/home/digbick/Documents/code/y2q/docs/configuration.md

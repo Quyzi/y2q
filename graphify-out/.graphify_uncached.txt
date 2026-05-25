@@ -145,7 +145,13 @@
 /home/digbick/Documents/code/y2q/crates/y2q-warp/src/ops/list.rs
 /home/digbick/Documents/code/y2q/crates/y2q-warp/src/ops/get.rs
 /home/digbick/Documents/code/y2q/crates/y2q-warp/src/ops/mod.rs
+/home/digbick/Documents/code/y2q/crates/y2q-behavior/src/lib.rs
+/home/digbick/Documents/code/y2q/crates/y2q-behavior/src/crypto.rs
+/home/digbick/Documents/code/y2q/crates/y2q-behavior/src/io.rs
+/home/digbick/Documents/code/y2q/crates/y2q-behavior/src/storage.rs
+/home/digbick/Documents/code/y2q/crates/y2q-behavior/src/index.rs
 /home/digbick/Documents/code/y2q/.opencode/opencode.json
+/home/digbick/Documents/code/y2q/.opencode/package.json
 /home/digbick/Documents/code/y2q/.opencode/plugins/graphify.js
 /home/digbick/Documents/code/y2q/README.md
 /home/digbick/Documents/code/y2q/CLAUDE.md
