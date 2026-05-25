@@ -33,13 +33,13 @@
 //! [`decrypt_meta`]: crate::crypto::decrypt_meta
 
 use std::path::Path;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinition};
 
 use crate::{
     Error, LabelQuery, ListPage, Metadata, SyncLevel,
-    crypto::{decrypt_meta, encrypt_meta, metadata_key::derive_index_key, metadata_key::prf},
+    crypto::{decrypt_meta, encrypt_meta, metadata_key::MekSlot, metadata_key::prf},
 };
 
 /// `(bucket, key)` (length-prefixed or HMAC-blinded) → JSON-serialized [`Metadata`].
@@ -57,10 +57,10 @@ const LABELS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("labels");
 #[derive(Clone)]
 pub struct MetadataIndex {
     db: Arc<Database>,
-    /// AES-256-GCM key for value encryption.
-    mek: Arc<OnceLock<[u8; 32]>>,
-    /// HMAC key for blinding index key fields; derived from `mek`.
-    ik: Arc<OnceLock<[u8; 32]>>,
+    /// Shared, clearable holder for the MEK (value encryption) and its derived
+    /// Index Key (key blinding). Empty until a login installs the MEK; zeroized
+    /// when the daemon goes idle.
+    slot: Arc<MekSlot>,
 }
 
 impl MetadataIndex {
@@ -79,19 +79,23 @@ impl MetadataIndex {
         txn.commit().map_err(map_redb)?;
         Ok(Self {
             db: Arc::new(db),
-            mek: Arc::new(OnceLock::new()),
-            ik: Arc::new(OnceLock::new()),
+            slot: Arc::new(MekSlot::new()),
         })
     }
 
     /// Enable index encryption.
     ///
-    /// Derives `IK = HMAC-SHA256(MEK, "y2q-index-key-v1")` and stores both.
-    /// Must be called before any reads or writes. Has no effect if called more
-    /// than once (the `OnceLock` silently ignores subsequent sets).
+    /// Installs the MEK and derives `IK = HMAC-SHA256(MEK, "y2q-index-key-v1")`.
+    /// Re-installable: an idle clear followed by a fresh login restores the same
+    /// keys (the MEK is deterministic from the deployment secret key).
     pub fn set_mek(&self, mek: [u8; 32]) {
-        let _ = self.ik.set(derive_index_key(&mek));
-        let _ = self.mek.set(mek);
+        self.slot.install(mek);
+    }
+
+    /// Return a handle to the shared MEK slot so a storage backend can share the
+    /// same slot and observe installs/clears the moment they happen.
+    pub fn mek_slot(&self) -> Arc<MekSlot> {
+        Arc::clone(&self.slot)
     }
 
     /// Insert or replace the metadata for `(m.bucket, m.key)`.
@@ -104,8 +108,7 @@ impl MetadataIndex {
         let raw_json = serde_json::to_vec(m).map_err(|e| Error::Index {
             message: format!("serialize metadata: {e}"),
         })?;
-        let mek = self.mek.get().copied();
-        let ik = self.ik.get().copied();
+        let (mek, ik) = self.slot.mek_ik();
         let bucket = m.bucket.clone();
         let key = m.key.clone();
         let new_labels: Vec<(String, String)> = m
@@ -115,11 +118,18 @@ impl MetadataIndex {
             .collect();
 
         tokio::task::spawn_blocking(move || -> Result<(), Error> {
+            // Writes require an installed MEK. Refuse rather than silently
+            // persisting plaintext metadata to the index.
             let payload = match mek {
                 Some(ref mek) => encrypt_meta(mek, &raw_json).map_err(|_| Error::Index {
                     message: "encrypt metadata".to_owned(),
                 })?,
-                None => raw_json,
+                None => {
+                    return Err(Error::Index {
+                        message: "metadata index write attempted without an installed MEK"
+                            .to_owned(),
+                    });
+                }
             };
 
             let object_key = match ik {
@@ -176,8 +186,7 @@ impl MetadataIndex {
     /// Succeeds without error if no row exists.
     pub async fn remove(&self, bucket: &str, key: &str) -> Result<(), Error> {
         let db = self.db.clone();
-        let mek = self.mek.get().copied();
-        let ik = self.ik.get().copied();
+        let (mek, ik) = self.slot.mek_ik();
         let bucket = bucket.to_owned();
         let key = key.to_owned();
 
@@ -219,8 +228,7 @@ impl MetadataIndex {
     /// Returns `Ok(None)` if no row exists.
     pub async fn lookup_by_key(&self, bucket: &str, key: &str) -> Result<Option<Metadata>, Error> {
         let db = self.db.clone();
-        let mek = self.mek.get().copied();
-        let ik = self.ik.get().copied();
+        let (mek, ik) = self.slot.mek_ik();
         let bucket = bucket.to_owned();
         let key = key.to_owned();
 
@@ -259,8 +267,7 @@ impl MetadataIndex {
         value: &str,
     ) -> Result<Vec<(String, String)>, Error> {
         let db = self.db.clone();
-        let mek = self.mek.get().copied();
-        let ik = self.ik.get().copied();
+        let (mek, ik) = self.slot.mek_ik();
         let name = name.to_owned();
         let value = value.to_owned();
 
@@ -326,8 +333,7 @@ impl MetadataIndex {
     /// the 32-byte HMAC prefix of the key is used for the skip-ahead jump.
     pub async fn list_buckets(&self) -> Result<Vec<String>, Error> {
         let db = self.db.clone();
-        let mek = self.mek.get().copied();
-        let ik = self.ik.get().copied();
+        let (mek, ik) = self.slot.mek_ik();
 
         tokio::task::spawn_blocking(move || -> Result<Vec<String>, Error> {
             let txn = db.begin_read().map_err(map_redb)?;
@@ -391,8 +397,7 @@ impl MetadataIndex {
     /// because their on-disk sidecar no longer exists.
     pub async fn list_all_keys(&self) -> Result<Vec<(String, String)>, Error> {
         let db = self.db.clone();
-        let mek = self.mek.get().copied();
-        let ik = self.ik.get().copied();
+        let (mek, ik) = self.slot.mek_ik();
 
         tokio::task::spawn_blocking(move || -> Result<Vec<(String, String)>, Error> {
             let txn = db.begin_read().map_err(map_redb)?;
@@ -444,8 +449,7 @@ impl MetadataIndex {
         limit: usize,
     ) -> Result<ListPage, Error> {
         let db = self.db.clone();
-        let mek = self.mek.get().copied();
-        let ik = self.ik.get().copied();
+        let (mek, ik) = self.slot.mek_ik();
         let bucket = bucket.to_owned();
         let prefix = prefix.map(str::to_owned);
         let after = after.map(str::to_owned);
@@ -528,7 +532,7 @@ impl MetadataIndex {
         limit: usize,
     ) -> Result<ListPage, Error> {
         let db = self.db.clone();
-        let mek = self.mek.get().copied();
+        let mek = self.slot.mek();
         let query = query.clone();
         let bucket = bucket.map(str::to_owned);
         let prefix = prefix.map(str::to_owned);

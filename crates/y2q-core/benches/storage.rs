@@ -85,6 +85,9 @@ static BACKENDS: OnceLock<Vec<Backend>> = OnceLock::new();
 
 /// Return the shared set of backends, initialising it once.
 ///
+/// Stand-in for the login-derived MEK; metadata writes require one installed.
+const BENCH_MEK: [u8; 32] = [7u8; 32];
+
 /// All bench functions share one set to avoid spinning up duplicate uring
 /// worker pools (each pool pins locked memory for its io_uring rings).
 fn backends() -> &'static [Backend] {
@@ -95,6 +98,9 @@ fn backends() -> &'static [Backend] {
         let fs_base = fs_dir.path().to_path_buf();
         let fs = FilesystemStorage::new(&fs_base, fs_base.join("idx.redb"))
             .expect("init FilesystemStorage");
+        // Metadata writes require an installed MEK (normally derived from the
+        // deployment secret key at login).
+        fs.install_mek(BENCH_MEK);
         out.push(Backend {
             name: "filesystem",
             storage: Arc::new(AnyStorage::Filesystem(fs)),
@@ -107,6 +113,7 @@ fn backends() -> &'static [Backend] {
             let u_base = u_dir.path().to_path_buf();
             let u = UringStorage::new(&u_base, u_base.join("idx.redb"), UringConfig::default())
                 .expect("init UringStorage");
+            u.install_mek(BENCH_MEK);
             out.push(Backend {
                 name: "uring",
                 storage: Arc::new(AnyStorage::Uring(u)),

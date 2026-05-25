@@ -599,11 +599,18 @@ async fn do_put(
 
     let meta_json = serde_json::to_vec(&metadata)
         .map_err(|e| internal(&bucket, &key, "put", format!("encode meta: {e}")))?;
-    let meta_bytes = if let Some(ref mek) = mek {
-        encrypt_meta(mek, &meta_json)
-            .map_err(|e| internal(&bucket, &key, "put", format!("encrypt meta: {e}")))?
-    } else {
-        meta_json
+    // Writes require an installed MEK; refuse rather than persisting plaintext.
+    let meta_bytes = match mek {
+        Some(ref mek) => encrypt_meta(mek, &meta_json)
+            .map_err(|e| internal(&bucket, &key, "put", format!("encrypt meta: {e}")))?,
+        None => {
+            return Err(internal(
+                &bucket,
+                &key,
+                "put",
+                "metadata write attempted without an installed MEK".to_owned(),
+            ));
+        }
     };
 
     let use_direct = large_object_bytes > 0 && payload.len() as u64 >= large_object_bytes;

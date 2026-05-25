@@ -7,7 +7,10 @@
 //! and pass it to handlers as `web::Data<Arc<AnyStorage>>`.
 
 use core::range::RangeInclusive;
+use std::sync::Arc;
 use std::time::SystemTime;
+
+use crate::crypto::metadata_key::MekSlot;
 
 use bytes::Bytes;
 
@@ -222,6 +225,32 @@ impl AnyStreamingPutGuard {
 }
 
 impl AnyStorage {
+    /// Install the Metadata Encryption Key on the active backend. Derived from
+    /// the deployment secret key when a login unwraps it; idempotent.
+    pub fn install_mek(&self, mek: [u8; 32]) {
+        match self {
+            Self::Filesystem(s) => s.install_mek(mek),
+            #[cfg(target_os = "linux")]
+            Self::Uring(s) => s.install_mek(mek),
+        }
+    }
+
+    /// Shared handle to the active backend's MEK slot.
+    pub fn mek_slot(&self) -> Arc<MekSlot> {
+        match self {
+            Self::Filesystem(s) => s.mek_slot(),
+            #[cfg(target_os = "linux")]
+            Self::Uring(s) => s.mek_slot(),
+        }
+    }
+
+    /// Zeroize and drop the installed MEK (and derived index key) on the active
+    /// backend. Called when the daemon goes idle, in step with the secret-key
+    /// drop. Returns `true` if a key was present. A later login re-installs it.
+    pub fn clear_mek(&self) -> bool {
+        self.mek_slot().clear()
+    }
+
     /// Begin a streaming PUT, acquiring the object lock and opening the tmp
     /// file. Returns the guard, the open tmp file, and a `write_offset` that
     /// must be passed to

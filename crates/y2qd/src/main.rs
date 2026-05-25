@@ -73,7 +73,7 @@ use crate::config::LogFormat;
 use crate::span::Y2qRootSpanBuilder;
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
-use y2q_core::crypto::{Argon2Params, derive_mek, keystore as keystore_mod};
+use y2q_core::crypto::{Argon2Params, keystore as keystore_mod};
 use y2q_core::{AnyStorage, FilesystemStorage, StorageExt};
 
 #[cfg(target_os = "linux")]
@@ -304,30 +304,11 @@ async fn main() -> std::io::Result<()> {
         "deployment public-key fingerprint"
     );
 
-    let mek = derive_mek(&public_keystore.public_key);
-
-    let auth_state = web::Data::new(AuthState::new(
-        public_keystore,
-        user_store,
-        cfg.auth.clone(),
-        cfg.crypto.argon2.clone(),
-    ));
-
-    // Background sweeper for expired sessions + idle-keystore drop.
-    {
-        let auth_state = auth_state.clone();
-        let interval = Duration::from_secs(cfg.auth.session_sweep_interval_seconds.max(1));
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(interval).await;
-                let removed = auth_state.sessions.sweep();
-                if removed > 0 {
-                    tracing::debug!(removed, "swept expired sessions");
-                }
-                auth_state.keystore.reconcile(&auth_state.sessions);
-            }
-        });
-    }
+    // The Metadata Encryption Key is derived from the deployment secret key,
+    // which only becomes available after a login. The storage backend exposes a
+    // shared slot that the login path fills; `mek_ready` is fired on the first
+    // install so the deferred startup index rebuild can run with a MEK present.
+    let mek_ready = Arc::new(tokio::sync::Notify::new());
 
     let index_path = cfg
         .storage
@@ -342,20 +323,12 @@ async fn main() -> std::io::Result<()> {
         config::StorageBackend::Filesystem => AnyStorage::Filesystem(
             FilesystemStorage::new(&cfg.storage.base_path, &index_path)
                 .map_err(|e| std::io::Error::other(format!("storage init: {e}")))?
-                .with_mek(mek)
                 .with_dirty_channel(dirty_tx, flush_notify.clone(), cfg.storage.sync_flush_limit),
         ),
         #[cfg(target_os = "linux")]
         config::StorageBackend::Uring => AnyStorage::Uring(
-            UringStorage::new(
-                &cfg.storage.base_path,
-                &index_path,
-                UringConfig {
-                    mek: Some(mek),
-                    ..UringConfig::default()
-                },
-            )
-            .map_err(|e| std::io::Error::other(format!("storage init: {e}")))?,
+            UringStorage::new(&cfg.storage.base_path, &index_path, UringConfig::default())
+                .map_err(|e| std::io::Error::other(format!("storage init: {e}")))?,
         ),
         #[cfg(not(target_os = "linux"))]
         config::StorageBackend::Uring => {
@@ -365,6 +338,39 @@ async fn main() -> std::io::Result<()> {
         }
     });
     let storage_data = web::Data::new(storage);
+
+    // Build auth state after storage so it can share the MEK slot: a successful
+    // login derives the MEK from the unwrapped secret key and installs it here.
+    let auth_state = web::Data::new(AuthState::new(
+        public_keystore,
+        user_store,
+        cfg.auth.clone(),
+        cfg.crypto.argon2.clone(),
+        Arc::clone(storage_data.as_ref()),
+        mek_ready.clone(),
+    ));
+
+    // Background sweeper for expired sessions + idle-keystore drop.
+    {
+        let auth_state = auth_state.clone();
+        let interval = Duration::from_secs(cfg.auth.session_sweep_interval_seconds.max(1));
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(interval).await;
+                let removed = auth_state.sessions.sweep();
+                if removed > 0 {
+                    tracing::debug!(removed, "swept expired sessions");
+                }
+                // When the idle keystore drop fires, zeroize the MEK too so no
+                // metadata key lingers in memory while no session is active.
+                if auth_state.keystore.reconcile(&auth_state.sessions) {
+                    auth_state.storage.clear_mek();
+                    tracing::debug!("idle: dropped secret key and zeroized MEK");
+                }
+            }
+        });
+    }
+
     let label_limits = web::Data::new(config::LabelLimits::from(&cfg.storage));
     let default_sync = web::Data::new(cfg.storage.default_sync);
     let encryption_params = web::Data::new(config::EncryptionParams {
@@ -401,9 +407,13 @@ async fn main() -> std::io::Result<()> {
     }
 
     // Startup auto-rebuild: repair index consistency after any unclean shutdown.
+    // Deferred until the first login installs the MEK, since the rebuild reads
+    // and re-indexes encrypted on-disk metadata and would otherwise have no key.
     {
         let storage_clone = Arc::clone(storage_data.as_ref());
+        let mek_ready = mek_ready.clone();
         tokio::spawn(async move {
+            mek_ready.notified().await;
             if let Err(e) = storage_clone.rebuild_cache().await {
                 tracing::warn!(error = %e, "startup cache rebuild failed to initiate");
             } else {
