@@ -1,0 +1,1178 @@
+{
+  "nodes": [
+    {
+      "id": "read_md_features",
+      "label": "Core features",
+      "file_type": "document",
+      "source_file": "README.md",
+      "description": "Post-quantum encryption, token auth, dual backends, Prometheus, search, TUI, profiling"
+    },
+    {
+      "id": "read_md_put_get",
+      "label": "PUT/GET objects",
+      "file_type": "document",
+      "source_file": "README.md",
+      "description": "REST object CRUD operations"
+    },
+    {
+      "id": "read_md_search_apis",
+      "label": "Label search queries",
+      "file_type": "document",
+      "source_file": "README.md",
+      "description": "Boolean label query with == != =~ ^= dollar= operators"
+    },
+    {
+      "id": "read_md_admin_cmds",
+      "label": "Admin CLI commands",
+      "file_type": "document",
+      "source_file": "README.md",
+      "description": "user add/ls/rm, rebuild start/status, locks ls/clear, admin trace"
+    },
+    {
+      "id": "read_md_search_lang",
+      "label": "Search query language",
+      "file_type": "document",
+      "source_file": "README.md",
+      "description": "operators, regex, grammar reference for label search"
+    },
+    {
+      "id": "read_md_crypto",
+      "label": "ML-KEM-768 encryption",
+      "file_type": "document",
+      "source_file": "README.md",
+      "description": "key encapsulation with AES-256-GCM, HKDF key derivation"
+    },
+    {
+      "id": "read_md_auth",
+      "label": "Token-based sessions",
+      "file_type": "document",
+      "source_file": "README.md",
+      "description": "Bearer tokens with TTL, per-account lockout"
+    },
+    {
+      "id": "read_md_backends",
+      "label": "Dual storage backends",
+      "file_type": "document",
+      "source_file": "README.md",
+      "description": "filesystem portable and Linux io_uring fast path"
+    },
+    {
+      "id": "read_md_index",
+      "label": "redb metadata index",
+      "file_type": "document",
+      "source_file": "README.md",
+      "description": "auto-rebuilt on startup, fast listing"
+    },
+    {
+      "id": "read_md_besteffort",
+      "label": "Best-effort flusher",
+      "file_type": "document",
+      "source_file": "README.md",
+      "description": "background async fsync with configurable interval"
+    },
+    {
+      "id": "read_md_labels",
+      "label": "Custom object labels",
+      "file_type": "document",
+      "source_file": "README.md",
+      "description": "X-Y2Q-<label> headers on PUT, arbitrary key/value metadata"
+    },
+    {
+      "id": "read_md_pyroscope",
+      "label": "Pyroscope profiling",
+      "file_type": "document",
+      "source_file": "README.md",
+      "description": "pprof-rs CPU profiling, opt-in cargo feature"
+    },
+    {
+      "id": "read_md_metrics",
+      "label": "Prometheus metrics",
+      "file_type": "document",
+      "source_file": "README.md",
+      "description": "/metrics/prometheus scrape, /metrics/dashboard"
+    },
+    {
+      "id": "read_md_openapi",
+      "label": "OpenAPI/Swagger UI",
+      "file_type": "document",
+      "source_file": "README.md",
+      "description": "interactive API docs at /swagger-ui/"
+    },
+    {
+      "id": "read_md_cp",
+      "label": "CLI cp command",
+      "file_type": "document",
+      "source_file": "README.md",
+      "description": "upload/download with sync modes, labels, glob patterns, recursive"
+    },
+    {
+      "id": "read_md_tui",
+      "label": "TUI file explorer",
+      "file_type": "document",
+      "source_file": "README.md",
+      "description": "interactive default CLI mode"
+    },
+    {
+      "id": "claude_md_crates",
+      "label": "Workspace crates",
+      "file_type": "document",
+      "source_file": "CLAUDE.md",
+      "description": "y2qd daemon, y2q-core core, y2q-cli client, y2q-warp benchmark"
+    },
+    {
+      "id": "claude_md_features",
+      "label": "Cargo features",
+      "file_type": "document",
+      "source_file": "CLAUDE.md",
+      "description": "pyroscope feature for y2qd only"
+    },
+    {
+      "id": "claude_md_checks",
+      "label": "CI quality gates",
+      "file_type": "document",
+      "source_file": "CLAUDE.md",
+      "description": "fmt + clippy + build must pass with zero warnings"
+    },
+    {
+      "id": "claude_md_observability",
+      "label": "Observability stack",
+      "file_type": "document",
+      "source_file": "CLAUDE.md",
+      "description": "tracing spans, Prometheus metrics, Pyroscope profiling"
+    },
+    {
+      "id": "claude_md_config_src",
+      "label": "figment config system",
+      "file_type": "document",
+      "source_file": "CLAUDE.md",
+      "description": "TOML + Y2QD_* env vars + --set flags"
+    },
+    {
+      "id": "arch_md_overview",
+      "label": "System architecture overview",
+      "file_type": "document",
+      "source_file": "docs/architecture.md",
+      "description": "HTTP daemon with encryption, storage backends, metadata index, sessions"
+    },
+    {
+      "id": "arch_md_flow",
+      "label": "PUT request flow",
+      "file_type": "document",
+      "source_file": "docs/architecture.md",
+      "description": "auth -> lock -> encapsulate -> HKDF -> seal -> write -> index -> 201"
+    },
+    {
+      "id": "arch_md_28hdr",
+      "label": "28-byte envelope header",
+      "file_type": "document",
+      "source_file": "docs/architecture.md",
+      "description": "magic + format_ver + kem_alg + aead_alg + nonce + plaintext_len"
+    },
+    {
+      "id": "arch_md_kdf",
+      "label": "Per-object key derivation",
+      "file_type": "document",
+      "source_file": "docs/architecture.md",
+      "description": "ML-KEM encapsulate -> HKDF-SHA256 -> AES-256-GCM content key"
+    },
+    {
+      "id": "arch_md_sk_wrap",
+      "label": "Secret-key wrapping",
+      "file_type": "document",
+      "source_file": "docs/architecture.md",
+      "description": "Argon2id KEK wraps SK under AES-256-GCM, zeroized on drop"
+    },
+    {
+      "id": "arch_md_argon2",
+      "label": "Argon2id parameters",
+      "file_type": "document",
+      "source_file": "docs/architecture.md",
+      "description": "m_cost_kib=65536 t_cost=3 p_cost=4 OWASP second-tier"
+    },
+    {
+      "id": "arch_md_pubkey_schema",
+      "label": "pubkey.json schema",
+      "file_type": "document",
+      "source_file": "docs/architecture.md",
+      "description": "kem_alg ml-kem-768, public_key_b64, fingerprint_sha256"
+    },
+    {
+      "id": "arch_md_user_record",
+      "label": "UserRecord format",
+      "file_type": "document",
+      "source_file": "docs/architecture.md",
+      "description": "username, timestamps, kdf params + salt, wrapped SK nonce+ciphertext"
+    },
+    {
+      "id": "arch_md_obj_layout",
+      "label": ".obj on-disk layout",
+      "file_type": "document",
+      "source_file": "docs/architecture.md",
+      "description": "64B header + N data + M metadata JSON + 64B trailer with CRC32"
+    },
+    {
+      "id": "arch_md_write_locks",
+      "label": "LockRegistry",
+      "file_type": "document",
+      "source_file": "docs/architecture.md",
+      "description": "lock-free papaya HashMap, per-object, vanishes on process exit"
+    },
+    {
+      "id": "arch_md_flusher",
+      "label": "Best-effort flusher",
+      "file_type": "document",
+      "source_file": "docs/architecture.md",
+      "description": "flume channel, background dedup fdatasync, timer/watermark wake"
+    },
+    {
+      "id": "arch_md_sessions",
+      "label": "DashMap session store",
+      "file_type": "document",
+      "source_file": "docs/architecture.md",
+      "description": "in-memory token_hash to SessionInfo, background sweeper, no persistence"
+    },
+    {
+      "id": "arch_md_lockout",
+      "label": "Login lockout",
+      "file_type": "document",
+      "source_file": "docs/architecture.md",
+      "description": "consecutive failures trigger lockout, timing floor 250ms"
+    },
+    {
+      "id": "arch_md_idle_drop",
+      "label": "Idle keystore drop",
+      "file_type": "document",
+      "source_file": "docs/architecture.md",
+      "description": "drop SK after last session expires via keystore_idle_drop_seconds"
+    },
+    {
+      "id": "arch_md_flock",
+      "label": "Daemon flock",
+      "file_type": "document",
+      "source_file": "docs/architecture.md",
+      "description": "exclusive POSIX flock on keystore .lock prevents dual-keystore"
+    },
+    {
+      "id": "arch_md_threats",
+      "label": "Threat model",
+      "file_type": "document",
+      "source_file": "docs/architecture.md",
+      "description": "defends disk theft credential theft quantum; not compromised daemon client TLS replay"
+    },
+    {
+      "id": "arch_md_metrics",
+      "label": "Prometheus metrics",
+      "file_type": "document",
+      "source_file": "docs/architecture.md",
+      "description": "storage ops counters, duration histograms, auth logins gauge, active sessions"
+    },
+    {
+      "id": "arch_md_request_id",
+      "label": "Per-request X-Request-ID",
+      "file_type": "document",
+      "source_file": "docs/architecture.md",
+      "description": "UUID propagated through tracing spans and SSE trace stream"
+    },
+    {
+      "id": "arch_md_srcmap_crypto",
+      "label": "Crypto source map",
+      "file_type": "document",
+      "source_file": "docs/architecture.md",
+      "description": "envelope.rs kdf.rs keystore.rs user_store.rs storage format.rs locks.rs index.rs"
+    },
+    {
+      "id": "api_md_auth_routes",
+      "label": "Auth API routes",
+      "file_type": "document",
+      "source_file": "docs/api.md",
+      "description": "POST login refresh logout password change at /api/v1/auth/*"
+    },
+    {
+      "id": "api_md_user_routes",
+      "label": "User CRUD routes",
+      "file_type": "document",
+      "source_file": "docs/api.md",
+      "description": "PUT add, GET list, DELETE remove at /api/v1/users/*"
+    },
+    {
+      "id": "api_md_obj_routes",
+      "label": "Object CRUD routes",
+      "file_type": "document",
+      "source_file": "docs/api.md",
+      "description": "PUT GET HEAD DELETE at bucket/key"
+    },
+    {
+      "id": "api_md_list_routes",
+      "label": "Listing routes",
+      "file_type": "document",
+      "source_file": "docs/api.md",
+      "description": "GET / list buckets, GET bucket list objects, GET search for labels"
+    },
+    {
+      "id": "api_md_admin_routes",
+      "label": "Admin routes",
+      "file_type": "document",
+      "source_file": "docs/api.md",
+      "description": "POST GET rebuild, GET DELETE locks at /api/v1/*"
+    },
+    {
+      "id": "api_md_obs_routes",
+      "label": "Observability routes",
+      "file_type": "document",
+      "source_file": "docs/api.md",
+      "description": "GET metrics/prometheus, metrics/dashboard, swagger-ui, api-docs/openapi.json"
+    },
+    {
+      "id": "api_md_put_headers",
+      "label": "PUT request headers",
+      "file_type": "document",
+      "source_file": "docs/api.md",
+      "description": "X-Y2Q-Sync durable/best-effort, X-Y2Q-<label> custom key/value"
+    },
+    {
+      "id": "api_md_head_headers",
+      "label": "HEAD response headers",
+      "file_type": "document",
+      "source_file": "docs/api.md",
+      "description": "X-Y2Q-Created Modified Checksum-MD5/SHA256 Cipher-Size/SHA256 KEM/AEAD"
+    },
+    {
+      "id": "api_md_err_model",
+      "label": "Error model",
+      "file_type": "document",
+      "source_file": "docs/api.md",
+      "description": "401 WWW-Authenticate Bearer 429 Retry-After generic 500 anti-probing"
+    },
+    {
+      "id": "api_md_status_codes",
+      "label": "HTTP status codes",
+      "file_type": "document",
+      "source_file": "docs/api.md",
+      "description": "200 201 202 204 206 400 401 404 409 416 429 500 501 503"
+    },
+    {
+      "id": "config_md_overlay",
+      "label": "3-layer config overlay",
+      "file_type": "document",
+      "source_file": "docs/configuration.md",
+      "description": "TOML lowest, Y2QD_* env_vars middle, --set CLI highest"
+    },
+    {
+      "id": "config_md_required",
+      "label": "Required config fields",
+      "file_type": "document",
+      "source_file": "docs/configuration.md",
+      "description": "server.host server.port storage.base_path crypto.keystore_dir"
+    },
+    {
+      "id": "config_md_server",
+      "label": "Server config",
+      "file_type": "document",
+      "source_file": "docs/configuration.md",
+      "description": "host port max_body_bytes unauthenticated_metrics + sub-section actix"
+    },
+    {
+      "id": "config_md_crypto",
+      "label": "Crypto config",
+      "file_type": "document",
+      "source_file": "docs/configuration.md",
+      "description": "keystore_dir envelope_chunk_size_bytes 4MiB configurable"
+    },
+    {
+      "id": "config_md_argon2_conf",
+      "label": "Argon2id config",
+      "file_type": "document",
+      "source_file": "docs/configuration.md",
+      "description": "m_cost_kib t_cost p_cost migration via password change"
+    },
+    {
+      "id": "config_md_auth_conf",
+      "label": "Auth config",
+      "file_type": "document",
+      "source_file": "docs/configuration.md",
+      "description": "default_ttl max_ttl session_sweep min_login_response lockout idle_drop"
+    },
+    {
+      "id": "config_md_obs_conf",
+      "label": "Observability config",
+      "file_type": "document",
+      "source_file": "docs/configuration.md",
+      "description": "log_filter RUST_LOG log_format text vs json"
+    },
+    {
+      "id": "config_md_pyroscope_conf",
+      "label": "Pyroscope profiling config",
+      "file_type": "document",
+      "source_file": "docs/configuration.md",
+      "description": "enabled server_url sample_rate basic_auth Grafana Cloud"
+    },
+    {
+      "id": "ops_md_first_run",
+      "label": "First-run workflow",
+      "file_type": "document",
+      "source_file": "docs/operations.md",
+      "description": "build config start capture root password create operator user"
+    },
+    {
+      "id": "ops_md_backup",
+      "label": "Backup priorities",
+      "file_type": "document",
+      "source_file": "docs/operations.md",
+      "description": "Critical: pubkey.json users.redb .obj files Optional: index rebuildable"
+    },
+    {
+      "id": "ops_md_hot_backup",
+      "label": "Hot backup procedure",
+      "file_type": "document",
+      "source_file": "docs/operations.md",
+      "description": "filesystem snapshots cp users.redb mid-write tear risk"
+    },
+    {
+      "id": "ops_md_restore",
+      "label": "Restore procedure",
+      "file_type": "document",
+      "source_file": "docs/operations.md",
+      "description": "stop restore keystore and storage restart rebuild if index drift"
+    },
+    {
+      "id": "ops_md_key_rotation",
+      "label": "Key rotation status",
+      "file_type": "document",
+      "source_file": "docs/operations.md",
+      "description": "not implemented, per-user password rotation migration workaround"
+    },
+    {
+      "id": "ops_md_locks_ops",
+      "label": "Write locks operations",
+      "file_type": "document",
+      "source_file": "docs/operations.md",
+      "description": "in-memory LockRegistry GET/DELETE locks older_than param"
+    },
+    {
+      "id": "ops_md_index_ops",
+      "label": "Index rebuild operations",
+      "file_type": "document",
+      "source_file": "docs/operations.md",
+      "description": "automatic startup scan manual POST rebuild fire-and-forget"
+    },
+    {
+      "id": "ops_md_tracing",
+      "label": "RUST_LOG tracing",
+      "file_type": "document",
+      "source_file": "docs/operations.md",
+      "description": "trace levels per-crate per-request spans tracing-actix-web"
+    },
+    {
+      "id": "ops_md_metrics_ops",
+      "label": "Metrics operations",
+      "file_type": "document",
+      "source_file": "docs/operations.md",
+      "description": "/metrics/prometheus and dashboard auth-gated unauthenticated_metrics toggle"
+    },
+    {
+      "id": "ops_md_proxy",
+      "label": "Reverse proxy setup",
+      "file_type": "document",
+      "source_file": "docs/operations.md",
+      "description": "nginx caddy traefik TLS termination proxy_request_buffering off large PUTs"
+    },
+    {
+      "id": "search_md_quickstart",
+      "label": "Search quick start",
+      "file_type": "document",
+      "source_file": "docs/search.md",
+      "description": "y2q search alias/bucket query alias/ all buckets alias/bucket/prefix scope"
+    },
+    {
+      "id": "search_md_ops_detail",
+      "label": "Search operators",
+      "file_type": "document",
+      "source_file": "docs/search.md",
+      "description": "== equality != inequality =~ regex ^= prefix suffix dollar= case-sensitive"
+    },
+    {
+      "id": "search_md_parsing",
+      "label": "Value parsing",
+      "file_type": "document",
+      "source_file": "docs/search.md",
+      "description": "bare values vs quoted double-quotes empty value only quoted no escape sequences"
+    },
+    {
+      "id": "search_md_missing_sem",
+      "label": "Missing-label semantics",
+      "file_type": "document",
+      "source_file": "docs/search.md",
+      "description": "== != =~ ^= dollar= return false != true for absent label"
+    },
+    {
+      "id": "search_md_precedence",
+      "label": "Boolean operator precedence",
+      "file_type": "document",
+      "source_file": "docs/search.md",
+      "description": "or < and < not left-associative && || ! synonyms case-insensitive"
+    },
+    {
+      "id": "search_md_params",
+      "label": "Search parameters",
+      "file_type": "document",
+      "source_file": "docs/search.md",
+      "description": "q required bucket prefix after cursor limit max 10000"
+    },
+    {
+      "id": "search_md_pagination",
+      "label": "Search pagination",
+      "file_type": "document",
+      "source_file": "docs/search.md",
+      "description": "sorted by bucket-key next null terminal opaque cursor"
+    },
+    {
+      "id": "search_md_errors",
+      "label": "Search error codes",
+      "file_type": "document",
+      "source_file": "docs/search.md",
+      "description": "400 malformed query invalid regex 401 token 500 index"
+    },
+    {
+      "id": "search_md_perf",
+      "label": "Search performance",
+      "file_type": "document",
+      "source_file": "docs/search.md",
+      "description": "full scan label cost grows with indexed objects linear-time regex safe"
+    },
+    {
+      "id": "search_md_grammar",
+      "label": "Formal PEG grammar",
+      "file_type": "document",
+      "source_file": "docs/search.md",
+      "description": "Pratt parser precedence pest grammar grammar.pest source file"
+    },
+    {
+      "id": "search_md_http_equiv",
+      "label": "HTTP search equivalent",
+      "file_type": "document",
+      "source_file": "docs/search.md",
+      "description": "GET /api/v1/search q= bucket= prefix= limit= --data-urlencode"
+    }
+  ],
+  "edges": [
+    {
+      "source": "read_md_features",
+      "target": "read_md_crypto",
+      "relation": "implements",
+      "confidence_score": 1.0,
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "read_md_features",
+      "target": "read_md_auth",
+      "relation": "implements",
+      "confidence_score": 1.0,
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "read_md_features",
+      "target": "read_md_backends",
+      "relation": "implements",
+      "confidence_score": 1.0,
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "read_md_features",
+      "target": "read_md_index",
+      "relation": "implements",
+      "confidence_score": 1.0,
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "read_md_features",
+      "target": "read_md_besteffort",
+      "relation": "implements",
+      "confidence_score": 1.0,
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "read_md_features",
+      "target": "read_md_labels",
+      "relation": "implements",
+      "confidence_score": 1.0,
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "read_md_features",
+      "target": "read_md_pyroscope",
+      "relation": "implements",
+      "confidence_score": 1.0,
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "read_md_features",
+      "target": "read_md_metrics",
+      "relation": "implements",
+      "confidence_score": 1.0,
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "read_md_features",
+      "target": "read_md_openapi",
+      "relation": "implements",
+      "confidence_score": 1.0,
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "read_md_put_get",
+      "target": "read_md_labels",
+      "relation": "references",
+      "confidence_score": 1.0,
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "read_md_put_get",
+      "target": "api_md_obj_routes",
+      "relation": "implements",
+      "confidence_score": 1.0,
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "read_md_search_apis",
+      "target": "read_md_search_lang",
+      "relation": "references",
+      "confidence_score": 1.0,
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "read_md_search_apis",
+      "target": "api_md_list_routes",
+      "relation": "implements",
+      "confidence_score": 1.0,
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "read_md_admin_cmds",
+      "target": "api_md_admin_routes",
+      "relation": "implements",
+      "confidence_score": 1.0,
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "read_md_crypto",
+      "target": "arch_md_kdf",
+      "relation": "references",
+      "confidence_score": 1.0,
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "read_md_crypto",
+      "target": "arch_md_28hdr",
+      "relation": "implements",
+      "confidence_score": 1.0,
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "read_md_auth",
+      "target": "arch_md_sessions",
+      "relation": "implements",
+      "confidence_score": 1.0,
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "read_md_backends",
+      "target": "arch_md_write_locks",
+      "relation": "implements",
+      "confidence_score": 0.8,
+      "confidence": "INFERRED"
+    },
+    {
+      "source": "read_md_tui",
+      "target": "claude_md_crates",
+      "relation": "implements",
+      "confidence_score": 1.0,
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "read_md_cp",
+      "target": "read_md_labels",
+      "relation": "implements",
+      "confidence_score": 1.0,
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "read_md_cp",
+      "target": "read_md_besteffort",
+      "relation": "implements",
+      "confidence_score": 1.0,
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "claude_md_crates",
+      "target": "arch_md_overview",
+      "relation": "references",
+      "confidence_score": 1.0,
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "claude_md_features",
+      "target": "config_md_pyroscope_conf",
+      "relation": "references",
+      "confidence_score": 1.0,
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "claude_md_observability",
+      "target": "config_md_obs_conf",
+      "relation": "implements",
+      "confidence_score": 1.0,
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "claude_md_config_src",
+      "target": "config_md_overlay",
+      "relation": "implements",
+      "confidence_score": 1.0,
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "arch_md_overview",
+      "target": "api_md_auth_routes",
+      "relation": "implements",
+      "confidence_score": 1.0,
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "arch_md_flow",
+      "target": "arch_md_write_locks",
+      "relation": "implements",
+      "confidence_score": 1.0,
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "arch_md_flow",
+      "target": "arch_md_kdf",
+      "relation": "implements",
+      "confidence_score": 1.0,
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "arch_md_28hdr",
+      "target": "api_md_head_headers",
+      "relation": "implements",
+      "confidence_score": 0.8,
+      "confidence": "INFERRED"
+    },
+    {
+      "source": "arch_md_kdf",
+      "target": "arch_md_sk_wrap",
+      "relation": "implements",
+      "confidence_score": 1.0,
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "arch_md_kdf",
+      "target": "api_md_put_headers",
+      "relation": "implements",
+      "confidence_score": 0.8,
+      "confidence": "INFERRED"
+    },
+    {
+      "source": "arch_md_sk_wrap",
+      "target": "config_md_argon2_conf",
+      "relation": "implements",
+      "confidence_score": 1.0,
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "arch_md_sk_wrap",
+      "target": "config_md_auth_conf",
+      "relation": "implements",
+      "confidence_score": 0.8,
+      "confidence": "INFERRED"
+    },
+    {
+      "source": "arch_md_sk_wrap",
+      "target": "arch_md_idle_drop",
+      "relation": "implements",
+      "confidence_score": 1.0,
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "arch_md_argon2",
+      "target": "config_md_argon2_conf",
+      "relation": "implements",
+      "confidence_score": 1.0,
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "arch_md_pubkey_schema",
+      "target": "config_md_crypto",
+      "relation": "implements",
+      "confidence_score": 1.0,
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "arch_md_user_record",
+      "target": "config_md_crypto",
+      "relation": "implements",
+      "confidence_score": 1.0,
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "arch_md_obj_layout",
+      "target": "api_md_head_headers",
+      "relation": "implements",
+      "confidence_score": 0.8,
+      "confidence": "INFERRED"
+    },
+    {
+      "source": "arch_md_write_locks",
+      "target": "api_md_admin_routes",
+      "relation": "implements",
+      "confidence_score": 1.0,
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "arch_md_write_locks",
+      "target": "ops_md_locks_ops",
+      "relation": "implements",
+      "confidence_score": 1.0,
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "arch_md_flusher",
+      "target": "read_md_besteffort",
+      "relation": "implements",
+      "confidence_score": 1.0,
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "arch_md_sessions",
+      "target": "config_md_auth_conf",
+      "relation": "implements",
+      "confidence_score": 1.0,
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "arch_md_lockout",
+      "target": "config_md_auth_conf",
+      "relation": "implements",
+      "confidence_score": 1.0,
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "arch_md_lockout",
+      "target": "api_md_status_codes",
+      "relation": "implements",
+      "confidence_score": 1.0,
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "arch_md_idle_drop",
+      "target": "config_md_auth_conf",
+      "relation": "implements",
+      "confidence_score": 1.0,
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "arch_md_flock",
+      "target": "config_md_crypto",
+      "relation": "implements",
+      "confidence_score": 1.0,
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "arch_md_threats",
+      "target": "arch_md_argon2",
+      "relation": "references",
+      "confidence_score": 1.0,
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "arch_md_threats",
+      "target": "arch_md_idle_drop",
+      "relation": "references",
+      "confidence_score": 1.0,
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "arch_md_metrics",
+      "target": "config_md_obs_conf",
+      "relation": "implements",
+      "confidence_score": 1.0,
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "arch_md_request_id",
+      "target": "config_md_obs_conf",
+      "relation": "implements",
+      "confidence_score": 0.8,
+      "confidence": "INFERRED"
+    },
+    {
+      "source": "api_md_auth_routes",
+      "target": "api_md_err_model",
+      "relation": "implements",
+      "confidence_score": 1.0,
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "api_md_auth_routes",
+      "target": "api_md_status_codes",
+      "relation": "implements",
+      "confidence_score": 1.0,
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "api_md_user_routes",
+      "target": "api_md_status_codes",
+      "relation": "implements",
+      "confidence_score": 1.0,
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "api_md_obj_routes",
+      "target": "api_md_put_headers",
+      "relation": "implements",
+      "confidence_score": 1.0,
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "api_md_obj_routes",
+      "target": "api_md_head_headers",
+      "relation": "implements",
+      "confidence_score": 1.0,
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "api_md_obj_routes",
+      "target": "api_md_status_codes",
+      "relation": "implements",
+      "confidence_score": 1.0,
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "api_md_list_routes",
+      "target": "search_md_params",
+      "relation": "implements",
+      "confidence_score": 1.0,
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "api_md_admin_routes",
+      "target": "api_md_status_codes",
+      "relation": "implements",
+      "confidence_score": 1.0,
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "api_md_admin_routes",
+      "target": "ops_md_index_ops",
+      "relation": "implements",
+      "confidence_score": 1.0,
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "api_md_obs_routes",
+      "target": "config_md_obs_conf",
+      "relation": "implements",
+      "confidence_score": 1.0,
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "api_md_obs_routes",
+      "target": "config_md_pyroscope_conf",
+      "relation": "implements",
+      "confidence_score": 0.7,
+      "confidence": "INFERRED"
+    },
+    {
+      "source": "config_md_crypto",
+      "target": "arch_md_28hdr",
+      "relation": "implements",
+      "confidence_score": 0.8,
+      "confidence": "INFERRED"
+    },
+    {
+      "source": "config_md_argon2_conf",
+      "target": "config_md_crypto",
+      "relation": "implements",
+      "confidence_score": 1.0,
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "config_md_obs_conf",
+      "target": "arch_md_request_id",
+      "relation": "implements",
+      "confidence_score": 1.0,
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "ops_md_first_run",
+      "target": "config_md_required",
+      "relation": "references",
+      "confidence_score": 1.0,
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "ops_md_first_run",
+      "target": "config_md_server",
+      "relation": "implements",
+      "confidence_score": 1.0,
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "ops_md_backup",
+      "target": "config_md_crypto",
+      "relation": "references",
+      "confidence_score": 1.0,
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "ops_md_hot_backup",
+      "target": "arch_md_flock",
+      "relation": "implements",
+      "confidence_score": 0.8,
+      "confidence": "INFERRED"
+    },
+    {
+      "source": "ops_md_restore",
+      "target": "ops_md_index_ops",
+      "relation": "implements",
+      "confidence_score": 1.0,
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "ops_md_key_rotation",
+      "target": "arch_md_sk_wrap",
+      "relation": "references",
+      "confidence_score": 1.0,
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "ops_md_locks_ops",
+      "target": "api_md_admin_routes",
+      "relation": "implements",
+      "confidence_score": 1.0,
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "ops_md_tracing",
+      "target": "config_md_obs_conf",
+      "relation": "implements",
+      "confidence_score": 1.0,
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "ops_md_metrics_ops",
+      "target": "api_md_obs_routes",
+      "relation": "implements",
+      "confidence_score": 1.0,
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "ops_md_proxy",
+      "target": "config_md_server",
+      "relation": "implements",
+      "confidence_score": 0.8,
+      "confidence": "INFERRED"
+    },
+    {
+      "source": "search_md_quickstart",
+      "target": "search_md_ops_detail",
+      "relation": "implements",
+      "confidence_score": 1.0,
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "search_md_quickstart",
+      "target": "search_md_params",
+      "relation": "implements",
+      "confidence_score": 1.0,
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "search_md_ops_detail",
+      "target": "search_md_parsing",
+      "relation": "implements",
+      "confidence_score": 1.0,
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "search_md_ops_detail",
+      "target": "search_md_missing_sem",
+      "relation": "implements",
+      "confidence_score": 1.0,
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "search_md_parsing",
+      "target": "search_md_missing_sem",
+      "relation": "references",
+      "confidence_score": 1.0,
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "search_md_missing_sem",
+      "target": "search_md_ops_detail",
+      "relation": "references",
+      "confidence_score": 1.0,
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "search_md_precedence",
+      "target": "search_md_grammar",
+      "relation": "implements",
+      "confidence_score": 1.0,
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "search_md_params",
+      "target": "search_md_pagination",
+      "relation": "implements",
+      "confidence_score": 1.0,
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "search_md_params",
+      "target": "search_md_errors",
+      "relation": "implements",
+      "confidence_score": 1.0,
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "search_md_pagination",
+      "target": "search_md_perf",
+      "relation": "implements",
+      "confidence_score": 1.0,
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "search_md_errors",
+      "target": "search_md_ops_detail",
+      "relation": "implements",
+      "confidence_score": 1.0,
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "search_md_perf",
+      "target": "search_md_grammar",
+      "relation": "implements",
+      "confidence_score": 1.0,
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "search_md_http_equiv",
+      "target": "api_md_list_routes",
+      "relation": "implements",
+      "confidence_score": 1.0,
+      "confidence": "EXTRACTED"
+    },
+    {
+      "source": "search_md_http_equiv",
+      "target": "search_md_pagination",
+      "relation": "implements",
+      "confidence_score": 1.0,
+      "confidence": "EXTRACTED"
+    }
+  ],
+  "hyperedges": [],
+  "input_tokens": 0,
+  "output_tokens": 0
+}
