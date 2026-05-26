@@ -244,11 +244,17 @@ impl AnyStorage {
         }
     }
 
-    /// Zeroize and drop the installed MEK (and derived index key) on the active
-    /// backend. Called when the daemon goes idle, in step with the secret-key
-    /// drop. Returns `true` if a key was present. A later login re-installs it.
+    /// Zeroize and drop the installed MEK on the active backend and close the
+    /// whole-file-encrypted metadata index, leaving only ciphertext on disk.
+    /// Called when the daemon goes idle, in step with the secret-key drop.
+    /// Returns `true` if a key was present. A later login re-installs and
+    /// reopens.
     pub fn clear_mek(&self) -> bool {
-        self.mek_slot().clear()
+        match self {
+            Self::Filesystem(s) => s.clear_mek(),
+            #[cfg(target_os = "linux")]
+            Self::Uring(s) => s.clear_mek(),
+        }
     }
 
     /// Begin a streaming PUT, acquiring the object lock and opening the tmp

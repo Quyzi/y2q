@@ -89,7 +89,7 @@ impl FilesystemStorage {
                 message: format!("create index parent: {e}"),
             })?;
         }
-        let index = MetadataIndex::open(index_path)?;
+        let index = MetadataIndex::new(index_path);
         let mek = index.mek_slot();
         Ok(Self {
             base_path,
@@ -109,12 +109,19 @@ impl FilesystemStorage {
     }
 
     /// Install the Metadata Encryption Key (derived from the deployment secret
-    /// key when a login unwraps it). All subsequent metadata writes are
-    /// encrypted; reads transparently decrypt or pass through legacy plaintext.
-    /// Also enables encrypted key blinding on the metadata index. Idempotent -
-    /// only the first install takes effect (the slot is a `OnceLock`).
+    /// key when a login unwraps it). Object sidecar metadata is encrypted under
+    /// the MEK, and the whole-file-encrypted metadata index is opened (its file
+    /// key is derived from the MEK). Idempotent across re-logins.
     pub fn install_mek(&self, mek: [u8; 32]) {
         self.index.set_mek(mek);
+    }
+
+    /// Clear the MEK and close the metadata index, leaving only ciphertext on
+    /// disk. Returns whether a key was present. Called on idle drop.
+    pub fn clear_mek(&self) -> bool {
+        let had = self.mek.clear();
+        self.index.close();
+        had
     }
 
     /// Shared handle to the MEK slot, so the daemon can install or clear the key

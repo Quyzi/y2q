@@ -82,7 +82,7 @@ The entire section is optional. Omitting it leaves actix's compiled-in defaults 
 |---|---|---|---|
 | `backend` | enum | `"filesystem"` | Either `"filesystem"` or `"uring"`. `uring` requires Linux ≥ 5.6 and is always compiled in on Linux (no cargo feature); on non-Linux targets it is unavailable and selecting it returns a runtime error. Both backends use the same on-disk `.obj` format and files are cross-compatible. |
 | `base_path` | string | *required* | Root directory for the object tree. Created on first write if absent. |
-| `index_path` | string | `<base_path>/_y2q_index.redb` | Path to the redb metadata index file. Override to put the index on a faster disk. |
+| `index_path` | string | `<base_path>/_y2q_index.redb` | Path to the redb metadata index file. The whole file is encrypted at rest under a key derived from the login-gated MEK; it is opened on first login and closed on idle. Override to put the index on a faster disk. |
 | `max_labels` | usize | `32` | Maximum `X-Y2Q-<label>` headers accepted per PUT. |
 | `max_label_name_bytes` | usize | `64` | Maximum byte length of a label name (after stripping `X-Y2Q-` and lowercasing). |
 | `max_label_value_bytes` | usize | `1024` | Maximum byte length of a label value. |

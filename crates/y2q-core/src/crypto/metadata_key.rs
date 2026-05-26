@@ -32,6 +32,7 @@ type HmacSha256 = Hmac<Sha256>;
 
 const DERIVATION_LABEL: &[u8] = b"y2q-metadata-encryption-key-v2";
 const INDEX_KEY_LABEL: &[u8] = b"y2q-index-key-v1";
+const INDEX_FILE_KEY_LABEL: &[u8] = b"y2q-index-file-key-v1";
 const VERSION_BYTE: u8 = 0x01;
 const NONCE_LEN: usize = 12;
 /// Minimum blob size for an encrypted blob: version + nonce + GCM tag.
@@ -58,6 +59,19 @@ pub fn prf(key: &[u8; 32], data: &[u8]) -> [u8; 32] {
 /// compromise of one operation does not directly expose the other.
 pub fn derive_index_key(mek: &[u8; 32]) -> [u8; 32] {
     prf(mek, INDEX_KEY_LABEL)
+}
+
+/// Derive the whole-file encryption key for the metadata index redb file.
+///
+/// `FK = HMAC-SHA256(MEK, "y2q-index-file-key-v1")`
+///
+/// Used by [`crate::storage::EncryptedFileBackend`] to encrypt every block of
+/// the `_y2q_index.redb` file at rest. Domain-separated from the MEK (object
+/// sidecar encryption) and the Index Key. Deterministic from the MEK, so the
+/// same file key is recovered on every restart + login - the existing
+/// encrypted index file reopens without any rewrapping.
+pub fn derive_index_file_key(mek: &[u8; 32]) -> [u8; 32] {
+    prf(mek, INDEX_FILE_KEY_LABEL)
 }
 
 /// Derive the Metadata Encryption Key from the raw bytes of the deployment
