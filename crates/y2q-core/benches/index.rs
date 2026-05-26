@@ -1,9 +1,9 @@
 //! Microbenchmarks for the redb-backed [`MetadataIndex`].
 //!
 //! Measures single-upsert latency, point-lookup latency, and full-bucket scan
-//! time as the index grows from 100 to 10 000 rows. All three operations are
-//! exercised without a MEK so results reflect plaintext key encoding; the
-//! encrypted path adds one HMAC per string field (negligible vs. redb I/O).
+//! time as the index grows from 100 to 10 000 rows. A MEK is installed so the
+//! whole-file-encrypted index opens; results therefore include the per-block
+//! AES-256-GCM cost of the encrypting backend.
 //!
 //! ## Running
 //!
@@ -36,10 +36,12 @@ fn make_meta(bucket: &str, key: &str) -> Metadata {
     }
 }
 
-fn open_index() -> (MetadataIndex, TempDir) {
+fn open_index() -> (Arc<MetadataIndex>, TempDir) {
     let dir = tempfile::tempdir().unwrap();
-    let idx = MetadataIndex::open(&dir.path().join("idx.redb")).unwrap();
-    (idx, dir)
+    let idx = MetadataIndex::new(dir.path().join("idx.redb"));
+    // Install a MEK so the encrypted index file is opened before use.
+    idx.set_mek([0x5a; 32]);
+    (Arc::new(idx), dir)
 }
 
 fn populate(rt: &Runtime, idx: &MetadataIndex, bucket: &str, n: usize) {

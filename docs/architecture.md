@@ -281,14 +281,18 @@ sequenceDiagram
 
 The index is a single redb database with two tables:
 
-The index is a single redb database with two tables:
-
 | Table | Key | Value | Purpose |
 |---|---|---|---|
 | `OBJECTS` | `len(bucket) || bucket || len(key) || key` | JSON `Metadata` | Object lookup, bucket scans |
 | `LABELS` | `len(name) || name || len(value) || value || len(bucket) || bucket || len(key) || key` | empty | Forward index for `label_name=value` queries |
 
 All composite keys use a 4-byte big-endian length prefix per field, which makes lexicographic byte order match `(field1, field2, ...)` tuple order. That lets range scans answer "all objects in bucket B" and "all `(bucket, key)` pairs with label N=V" with no extra filtering.
+
+### Encryption at rest
+
+The entire `_y2q_index.redb` file is encrypted at rest. redb runs on top of a custom `StorageBackend` (`EncryptedFileBackend`) that transparently encrypts every 4 KiB block with AES-256-GCM (fresh per-block nonce, block index bound as AAD) and translates redb's logical offsets to physical ones. A small authenticated header records the logical file length. Inside the database, table keys and values are stored in the clear - the whole-file layer is the sole protection, so nothing about the schema, sizes, or contents leaks on disk.
+
+The file key is derived from the login-gated MEK (`FK = HMAC-SHA256(MEK, "y2q-index-file-key-v1")`), which is only available while a session is active. Consequently the database is **opened on first login** and **closed on idle keystore drop** - while idle, only ciphertext remains and every index operation returns a "metadata index locked" error. The MEK (hence the file key) is deterministic from the deployment secret key, so the existing encrypted file reopens unchanged on the next login with no rewrapping.
 
 Listing operations are implemented as bounded range scans:
 
@@ -297,7 +301,7 @@ Listing operations are implemented as bounded range scans:
 
 ### Rebuild
 
-The index is a cache. If it goes missing or corrupt, every operation still works against the on-disk truth (by reading `.obj` files directly) - just slower for listings. Two paths kick off a rebuild:
+The index is a cache. If it goes missing or corrupt, every operation still works against the on-disk truth (by reading `.obj` files directly) - just slower for listings. A pre-encryption (plaintext) index file from an older build is incompatible: on first open the encrypting backend detects the missing magic, recreates the file empty, and the rebuild below repopulates it. Two paths kick off a rebuild:
 
 1. **Automatic startup rebuild** - on every boot the daemon walks the storage tree and reconciles the index against on-disk `.obj` files. Objects missing from the index are re-inserted; index rows whose `.obj` file is gone are removed and logged as data-loss events.
 2. **Manual rebuild** - `POST /api/v1/rebuild` starts a background scan; `GET /api/v1/rebuild` polls progress.
