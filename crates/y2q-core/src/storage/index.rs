@@ -50,6 +50,12 @@ const OBJECTS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("objects");
 /// value `value`".
 const LABELS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("labels");
 
+/// `bucket_name` → empty. Registry of explicitly-created buckets so that empty
+/// buckets (no objects) still appear in `list_buckets`. The on-disk bucket
+/// directory name is an opaque keyed HMAC and cannot be reversed, so the
+/// plaintext name is kept here inside the whole-file-encrypted index.
+const BUCKETS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("buckets");
+
 /// A persistent secondary index over object metadata, backed by a
 /// whole-file-encrypted redb file.
 ///
@@ -121,6 +127,7 @@ impl MetadataIndex {
         {
             let _ = txn.open_table(OBJECTS).map_err(map_redb)?;
             let _ = txn.open_table(LABELS).map_err(map_redb)?;
+            let _ = txn.open_table(BUCKETS).map_err(map_redb)?;
         }
         txn.commit().map_err(map_redb)?;
         Ok(db)
@@ -337,6 +344,68 @@ impl MetadataIndex {
             // the caller sees plain string order.
             buckets.sort();
             Ok(buckets)
+        })
+        .await
+        .map_err(|e| Error::Index {
+            message: format!("join: {e}"),
+        })?
+    }
+
+    /// Record `bucket` in the bucket registry so it lists even with no objects.
+    /// Idempotent.
+    pub async fn register_bucket(&self, bucket: &str) -> Result<(), Error> {
+        let db = self.db()?;
+        let bucket = bucket.to_owned();
+        tokio::task::spawn_blocking(move || -> Result<(), Error> {
+            let txn = db.begin_write().map_err(map_redb)?;
+            {
+                let mut buckets = txn.open_table(BUCKETS).map_err(map_redb)?;
+                buckets
+                    .insert(bucket.as_bytes(), [].as_slice())
+                    .map_err(map_redb)?;
+            }
+            txn.commit().map_err(map_redb)?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| Error::Index {
+            message: format!("join: {e}"),
+        })?
+    }
+
+    /// Remove `bucket` from the bucket registry. Succeeds if absent.
+    pub async fn unregister_bucket(&self, bucket: &str) -> Result<(), Error> {
+        let db = self.db()?;
+        let bucket = bucket.to_owned();
+        tokio::task::spawn_blocking(move || -> Result<(), Error> {
+            let txn = db.begin_write().map_err(map_redb)?;
+            {
+                let mut buckets = txn.open_table(BUCKETS).map_err(map_redb)?;
+                buckets.remove(bucket.as_bytes()).map_err(map_redb)?;
+            }
+            txn.commit().map_err(map_redb)?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| Error::Index {
+            message: format!("join: {e}"),
+        })?
+    }
+
+    /// Return every explicitly-registered bucket name (including empty ones).
+    pub async fn list_registered_buckets(&self) -> Result<Vec<String>, Error> {
+        let db = self.db()?;
+        tokio::task::spawn_blocking(move || -> Result<Vec<String>, Error> {
+            let txn = db.begin_read().map_err(map_redb)?;
+            let table = txn.open_table(BUCKETS).map_err(map_redb)?;
+            let mut out = Vec::new();
+            for entry in table.iter().map_err(map_redb)? {
+                let (k, _v) = entry.map_err(map_redb)?;
+                if let Ok(name) = std::str::from_utf8(k.value()) {
+                    out.push(name.to_owned());
+                }
+            }
+            Ok(out)
         })
         .await
         .map_err(|e| Error::Index {

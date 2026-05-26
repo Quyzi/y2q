@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use y2q_core::AnyStorage;
-use y2q_core::crypto::{Argon2Params, Keystore, UserStore};
+use y2q_core::crypto::{Argon2Params, Keystore, UserRecord, UserStore, kdf};
 
 use super::keystore::KeystoreSlot;
 use super::session::SessionStore;
@@ -39,6 +39,11 @@ pub struct AuthState {
     /// Set once the deferred startup rebuild has been triggered, so later
     /// idle-clear / re-login cycles don't fire it again.
     rebuild_triggered: AtomicBool,
+    /// A throwaway user record whose Argon2id unwrap is run on the login path
+    /// for usernames that don't exist, so a missing user costs the same KDF
+    /// work as a wrong password and login can't be used as an
+    /// existence-timing oracle. Its params mirror the current config.
+    pub dummy_record: UserRecord,
 }
 
 impl AuthState {
@@ -50,6 +55,7 @@ impl AuthState {
         storage: Arc<AnyStorage>,
         mek_ready: Arc<tokio::sync::Notify>,
     ) -> Self {
+        let dummy_record = Self::build_dummy_record(&argon2_config);
         Self {
             public_keystore,
             user_store,
@@ -61,6 +67,32 @@ impl AuthState {
             storage,
             mek_ready,
             rebuild_triggered: AtomicBool::new(false),
+            dummy_record,
+        }
+    }
+
+    /// Build the throwaway record used to equalize login timing for unknown
+    /// usernames. Wraps a fixed dummy SK under a fixed password with current
+    /// Argon2 costs and a random salt; only the KDF cost matters, never the
+    /// recoverability (its unwrap with an attacker password is expected to
+    /// fail). Computed once at startup.
+    fn build_dummy_record(argon2_config: &Argon2Config) -> UserRecord {
+        let params = Argon2Params::with_random_salt(
+            argon2_config.m_cost_kib,
+            argon2_config.t_cost,
+            argon2_config.p_cost,
+        );
+        // A 2400-byte placeholder roughly the size of an ML-KEM-768 secret key,
+        // so the wrap/unwrap moves a representative amount of data.
+        let dummy_sk = [0u8; 2400];
+        let wrapped_sk = kdf::wrap_sk(&dummy_sk, b"y2q-dummy-password", &params)
+            .expect("wrap dummy SK for login-timing record");
+        UserRecord {
+            username: String::new(),
+            created_at: 0,
+            last_login: None,
+            kdf: params,
+            wrapped_sk,
         }
     }
 
@@ -139,5 +171,27 @@ impl LoginAttempts {
             s.failed_count = 0;
             s.locked_until = None;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dummy_record_does_real_argon2_work() {
+        // Cheap costs keep the test fast; the point is that the dummy record is
+        // a genuine wrapped SK so its unwrap exercises Argon2id — the same work
+        // the not-found login branch must perform to avoid a timing oracle.
+        let cfg = Argon2Config {
+            m_cost_kib: 8,
+            t_cost: 1,
+            p_cost: 1,
+        };
+        let rec = AuthState::build_dummy_record(&cfg);
+        // The correct dummy password unwraps; any other fails — proving the
+        // record wraps real material and the unwrap runs the full KDF + AEAD.
+        assert!(kdf::unwrap_sk(&rec.wrapped_sk, b"y2q-dummy-password", &rec.kdf).is_ok());
+        assert!(kdf::unwrap_sk(&rec.wrapped_sk, b"not-the-password", &rec.kdf).is_err());
     }
 }

@@ -14,24 +14,17 @@ use std::{
 use crate::crypto::metadata_key::MekSlot;
 
 use bytes::Bytes;
-use uuid::Uuid;
 
 use std::time::{Instant, SystemTime};
 
 use crate::{
     CacheRebuildStatus, DEFAULT_LIST_LIMIT, Error, ListOptions, ListPage, Listing, MAX_LIST_LIMIT,
     Metadata, MetadataIndex, Object, PutOptions, StaleLock, Storage, StorageExt, SyncLevel,
+    storage::filesystem::{obj_path_for, require_path_key},
     storage::locks::LockRegistry,
 };
 
 use super::{ops::UringOp, runtime::WorkerPool, streaming::UringStreamingPutGuard};
-
-/// UUID v5 namespace used to derive deterministic filenames from object keys.
-///
-/// Matches the constant used by [`crate::FilesystemStorage`].
-const Y2Q_NAMESPACE: Uuid = Uuid::from_bytes([
-    0x6b, 0xa7, 0xb8, 0x11, 0x9d, 0xad, 0x11, 0xd1, 0x80, 0xb4, 0x00, 0xc0, 0x4f, 0xd4, 0x30, 0xc8,
-]);
 
 /// io_uring-backed object storage backend.
 ///
@@ -164,18 +157,12 @@ impl UringStorage {
     }
 
     /// Canonical on-disk path for the single-file object record of
-    /// `(bucket, key)`: `<base>/<bucket>/<xx>/<yy>/<uuid>.obj`.
-    fn obj_path(&self, bucket: &str, key: &str) -> PathBuf {
-        let id = Uuid::new_v5(&Y2Q_NAMESPACE, key.as_bytes());
-        let s = id.hyphenated().to_string();
-        let mut p = self
-            .base_path
-            .join(bucket)
-            .join(&s[0..2])
-            .join(&s[2..4])
-            .join(&s);
-        p.set_extension("obj");
-        p
+    /// `(bucket, key)`: `<base>/<bucket_dir>/<xx>/<yy>/<id>.obj`, where
+    /// `bucket_dir` and `id` are keyed HMACs under the login-gated path key.
+    /// Errors if no login has installed the MEK (and hence the path key) yet.
+    fn obj_path(&self, bucket: &str, key: &str) -> Result<PathBuf, Error> {
+        let path_key = require_path_key(&self.mek)?;
+        Ok(obj_path_for(&self.base_path, &path_key, bucket, key))
     }
 
     /// Dispatch an op to the worker that owns `(bucket, key)`, then await the
@@ -231,7 +218,7 @@ impl UringStorage {
         validate_bucket(bucket)?;
         validate_key(key)?;
 
-        let obj_path = self.obj_path(bucket, key);
+        let obj_path = self.obj_path(bucket, key)?;
         let tmp_path = obj_path.with_extension("tmp");
 
         if let Some(parent) = obj_path.parent() {
@@ -386,7 +373,7 @@ impl Storage for UringStorage {
         validate_bucket(bucket)?;
         validate_key(key)?;
         let started = Instant::now();
-        let obj_path = self.obj_path(bucket, key);
+        let obj_path = self.obj_path(bucket, key)?;
         let (reply, reply_rx) = tokio::sync::oneshot::channel();
         let op = UringOp::Get {
             obj_path,
@@ -408,7 +395,7 @@ impl Storage for UringStorage {
     ) -> Result<Bytes, Error> {
         validate_bucket(bucket)?;
         validate_key(key)?;
-        let obj_path = self.obj_path(bucket, key);
+        let obj_path = self.obj_path(bucket, key)?;
         let (reply, reply_rx) = tokio::sync::oneshot::channel();
         let op = UringOp::GetRange {
             obj_path,
@@ -431,7 +418,7 @@ impl Storage for UringStorage {
         validate_bucket(bucket)?;
         validate_key(key)?;
         let started = Instant::now();
-        let obj_path = self.obj_path(bucket, key);
+        let obj_path = self.obj_path(bucket, key)?;
         let tmp_path = obj_path.with_extension("tmp");
         let (reply, reply_rx) = tokio::sync::oneshot::channel();
         let crypto = match (options.plaintext_metrics, options.cipher_metadata) {
@@ -479,7 +466,7 @@ impl Storage for UringStorage {
         validate_bucket(bucket)?;
         validate_key(key)?;
         let started = Instant::now();
-        let obj_path = self.obj_path(bucket, key);
+        let obj_path = self.obj_path(bucket, key)?;
         let (reply, reply_rx) = tokio::sync::oneshot::channel();
         let op = UringOp::Delete {
             obj_path,
@@ -507,7 +494,7 @@ impl Storage for UringStorage {
         validate_bucket(bucket)?;
         validate_key(key)?;
         let started = Instant::now();
-        let obj_path = self.obj_path(bucket, key);
+        let obj_path = self.obj_path(bucket, key)?;
         let (reply, reply_rx) = tokio::sync::oneshot::channel();
         let op = UringOp::Describe {
             obj_path,
@@ -537,10 +524,12 @@ impl Storage for UringStorage {
         // than the io_uring data path — this is an infrequent, small write.
         let result = async {
             self.locks.check_not_locked(bucket, key)?;
+            let path_key = require_path_key(&self.mek)?;
             crate::storage::filesystem::set_labels_impl(
                 &self.base_path,
                 &self.index,
                 self.mek.mek().as_ref(),
+                &path_key,
                 bucket,
                 key,
                 labels,
@@ -559,19 +548,34 @@ impl Storage for UringStorage {
 
 impl Listing for UringStorage {
     async fn list_buckets(&self) -> Result<Vec<String>, Error> {
-        crate::storage::filesystem::list_buckets_union(&self.base_path, &self.index).await
+        crate::storage::filesystem::list_buckets_union(&self.index).await
     }
 
     async fn create_bucket(&self, bucket: &str) -> Result<bool, Error> {
-        crate::storage::filesystem::create_bucket_impl(&self.base_path, bucket).await
+        let path_key = require_path_key(&self.mek)?;
+        crate::storage::filesystem::create_bucket_impl(
+            &self.base_path,
+            &self.index,
+            &path_key,
+            bucket,
+        )
+        .await
     }
 
     async fn delete_bucket(&self, bucket: &str) -> Result<u64, Error> {
-        crate::storage::filesystem::delete_bucket_impl(&self.base_path, &self.index, bucket).await
+        let path_key = require_path_key(&self.mek)?;
+        crate::storage::filesystem::delete_bucket_impl(
+            &self.base_path,
+            &self.index,
+            &path_key,
+            bucket,
+        )
+        .await
     }
 
     async fn get_bucket_config(&self, bucket: &str) -> Result<crate::BucketConfig, Error> {
-        crate::storage::filesystem::get_bucket_config_impl(&self.base_path, bucket).await
+        let path_key = require_path_key(&self.mek)?;
+        crate::storage::filesystem::get_bucket_config_impl(&self.base_path, &path_key, bucket).await
     }
 
     async fn set_bucket_config(
@@ -579,7 +583,14 @@ impl Listing for UringStorage {
         bucket: &str,
         config: &crate::BucketConfig,
     ) -> Result<(), Error> {
-        crate::storage::filesystem::set_bucket_config_impl(&self.base_path, bucket, config).await
+        let path_key = require_path_key(&self.mek)?;
+        crate::storage::filesystem::set_bucket_config_impl(
+            &self.base_path,
+            &path_key,
+            bucket,
+            config,
+        )
+        .await
     }
 
     async fn bucket_usage(&self, bucket: &str) -> Result<u64, Error> {
@@ -1156,7 +1167,7 @@ mod tests {
             .unwrap();
 
         // Inspect the on-disk header directly to confirm the buffered layout.
-        let obj_path = storage.obj_path("b", "k");
+        let obj_path = storage.obj_path("b", "k").unwrap();
         let bytes = std::fs::read(&obj_path).unwrap();
         assert!(bytes.len() >= super::super::format::HEADER_SIZE);
         let header_arr: [u8; super::super::format::HEADER_SIZE] = bytes
@@ -1312,7 +1323,7 @@ mod tests {
             .unwrap();
 
         // Yank the ghost's .obj file but leave the index entry.
-        let ghost_path = storage.obj_path("b", "ghost");
+        let ghost_path = storage.obj_path("b", "ghost").unwrap();
         std::fs::remove_file(&ghost_path).unwrap();
 
         storage.rebuild_cache().await.unwrap();
@@ -1372,7 +1383,7 @@ mod tests {
             .await
             .unwrap();
 
-        let obj_path = storage.obj_path("b", "k");
+        let obj_path = storage.obj_path("b", "k").unwrap();
         let bytes = std::fs::read(&obj_path).unwrap();
         let header_arr: [u8; super::super::format::HEADER_SIZE] = bytes
             [..super::super::format::HEADER_SIZE]

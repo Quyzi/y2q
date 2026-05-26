@@ -8,36 +8,28 @@ use std::{
 use base64::Engine;
 use bytes::Bytes;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
-use uuid::Uuid;
 
 use crate::{
     CacheRebuildStatus, CipherMetadata, DEFAULT_LIST_LIMIT, Error, ListOptions, ListPage, Listing,
     MAX_LIST_LIMIT, Metadata, MetadataIndex, Object, PlaintextMetrics, PutOptions, StaleLock,
     Storage, StorageExt, SyncLevel,
-    crypto::{decrypt_meta, encrypt_meta, metadata_key::MekSlot},
+    crypto::{decrypt_meta, encrypt_meta, metadata_key::MekSlot, prf},
     storage::{
         format::{self, HEADER_SIZE, Header},
         locks::LockRegistry,
     },
 };
 
-/// UUID v5 namespace used to derive deterministic filenames from object keys.
-///
-/// This is the RFC 4122 URL namespace (`6ba7b811-9dad-11d1-80b4-00c04fd430c8`),
-/// chosen as a stable, well-known constant so the same key always maps to the
-/// same filename regardless of which process or host computes it.
-const Y2Q_NAMESPACE: Uuid = Uuid::from_bytes([
-    0x6b, 0xa7, 0xb8, 0x11, 0x9d, 0xad, 0x11, 0xd1, 0x80, 0xb4, 0x00, 0xc0, 0x4f, 0xd4, 0x30, 0xc8,
-]);
-
 /// A [`Storage`] backend that persists objects on a local filesystem.
 ///
 /// Objects are stored in a two-level hex-sharded directory tree rooted at
-/// `base_path`:
+/// `base_path`, with both the bucket directory and the object filename derived
+/// as keyed HMACs under the login-gated path key (so the tree leaks neither
+/// bucket names nor object-key existence to anyone without a login):
 ///
 /// ```text
-/// <base_path>/<bucket>/<xx>/<yy>/<uuid>.obj    — single-file object record
-/// <base_path>/<bucket>/<xx>/<yy>/<uuid>.lock   — ephemeral write-lock file
+/// <base_path>/<bucket_dir>/<xx>/<yy>/<id>.obj    — single-file object record
+/// <base_path>/<bucket_dir>/<xx>/<yy>/<id>.lock   — ephemeral write-lock file
 /// ```
 ///
 /// Each `.obj` file uses the shared [`crate::storage::format`] layout:
@@ -146,22 +138,70 @@ impl FilesystemStorage {
     }
 
     /// Canonical on-disk path for the single-file object record of
-    /// `(bucket, key)`: `<base>/<bucket>/<xx>/<yy>/<uuid>.obj`.
+    /// `(bucket, key)`: `<base>/<bucket_dir>/<xx>/<yy>/<id>.obj`, where
+    /// `bucket_dir` and `id` are keyed HMACs under the login-gated path key.
     ///
     /// Matches the path scheme used by [`crate::UringStorage`] so both
-    /// backends can read each other's files when sharing a `base_path`.
-    pub fn key_path(&self, bucket: &str, key: &str) -> PathBuf {
-        let id = Uuid::new_v5(&Y2Q_NAMESPACE, key.as_bytes());
-        let s = id.hyphenated().to_string();
-        let mut p = self
-            .base_path
-            .join(bucket)
-            .join(&s[0..2])
-            .join(&s[2..4])
-            .join(&s);
-        p.set_extension("obj");
-        p
+    /// backends can read each other's files when sharing a `base_path` and the
+    /// same deployment secret key. Errors if no login has installed the MEK
+    /// (and hence the path key) yet.
+    pub fn key_path(&self, bucket: &str, key: &str) -> Result<PathBuf, Error> {
+        let path_key = require_path_key(&self.mek)?;
+        Ok(obj_path_for(&self.base_path, &path_key, bucket, key))
     }
+}
+
+/// Lowercase-hex encode `bytes`.
+fn to_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
+/// Read the path key from `mek`, erroring if no session has installed it.
+///
+/// Object and bucket on-disk locations are keyed by the login-gated path key,
+/// so every path-building operation requires an active session — mirroring the
+/// MEK requirement for metadata encryption.
+pub(crate) fn require_path_key(mek: &MekSlot) -> Result<[u8; 32], Error> {
+    mek.path_key().ok_or_else(|| Error::InternalError {
+        bucket: String::new(),
+        key: String::new(),
+        operation: "path".to_owned(),
+        message: "path operation attempted without an installed MEK".to_owned(),
+    })
+}
+
+/// Keyed opaque directory name for `bucket`:
+/// `hex(HMAC-SHA256(path_key, "y2q-bucket\0" || len(bucket) || bucket))`.
+pub(crate) fn encode_bucket_dir(path_key: &[u8; 32], bucket: &str) -> String {
+    let mut buf = Vec::with_capacity(15 + bucket.len());
+    buf.extend_from_slice(b"y2q-bucket\0");
+    buf.extend_from_slice(&(bucket.len() as u32).to_be_bytes());
+    buf.extend_from_slice(bucket.as_bytes());
+    to_hex(&prf(path_key, &buf))
+}
+
+/// Keyed opaque object id (filename stem) for `(bucket, key)`:
+/// `hex(HMAC-SHA256(path_key, "y2q-object\0" || len(bucket)||bucket || len(key)||key))`.
+/// Including the bucket means identical keys in different buckets map to
+/// distinct ids.
+pub(crate) fn encode_object_id(path_key: &[u8; 32], bucket: &str, key: &str) -> String {
+    let mut buf = Vec::with_capacity(19 + bucket.len() + key.len());
+    buf.extend_from_slice(b"y2q-object\0");
+    for part in [bucket.as_bytes(), key.as_bytes()] {
+        buf.extend_from_slice(&(part.len() as u32).to_be_bytes());
+        buf.extend_from_slice(part);
+    }
+    to_hex(&prf(path_key, &buf))
+}
+
+/// Absolute on-disk directory for `bucket` under `base_path`.
+pub(crate) fn bucket_dir_path(base_path: &Path, path_key: &[u8; 32], bucket: &str) -> PathBuf {
+    base_path.join(encode_bucket_dir(path_key, bucket))
 }
 
 /// Reserved bucket names that conflict with the `/api/v1/*` admin namespace.
@@ -185,12 +225,18 @@ pub(crate) fn validate_bucket(bucket: &str) -> Result<(), Error> {
     Ok(())
 }
 
-/// Create the on-disk directory for `bucket`. Returns `true` if it was newly
-/// created, `false` if it already existed. Shared by both storage backends,
-/// which use an identical `<base>/<bucket>/...` layout.
-pub(crate) async fn create_bucket_impl(base_path: &Path, bucket: &str) -> Result<bool, Error> {
+/// Create the on-disk directory for `bucket` and register it in the encrypted
+/// index. Returns `true` if it was newly created, `false` if it already
+/// existed. Shared by both storage backends, which use an identical
+/// `<base>/<bucket_dir>/...` layout.
+pub(crate) async fn create_bucket_impl(
+    base_path: &Path,
+    index: &MetadataIndex,
+    path_key: &[u8; 32],
+    bucket: &str,
+) -> Result<bool, Error> {
     validate_bucket(bucket)?;
-    let dir = base_path.join(bucket);
+    let dir = bucket_dir_path(base_path, path_key, bucket);
     if tokio::fs::try_exists(&dir).await.unwrap_or(false) {
         return Ok(false);
     }
@@ -202,6 +248,9 @@ pub(crate) async fn create_bucket_impl(base_path: &Path, bucket: &str) -> Result
             operation: "create_bucket".to_owned(),
             message: e.to_string(),
         })?;
+    // Record the plaintext name in the encrypted index so empty buckets still
+    // list (the on-disk dir name is an opaque, irreversible HMAC).
+    index.register_bucket(bucket).await?;
     Ok(true)
 }
 
@@ -210,10 +259,11 @@ pub(crate) async fn create_bucket_impl(base_path: &Path, bucket: &str) -> Result
 pub(crate) async fn delete_bucket_impl(
     base_path: &Path,
     index: &MetadataIndex,
+    path_key: &[u8; 32],
     bucket: &str,
 ) -> Result<u64, Error> {
     validate_bucket(bucket)?;
-    let dir = base_path.join(bucket);
+    let dir = bucket_dir_path(base_path, path_key, bucket);
     let dir_exists = tokio::fs::try_exists(&dir).await.unwrap_or(false);
 
     let keys = index.list_all_keys().await?;
@@ -241,43 +291,41 @@ pub(crate) async fn delete_bucket_impl(
                 message: e.to_string(),
             })?;
     }
+    index.unregister_bucket(bucket).await?;
     Ok(removed)
 }
 
-/// Union the index-derived bucket list with on-disk bucket directories so that
-/// empty buckets (created via `create_bucket`, no objects yet) are still
-/// reported. Result is sorted and de-duplicated.
-pub(crate) async fn list_buckets_union(
-    base_path: &Path,
-    index: &MetadataIndex,
-) -> Result<Vec<String>, Error> {
+/// Union the bucket names that have objects (derived from the encrypted index)
+/// with the registry of explicitly-created buckets, so that empty buckets
+/// (created via `create_bucket`, no objects yet) are still reported. Result is
+/// sorted and de-duplicated.
+///
+/// The on-disk directory names are opaque keyed HMACs and cannot be decoded
+/// back to bucket names, so the encrypted index — not a `read_dir` — is the
+/// source of truth for bucket names.
+pub(crate) async fn list_buckets_union(index: &MetadataIndex) -> Result<Vec<String>, Error> {
     let mut buckets = index.list_buckets().await?;
-    if let Ok(mut entries) = tokio::fs::read_dir(base_path).await {
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            if entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false)
-                && let Some(name) = entry.file_name().to_str()
-                && validate_bucket(name).is_ok()
-            {
-                buckets.push(name.to_owned());
-            }
-        }
-    }
+    buckets.extend(index.list_registered_buckets().await?);
     buckets.sort();
     buckets.dedup();
     Ok(buckets)
 }
 
-/// Canonical `.obj` path for `(bucket, key)` rooted at `base_path`. Mirrors
+/// Canonical `.obj` path for `(bucket, key)` rooted at `base_path`, using the
+/// keyed opaque bucket directory and object id. Mirrors
 /// [`FilesystemStorage::key_path`] / the uring backend so the shared bucket and
 /// label helpers can locate records without a backend instance.
-pub(crate) fn obj_path_for(base_path: &Path, bucket: &str, key: &str) -> PathBuf {
-    let id = Uuid::new_v5(&Y2Q_NAMESPACE, key.as_bytes());
-    let s = id.hyphenated().to_string();
-    let mut p = base_path
-        .join(bucket)
-        .join(&s[0..2])
-        .join(&s[2..4])
-        .join(&s);
+pub(crate) fn obj_path_for(
+    base_path: &Path,
+    path_key: &[u8; 32],
+    bucket: &str,
+    key: &str,
+) -> PathBuf {
+    let id = encode_object_id(path_key, bucket, key);
+    let mut p = bucket_dir_path(base_path, path_key, bucket)
+        .join(&id[0..2])
+        .join(&id[2..4])
+        .join(&id);
     p.set_extension("obj");
     p
 }
@@ -292,6 +340,7 @@ pub(crate) async fn set_labels_impl(
     base_path: &Path,
     index: &MetadataIndex,
     mek: Option<&[u8; 32]>,
+    path_key: &[u8; 32],
     bucket: &str,
     key: &str,
     labels: std::collections::BTreeMap<String, String>,
@@ -299,7 +348,7 @@ pub(crate) async fn set_labels_impl(
     validate_bucket(bucket)?;
     validate_key(key)?;
 
-    let obj_path = obj_path_for(base_path, bucket, key);
+    let obj_path = obj_path_for(base_path, path_key, bucket, key);
     let bytes = match tokio::fs::read(&obj_path).await {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -399,16 +448,17 @@ pub(crate) async fn set_labels_impl(
 }
 
 /// Filename of the per-bucket JSON config sidecar, stored at the bucket root
-/// (`<base>/<bucket>/.y2q-bucket.json`). It is a plain file, not a sharded
+/// (`<base>/<bucket_dir>/.y2q-bucket.json`). It is a plain file, not a sharded
 /// `.obj`, so it never appears in object listings.
 const BUCKET_CONFIG_FILE: &str = ".y2q-bucket.json";
 
 pub(crate) async fn get_bucket_config_impl(
     base_path: &Path,
+    path_key: &[u8; 32],
     bucket: &str,
 ) -> Result<crate::BucketConfig, Error> {
     validate_bucket(bucket)?;
-    let path = base_path.join(bucket).join(BUCKET_CONFIG_FILE);
+    let path = bucket_dir_path(base_path, path_key, bucket).join(BUCKET_CONFIG_FILE);
     match tokio::fs::read(&path).await {
         Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| Error::InternalError {
             bucket: bucket.to_owned(),
@@ -428,11 +478,12 @@ pub(crate) async fn get_bucket_config_impl(
 
 pub(crate) async fn set_bucket_config_impl(
     base_path: &Path,
+    path_key: &[u8; 32],
     bucket: &str,
     config: &crate::BucketConfig,
 ) -> Result<(), Error> {
     validate_bucket(bucket)?;
-    let dir = base_path.join(bucket);
+    let dir = bucket_dir_path(base_path, path_key, bucket);
     tokio::fs::create_dir_all(&dir)
         .await
         .map_err(|e| Error::InternalError {
@@ -756,7 +807,7 @@ impl FilesystemStorage {
         validate_bucket(bucket)?;
         validate_key(key)?;
 
-        let obj_path = self.key_path(bucket, key);
+        let obj_path = self.key_path(bucket, key)?;
         let tmp_path = obj_path.with_extension("tmp");
 
         if let Some(parent) = obj_path.parent() {
@@ -836,7 +887,7 @@ impl Storage for FilesystemStorage {
             validate_bucket(bucket)?;
             validate_key(key)?;
 
-            let obj_path = self.key_path(bucket, key);
+            let obj_path = self.key_path(bucket, key)?;
             self.locks.check_not_locked(bucket, key)?;
 
             let mut file = match tokio::fs::File::open(&obj_path).await {
@@ -908,7 +959,7 @@ impl Storage for FilesystemStorage {
         validate_bucket(bucket)?;
         validate_key(key)?;
 
-        let obj_path = self.key_path(bucket, key);
+        let obj_path = self.key_path(bucket, key)?;
         self.locks.check_not_locked(bucket, key)?;
 
         let mut file = match tokio::fs::File::open(&obj_path).await {
@@ -987,7 +1038,7 @@ impl Storage for FilesystemStorage {
             validate_bucket(bucket)?;
             validate_key(key)?;
 
-            let obj_path = self.key_path(bucket, key);
+            let obj_path = self.key_path(bucket, key)?;
             let tmp_path = obj_path.with_extension("tmp");
 
             if let Some(parent) = obj_path.parent() {
@@ -1206,7 +1257,7 @@ impl Storage for FilesystemStorage {
             validate_bucket(bucket)?;
             validate_key(key)?;
 
-            let obj_path = self.key_path(bucket, key);
+            let obj_path = self.key_path(bucket, key)?;
             self.locks.check_not_locked(bucket, key)?;
 
             let mut file = match tokio::fs::File::open(&obj_path).await {
@@ -1290,10 +1341,12 @@ impl Storage for FilesystemStorage {
         let started = Instant::now();
         let result = async {
             self.locks.check_not_locked(bucket, key)?;
+            let path_key = require_path_key(&self.mek)?;
             set_labels_impl(
                 &self.base_path,
                 &self.index,
                 self.mek.mek().as_ref(),
+                &path_key,
                 bucket,
                 key,
                 labels,
@@ -1315,7 +1368,7 @@ impl Storage for FilesystemStorage {
             validate_bucket(bucket)?;
             validate_key(key)?;
 
-            let obj_path = self.key_path(bucket, key);
+            let obj_path = self.key_path(bucket, key)?;
             self.locks.check_not_locked(bucket, key)?;
 
             if !tokio::fs::try_exists(&obj_path).await.unwrap_or(false) {
@@ -1346,19 +1399,22 @@ impl Storage for FilesystemStorage {
 
 impl Listing for FilesystemStorage {
     async fn list_buckets(&self) -> Result<Vec<String>, Error> {
-        list_buckets_union(&self.base_path, &self.index).await
+        list_buckets_union(&self.index).await
     }
 
     async fn create_bucket(&self, bucket: &str) -> Result<bool, Error> {
-        create_bucket_impl(&self.base_path, bucket).await
+        let path_key = require_path_key(&self.mek)?;
+        create_bucket_impl(&self.base_path, &self.index, &path_key, bucket).await
     }
 
     async fn delete_bucket(&self, bucket: &str) -> Result<u64, Error> {
-        delete_bucket_impl(&self.base_path, &self.index, bucket).await
+        let path_key = require_path_key(&self.mek)?;
+        delete_bucket_impl(&self.base_path, &self.index, &path_key, bucket).await
     }
 
     async fn get_bucket_config(&self, bucket: &str) -> Result<crate::BucketConfig, Error> {
-        get_bucket_config_impl(&self.base_path, bucket).await
+        let path_key = require_path_key(&self.mek)?;
+        get_bucket_config_impl(&self.base_path, &path_key, bucket).await
     }
 
     async fn set_bucket_config(
@@ -1366,7 +1422,8 @@ impl Listing for FilesystemStorage {
         bucket: &str,
         config: &crate::BucketConfig,
     ) -> Result<(), Error> {
-        set_bucket_config_impl(&self.base_path, bucket, config).await
+        let path_key = require_path_key(&self.mek)?;
+        set_bucket_config_impl(&self.base_path, &path_key, bucket, config).await
     }
 
     async fn bucket_usage(&self, bucket: &str) -> Result<u64, Error> {
@@ -1534,22 +1591,17 @@ async fn run_rebuild(
     Ok(())
 }
 
-/// Recursively gather every `*.obj` file under `base_path/<bucket>/xx/yy/`.
+/// Recursively gather every `*.obj` file under `base_path/<bucket_dir>/xx/yy/`.
 ///
-/// Bucket directories whose name fails [`validate_bucket`] are skipped, which
-/// excludes reserved entries like `_y2q_index.redb`.
+/// Bucket directory names are opaque keyed HMACs, so they cannot be filtered by
+/// name; every subdirectory is walked and only `*.obj` files are collected.
+/// The true `(bucket, key)` for each record is read from its (encrypted)
+/// embedded metadata by the caller, not inferred from the path.
 async fn collect_obj_files(base_path: &Path) -> std::io::Result<Vec<PathBuf>> {
     let mut out = Vec::new();
     let mut buckets = tokio::fs::read_dir(base_path).await?;
     while let Some(b_entry) = buckets.next_entry().await? {
         if !b_entry.file_type().await?.is_dir() {
-            continue;
-        }
-        let bucket_name = match b_entry.file_name().into_string() {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-        if validate_bucket(&bucket_name).is_err() {
             continue;
         }
         let bucket_path = b_entry.path();
@@ -1584,6 +1636,12 @@ mod tests {
 
     /// Stand-in for the login-derived MEK; metadata writes require one.
     const TEST_MEK: [u8; 32] = [7u8; 32];
+
+    /// The path key derived from [`TEST_MEK`] — used to recompute expected
+    /// opaque on-disk names in tests.
+    fn test_path_key() -> [u8; 32] {
+        crate::crypto::derive_path_key(&TEST_MEK)
+    }
 
     fn make_storage() -> (FilesystemStorage, TempDir) {
         let dir = TempDir::new().unwrap();
@@ -1622,6 +1680,74 @@ mod tests {
         .unwrap();
         let got = s.get("bucket1", "my-key").await.unwrap();
         assert_eq!(&got[..], b"hello world");
+    }
+
+    #[tokio::test]
+    async fn on_disk_path_is_opaque_and_keyed() {
+        let (s, dir) = make_storage();
+        let path = s.key_path("photos", "vacation/cliff.jpg").unwrap();
+
+        // Neither the bucket name nor the key appears anywhere in the path.
+        let as_str = path.to_string_lossy();
+        assert!(!as_str.contains("photos"), "bucket name leaked: {as_str}");
+        assert!(!as_str.contains("vacation"), "key leaked: {as_str}");
+        assert!(!as_str.contains("cliff"), "key leaked: {as_str}");
+
+        // The bucket directory is a 64-char lowercase-hex HMAC, not the plaintext.
+        let base = std::fs::canonicalize(dir.path().join("data")).unwrap();
+        let bucket_dir = path
+            .strip_prefix(&base)
+            .unwrap()
+            .components()
+            .next()
+            .unwrap()
+            .as_os_str()
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(bucket_dir.len(), 64);
+        assert!(bucket_dir.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert_eq!(bucket_dir, encode_bucket_dir(&test_path_key(), "photos"));
+    }
+
+    #[tokio::test]
+    async fn on_disk_path_changes_with_a_different_mek() {
+        let (s1, _d1) = make_storage();
+        let p1 = s1.key_path("b", "k").unwrap();
+
+        let dir = TempDir::new().unwrap();
+        let s2 =
+            FilesystemStorage::new(dir.path().join("data"), dir.path().join("i.redb")).unwrap();
+        s2.install_mek([9u8; 32]);
+        let p2 = s2.key_path("b", "k").unwrap();
+
+        // Same (bucket, key) under a different deployment key yields a different
+        // opaque path: the layout is keyed, not a public function of the key.
+        assert_ne!(
+            p1.file_name().unwrap(),
+            p2.file_name().unwrap(),
+            "object id must depend on the path key"
+        );
+    }
+
+    #[tokio::test]
+    async fn path_ops_error_without_an_installed_mek() {
+        let dir = TempDir::new().unwrap();
+        let s = FilesystemStorage::new(dir.path().join("data"), dir.path().join("i.redb")).unwrap();
+        // No install_mek: the path key is unavailable, so path-building errors.
+        assert!(s.key_path("b", "k").is_err());
+    }
+
+    #[tokio::test]
+    async fn empty_created_bucket_lists_via_registry() {
+        let (s, _dir) = make_storage();
+        assert!(s.create_bucket("empty-one").await.unwrap());
+        // No objects, but the explicitly-created bucket still lists.
+        let buckets = s.list_buckets().await.unwrap();
+        assert!(buckets.contains(&"empty-one".to_owned()));
+        // Deleting it removes it from the listing.
+        s.delete_bucket("empty-one").await.unwrap();
+        let buckets = s.list_buckets().await.unwrap();
+        assert!(!buckets.contains(&"empty-one".to_owned()));
     }
 
     #[tokio::test]
@@ -1683,7 +1809,7 @@ mod tests {
         s.delete("b", "k").await.unwrap();
         let err = s.get("b", "k").await.unwrap_err();
         assert!(matches!(err, crate::Error::NotFound { .. }));
-        assert!(!s.key_path("b", "k").exists());
+        assert!(!s.key_path("b", "k").unwrap().exists());
     }
 
     #[tokio::test]
@@ -2222,7 +2348,7 @@ mod tests {
             .unwrap();
 
         // Remove the ghost's .obj file but leave its index entry.
-        tokio::fs::remove_file(s.key_path("b", "ghost"))
+        tokio::fs::remove_file(s.key_path("b", "ghost").unwrap())
             .await
             .unwrap();
 
@@ -2307,7 +2433,7 @@ mod tests {
             .await
             .unwrap();
 
-        let obj_path = s.key_path("b", "k");
+        let obj_path = s.key_path("b", "k").unwrap();
         assert_eq!(obj_path.extension().and_then(|e| e.to_str()), Some("obj"));
 
         let bytes = std::fs::read(&obj_path).unwrap();

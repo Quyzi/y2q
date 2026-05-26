@@ -26,7 +26,8 @@ pub use kdf::{Argon2Params, WrappedSk, default_argon2_params};
 pub use keys::{DecryptedKeystore, Keystore};
 pub use keystore::{KeystoreFiles, PubkeyFile};
 pub use metadata_key::{
-    decrypt_meta, derive_index_file_key, derive_index_key, derive_mek, encrypt_meta, prf,
+    decrypt_meta, derive_index_file_key, derive_index_key, derive_mek, derive_path_key,
+    encrypt_meta, prf,
 };
 pub use user_store::{UserRecord, UserStore, UserSummary};
 

@@ -76,6 +76,19 @@ pub async fn handle(
                 .try_into_mut()
                 .unwrap_or_else(|b| BytesMut::from(b.as_ref()));
             let plaintext = cipher::decrypt_after_get(&auth.keystore, &bucket, &key, buf)?;
+            // v2 envelopes are zero-padded to a Padmé boundary to hide the exact
+            // object size, so the decrypted plaintext may carry trailing pad
+            // bytes. Trim to the true size recorded in the (encrypted) metadata.
+            let size = storage
+                .describe(&bucket, &key)
+                .await
+                .map_err(AppError::from)?
+                .size as usize;
+            let plaintext = if plaintext.len() > size {
+                plaintext.slice(0..size)
+            } else {
+                plaintext
+            };
             return Ok(HttpResponse::Ok()
                 .content_type("application/octet-stream")
                 .body(plaintext));
