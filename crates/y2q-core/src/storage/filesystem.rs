@@ -343,7 +343,7 @@ pub(crate) async fn set_labels_impl(
     path_key: &[u8; 32],
     bucket: &str,
     key: &str,
-    labels: std::collections::BTreeMap<String, String>,
+    labels: crate::LabelSet,
 ) -> Result<(), Error> {
     validate_bucket(bucket)?;
     validate_key(key)?;
@@ -1336,7 +1336,7 @@ impl Storage for FilesystemStorage {
         &self,
         bucket: &str,
         key: &str,
-        labels: std::collections::BTreeMap<String, String>,
+        labels: crate::LabelSet,
     ) -> Result<(), Error> {
         let started = Instant::now();
         let result = async {
@@ -1631,7 +1631,6 @@ async fn collect_obj_files(base_path: &Path) -> std::io::Result<Vec<PathBuf>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
     use tempfile::TempDir;
 
     /// Stand-in for the login-derived MEK; metadata writes require one.
@@ -1657,10 +1656,10 @@ mod tests {
     }
 
     fn opts(labels: &[(&str, &str)]) -> PutOptions {
-        let mut m = BTreeMap::new();
-        for (k, v) in labels {
-            m.insert((*k).to_owned(), (*v).to_owned());
-        }
+        let m: crate::LabelSet = labels
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect();
         PutOptions {
             labels: m,
             ..Default::default()
@@ -1864,8 +1863,11 @@ mod tests {
         .await
         .unwrap();
         let meta = s.describe("b", "k").await.unwrap();
-        assert_eq!(meta.labels.get("env").map(String::as_str), Some("prod"));
-        assert_eq!(meta.labels.get("owner").map(String::as_str), Some("alice"));
+        assert!(meta.labels.contains(&("env".to_owned(), "prod".to_owned())));
+        assert!(
+            meta.labels
+                .contains(&("owner".to_owned(), "alice".to_owned()))
+        );
     }
 
     #[tokio::test]
@@ -2101,9 +2103,12 @@ mod tests {
         .await
         .unwrap();
 
-        let mut new_labels = std::collections::BTreeMap::new();
-        new_labels.insert("env".to_owned(), "staging".to_owned());
-        new_labels.insert("team".to_owned(), "core".to_owned());
+        let new_labels: crate::LabelSet = [
+            ("env".to_owned(), "staging".to_owned()),
+            ("team".to_owned(), "core".to_owned()),
+        ]
+        .into_iter()
+        .collect();
         s.set_labels("b", "k", new_labels.clone()).await.unwrap();
 
         // Data unchanged.
@@ -2157,7 +2162,7 @@ mod tests {
     async fn set_labels_missing_object_is_not_found() {
         let (s, _dir) = make_storage();
         assert!(
-            s.set_labels("b", "ghost", std::collections::BTreeMap::new())
+            s.set_labels("b", "ghost", crate::LabelSet::new())
                 .await
                 .is_err()
         );

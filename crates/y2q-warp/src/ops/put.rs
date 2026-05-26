@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use y2q_client::Y2qClient;
@@ -23,7 +23,7 @@ pub async fn put_op(
     let start_ns = wall_ns();
     let reader = BoundedRepeatReader::new(size);
     let result = client
-        .put_from_reader(bucket, key, reader, Some(size), &BTreeMap::new(), None)
+        .put_from_reader(bucket, key, reader, Some(size), &BTreeSet::new(), None)
         .await;
     let end_ns = wall_ns();
 

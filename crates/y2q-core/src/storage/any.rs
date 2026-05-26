@@ -95,7 +95,7 @@ impl Storage for AnyStorage {
         &self,
         bucket: &str,
         key: &str,
-        labels: std::collections::BTreeMap<String, String>,
+        labels: crate::LabelSet,
     ) -> Result<(), Error> {
         match self {
             Self::Filesystem(s) => s.set_labels(bucket, key, labels).await,

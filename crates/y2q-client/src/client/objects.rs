@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 
 use futures::TryStreamExt;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -65,7 +65,7 @@ impl Y2qClient {
         key: &str,
         reader: R,
         content_length: Option<u64>,
-        labels: &BTreeMap<String, String>,
+        labels: &BTreeSet<(String, String)>,
         sync: Option<&str>,
     ) -> Result<bool, ClientError>
     where
@@ -107,8 +107,8 @@ impl Y2qClient {
         bucket: &str,
         key: &str,
         op: &str,
-        labels: &BTreeMap<String, String>,
-    ) -> Result<BTreeMap<String, String>, ClientError> {
+        labels: &BTreeSet<(String, String)>,
+    ) -> Result<BTreeSet<(String, String)>, ClientError> {
         let url = self.url(&format!("{bucket}/{key}"));
         let mut rb = self.authed(self.inner.patch(url)).query(&[("op", op)]);
         for (k, v) in labels {
@@ -117,11 +117,19 @@ impl Y2qClient {
         let resp = rb.send().await?;
         let resp = Self::check_status(resp).await?;
         let body = resp.json::<serde_json::Value>().await?;
+        // `labels` is an array of `[name, value]` pairs.
         let out = body["labels"]
-            .as_object()
-            .map(|m| {
-                m.iter()
-                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_owned())))
+            .as_array()
+            .map(|pairs| {
+                pairs
+                    .iter()
+                    .filter_map(|p| {
+                        let a = p.as_array()?;
+                        Some((
+                            a.first()?.as_str()?.to_owned(),
+                            a.get(1)?.as_str()?.to_owned(),
+                        ))
+                    })
                     .collect()
             })
             .unwrap_or_default();
@@ -144,7 +152,9 @@ impl Y2qClient {
             hdr(h, name)?.parse().ok()
         }
 
-        let mut labels = BTreeMap::new();
+        // A name may repeat across header lines; reqwest yields each occurrence,
+        // so every distinct (name, value) pair is collected.
+        let mut labels = BTreeSet::new();
         for (name, value) in headers {
             let name_str = name.as_str();
             if let Some(label) = name_str.strip_prefix("x-y2q-").filter(|s| {
@@ -161,7 +171,7 @@ impl Y2qClient {
                 )
             }) && let Ok(v) = value.to_str()
             {
-                labels.insert(label.to_owned(), v.to_owned());
+                labels.insert((label.to_owned(), v.to_owned()));
             }
         }
 

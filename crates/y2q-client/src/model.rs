@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 
@@ -53,7 +53,7 @@ pub struct ObjectHead {
     pub created: u64,
     pub modified: u64,
     pub checksum_gxhash: String,
-    pub labels: BTreeMap<String, String>,
+    pub labels: BTreeSet<(String, String)>,
     pub cipher_size: Option<u64>,
     pub cipher_sha256: Option<String>,
     pub kem_alg: Option<String>,
@@ -73,7 +73,7 @@ pub struct MetadataView {
     pub key: String,
     pub disk_path: String,
     pub url_path: String,
-    pub labels: BTreeMap<String, String>,
+    pub labels: BTreeSet<(String, String)>,
     pub cipher_size: Option<u64>,
     pub cipher_sha256: Option<String>,
     pub kem_alg: Option<String>,

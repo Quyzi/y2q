@@ -8,7 +8,12 @@
 use bytes::Bytes;
 use core::range::RangeInclusive;
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, ops::Deref, path::PathBuf, time::SystemTime};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    ops::Deref,
+    path::PathBuf,
+    time::SystemTime,
+};
 
 pub mod crypto;
 /// Label search query language: a small boolean grammar over object labels.
@@ -58,6 +63,33 @@ impl Deref for Object {
     }
 }
 
+/// A set of `(name, value)` label pairs attached to an object.
+///
+/// Stored as a set of pairs rather than a name-keyed map so that an object may
+/// carry several labels that share a name (e.g. two `env` labels). Exact
+/// `(name, value)` duplicates collapse; differing values under one name do not.
+pub type LabelSet = BTreeSet<(String, String)>;
+
+/// Deserialize a [`LabelSet`], accepting both the current array-of-pairs form
+/// (`[["env","prod"],["env","stage"]]`) and the legacy name-keyed object form
+/// (`{"env":"prod"}`) written before labels allowed duplicate names. Legacy
+/// objects on disk therefore keep deserializing without a migration pass.
+fn de_label_set<'de, D>(de: D) -> Result<LabelSet, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Repr {
+        Pairs(Vec<(String, String)>),
+        Map(BTreeMap<String, String>),
+    }
+    Ok(match Repr::deserialize(de)? {
+        Repr::Pairs(v) => v.into_iter().collect(),
+        Repr::Map(m) => m.into_iter().collect(),
+    })
+}
+
 /// Descriptive information about a stored object.
 ///
 /// Timestamps are nanoseconds since the Unix epoch. The plaintext checksum
@@ -83,9 +115,10 @@ pub struct Metadata {
     /// Logical URL path: `"<bucket>/<key>"`.
     pub url_path: String,
     /// Arbitrary user-supplied labels (from `X-Y2Q-<label>` request headers on PUT).
-    /// Names are stored lowercased.
-    #[serde(default)]
-    pub labels: BTreeMap<String, String>,
+    /// Names are stored lowercased. A name may appear more than once with
+    /// different values.
+    #[serde(default, deserialize_with = "de_label_set")]
+    pub labels: LabelSet,
     /// Total bytes on disk for the encrypted envelope, when encryption is
     /// enabled. `None` for legacy plaintext objects written before the
     /// crypto layer was wired in.
@@ -140,8 +173,9 @@ pub enum SyncLevel {
 /// without breaking the trait signature.
 #[derive(Debug, Default, Clone)]
 pub struct PutOptions {
-    /// User-supplied labels to attach to the object.
-    pub labels: BTreeMap<String, String>,
+    /// User-supplied labels to attach to the object. A name may appear more
+    /// than once with different values.
+    pub labels: LabelSet,
     /// Durability guarantee required before the PUT returns success.
     pub sync: SyncLevel,
     /// When the daemon performs encryption ahead of the backend, the
@@ -469,12 +503,7 @@ pub trait Storage {
     /// Replace the user labels on an existing object, preserving its data and
     /// all envelope/cipher metadata. Updates `modified`. Returns
     /// [`Error::NotFound`] if no object exists at that address.
-    async fn set_labels(
-        &self,
-        bucket: &str,
-        key: &str,
-        labels: std::collections::BTreeMap<String, String>,
-    ) -> Result<(), Error>;
+    async fn set_labels(&self, bucket: &str, key: &str, labels: LabelSet) -> Result<(), Error>;
 }
 
 /// Per-bucket configuration persisted as a JSON sidecar in the bucket

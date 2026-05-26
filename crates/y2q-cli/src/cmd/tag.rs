@@ -1,7 +1,7 @@
 //! `tag` and `attribute` — mutate object labels. Both map to y2q's single
 //! label namespace (tags and attributes are the same store).
 
-use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 
 use crate::cli::{AttributeCmd, TagCmd};
 use crate::cmd::objects::make_client;
@@ -22,8 +22,8 @@ fn split_target(target: &str) -> Result<(RemotePath, String, String), CliError> 
     Ok((remote, bucket, key))
 }
 
-fn parse_kv(pairs: &[String]) -> Result<BTreeMap<String, String>, CliError> {
-    let mut map = BTreeMap::new();
+fn parse_kv(pairs: &[String]) -> Result<BTreeSet<(String, String)>, CliError> {
+    let mut set = BTreeSet::new();
     for raw in pairs {
         let (k, v) = raw
             .split_once('=')
@@ -31,9 +31,10 @@ fn parse_kv(pairs: &[String]) -> Result<BTreeMap<String, String>, CliError> {
         if k.is_empty() {
             return Err(CliError::Other("label key must not be empty".into()));
         }
-        map.insert(k.to_lowercase(), v.to_owned());
+        // A name may be given more than once with different values.
+        set.insert((k.to_lowercase(), v.to_owned()));
     }
-    Ok(map)
+    Ok(set)
 }
 
 async fn set(target: &str, pairs: &[String], mode: OutputMode) -> Result<(), CliError> {
@@ -67,8 +68,9 @@ async fn list(target: &str, mode: OutputMode) -> Result<(), CliError> {
 
 async fn remove(target: &str, keys: &[String], mode: OutputMode) -> Result<(), CliError> {
     let (remote, bucket, key) = split_target(target)?;
-    // Empty map with op=remove clears all; named keys remove just those.
-    let labels: BTreeMap<String, String> = keys
+    // Empty set with op=remove clears all; named keys remove every value of
+    // those names (the value carried here is ignored server-side).
+    let labels: BTreeSet<(String, String)> = keys
         .iter()
         .map(|k| (k.to_lowercase(), String::new()))
         .collect();

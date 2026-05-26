@@ -517,7 +517,7 @@ impl Storage for UringStorage {
         &self,
         bucket: &str,
         key: &str,
-        labels: std::collections::BTreeMap<String, String>,
+        labels: crate::LabelSet,
     ) -> Result<(), Error> {
         let started = Instant::now();
         // Label-only metadata rewrite; uses the shared tokio-fs helper rather
@@ -838,7 +838,6 @@ mod tests {
     use super::*;
     use crate::PutOptions;
     use bytes::Bytes;
-    use std::collections::BTreeMap;
     use tempfile::TempDir;
 
     /// Stand-in for the login-derived MEK; metadata writes require one.
@@ -921,8 +920,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let storage = make_storage(&dir, 1);
         let body = vec![7u8; 4096];
-        let mut labels = BTreeMap::new();
-        labels.insert("env".to_owned(), "prod".to_owned());
+        let labels: crate::LabelSet = [("env".to_owned(), "prod".to_owned())]
+            .into_iter()
+            .collect();
         storage
             .put(
                 "b",
@@ -939,7 +939,7 @@ mod tests {
         assert_eq!(meta.size, 4096);
         assert_eq!(meta.bucket, "b");
         assert_eq!(meta.key, "k");
-        assert_eq!(meta.labels.get("env"), Some(&"prod".to_owned()));
+        assert!(meta.labels.contains(&("env".to_owned(), "prod".to_owned())));
         assert!(!meta.checksum_gxhash.is_empty());
     }
 

@@ -12,7 +12,7 @@
 //! ```
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
+use std::{path::PathBuf, sync::Arc};
 use tempfile::TempDir;
 use tokio::runtime::Runtime;
 use y2q_core::{Metadata, MetadataIndex, SyncLevel};
@@ -27,7 +27,7 @@ fn make_meta(bucket: &str, key: &str) -> Metadata {
         key: key.to_owned(),
         disk_path: PathBuf::from("/tmp/dummy"),
         url_path: format!("{bucket}/{key}"),
-        labels: BTreeMap::new(),
+        labels: Default::default(),
         cipher_size: None,
         cipher_sha256: None,
         kem_alg: None,

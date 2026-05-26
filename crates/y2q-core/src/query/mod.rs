@@ -21,23 +21,24 @@
 //! code). The example is instead verified by the `doc_example` unit test below.
 //!
 //! ```text
-//! use std::collections::BTreeMap;
-//! use y2q_core::LabelQuery;
+//! use y2q_core::{LabelQuery, LabelSet};
 //!
 //! let q = LabelQuery::parse(r#"env == prod and (tier =~ "web.*" or not region $= -dev)"#).unwrap();
-//! let mut labels = BTreeMap::new();
-//! labels.insert("env".to_owned(), "prod".to_owned());
-//! labels.insert("tier".to_owned(), "web1".to_owned());
-//! labels.insert("region".to_owned(), "us-east".to_owned());
+//! let labels: LabelSet = [
+//!     ("env".to_owned(), "prod".to_owned()),
+//!     ("tier".to_owned(), "web1".to_owned()),
+//!     ("region".to_owned(), "us-east".to_owned()),
+//! ]
+//! .into_iter()
+//! .collect();
 //! assert!(q.matches(&labels));
 //! ```
 
-use crate::Error;
+use crate::{Error, LabelSet};
 use pest::Parser;
 use pest::iterators::{Pair, Pairs};
 use pest::pratt_parser::{Assoc, Op, PrattParser};
 use pest_derive::Parser;
-use std::collections::BTreeMap;
 use std::sync::LazyLock;
 
 #[derive(Parser)]
@@ -108,18 +109,26 @@ impl LabelQuery {
     }
 
     /// Evaluate this query against an object's labels.
-    pub fn matches(&self, labels: &BTreeMap<String, String>) -> bool {
+    ///
+    /// A name may carry several values. A positive condition (`==`, `=~`, `^=`,
+    /// `$=`) holds when *any* value under `name` satisfies it. `!=` holds when
+    /// *no* value under `name` equals the operand - so it is also true when the
+    /// label is absent, matching the single-value semantics.
+    pub fn matches(&self, labels: &LabelSet) -> bool {
         match self {
             LabelQuery::And(a, b) => a.matches(labels) && b.matches(labels),
             LabelQuery::Or(a, b) => a.matches(labels) || b.matches(labels),
             LabelQuery::Not(inner) => !inner.matches(labels),
-            LabelQuery::Cond { name, op } => match op {
-                MatchOp::Ne(v) => labels.get(name).map(|x| x != v).unwrap_or(true),
-                MatchOp::Eq(v) => labels.get(name).is_some_and(|x| x == v),
-                MatchOp::Regex(re) => labels.get(name).is_some_and(|x| re.is_match(x)),
-                MatchOp::Prefix(v) => labels.get(name).is_some_and(|x| x.starts_with(v)),
-                MatchOp::Suffix(v) => labels.get(name).is_some_and(|x| x.ends_with(v)),
-            },
+            LabelQuery::Cond { name, op } => {
+                let mut values = labels.iter().filter(|(n, _)| n == name).map(|(_, v)| v);
+                match op {
+                    MatchOp::Ne(v) => !values.any(|x| x == v),
+                    MatchOp::Eq(v) => values.any(|x| x == v),
+                    MatchOp::Regex(re) => values.any(|x| re.is_match(x)),
+                    MatchOp::Prefix(v) => values.any(|x| x.starts_with(v)),
+                    MatchOp::Suffix(v) => values.any(|x| x.ends_with(v)),
+                }
+            }
         }
     }
 }
@@ -204,7 +213,7 @@ fn value_str(pair: Pair<Rule>) -> String {
 mod tests {
     use super::*;
 
-    fn labels(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+    fn labels(pairs: &[(&str, &str)]) -> LabelSet {
         pairs
             .iter()
             .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
@@ -223,6 +232,24 @@ mod tests {
         assert!(q.matches(&labels(&[("env", "dev")])));
         // Missing label: inequality holds.
         assert!(q.matches(&labels(&[])));
+    }
+
+    #[test]
+    fn multi_value_same_name() {
+        // Two values share the name `env`. `==` matches if any value equals.
+        let env_both = labels(&[("env", "prod"), ("env", "stage")]);
+
+        assert!(LabelQuery::parse("env == prod").unwrap().matches(&env_both));
+        assert!(
+            LabelQuery::parse("env == stage")
+                .unwrap()
+                .matches(&env_both)
+        );
+        assert!(!LabelQuery::parse("env == dev").unwrap().matches(&env_both));
+
+        // `!=` is true only when no value equals the operand.
+        assert!(!LabelQuery::parse("env != prod").unwrap().matches(&env_both));
+        assert!(LabelQuery::parse("env != dev").unwrap().matches(&env_both));
     }
 
     #[test]

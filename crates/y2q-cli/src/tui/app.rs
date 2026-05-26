@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
@@ -1413,7 +1413,7 @@ impl App {
         bucket: String,
         key: String,
         op: &'static str,
-        labels: BTreeMap<String, String>,
+        labels: BTreeSet<(String, String)>,
     ) {
         let config = self.config.clone();
         let tokens_path = default_tokens_path().unwrap_or_default();
@@ -1489,9 +1489,9 @@ impl App {
             }
             KeyCode::Char('d') => {
                 if let Some((k, _)) = labels.get(selected).cloned() {
-                    let mut map = BTreeMap::new();
-                    map.insert(k, String::new());
-                    self.spawn_label_mutation(alias, bucket, okey, "remove", map);
+                    let mut set = BTreeSet::new();
+                    set.insert((k, String::new()));
+                    self.spawn_label_mutation(alias, bucket, okey, "remove", set);
                 }
             }
             _ => {}
@@ -2596,9 +2596,9 @@ impl App {
                     self.mode = Mode::Error("label key must not be empty".into());
                     return;
                 }
-                let mut map = BTreeMap::new();
-                map.insert(k.to_lowercase(), v.to_owned());
-                self.spawn_label_mutation(alias, bucket, key, "set", map);
+                let mut set = BTreeSet::new();
+                set.insert((k.to_lowercase(), v.to_owned()));
+                self.spawn_label_mutation(alias, bucket, key, "set", set);
             }
             InputAction::SetQuota { alias, bucket } => {
                 match crate::ops::buckets::parse_size(value.trim()) {
@@ -2843,8 +2843,8 @@ mod tests {
     }
 
     fn head_full() -> ObjectHead {
-        let mut labels = std::collections::BTreeMap::new();
-        labels.insert("env".into(), "prod".into());
+        let mut labels = std::collections::BTreeSet::new();
+        labels.insert(("env".to_owned(), "prod".to_owned()));
         ObjectHead {
             size: 2048,
             created: 1,

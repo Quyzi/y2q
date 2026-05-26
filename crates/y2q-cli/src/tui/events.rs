@@ -72,7 +72,7 @@ pub enum Event {
         alias: String,
         bucket: String,
         key: String,
-        labels: std::collections::BTreeMap<String, String>,
+        labels: std::collections::BTreeSet<(String, String)>,
     },
     /// A bucket's configuration was fetched; opens the config editor.
     BucketConfigLoaded {
