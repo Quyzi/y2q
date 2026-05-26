@@ -144,7 +144,14 @@ pub async fn login(
     let not_found = record.is_none();
     let result = match record {
         Some(rec) => attempt_unwrap(rec, password.clone()).await,
-        None => Err(AuthError::InvalidCredentials),
+        None => {
+            // Run the Argon2id unwrap against a throwaway record so an unknown
+            // username costs the same KDF work as a wrong password — otherwise
+            // login response time is a username-existence oracle. The result is
+            // discarded; this branch always reports invalid credentials.
+            let _ = attempt_unwrap(state.dummy_record.clone(), password.clone()).await;
+            Err(AuthError::InvalidCredentials)
+        }
     };
 
     match result {

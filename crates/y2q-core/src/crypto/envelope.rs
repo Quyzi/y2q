@@ -103,6 +103,30 @@ pub const KEM_ALG_NAME: &str = "ml-kem-768";
 /// Identifying string written into [`crate::Metadata::aead_alg`].
 pub const AEAD_ALG_NAME: &str = "aes-256-gcm";
 
+/// Padmé-padded length for a plaintext of `l` bytes.
+///
+/// Padmé (Nikitin et al., "Reducing Metadata Leakage from Encrypted Files…",
+/// PETS 2019) rounds `l` up so that the padded size leaks at most O(log log l)
+/// bits about the true size, with overhead bounded below ~12%. The on-disk
+/// `plaintext_len` / container `data_len` fields therefore reveal only a coarse
+/// bucket, not the exact object size. The true size is kept in the encrypted
+/// metadata sidecar and used to trim the decrypted plaintext on read.
+pub fn padme_len(l: u64) -> u64 {
+    if l < 2 {
+        return l;
+    }
+    // e = floor(log2 l)  (>= 1 for l >= 2)
+    let e: u32 = 63 - l.leading_zeros();
+    // s = floor(log2 e) + 1
+    let s: u32 = (31 - e.leading_zeros()) + 1;
+    if e <= s {
+        return l;
+    }
+    let last_bits = e - s;
+    let mask: u64 = (1u64 << last_bits) - 1;
+    l.saturating_add(mask) & !mask
+}
+
 /// Summary of a successful encryption, returned alongside the ciphertext so
 /// the caller can persist these fields in the object's metadata sidecar.
 #[derive(Debug, Clone)]
@@ -634,9 +658,30 @@ impl EncryptSession {
     pub async fn finish(
         mut self,
     ) -> Result<(crate::storage::streaming_sink::StreamingSink, EnvelopeInfo), CryptoError> {
+        // Zero-pad up to the Padmé boundary to hide the exact object size. The
+        // padding is appended to the still-unflushed tail buffer (and beyond),
+        // flushing full chunks as it fills so that — as the chunk format
+        // requires — only the final chunk is shorter than `chunk_size`. The
+        // cleartext `plaintext_len` therefore becomes the padded length; the
+        // true size lives only in the encrypted metadata sidecar and trims the
+        // plaintext on read.
+        let real_total = self.plaintext_total + self.buf.len() as u64;
+        let target = padme_len(real_total);
+        let mut pad_remaining = target - real_total;
+        while pad_remaining > 0 {
+            let space = self.chunk_size - self.buf.len();
+            let take = (space as u64).min(pad_remaining) as usize;
+            self.buf.resize(self.buf.len() + take, 0);
+            pad_remaining -= take as u64;
+            if self.buf.len() == self.chunk_size {
+                self.flush_chunk().await?;
+            }
+        }
+        // Flush the final (possibly partial) chunk of real tail + padding.
         if !self.buf.is_empty() {
             self.flush_chunk().await?;
         }
+
         let cipher_size = self.bytes_written;
 
         // Patch plaintext_len at its position within the v2 envelope.
@@ -911,7 +956,63 @@ mod tests {
         let env = read_file(file).await;
         assert!(looks_encrypted(&env));
         let recovered = decrypt(sk.as_bytes(), &env).unwrap();
-        assert_eq!(recovered, pt);
+        // The envelope zero-pads to a Padmé boundary to hide the exact size; the
+        // higher layer trims to the true size from metadata. The recovered
+        // plaintext therefore carries the original bytes followed by zero pad.
+        assert_eq!(recovered.len() as u64, padme_len(pt.len() as u64));
+        assert_eq!(&recovered[..pt.len()], pt);
+        assert!(recovered[pt.len()..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn padme_len_never_shrinks_and_is_bounded() {
+        for l in [0u64, 1, 2, 3, 19, 1000, 1 << 20, (1 << 20) + 1, 12_345_678] {
+            let p = padme_len(l);
+            assert!(p >= l, "padme({l}) = {p} shrank");
+            // Padmé overhead is bounded well under ~12%.
+            if l > 0 {
+                assert!(
+                    p <= l + l / 8 + 1,
+                    "padme({l}) = {p} exceeds the ~12% overhead bound"
+                );
+            }
+        }
+        // Powers of two and their multiples by the bucket size are unchanged.
+        assert_eq!(padme_len(0), 0);
+        assert_eq!(padme_len(1), 1);
+        assert_eq!(padme_len(1 << 20), 1 << 20);
+    }
+
+    #[tokio::test]
+    async fn v2_quantizes_size_and_trims_back() {
+        let (pk, sk) = mlkem768::keypair();
+        // Two plaintexts of slightly different size that share a Padmé bucket.
+        let a = vec![0x11u8; 1000];
+        let b = vec![0x22u8; 1001];
+        assert_eq!(
+            padme_len(a.len() as u64),
+            padme_len(b.len() as u64),
+            "test inputs must share a Padmé bucket"
+        );
+
+        let mut sizes = Vec::new();
+        for pt in [&a, &b] {
+            let file = tempfile_v2().await;
+            let mut session = EncryptSession::new(file, pk.as_bytes(), 0, DEFAULT_CHUNK_SIZE_BYTES)
+                .await
+                .unwrap();
+            session.feed(pt).await.unwrap();
+            let (file, info) = session.finish().await.unwrap();
+            sizes.push(info.cipher_size);
+            // The decrypted plaintext is padded; trimming to the true size (as
+            // the GET handler does from metadata) recovers the original bytes.
+            let env = read_file(file).await;
+            let recovered = decrypt(sk.as_bytes(), &env).unwrap();
+            assert_eq!(&recovered[..pt.len()], pt.as_slice());
+        }
+        // The on-disk envelope size is identical for both, so it leaks only the
+        // bucket, not which of the two objects was stored.
+        assert_eq!(sizes[0], sizes[1], "cipher size must be quantized");
     }
 
     #[tokio::test]

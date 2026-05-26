@@ -33,6 +33,7 @@ type HmacSha256 = Hmac<Sha256>;
 const DERIVATION_LABEL: &[u8] = b"y2q-metadata-encryption-key-v2";
 const INDEX_KEY_LABEL: &[u8] = b"y2q-index-key-v1";
 const INDEX_FILE_KEY_LABEL: &[u8] = b"y2q-index-file-key-v1";
+const PATH_KEY_LABEL: &[u8] = b"y2q-path-key-v1";
 const VERSION_BYTE: u8 = 0x01;
 const NONCE_LEN: usize = 12;
 /// Minimum blob size for an encrypted blob: version + nonce + GCM tag.
@@ -74,6 +75,19 @@ pub fn derive_index_file_key(mek: &[u8; 32]) -> [u8; 32] {
     prf(mek, INDEX_FILE_KEY_LABEL)
 }
 
+/// Derive the Path Key (PK) from the MEK.
+///
+/// `PK = HMAC-SHA256(MEK, "y2q-path-key-v1")`
+///
+/// Used to keyed-hash bucket directory names and object filenames on disk so
+/// that the storage tree reveals neither bucket names nor object-key existence
+/// to anyone without a login. Domain-separated from the MEK, Index Key, and
+/// Index File Key, and deterministic from the MEK so paths are stable across
+/// restarts.
+pub fn derive_path_key(mek: &[u8; 32]) -> [u8; 32] {
+    prf(mek, PATH_KEY_LABEL)
+}
+
 /// Derive the Metadata Encryption Key from the raw bytes of the deployment
 /// *secret* key.
 ///
@@ -104,6 +118,7 @@ pub struct MekSlot {
 struct MekKeys {
     mek: Zeroizing<[u8; 32]>,
     ik: Zeroizing<[u8; 32]>,
+    path_key: Zeroizing<[u8; 32]>,
 }
 
 impl MekSlot {
@@ -118,9 +133,11 @@ impl MekSlot {
     /// Replaces any prior value.
     pub fn install(&self, mek: [u8; 32]) {
         let ik = derive_index_key(&mek);
+        let path_key = derive_path_key(&mek);
         *self.inner.write().expect("MekSlot poisoned") = Some(MekKeys {
             mek: Zeroizing::new(mek),
             ik: Zeroizing::new(ik),
+            path_key: Zeroizing::new(path_key),
         });
     }
 
@@ -148,6 +165,16 @@ impl MekSlot {
             Some(k) => (Some(*k.mek), Some(*k.ik)),
             None => (None, None),
         }
+    }
+
+    /// A copy of the Path Key, if installed. Used to keyed-hash on-disk bucket
+    /// and object names.
+    pub fn path_key(&self) -> Option<[u8; 32]> {
+        self.inner
+            .read()
+            .expect("MekSlot poisoned")
+            .as_ref()
+            .map(|k| *k.path_key)
     }
 
     /// Whether a key is currently installed.
