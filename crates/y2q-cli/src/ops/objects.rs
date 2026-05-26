@@ -1,7 +1,7 @@
 //! Object operations shared by the CLI and the TUI: glob expansion, delete,
 //! and same-server copy / rename.
 
-use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 
 use y2q_client::{ClientError, ListOptions, Y2qClient};
 
@@ -68,8 +68,8 @@ pub async fn set_labels(
     bucket: &str,
     key: &str,
     op: &str,
-    labels: &BTreeMap<String, String>,
-) -> Result<BTreeMap<String, String>, ClientError> {
+    labels: &BTreeSet<(String, String)>,
+) -> Result<BTreeSet<(String, String)>, ClientError> {
     client.set_labels(bucket, key, op, labels).await
 }
 
@@ -96,7 +96,7 @@ pub async fn copy(
     let mut buf: Vec<u8> = Vec::new();
     client.get_to_writer(bucket, src_key, &mut buf).await?;
     let len = buf.len() as u64;
-    let labels: BTreeMap<String, String> = head.labels;
+    let labels: BTreeSet<(String, String)> = head.labels;
     client
         .put_from_reader(
             bucket,

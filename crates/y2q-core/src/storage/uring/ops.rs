@@ -13,7 +13,6 @@
 
 use core::range::RangeInclusive;
 use std::{
-    collections::BTreeMap,
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
@@ -27,7 +26,7 @@ use tokio::sync::oneshot;
 use tokio_uring::fs::{File, OpenOptions};
 
 use crate::{
-    Error, Metadata, Object, SyncLevel,
+    Error, LabelSet, Metadata, Object, SyncLevel,
     crypto::{decrypt_meta, encrypt_meta},
     storage::{bufpool, locks::LockRegistry},
 };
@@ -72,7 +71,7 @@ pub(super) enum UringOp {
         key: String,
         url_path: String,
         payload: Bytes,
-        labels: BTreeMap<String, String>,
+        labels: LabelSet,
         /// Encryption-side fields supplied by the daemon when it has
         /// already encrypted the body before this PUT. Boxed to keep the
         /// enum variant size in check (clippy::large_enum_variant).
@@ -512,7 +511,7 @@ async fn do_put(
     key: String,
     url_path: String,
     payload: Bytes,
-    labels: BTreeMap<String, String>,
+    labels: LabelSet,
     plaintext_metrics: Option<crate::PlaintextMetrics>,
     cipher_metadata: Option<crate::CipherMetadata>,
     large_object_bytes: u64,
@@ -640,7 +639,7 @@ async fn do_put(
         // the fallback happened. Cheap; this branch is rare.
         metadata
             .labels
-            .insert("y2q.direct_io".to_owned(), "fallback".to_owned());
+            .insert(("y2q.direct_io".to_owned(), "fallback".to_owned()));
     }
 
     put_via_buffered(

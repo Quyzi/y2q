@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use y2q_client::Y2qClient;
@@ -31,7 +31,7 @@ pub async fn run(
         return Err(CliError::RemoteToRemote);
     }
 
-    let mut label_map: BTreeMap<String, String> = BTreeMap::new();
+    let mut label_map: BTreeSet<(String, String)> = BTreeSet::new();
     for raw in &labels {
         let (k, v) = raw
             .split_once('=')
@@ -42,7 +42,8 @@ pub async fn run(
                 "label key must not be empty".into(),
             ));
         }
-        label_map.insert(k.to_lowercase(), v.to_owned());
+        // A name may be repeated with different values.
+        label_map.insert((k.to_lowercase(), v.to_owned()));
     }
 
     let range = range.as_deref().map(parse_range).transpose()?;
@@ -116,7 +117,7 @@ pub(crate) fn parse_range(s: &str) -> Result<(u64, u64), CliError> {
 async fn upload_single(
     local_path: &str,
     remote: &RemotePath,
-    labels: BTreeMap<String, String>,
+    labels: BTreeSet<(String, String)>,
     sync: Option<&str>,
     mode: OutputMode,
 ) -> Result<(), CliError> {
@@ -179,7 +180,7 @@ struct UploadCtx<'a> {
     bucket: &'a str,
     dst_prefix: &'a str,
     client: &'a Y2qClient,
-    labels: &'a BTreeMap<String, String>,
+    labels: &'a BTreeSet<(String, String)>,
     sync: Option<&'a str>,
     mode: OutputMode,
 }
@@ -187,7 +188,7 @@ struct UploadCtx<'a> {
 async fn upload_glob(
     pattern: &str,
     remote: &RemotePath,
-    labels: BTreeMap<String, String>,
+    labels: BTreeSet<(String, String)>,
     sync: Option<&str>,
     recursive: bool,
     mode: OutputMode,
@@ -244,7 +245,7 @@ async fn upload_glob(
 async fn upload_recursive(
     src_dir: &Path,
     remote: &RemotePath,
-    labels: BTreeMap<String, String>,
+    labels: BTreeSet<(String, String)>,
     sync: Option<&str>,
     mode: OutputMode,
 ) -> Result<(), CliError> {

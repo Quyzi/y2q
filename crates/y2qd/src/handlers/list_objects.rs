@@ -1,7 +1,6 @@
 //! `GET /{bucket}/` — enumerate objects in a bucket with optional prefix
 //! filter and cursor-based pagination.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use actix_web::{HttpResponse, web};
@@ -45,8 +44,10 @@ pub struct MetadataView {
     pub disk_path: String,
     /// Logical URL path: `"<bucket>/<key>"`.
     pub url_path: String,
-    /// User-supplied labels attached to the object.
-    pub labels: BTreeMap<String, String>,
+    /// User-supplied labels attached to the object, as `(name, value)` pairs.
+    /// A name may appear more than once with different values.
+    #[schema(value_type = Vec<Vec<String>>)]
+    pub labels: Vec<(String, String)>,
     /// Total bytes on disk (encrypted envelope), if encryption is enabled.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cipher_size: Option<u64>,
@@ -75,7 +76,7 @@ impl From<Metadata> for MetadataView {
             key: m.key,
             disk_path: m.disk_path.to_string_lossy().into_owned(),
             url_path: m.url_path,
-            labels: m.labels,
+            labels: m.labels.into_iter().collect(),
             cipher_size: m.cipher_size,
             cipher_sha256: m.cipher_sha256,
             kem_alg: m.kem_alg,

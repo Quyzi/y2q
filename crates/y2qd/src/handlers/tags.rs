@@ -2,13 +2,15 @@
 //! attributes) without re-uploading its body.
 //!
 //! The operation is selected with the `?op=` query parameter:
-//! - `set` (default): merge the supplied `X-Y2Q-<label>` headers into the
-//!   existing label set (overwriting same-named labels).
-//! - `remove`: delete the supplied label names; with no labels supplied,
-//!   clears every label.
+//! - `set` (default): add the supplied `X-Y2Q-<label>` pairs to the existing
+//!   label set. A name may end up with several values; exact duplicates
+//!   collapse. To replace a name's values, use `remove` then `set`, or
+//!   `replace`.
+//! - `remove`: delete every value of each supplied label name; with no labels
+//!   supplied, clears every label.
 //! - `replace`: replace the entire label set with the supplied labels.
 
-use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use actix_web::{HttpRequest, HttpResponse, web};
@@ -32,8 +34,8 @@ pub struct TagQuery {
 pub struct SetTagsResponse {
     pub bucket: String,
     pub key: String,
-    /// The full label set after the operation.
-    pub labels: BTreeMap<String, String>,
+    /// The full label set after the operation, as `(name, value)` pairs.
+    pub labels: BTreeSet<(String, String)>,
 }
 
 /// Mutate an object's labels. Requires a valid Bearer token.
@@ -82,13 +84,13 @@ pub async fn handle(
         }
         "remove" => {
             if incoming.is_empty() {
-                BTreeMap::new()
+                BTreeSet::new()
             } else {
-                let mut remaining = current;
-                for name in incoming.keys() {
-                    remaining.remove(name);
-                }
-                remaining
+                let names: BTreeSet<&String> = incoming.iter().map(|(n, _)| n).collect();
+                current
+                    .into_iter()
+                    .filter(|(n, _)| !names.contains(n))
+                    .collect()
             }
         }
         "replace" => incoming,

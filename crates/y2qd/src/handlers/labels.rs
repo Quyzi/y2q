@@ -3,7 +3,7 @@
 //! Reserved names emitted by the server on HEAD (`created`, `modified`,
 //! `checksum-gxhash`) cannot be supplied by clients on PUT.
 
-use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 
 use actix_web::HttpRequest;
 use y2q_core::Error as CoreError;
@@ -27,15 +27,16 @@ const CONSUMED_BY_HANDLER: &[&str] = &["sync"];
 ///   400 [`Error::ReservedLabel`].
 /// - Non-UTF-8 values cause 400 [`Error::InvalidLabelValue`].
 /// - Names and values exceeding the configured limits cause 400 errors.
-/// - When the same label is sent multiple times, **last value wins**.
+/// - The same name may be sent multiple times with different values; every
+///   distinct `(name, value)` pair is kept. Exact duplicates collapse.
 ///
 /// [`Error::ReservedLabel`]: y2q_core::Error::ReservedLabel
 /// [`Error::InvalidLabelValue`]: y2q_core::Error::InvalidLabelValue
 pub fn extract_labels(
     req: &HttpRequest,
     limits: &LabelLimits,
-) -> Result<BTreeMap<String, String>, AppError> {
-    let mut out: BTreeMap<String, String> = BTreeMap::new();
+) -> Result<BTreeSet<(String, String)>, AppError> {
+    let mut out: BTreeSet<(String, String)> = BTreeSet::new();
     for (name, value) in req.headers().iter() {
         let lower = name.as_str().to_ascii_lowercase();
         let Some(label) = lower.strip_prefix(HEADER_PREFIX) else {
@@ -70,7 +71,7 @@ pub fn extract_labels(
                 name: label.to_owned(),
             }));
         }
-        out.insert(label.to_owned(), value_str.to_owned());
+        out.insert((label.to_owned(), value_str.to_owned()));
     }
     if out.len() > limits.max_labels {
         return Err(AppError(CoreError::TooManyLabels { count: out.len() }));
@@ -98,8 +99,20 @@ mod tests {
             .insert_header(("X-Y2Q-Owner", "alice"))
             .to_http_request();
         let labels = extract_labels(&req, &limits()).unwrap();
-        assert_eq!(labels.get("env").map(String::as_str), Some("prod"));
-        assert_eq!(labels.get("owner").map(String::as_str), Some("alice"));
+        assert!(labels.contains(&("env".to_owned(), "prod".to_owned())));
+        assert!(labels.contains(&("owner".to_owned(), "alice".to_owned())));
+    }
+
+    #[test]
+    fn keeps_repeated_name_with_different_values() {
+        let req = TestRequest::default()
+            .append_header(("X-Y2Q-Env", "prod"))
+            .append_header(("X-Y2Q-Env", "stage"))
+            .to_http_request();
+        let labels = extract_labels(&req, &limits()).unwrap();
+        assert!(labels.contains(&("env".to_owned(), "prod".to_owned())));
+        assert!(labels.contains(&("env".to_owned(), "stage".to_owned())));
+        assert_eq!(labels.len(), 2);
     }
 
     #[test]
@@ -120,8 +133,8 @@ mod tests {
             .insert_header(("X-Y2Q-env", "prod"))
             .to_http_request();
         let labels = extract_labels(&req, &limits()).unwrap();
-        assert!(!labels.contains_key("sync"));
-        assert_eq!(labels.get("env").map(String::as_str), Some("prod"));
+        assert!(!labels.iter().any(|(n, _)| n == "sync"));
+        assert!(labels.contains(&("env".to_owned(), "prod".to_owned())));
     }
 
     #[test]

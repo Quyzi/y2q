@@ -4,7 +4,7 @@
 //! Domain types are associated types so the contract is free of any concrete
 //! storage crate, and async methods are dyn-compatible via [`async_trait`].
 
-use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::ops::RangeInclusive;
 use std::time::SystemTime;
 
@@ -50,12 +50,13 @@ pub trait ObjectStore: Send + Sync {
     /// Return an object's metadata without fetching its payload.
     async fn describe(&self, bucket: &str, key: &str) -> Result<Self::Metadata, Self::Error>;
 
-    /// Replace an object's label set with `labels`.
+    /// Replace an object's label set with `labels`. A name may appear more than
+    /// once with different values; pairs are stored as a set.
     async fn set_labels(
         &self,
         bucket: &str,
         key: &str,
-        labels: BTreeMap<String, String>,
+        labels: BTreeSet<(String, String)>,
     ) -> Result<(), Self::Error>;
 }
 

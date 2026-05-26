@@ -37,7 +37,7 @@ pub async fn prepare(
 
         tasks.spawn(async move {
             let _permit = sem.acquire_owned().await.unwrap();
-            use std::collections::BTreeMap;
+            use std::collections::BTreeSet;
             let reader = BoundedRepeatReader::new(size);
             client
                 .put_from_reader(
@@ -45,7 +45,7 @@ pub async fn prepare(
                     &key_clone,
                     reader,
                     Some(size),
-                    &BTreeMap::new(),
+                    &BTreeSet::new(),
                     None,
                 )
                 .await
