@@ -117,11 +117,17 @@ struct AppState {
     ops_history: HashMap<OpKind, VecDeque<u64>>,
     errors_4xx_per_sec: HashMap<OpKind, f64>,
     errors_5xx_per_sec: HashMap<OpKind, f64>,
-    prev_bytes: u64,
-    prev_ops: HashMap<OpKind, u64>,
+    /// Cumulative byte/op counts timestamped at snapshot-arrival time. Displayed
+    /// throughput is the *slope* over a trailing window of these, not a per-tick
+    /// delta. Because cumulative counts are monotonic and anchored to real
+    /// arrival times, a dropped or late snapshot can never produce the
+    /// zero-delta-then-catch-up "dip + spike" pair the old per-tick reset did.
+    bytes_ring: VecDeque<(Instant, u64)>,
+    ops_ring: HashMap<OpKind, VecDeque<(Instant, u64)>>,
     prev_errors_4xx: HashMap<OpKind, u64>,
     prev_errors_5xx: HashMap<OpKind, u64>,
-    last_sample: Instant,
+    last_err_sample: Instant,
+    last_history: Instant,
     bench_start: Option<Instant>,
 }
 
@@ -134,11 +140,12 @@ impl AppState {
             ops_history: HashMap::new(),
             errors_4xx_per_sec: HashMap::new(),
             errors_5xx_per_sec: HashMap::new(),
-            prev_bytes: 0,
-            prev_ops: HashMap::new(),
+            bytes_ring: VecDeque::new(),
+            ops_ring: HashMap::new(),
             prev_errors_4xx: HashMap::new(),
             prev_errors_5xx: HashMap::new(),
-            last_sample: Instant::now(),
+            last_err_sample: Instant::now(),
+            last_history: Instant::now(),
             bench_start: None,
         }
     }
@@ -154,53 +161,75 @@ impl AppState {
                 }
                 self.phase = Phase::Running;
                 self.aggregates = agg;
-                self.tick_sample();
+                self.record_snapshot();
             }
         }
     }
 
+    /// Append the latest cumulative counts to the rings (called on every
+    /// snapshot arrival, decoupled from the history sampling cadence).
+    fn record_snapshot(&mut self) {
+        let now = Instant::now();
+        let total_bytes: u64 = self.aggregates.values().map(|a| a.total_bytes).sum();
+        push_ring(&mut self.bytes_ring, now, total_bytes);
+
+        // Snapshot per-op cumulative counts up front to avoid borrowing
+        // `self.aggregates` while mutating the ring/error maps below.
+        let snap: Vec<(OpKind, u64, u64, u64)> = self
+            .aggregates
+            .iter()
+            .map(|(&op, a)| (op, a.n_ops, a.n_errors_4xx, a.n_errors_5xx))
+            .collect();
+
+        let dt_s = self.last_err_sample.elapsed().as_secs_f64().max(1e-3);
+        for (op, n_ops, n_4xx, n_5xx) in snap {
+            push_ring(self.ops_ring.entry(op).or_default(), now, n_ops);
+
+            let p4 = *self.prev_errors_4xx.get(&op).unwrap_or(&0);
+            self.errors_4xx_per_sec
+                .insert(op, n_4xx.saturating_sub(p4) as f64 / dt_s);
+            self.prev_errors_4xx.insert(op, n_4xx);
+
+            let p5 = *self.prev_errors_5xx.get(&op).unwrap_or(&0);
+            self.errors_5xx_per_sec
+                .insert(op, n_5xx.saturating_sub(p5) as f64 / dt_s);
+            self.prev_errors_5xx.insert(op, n_5xx);
+        }
+        self.last_err_sample = now;
+    }
+
     fn tick(&mut self) {
-        if matches!(self.phase, Phase::Running) {
-            self.tick_sample();
+        if matches!(self.phase, Phase::Running)
+            && self.last_history.elapsed().as_millis() >= SAMPLE_INTERVAL_MS
+        {
+            self.push_history();
+            self.last_history = Instant::now();
         }
     }
 
-    fn tick_sample(&mut self) {
-        let dt = self.last_sample.elapsed();
-        if dt.as_millis() < SAMPLE_INTERVAL_MS {
-            return;
-        }
-        let dt_s = dt.as_secs_f64();
+    /// Push one bar per op to the sparkline histories, valued by the trailing
+    /// 1s slope of the cumulative rings. Cadence is the fixed ticker, so the
+    /// x-axis is uniform; values come from the rings, so the y-axis is correct
+    /// regardless of snapshot jitter.
+    fn push_history(&mut self) {
+        let now = Instant::now();
+        let window = Duration::from_secs(1);
 
-        let total_bytes: u64 = self.aggregates.values().map(|a| a.total_bytes).sum();
-        let byte_delta = total_bytes.saturating_sub(self.prev_bytes);
+        let bps = rate_per_s(&self.bytes_ring, window, now);
         push_cap(
             &mut self.throughput_history,
-            (byte_delta as f64 / (1_048_576.0 * dt_s)).round() as u64,
+            (bps as f64 / 1_048_576.0).round() as u64,
         );
-        self.prev_bytes = total_bytes;
 
-        for (&op, agg) in &self.aggregates {
-            let prev_ops = *self.prev_ops.get(&op).unwrap_or(&0);
-            let ops_delta = agg.n_ops.saturating_sub(prev_ops);
-            push_cap(
-                self.ops_history.entry(op).or_default(),
-                (ops_delta as f64 / dt_s).round() as u64,
-            );
-            self.prev_ops.insert(op, agg.n_ops);
-
-            let prev_4xx = *self.prev_errors_4xx.get(&op).unwrap_or(&0);
-            let delta_4xx = agg.n_errors_4xx.saturating_sub(prev_4xx);
-            self.errors_4xx_per_sec.insert(op, delta_4xx as f64 / dt_s);
-            self.prev_errors_4xx.insert(op, agg.n_errors_4xx);
-
-            let prev_5xx = *self.prev_errors_5xx.get(&op).unwrap_or(&0);
-            let delta_5xx = agg.n_errors_5xx.saturating_sub(prev_5xx);
-            self.errors_5xx_per_sec.insert(op, delta_5xx as f64 / dt_s);
-            self.prev_errors_5xx.insert(op, agg.n_errors_5xx);
+        let ops: Vec<OpKind> = self.aggregates.keys().copied().collect();
+        for op in ops {
+            let r = self
+                .ops_ring
+                .get(&op)
+                .map(|ring| rate_per_s(ring, window, now))
+                .unwrap_or(0);
+            push_cap(self.ops_history.entry(op).or_default(), r);
         }
-
-        self.last_sample = Instant::now();
     }
 
     fn bench_elapsed(&self) -> Duration {
@@ -213,6 +242,45 @@ fn push_cap(h: &mut VecDeque<u64>, v: u64) {
         h.pop_front();
     }
     h.push_back(v);
+}
+
+/// Append a timestamped cumulative sample, trimming entries older than the
+/// retention window (but always keeping at least two points for a slope).
+fn push_ring(ring: &mut VecDeque<(Instant, u64)>, now: Instant, val: u64) {
+    ring.push_back((now, val));
+    while ring.len() > 2 {
+        match ring.front() {
+            Some(&(t, _)) if now.duration_since(t) > Duration::from_secs(3) => {
+                ring.pop_front();
+            }
+            _ => break,
+        }
+    }
+}
+
+/// Average rate per second over the trailing `window`: the slope between the
+/// newest cumulative sample and the newest sample at or before `now - window`
+/// (falling back to the oldest sample). Monotonic input → never negative, and
+/// a missing snapshot just widens the interval rather than zeroing it.
+fn rate_per_s(ring: &VecDeque<(Instant, u64)>, window: Duration, now: Instant) -> u64 {
+    if ring.len() < 2 {
+        return 0;
+    }
+    let (t_late, v_late) = *ring.back().unwrap();
+    let target = now.checked_sub(window);
+    let mut start = *ring.front().unwrap();
+    for &p in ring.iter() {
+        match target {
+            Some(tt) if p.0 <= tt => start = p,
+            _ => break,
+        }
+    }
+    let (t_early, v_early) = start;
+    let dt = t_late.saturating_duration_since(t_early).as_secs_f64();
+    if dt <= 0.0 {
+        return 0;
+    }
+    (v_late.saturating_sub(v_early) as f64 / dt).round() as u64
 }
 
 fn rjust(data: &VecDeque<u64>, width: usize) -> Vec<u64> {

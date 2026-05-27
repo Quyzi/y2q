@@ -16,15 +16,15 @@ pub async fn stat_op(client: &Y2qClient, bucket: &str, key: &str, run_id: &str) 
     let result = client.head(bucket, key).await;
     let end_ns = wall_ns();
 
-    let bytes = result.as_ref().map(|h| h.size).unwrap_or(0);
-
     OpRecord {
         run_id: run_id.to_owned(),
         op: "STAT".to_owned(),
         start_ns,
         end_ns,
         first_byte_ns: None,
-        bytes,
+        // HEAD transfers metadata only; no object body crosses the wire.
+        // Recording the object size here would inflate aggregate throughput.
+        bytes: 0,
         key: format!("{bucket}/{key}"),
         error: result.err().map(|e| e.to_string()),
     }
