@@ -160,7 +160,8 @@ impl Y2qClient {
             if let Some(label) = name_str.strip_prefix("x-y2q-").filter(|s| {
                 !matches!(
                     *s,
-                    "created"
+                    "size"
+                        | "created"
                         | "modified"
                         | "checksum-gxhash"
                         | "cipher-size"

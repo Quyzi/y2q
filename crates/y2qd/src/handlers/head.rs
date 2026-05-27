@@ -82,8 +82,10 @@ pub async fn handle(
         builder.insert_header(("X-Y2Q-Envelope-Version", v.to_string()));
     }
 
+    // A label name may repeat with different values; append (not insert) so
+    // every value emits its own header line instead of overwriting the prior.
     for (name, value) in &meta.labels {
-        builder.insert_header((format!("X-Y2Q-{}", name), value.clone()));
+        builder.append_header((format!("X-Y2Q-{}", name), value.clone()));
     }
 
     Ok(builder.finish())
