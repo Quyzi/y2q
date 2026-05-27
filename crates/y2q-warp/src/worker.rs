@@ -94,15 +94,10 @@ async fn execute_op(
             rec
         }
         OpKind::Get => {
-            let key = match pool {
-                Some(p) => match p.pick_for_get().await {
-                    Some(k) => k,
-                    None => return None,
-                },
-                None => return None,
-            };
+            let p = pool?;
+            let key = p.pick_for_get().await?;
             let token = token_rx.borrow().clone();
-            get::get_op(
+            let rec = get::get_op(
                 raw_http,
                 &config.base_url,
                 token.as_str(),
@@ -110,7 +105,9 @@ async fn execute_op(
                 &key,
                 run_id,
             )
-            .await
+            .await;
+            p.release_read(&key).await;
+            rec
         }
         OpKind::Delete => {
             let key = match pool {
@@ -129,14 +126,11 @@ async fn execute_op(
             rec
         }
         OpKind::Stat => {
-            let key = match pool {
-                Some(p) => match p.pick_for_get().await {
-                    Some(k) => k,
-                    None => return None,
-                },
-                None => return None,
-            };
-            stat::stat_op(client, bucket, &key, run_id).await
+            let p = pool?;
+            let key = p.pick_for_get().await?;
+            let rec = stat::stat_op(client, bucket, &key, run_id).await;
+            p.release_read(&key).await;
+            rec
         }
         OpKind::List => list::list_op(client, bucket, run_id).await,
     })

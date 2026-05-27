@@ -38,8 +38,9 @@
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::FileExt;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::RwLock;
 
 use aes_gcm::{Aes256Gcm, KeyInit, aead::Aead};
 use rand::RngCore;
@@ -69,20 +70,28 @@ fn block_phys_offset(idx: u64) -> u64 {
 }
 
 /// A [`redb::StorageBackend`] that encrypts the whole backing file in blocks.
+///
+/// I/O goes through positioned reads/writes (`pread`/`pwrite`) so the backing
+/// file has no shared seek cursor. That lets reads run under a shared
+/// [`RwLock`] read guard - concurrent reads no longer serialize against each
+/// other - while writes (redb already single-writes) take the exclusive guard.
 pub struct EncryptedFileBackend {
     cipher: Aes256Gcm,
-    inner: Mutex<Inner>,
+    inner: RwLock<Inner>,
 }
 
 struct Inner {
     file: File,
     /// Logical length redb believes the file has.
     logical_len: u64,
+    /// Cached physical length of the backing file. Maintained on every write so
+    /// the hot path never has to `stat(2)` per block.
+    phys_len: u64,
 }
 
 impl fmt::Debug for EncryptedFileBackend {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let len = self.inner.lock().map(|i| i.logical_len).unwrap_or(0);
+        let len = self.inner.read().map(|i| i.logical_len).unwrap_or(0);
         f.debug_struct("EncryptedFileBackend")
             .field("logical_len", &len)
             .finish_non_exhaustive()
@@ -110,12 +119,12 @@ impl EncryptedFileBackend {
             .truncate(false)
             .open(path)?;
 
-        let phys_len = file.metadata()?.len();
-        let logical_len = if phys_len == 0 {
+        let initial_phys = file.metadata()?.len();
+        let logical_len = if initial_phys == 0 {
             // Fresh file: write an empty header.
             write_header(&cipher, &mut file, 0)?;
             0
-        } else if phys_len >= 8 && read_magic(&mut file)? == *MAGIC {
+        } else if initial_phys >= 8 && read_magic(&mut file)? == *MAGIC {
             read_header(&cipher, &mut file)?
         } else {
             // Foreign/legacy/corrupt file with no recognizable magic. Recreate.
@@ -123,10 +132,16 @@ impl EncryptedFileBackend {
             write_header(&cipher, &mut file, 0)?;
             0
         };
+        // Re-stat: the branches above may have created or truncated the file.
+        let phys_len = file.metadata()?.len();
 
         Ok(Self {
             cipher,
-            inner: Mutex::new(Inner { file, logical_len }),
+            inner: RwLock::new(Inner {
+                file,
+                logical_len,
+                phys_len,
+            }),
         })
     }
 
@@ -153,16 +168,14 @@ impl EncryptedFileBackend {
     /// Read and decrypt data block `idx`. Blocks that have never been written
     /// (physical offset beyond the file end) read back as all-zero, matching the
     /// semantics redb expects from a freshly extended file.
-    fn read_block(&self, inner: &mut Inner, idx: u64) -> Result<[u8; BLOCK_SIZE], io::Error> {
+    fn read_block(&self, inner: &Inner, idx: u64) -> Result<[u8; BLOCK_SIZE], io::Error> {
         let phys = block_phys_offset(idx);
-        let phys_len = inner.file.metadata()?.len();
-        if phys.saturating_add(PHYS_BLOCK as u64) > phys_len {
+        if phys.saturating_add(PHYS_BLOCK as u64) > inner.phys_len {
             // Not yet materialized on disk.
             return Ok([0u8; BLOCK_SIZE]);
         }
         let mut buf = vec![0u8; PHYS_BLOCK];
-        inner.file.seek(SeekFrom::Start(phys))?;
-        inner.file.read_exact(&mut buf)?;
+        inner.file.read_exact_at(&mut buf, phys)?;
         let nonce = &buf[..NONCE_LEN];
         let ct = &buf[NONCE_LEN..];
         let plain = self
@@ -191,24 +204,30 @@ impl EncryptedFileBackend {
         idx: u64,
         plain: &[u8; BLOCK_SIZE],
     ) -> Result<(), io::Error> {
-        let phys_len = inner.file.metadata()?.len();
         // First block index not yet present on disk.
-        let next_missing = if phys_len <= HEADER_PHYS {
+        let next_missing = if inner.phys_len <= HEADER_PHYS {
             0
         } else {
-            (phys_len - HEADER_PHYS).div_ceil(PHYS_BLOCK as u64)
+            (inner.phys_len - HEADER_PHYS).div_ceil(PHYS_BLOCK as u64)
         };
         if idx > next_missing {
+            // Materialize the gap as sealed all-zero blocks in a single buffer,
+            // written with one positioned write instead of seek+write per block.
             let zero = [0u8; BLOCK_SIZE];
+            let mut batch = Vec::with_capacity((idx - next_missing) as usize * PHYS_BLOCK);
             for gap in next_missing..idx {
-                let block = self.seal_block(gap, &zero)?;
-                inner.file.seek(SeekFrom::Start(block_phys_offset(gap)))?;
-                inner.file.write_all(&block)?;
+                batch.extend_from_slice(&self.seal_block(gap, &zero)?);
             }
+            inner
+                .file
+                .write_all_at(&batch, block_phys_offset(next_missing))?;
         }
         let block = self.seal_block(idx, plain)?;
-        inner.file.seek(SeekFrom::Start(block_phys_offset(idx)))?;
-        inner.file.write_all(&block)?;
+        inner.file.write_all_at(&block, block_phys_offset(idx))?;
+        let end_phys = block_phys_offset(idx) + PHYS_BLOCK as u64;
+        if end_phys > inner.phys_len {
+            inner.phys_len = end_phys;
+        }
         Ok(())
     }
 }
@@ -283,18 +302,18 @@ fn read_header(cipher: &Aes256Gcm, file: &mut File) -> Result<u64, io::Error> {
 
 impl StorageBackend for EncryptedFileBackend {
     fn len(&self) -> Result<u64, io::Error> {
-        Ok(self.inner.lock().expect("backend poisoned").logical_len)
+        Ok(self.inner.read().expect("backend poisoned").logical_len)
     }
 
     fn read(&self, offset: u64, out: &mut [u8]) -> Result<(), io::Error> {
-        let mut inner = self.inner.lock().expect("backend poisoned");
+        let inner = self.inner.read().expect("backend poisoned");
         let mut done = 0usize;
         while done < out.len() {
             let logical_pos = offset + done as u64;
             let idx = logical_pos / BLOCK_SIZE as u64;
             let within = (logical_pos % BLOCK_SIZE as u64) as usize;
             let n = (BLOCK_SIZE - within).min(out.len() - done);
-            let plain = self.read_block(&mut inner, idx)?;
+            let plain = self.read_block(&inner, idx)?;
             out[done..done + n].copy_from_slice(&plain[within..within + n]);
             done += n;
         }
@@ -302,7 +321,7 @@ impl StorageBackend for EncryptedFileBackend {
     }
 
     fn write(&self, offset: u64, data: &[u8]) -> Result<(), io::Error> {
-        let mut inner = self.inner.lock().expect("backend poisoned");
+        let mut inner = self.inner.write().expect("backend poisoned");
         let mut done = 0usize;
         while done < data.len() {
             let logical_pos = offset + done as u64;
@@ -313,7 +332,7 @@ impl StorageBackend for EncryptedFileBackend {
             let mut plain = if within == 0 && n == BLOCK_SIZE {
                 [0u8; BLOCK_SIZE]
             } else {
-                self.read_block(&mut inner, idx)?
+                self.read_block(&inner, idx)?
             };
             plain[within..within + n].copy_from_slice(&data[done..done + n]);
             self.write_block(&mut inner, idx, &plain)?;
@@ -329,14 +348,15 @@ impl StorageBackend for EncryptedFileBackend {
     }
 
     fn set_len(&self, len: u64) -> Result<(), io::Error> {
-        let mut inner = self.inner.lock().expect("backend poisoned");
+        let mut inner = self.inner.write().expect("backend poisoned");
         inner.logical_len = len;
         // Physically truncate to the matching block count when shrinking; growth
         // is materialized lazily on write (and gap-filled there).
         let needed_blocks = len.div_ceil(BLOCK_SIZE as u64);
         let needed_phys = HEADER_PHYS + needed_blocks * PHYS_BLOCK as u64;
-        if inner.file.metadata()?.len() > needed_phys {
+        if inner.phys_len > needed_phys {
             inner.file.set_len(needed_phys)?;
+            inner.phys_len = needed_phys;
         }
         // Match `ftruncate` semantics: bytes at or beyond `len` must read as
         // zero if the file is later regrown. The last logical block may still
@@ -344,9 +364,9 @@ impl StorageBackend for EncryptedFileBackend {
         let rem = (len % BLOCK_SIZE as u64) as usize;
         if rem != 0 {
             let idx = len / BLOCK_SIZE as u64;
-            let present = inner.file.metadata()?.len() >= block_phys_offset(idx + 1);
+            let present = inner.phys_len >= block_phys_offset(idx + 1);
             if present {
-                let mut plain = self.read_block(&mut inner, idx)?;
+                let mut plain = self.read_block(&inner, idx)?;
                 plain[rem..].fill(0);
                 self.write_block(&mut inner, idx, &plain)?;
             }
@@ -357,7 +377,7 @@ impl StorageBackend for EncryptedFileBackend {
 
     fn sync_data(&self) -> Result<(), io::Error> {
         self.inner
-            .lock()
+            .read()
             .expect("backend poisoned")
             .file
             .sync_data()
