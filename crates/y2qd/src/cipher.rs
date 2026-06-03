@@ -9,13 +9,10 @@
 //! `Metadata` sidecar reflects what users see, not the encrypted bytes the
 //! backend stores.
 
-use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use bytes::{Bytes, BytesMut};
-use gxhash::GxHasher;
-use std::hash::Hasher;
 use y2q_core::crypto::{DecryptedKeystore, envelope};
 use y2q_core::storage::streaming_sink::StreamingSink;
-use y2q_core::{CipherMetadata, PlaintextMetrics};
+use y2q_core::{CipherMetadata, PlaintextMetrics, StreamChecksum};
 
 use crate::error::AppError;
 
@@ -132,7 +129,7 @@ pub async fn stream_encrypt_for_put(
                 })
             })?;
 
-    let mut hasher = GxHasher::with_seed(0);
+    let mut hasher = StreamChecksum::new();
     let mut plaintext_size: u64 = 0;
 
     while let Some(chunk) = stream.next().await {
@@ -144,7 +141,7 @@ pub async fn stream_encrypt_for_put(
                 message: e.to_string(),
             })
         })?;
-        hasher.write(&chunk);
+        hasher.update(&chunk);
         plaintext_size += chunk.len() as u64;
         session.feed(&chunk).await.map_err(|_| {
             AppError(y2q_core::Error::EncryptionFailed {
@@ -161,15 +158,13 @@ pub async fn stream_encrypt_for_put(
         })
     })?;
 
-    let digest = hasher.finish().to_le_bytes();
-
     let cipher_size = info.cipher_size;
     // SHA-256 of the on-disk envelope would require a read-back; omit
     // cipher_sha256 here (set to empty string). The plaintext checksum
     // is a non-cryptographic gxhash64 for fast corruption detection.
     let plaintext_metrics = PlaintextMetrics {
         size: plaintext_size,
-        checksum_gxhash_b64: B64.encode(digest),
+        checksum_gxhash_b64: hasher.finish_b64(),
     };
     let cipher_metadata = CipherMetadata {
         cipher_size,
