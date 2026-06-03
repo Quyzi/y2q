@@ -18,10 +18,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use base64::Engine;
 use bytes::Bytes;
-use gxhash::GxHasher;
-use std::hash::Hasher;
 use tokio::sync::oneshot;
 use tokio_uring::fs::{File, OpenOptions};
 
@@ -549,22 +546,7 @@ async fn do_put(
     // we're about to write to disk.
     let (size, checksum_gxhash) = match plaintext_metrics {
         Some(p) => (p.size, p.checksum_gxhash_b64),
-        None => {
-            // Stream the checksum chunk-by-chunk. Memory is the same as a
-            // single hash call (the payload is already resident here), but
-            // the streaming shape mirrors how the O_DIRECT path consumes
-            // the buffer in chunks.
-            const HASH_CHUNK: usize = 1024 * 1024;
-            let mut hasher = GxHasher::with_seed(0);
-            for chunk in payload.chunks(HASH_CHUNK) {
-                hasher.write(chunk);
-            }
-            let b64 = base64::engine::general_purpose::STANDARD;
-            (
-                payload.len() as u64,
-                b64.encode(hasher.finish().to_le_bytes()),
-            )
-        }
+        None => (payload.len() as u64, crate::checksum::checksum_b64(&payload)),
     };
     let (cipher_size, cipher_sha256, kem_alg, aead_alg, envelope_version) = match cipher_metadata {
         Some(c) => (

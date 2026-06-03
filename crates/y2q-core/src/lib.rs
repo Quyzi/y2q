@@ -15,6 +15,9 @@ use std::{
     time::SystemTime,
 };
 
+/// Boundary-independent plaintext checksum ([`StreamChecksum`]).
+pub mod checksum;
+pub use checksum::StreamChecksum;
 pub mod crypto;
 /// Label search query language: a small boolean grammar over object labels.
 pub mod query;

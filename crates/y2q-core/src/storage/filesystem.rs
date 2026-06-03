@@ -5,7 +5,6 @@ use std::{
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
-use base64::Engine;
 use bytes::Bytes;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
@@ -549,12 +548,7 @@ fn validate_key(key: &str) -> Result<(), Error> {
 }
 
 fn compute_checksum(data: &[u8]) -> String {
-    use gxhash::GxHasher;
-    use std::hash::Hasher;
-    let mut hasher = GxHasher::with_seed(0);
-    hasher.write(data);
-    let engine = base64::engine::general_purpose::STANDARD;
-    engine.encode(hasher.finish().to_le_bytes())
+    crate::checksum::checksum_b64(data)
 }
 
 fn now_nanos() -> u64 {
