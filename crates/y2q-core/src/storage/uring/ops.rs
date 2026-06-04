@@ -546,7 +546,10 @@ async fn do_put(
     // we're about to write to disk.
     let (size, checksum_gxhash) = match plaintext_metrics {
         Some(p) => (p.size, p.checksum_gxhash_b64),
-        None => (payload.len() as u64, crate::checksum::checksum_b64(&payload)),
+        None => (
+            payload.len() as u64,
+            crate::checksum::checksum_b64(&payload),
+        ),
     };
     let (cipher_size, cipher_sha256, kem_alg, aead_alg, envelope_version) = match cipher_metadata {
         Some(c) => (
