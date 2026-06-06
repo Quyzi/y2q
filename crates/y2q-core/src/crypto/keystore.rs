@@ -175,6 +175,8 @@ pub fn first_run(
         last_login: None,
         kdf: params,
         wrapped_sk: wrapped,
+        // The bootstrap user is the daemon's first administrator.
+        role: super::Role::Admin,
     };
     user_store.upsert(&record)?;
 

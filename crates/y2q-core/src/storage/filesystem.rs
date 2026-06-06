@@ -1396,6 +1396,10 @@ impl Listing for FilesystemStorage {
         list_buckets_union(&self.index).await
     }
 
+    async fn bucket_exists(&self, bucket: &str) -> Result<bool, Error> {
+        self.index.bucket_exists(bucket).await
+    }
+
     async fn create_bucket(&self, bucket: &str) -> Result<bool, Error> {
         let path_key = require_path_key(&self.mek)?;
         create_bucket_impl(&self.base_path, &self.index, &path_key, bucket).await
@@ -2134,6 +2138,7 @@ mod tests {
             quota_bytes: Some(4096),
             default_sse: Some("aes256-gcm".to_owned()),
             cors_allow_origin: None,
+            ..Default::default()
         };
         s.set_bucket_config("b", &want).await.unwrap();
         assert_eq!(s.get_bucket_config("b").await.unwrap(), want);

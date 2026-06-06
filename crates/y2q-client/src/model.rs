@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -31,6 +31,10 @@ pub struct ChangePasswordRequest {
 pub struct AddUserRequest {
     pub username: String,
     pub password: String,
+    /// Global role: `"admin"` or `"user"`. Omitted (server defaults to `user`)
+    /// when `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -43,6 +47,22 @@ pub struct UserView {
     pub username: String,
     pub created_at: u64,
     pub last_login: Option<u64>,
+    /// Global role: `"admin"` or `"user"`. Defaults empty when talking to a
+    /// server that predates roles.
+    #[serde(default)]
+    pub role: String,
+}
+
+/// Bucket owner + ACL, mirrors the daemon's `AclBody`
+/// (`/api/v1/buckets/{bucket}/acl`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AclBody {
+    /// Bucket owner (full control). `None` for an unclaimed legacy bucket.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    /// Per-user grants: username → `"read"` | `"write"` | `"admin"`.
+    #[serde(default)]
+    pub grants: BTreeMap<String, String>,
 }
 
 // ── Objects ───────────────────────────────────────────────────────────────────
@@ -71,7 +91,6 @@ pub struct MetadataView {
     pub checksum_gxhash: String,
     pub bucket: String,
     pub key: String,
-    pub disk_path: String,
     pub url_path: String,
     pub labels: BTreeSet<(String, String)>,
     pub cipher_size: Option<u64>,

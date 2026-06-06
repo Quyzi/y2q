@@ -9,6 +9,7 @@
 
 use actix_web::web;
 
+pub(crate) mod acl;
 pub(crate) mod buckets;
 pub(crate) mod delete;
 pub(crate) mod get;
@@ -42,6 +43,9 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
     cfg.service(web::resource("/api/v1/users/add").route(web::put().to(auth_handlers::add_user)));
     cfg.service(web::resource("/api/v1/users").route(web::get().to(auth_handlers::list_users)));
     cfg.service(
+        web::resource("/api/v1/users/{user}/role").route(web::put().to(auth_handlers::set_role)),
+    );
+    cfg.service(
         web::resource("/api/v1/users/{user}").route(web::delete().to(auth_handlers::delete_user)),
     );
 
@@ -69,6 +73,11 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         web::resource("/api/v1/buckets/{bucket}/config")
             .route(web::get().to(buckets::get_config))
             .route(web::put().to(buckets::set_config)),
+    );
+    cfg.service(
+        web::resource("/api/v1/buckets/{bucket}/acl")
+            .route(web::get().to(acl::get_acl))
+            .route(web::put().to(acl::set_acl)),
     );
 
     cfg.service(

@@ -16,10 +16,11 @@ use std::sync::Arc;
 use actix_web::{HttpRequest, HttpResponse, web};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
-use y2q_core::{AnyStorage, Storage};
+use y2q_core::{AnyStorage, BucketPermission, Storage};
 
 use super::labels::extract_labels;
 use crate::auth::Authenticated;
+use crate::authz::authorize_bucket;
 use crate::config::LabelLimits;
 use crate::error::{AppError, ErrorBody};
 
@@ -64,9 +65,10 @@ pub async fn handle(
     req: HttpRequest,
     storage: web::Data<Arc<AnyStorage>>,
     limits: web::Data<LabelLimits>,
-    _auth: Authenticated,
+    auth: Authenticated,
 ) -> Result<HttpResponse, AppError> {
     let (bucket, key) = path.into_inner();
+    authorize_bucket(&auth, &storage, &bucket, BucketPermission::Write).await?;
     let incoming = extract_labels(&req, limits.get_ref())?;
     let op = query.op.as_deref().unwrap_or("set");
 

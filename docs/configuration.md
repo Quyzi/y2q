@@ -130,6 +130,7 @@ Changing these only affects newly written records. Existing user records carry t
 | `max_failed_logins` | u32 | `10` | Consecutive failed logins per username before lockout. Set to `0` to disable lockout. |
 | `lockout_seconds` | u64 | `900` (15 min) | Lockout duration once `max_failed_logins` is hit. |
 | `keystore_idle_drop_seconds` | u64 | `0` | Drop the in-memory decrypted SK this many seconds after the last session expires. `0` = drop immediately on the next sweep. Raise to forgive brief gaps between sessions; lower to bound how long the SK lives in memory. |
+| `enforce_authorization` | bool | `true` | Enforce per-bucket ownership/ACLs and the global admin role. New buckets are private to their creator; admin endpoints (user management, rebuild, locks, trace) require an admin account. Set `false` for a single-user or migration deployment where every authenticated user should have full access. See the [API authorization model](api.md#authorization). |
 
 ### `[observability]`
 
@@ -198,6 +199,7 @@ min_login_response_ms = 500
 max_failed_logins = 5
 lockout_seconds = 1800                 # 30 min
 keystore_idle_drop_seconds = 300       # forget SK 5 min after last logout
+enforce_authorization = true           # bucket ownership/ACLs + admin role
 
 [observability]
 log_filter = "y2qd=info,actix_web=warn"

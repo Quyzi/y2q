@@ -80,6 +80,7 @@ use y2q_core::{AnyStorage, FilesystemStorage, StorageExt};
 use y2q_core::{UringStorage, storage::uring::UringConfig};
 
 mod auth;
+mod authz;
 mod cipher;
 mod cli;
 mod config;
@@ -131,6 +132,8 @@ impl<W: std::io::Write> std::io::Write for IgnoreBrokenPipe<W> {
         handlers::buckets::remove,
         handlers::buckets::get_config,
         handlers::buckets::set_config,
+        handlers::acl::get_acl,
+        handlers::acl::set_acl,
         handlers::tags::handle,
         handlers::rebuild::start,
         handlers::rebuild::status,
@@ -143,6 +146,7 @@ impl<W: std::io::Write> std::io::Write for IgnoreBrokenPipe<W> {
         auth::handlers::add_user,
         auth::handlers::list_users,
         auth::handlers::delete_user,
+        auth::handlers::set_role,
     ),
     components(schemas(
         error::ErrorBody,
@@ -150,6 +154,7 @@ impl<W: std::io::Write> std::io::Write for IgnoreBrokenPipe<W> {
         handlers::buckets::CreateBucketResponse,
         handlers::buckets::DeleteBucketResponse,
         handlers::buckets::BucketConfigBody,
+        handlers::acl::AclBody,
         handlers::tags::SetTagsResponse,
         handlers::list_objects::ListObjectsResponse,
         handlers::list_objects::MetadataView,
@@ -161,6 +166,7 @@ impl<W: std::io::Write> std::io::Write for IgnoreBrokenPipe<W> {
         auth::handlers::TokenResponse,
         auth::handlers::ChangePasswordRequest,
         auth::handlers::AddUserRequest,
+        auth::handlers::SetRoleRequest,
         auth::handlers::ListUsersResponse,
         auth::handlers::UserView,
     )),
@@ -298,6 +304,11 @@ async fn main() -> std::io::Result<()> {
             return Err(std::io::Error::other(format!("load keystore: {e}")));
         }
     };
+
+    // Records written before the role field default to `User` on load. Without
+    // this, an upgraded deployment would have zero admins and lock everyone out
+    // of the admin endpoints — so ensure at least one administrator exists.
+    reconcile_admin(&user_store)?;
 
     tracing::info!(
         fingerprint = %public_keystore.fingerprint,
@@ -570,6 +581,46 @@ async fn main() -> std::io::Result<()> {
     }
 
     result
+}
+
+/// Guarantee at least one administrator exists after loading the user store.
+///
+/// User records written before the `role` field deserialize as
+/// [`Role::User`](y2q_core::crypto::Role::User). On an upgraded deployment that
+/// would leave zero admins and lock everyone out of the admin endpoints, so if
+/// no admin is present we promote `root` (or, if absent, the earliest-created
+/// user) and log a warning. A fresh first-run install already has an admin
+/// `root`, so this is a no-op there.
+fn reconcile_admin(user_store: &y2q_core::crypto::UserStore) -> std::io::Result<()> {
+    use y2q_core::crypto::Role;
+    let users = user_store
+        .list()
+        .map_err(|e| std::io::Error::other(format!("list users: {e}")))?;
+    if users.is_empty() || users.iter().any(|u| u.role == Role::Admin) {
+        return Ok(());
+    }
+    let target = users
+        .iter()
+        .find(|u| u.username == "root")
+        .or_else(|| users.iter().min_by_key(|u| u.created_at))
+        .map(|u| u.username.clone());
+    let Some(name) = target else {
+        return Ok(());
+    };
+    if let Some(mut rec) = user_store
+        .get(&name)
+        .map_err(|e| std::io::Error::other(format!("get user `{name}`: {e}")))?
+    {
+        rec.role = Role::Admin;
+        user_store
+            .upsert(&rec)
+            .map_err(|e| std::io::Error::other(format!("promote `{name}` to admin: {e}")))?;
+        tracing::warn!(
+            user = %name,
+            "no administrator found in user store; promoted existing user to admin (post-upgrade reconciliation)"
+        );
+    }
+    Ok(())
 }
 
 /// Print the first-run root password to stdout exactly once.

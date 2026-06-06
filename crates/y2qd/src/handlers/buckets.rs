@@ -9,9 +9,10 @@ use std::sync::Arc;
 use actix_web::{HttpResponse, web};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
-use y2q_core::{AnyStorage, BucketConfig, Listing};
+use y2q_core::{AnyStorage, BucketConfig, BucketPermission, Listing};
 
 use crate::auth::Authenticated;
+use crate::authz::{Decision, authorize_bucket, claim_ownership};
 use crate::error::{AppError, ErrorBody};
 
 /// Response body for `PUT /{bucket}/`.
@@ -48,13 +49,18 @@ pub struct DeleteBucketResponse {
 pub async fn create(
     path: web::Path<String>,
     storage: web::Data<Arc<AnyStorage>>,
-    _auth: Authenticated,
+    auth: Authenticated,
 ) -> Result<HttpResponse, AppError> {
     let bucket = path.into_inner();
+    let decision = authorize_bucket(&auth, &storage, &bucket, BucketPermission::Write).await?;
     let created = storage
         .create_bucket(&bucket)
         .await
         .map_err(AppError::from)?;
+    // Explicitly creating a brand-new bucket makes the caller its owner.
+    if matches!(decision, Decision::ClaimOwnership) {
+        claim_ownership(&storage, &bucket, &auth.username).await?;
+    }
     Ok(HttpResponse::Ok().json(CreateBucketResponse { bucket, created }))
 }
 
@@ -77,9 +83,10 @@ pub async fn create(
 pub async fn remove(
     path: web::Path<String>,
     storage: web::Data<Arc<AnyStorage>>,
-    _auth: Authenticated,
+    auth: Authenticated,
 ) -> Result<HttpResponse, AppError> {
     let bucket = path.into_inner();
+    authorize_bucket(&auth, &storage, &bucket, BucketPermission::Admin).await?;
     let objects_removed = storage
         .delete_bucket(&bucket)
         .await
@@ -113,15 +120,10 @@ impl From<BucketConfig> for BucketConfigBody {
     }
 }
 
-impl From<BucketConfigBody> for BucketConfig {
-    fn from(b: BucketConfigBody) -> Self {
-        Self {
-            quota_bytes: b.quota_bytes,
-            default_sse: b.default_sse,
-            cors_allow_origin: b.cors_allow_origin,
-        }
-    }
-}
+// Note: there is deliberately no `From<BucketConfigBody> for BucketConfig`. The
+// config endpoint must read-modify-write so it preserves `owner`/`acl`; a blanket
+// conversion would zero those fields and silently drop ownership. `set_config`
+// merges the body into the existing config instead.
 
 /// Read a bucket's configuration.
 #[utoipa::path(
@@ -140,9 +142,10 @@ impl From<BucketConfigBody> for BucketConfig {
 pub async fn get_config(
     path: web::Path<String>,
     storage: web::Data<Arc<AnyStorage>>,
-    _auth: Authenticated,
+    auth: Authenticated,
 ) -> Result<HttpResponse, AppError> {
     let bucket = path.into_inner();
+    authorize_bucket(&auth, &storage, &bucket, BucketPermission::Read).await?;
     let cfg = storage
         .get_bucket_config(&bucket)
         .await
@@ -170,10 +173,21 @@ pub async fn set_config(
     path: web::Path<String>,
     body: web::Json<BucketConfigBody>,
     storage: web::Data<Arc<AnyStorage>>,
-    _auth: Authenticated,
+    auth: Authenticated,
 ) -> Result<HttpResponse, AppError> {
     let bucket = path.into_inner();
-    let cfg: BucketConfig = body.into_inner().into();
+    authorize_bucket(&auth, &storage, &bucket, BucketPermission::Admin).await?;
+    let body = body.into_inner();
+    // Read-modify-write: this endpoint only edits the quota/SSE/CORS fields and
+    // must preserve the bucket's owner and ACL (which are managed separately via
+    // the ACL endpoints, never through this public config body).
+    let mut cfg = storage
+        .get_bucket_config(&bucket)
+        .await
+        .map_err(AppError::from)?;
+    cfg.quota_bytes = body.quota_bytes;
+    cfg.default_sse = body.default_sse;
+    cfg.cors_allow_origin = body.cors_allow_origin;
     storage
         .set_bucket_config(&bucket, &cfg)
         .await

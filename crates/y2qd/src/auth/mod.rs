@@ -24,7 +24,7 @@ use actix_web::{FromRequest, HttpRequest, dev::Payload, http::header};
 use std::future::{Ready, ready};
 use std::sync::Arc;
 
-use y2q_core::crypto::DecryptedKeystore;
+use y2q_core::crypto::{DecryptedKeystore, Role};
 
 /// Identity attached to a successfully-authenticated request.
 ///
@@ -37,10 +37,32 @@ use y2q_core::crypto::DecryptedKeystore;
 pub struct Authenticated {
     /// Username from the user record this session was minted under.
     pub username: String,
+    /// Global role captured at login. Admins bypass per-bucket ACLs and may
+    /// call admin endpoints.
+    pub role: Role,
     /// Hashed token id (used to look up / revoke this session).
     pub token_hash: [u8; 32],
     /// Decrypted keypair held in process memory. Cheap to clone — `Arc`.
     pub keystore: Arc<DecryptedKeystore>,
+    /// Whether bucket ownership/ACL and the admin role are enforced
+    /// (`[auth] enforce_authorization`). When `false`, [`crate::authz`] and
+    /// [`AdminAuthenticated`] short-circuit to allow.
+    pub authz_enforced: bool,
+}
+
+impl Authenticated {
+    /// Whether this caller holds the global admin role (and authorization is
+    /// being enforced — when it is not, every caller is effectively admin).
+    pub fn is_admin(&self) -> bool {
+        !self.authz_enforced || self.role == Role::Admin
+    }
+
+    /// Whether this caller may use admin *read* endpoints (user list, rebuild
+    /// status, lock list, trace): a full admin or an auditor (or anyone when
+    /// authorization is not enforced).
+    pub fn is_admin_or_auditor(&self) -> bool {
+        !self.authz_enforced || matches!(self.role, Role::Admin | Role::Auditor)
+    }
 }
 
 impl FromRequest for Authenticated {
@@ -52,6 +74,48 @@ impl FromRequest for Authenticated {
     }
 }
 
+/// Like [`Authenticated`] but the extractor rejects non-admin callers with
+/// 403 (unless `[auth] enforce_authorization = false`). Declared by handlers
+/// that must be restricted to global administrators.
+#[derive(Clone)]
+pub struct AdminAuthenticated(pub Authenticated);
+
+impl FromRequest for AdminAuthenticated {
+    type Error = AuthError;
+    type Future = Ready<Result<Self, AuthError>>;
+
+    fn from_request(req: &HttpRequest, _payload: &mut Payload) -> Self::Future {
+        ready(extract_authenticated(req).and_then(|auth| {
+            if auth.is_admin() {
+                Ok(AdminAuthenticated(auth))
+            } else {
+                Err(AuthError::Forbidden)
+            }
+        }))
+    }
+}
+
+/// Guard extractor for admin *read* endpoints: admits full administrators and
+/// auditors (or anyone when authorization is not enforced). Used purely to gate
+/// access — it carries no identity, unlike [`AdminAuthenticated`]. The mutating
+/// admin endpoints use [`AdminAuthenticated`] instead.
+pub struct AdminReadAuthenticated;
+
+impl FromRequest for AdminReadAuthenticated {
+    type Error = AuthError;
+    type Future = Ready<Result<Self, AuthError>>;
+
+    fn from_request(req: &HttpRequest, _payload: &mut Payload) -> Self::Future {
+        ready(extract_authenticated(req).and_then(|auth| {
+            if auth.is_admin_or_auditor() {
+                Ok(AdminReadAuthenticated)
+            } else {
+                Err(AuthError::Forbidden)
+            }
+        }))
+    }
+}
+
 fn extract_authenticated(req: &HttpRequest) -> Result<Authenticated, AuthError> {
     let state = req
         .app_data::<actix_web::web::Data<AuthState>>()
@@ -60,14 +124,21 @@ fn extract_authenticated(req: &HttpRequest) -> Result<Authenticated, AuthError> 
     let token = parse_bearer(req)?;
     let token_hash = session::hash_token(&token);
     let session = state.sessions.get_active(&token_hash)?;
+    // A user disabled mid-session is rejected immediately (a role change also
+    // revokes their sessions, so this is belt-and-suspenders).
+    if state.config.enforce_authorization && session.role == Role::Disabled {
+        return Err(AuthError::AccountDisabled);
+    }
     let keystore = state
         .keystore
         .current()
         .ok_or(AuthError::KeystoreUnavailable)?;
     Ok(Authenticated {
         username: session.username.clone(),
+        role: session.role,
         token_hash,
         keystore,
+        authz_enforced: state.config.enforce_authorization,
     })
 }
 

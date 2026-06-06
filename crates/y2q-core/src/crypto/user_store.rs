@@ -18,6 +18,34 @@ use super::kdf::{Argon2Params, WrappedSk};
 /// `username` (UTF-8) → JSON-serialized [`UserRecord`].
 const USERS: TableDefinition<&str, &[u8]> = TableDefinition::new("users");
 
+/// Global role of a user: an account-wide capability ceiling applied on top of
+/// per-bucket ownership and ACL grants. The daemon interprets each role as a
+/// set of allowed verbs (read / write / admin) and whether the role can see
+/// every bucket; see `y2qd`'s `authz` module for the exact mapping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Role {
+    /// Full administrative access: all admin endpoints plus every bucket.
+    Admin,
+    /// Regular user: no admin endpoints; bucket access governed by ownership
+    /// and ACL grants only.
+    #[default]
+    User,
+    /// Read-only on every bucket the user can otherwise reach (owned or
+    /// granted). No writes, deletes, or admin actions anywhere.
+    ReadOnly,
+    /// Write/delete only, on buckets the user can otherwise reach — never read.
+    /// A drop-box / ingest account.
+    WriteOnly,
+    /// Read-only across *all* buckets (global visibility) plus read access to
+    /// admin endpoints (user list, rebuild status, lock list, any bucket's
+    /// ACL). A look-but-don't-touch administrator. No mutations.
+    Auditor,
+    /// Suspended: every request is rejected and login is refused, without
+    /// deleting the account or its wrapped secret-key copy.
+    Disabled,
+}
+
 /// One user record. The wrapped SK lets this user (and only this user) recover
 /// the deployment secret key after presenting their password.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -32,6 +60,10 @@ pub struct UserRecord {
     pub kdf: Argon2Params,
     /// The deployment SK wrapped under this user's KEK.
     pub wrapped_sk: WrappedSk,
+    /// Global role. Defaults to [`Role::User`] so records written before this
+    /// field existed deserialize as ordinary users (no migration pass needed).
+    #[serde(default)]
+    pub role: Role,
 }
 
 /// Public-safe summary surfaced by `GET /api/v1/users`.
@@ -43,6 +75,8 @@ pub struct UserSummary {
     pub created_at: u64,
     /// Nanoseconds since Unix epoch of the last successful login, or `None` if never.
     pub last_login: Option<u64>,
+    /// Global role of the user.
+    pub role: Role,
 }
 
 impl From<&UserRecord> for UserSummary {
@@ -51,6 +85,7 @@ impl From<&UserRecord> for UserSummary {
             username: r.username.clone(),
             created_at: r.created_at,
             last_login: r.last_login,
+            role: r.role,
         }
     }
 }
@@ -198,7 +233,36 @@ mod tests {
             last_login: None,
             kdf: params,
             wrapped_sk: wrapped,
+            role: Role::User,
         }
+    }
+
+    #[test]
+    fn legacy_record_without_role_defaults_to_user() {
+        // Simulate a record written before the `role` field existed by dropping
+        // it from the serialized JSON; it must deserialize as `User`.
+        let mut r = rec("old");
+        r.role = Role::Admin;
+        let mut v: serde_json::Value = serde_json::to_value(&r).unwrap();
+        v.as_object_mut().unwrap().remove("role");
+        let back: UserRecord = serde_json::from_value(v).unwrap();
+        assert_eq!(back.role, Role::User);
+    }
+
+    #[test]
+    fn role_serializes_lowercase() {
+        assert_eq!(serde_json::to_string(&Role::Admin).unwrap(), "\"admin\"");
+        assert_eq!(serde_json::to_string(&Role::User).unwrap(), "\"user\"");
+        let r: Role = serde_json::from_str("\"admin\"").unwrap();
+        assert_eq!(r, Role::Admin);
+    }
+
+    #[test]
+    fn summary_carries_role() {
+        let mut r = rec("admin-user");
+        r.role = Role::Admin;
+        let s = UserSummary::from(&r);
+        assert_eq!(s.role, Role::Admin);
     }
 
     #[test]

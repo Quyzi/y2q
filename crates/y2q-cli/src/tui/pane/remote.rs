@@ -186,7 +186,6 @@ mod tests {
             checksum_gxhash: String::new(),
             bucket: "b".into(),
             key: key.into(),
-            disk_path: String::new(),
             url_path: String::new(),
             labels: Default::default(),
             cipher_size: None,

@@ -11,6 +11,7 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use dashmap::DashMap;
 use rand::RngCore;
 use sha2::{Digest, Sha256};
+use y2q_core::crypto::Role;
 
 use super::error::AuthError;
 
@@ -45,6 +46,11 @@ pub fn hash_token(token: &str) -> [u8; 32] {
 #[derive(Debug, Clone)]
 pub struct SessionInfo {
     pub username: String,
+    /// Global role captured at login, used to authorize admin endpoints and
+    /// grant implicit access to every bucket. Cached here so authorization does
+    /// no user-store lookup on the request hot path; a role change therefore
+    /// only takes effect on the user's next login (sessions are short-lived).
+    pub role: Role,
     /// When the session was issued (informational; not used for expiry).
     #[allow(dead_code)]
     pub created_at: SystemTime,
@@ -101,6 +107,22 @@ impl SessionStore {
         self.inner.remove(token_hash).is_some()
     }
 
+    /// Revoke every session belonging to `username`. Returns the count removed.
+    /// Used when a user's role changes (or they are disabled) so the change
+    /// takes effect immediately rather than at the next session expiry.
+    pub fn revoke_user(&self, username: &str) -> usize {
+        let victims: Vec<[u8; 32]> = self
+            .inner
+            .iter()
+            .filter_map(|r| (r.value().username == username).then_some(*r.key()))
+            .collect();
+        let n = victims.len();
+        for k in victims {
+            self.inner.remove(&k);
+        }
+        n
+    }
+
     /// Total number of (possibly expired) entries — used to decide when to
     /// drop the in-memory SK.
     pub fn len(&self) -> usize {
@@ -150,6 +172,7 @@ mod tests {
         let s = SessionStore::new();
         let info = SessionInfo {
             username: "alice".into(),
+            role: Role::User,
             created_at: SystemTime::now(),
             expires_at: SystemTime::now() + Duration::from_secs(60),
         };
@@ -166,6 +189,7 @@ mod tests {
         let s = SessionStore::new();
         let info = SessionInfo {
             username: "alice".into(),
+            role: Role::User,
             created_at: SystemTime::now() - Duration::from_secs(120),
             expires_at: SystemTime::now() - Duration::from_secs(1),
         };
@@ -187,11 +211,13 @@ mod tests {
         let now = SystemTime::now();
         s.insert(SessionInfo {
             username: "a".into(),
+            role: Role::User,
             created_at: now,
             expires_at: now + Duration::from_secs(60),
         });
         s.insert(SessionInfo {
             username: "b".into(),
+            role: Role::User,
             created_at: now - Duration::from_secs(120),
             expires_at: now - Duration::from_secs(1),
         });

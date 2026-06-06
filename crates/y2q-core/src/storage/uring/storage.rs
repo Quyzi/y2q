@@ -551,6 +551,10 @@ impl Listing for UringStorage {
         crate::storage::filesystem::list_buckets_union(&self.index).await
     }
 
+    async fn bucket_exists(&self, bucket: &str) -> Result<bool, Error> {
+        self.index.bucket_exists(bucket).await
+    }
+
     async fn create_bucket(&self, bucket: &str) -> Result<bool, Error> {
         let path_key = require_path_key(&self.mek)?;
         crate::storage::filesystem::create_bucket_impl(

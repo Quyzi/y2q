@@ -16,6 +16,47 @@ Tokens are issued by `POST /api/v1/auth/login`. They are 43-character URL-safe b
 
 A daemon restart invalidates every token.
 
+## Authorization
+
+Authentication answers *who* is calling; authorization answers *what they may do*. y2q enforces two layers (both active when `[auth] enforce_authorization = true`, the default). Access is modelled as a set of **verb capabilities** — read, write, admin — and the effective set for any action is the *intersection* of the caller's global-role ceiling and their per-bucket relationship.
+
+### Capabilities
+
+| Verb | Allows |
+|---|---|
+| `read` | `GET`/`HEAD` objects, list objects, search, read bucket config |
+| `write` | `PUT`/`DELETE` objects and `PATCH` tags |
+| `admin` | delete the bucket, edit its config, manage its ACL |
+
+`write` normally implies `read`, but the `writeonly` levels below grant write *without* read (a drop-box).
+
+### Global roles
+
+Every user has one global role — an account-wide ceiling applied on top of bucket grants. Change it with `PUT /api/v1/users/{user}/role` (admin only). The first-run `root` user is `admin`.
+
+| Role | Bucket reach | Capabilities | Admin endpoints |
+|---|---|---|---|
+| `admin` | all buckets | read + write + admin | all (read + write) |
+| `user` | owned / granted | governed by the bucket grant | none |
+| `readonly` | owned / granted | read only | none |
+| `writeonly` | owned / granted | write/delete only, never read | none |
+| `auditor` | **all buckets** | read only | read only (user list, rebuild status, lock list, any ACL) |
+| `disabled` | none | none — every request rejected, login refused | none |
+
+A role *caps* what a user can do even on buckets they own: a `readonly` owner can read their own bucket but not write it; a `writeonly` owner can write but not read.
+
+### Per-bucket ownership and ACL
+
+Each bucket has an **owner** (full control) and an optional **ACL** mapping other users to a grant level: `read`, `write`, `writeonly` (write without read), or `admin`. Admins act on every bucket; auditors can read every bucket.
+
+**New buckets are private to their creator.** A `PUT /{bucket}/` or the first object `PUT` into a non-existent bucket makes the caller its owner (only if their role permits writing). Until they grant access, only they (and admins/auditors) can see it.
+
+**Existence is hidden.** A bucket you have *no* relationship to is indistinguishable from one that does not exist: it is omitted from `GET /` and search results, and any direct operation on it returns **404** — never 403. **403** is returned only when you can already see the bucket but lack the verb for the action (because of your grant level, your role ceiling, or both).
+
+**Legacy buckets** (created before ownership existed, so with no recorded owner) are accessible only to admins/auditors until an admin assigns an owner via `PUT /api/v1/buckets/{bucket}/acl`.
+
+When `enforce_authorization = false`, all of the above is skipped and every authenticated user has full access (single-user / migration mode).
+
 ## Error model
 
 Every error response carries this body:
@@ -124,17 +165,18 @@ Change the caller's password. Re-wraps the SK under the new password using the *
 
 ### `PUT /api/v1/users/add`
 
-Create a new user. Requires an active session - the SK is wrapped under the new user's password from the in-memory copy.
+Create a new user. **Admin only.** The SK is wrapped under the new user's password from the in-memory copy.
 
 **Request:**
 ```json
 {
   "username": "bob",
-  "password": "..."
+  "password": "...",
+  "role": "user"
 }
 ```
 
-Username: `[A-Za-z0-9_.-]+`, max 64 bytes, case-sensitive.
+Username: `[A-Za-z0-9_.-]+`, max 64 bytes, case-sensitive. `role` is optional (defaults to `"user"`) and is one of `admin`, `user`, `readonly`, `writeonly`, `auditor`, `disabled` — see [Authorization](#authorization).
 
 **Response (201):** empty.
 
@@ -143,11 +185,12 @@ Username: `[A-Za-z0-9_.-]+`, max 64 bytes, case-sensitive.
 | 201 | User created |
 | 400 | Invalid username or empty password |
 | 401 | Token missing or invalid |
+| 403 | Caller is not an admin |
 | 409 | Username already exists |
 
 ### `GET /api/v1/users`
 
-List all users. Returns no cryptographic material.
+List all users. **Admin or auditor.** Returns no cryptographic material.
 
 **Response (200):**
 ```json
@@ -156,12 +199,14 @@ List all users. Returns no cryptographic material.
     {
       "username": "alice",
       "created_at": 1715000000000000000,
-      "last_login": 1715002500000000000
+      "last_login": 1715002500000000000,
+      "role": "admin"
     },
     {
       "username": "bob",
       "created_at": 1715001000000000000,
-      "last_login": null
+      "last_login": null,
+      "role": "user"
     }
   ]
 }
@@ -173,10 +218,11 @@ Timestamps are nanoseconds since the Unix epoch. `last_login` is `null` if the u
 |---|---|
 | 200 | User list |
 | 401 | Token missing or invalid |
+| 403 | Caller is not an admin |
 
 ### `DELETE /api/v1/users/{user}`
 
-Remove a user. Other users keep their wrapped SK copies and continue to work. Refuses to delete the last remaining user.
+Remove a user. **Admin only.** Other users keep their wrapped SK copies and continue to work. Refuses to delete the last remaining user, or the last remaining admin.
 
 **Response (204):** empty.
 
@@ -184,8 +230,31 @@ Remove a user. Other users keep their wrapped SK copies and continue to work. Re
 |---|---|
 | 204 | Deleted |
 | 401 | Token missing or invalid |
+| 403 | Caller is not an admin |
 | 404 | User not found |
-| 409 | Cannot delete the last user |
+| 409 | Cannot delete the last user, or the last admin |
+
+### `PUT /api/v1/users/{user}/role`
+
+Change a user's global role. **Admin only.** Takes effect immediately — the target's existing sessions are revoked, so a demotion or `disabled` applies without waiting for session expiry. Refuses to demote the only remaining admin.
+
+**Request:**
+```json
+{ "role": "readonly" }
+```
+
+`role` is one of `admin`, `user`, `readonly`, `writeonly`, `auditor`, `disabled`.
+
+**Response (204):** empty.
+
+| Code | Meaning |
+|---|---|
+| 204 | Role updated |
+| 400 | Unknown role |
+| 401 | Token missing or invalid |
+| 403 | Caller is not an admin |
+| 404 | User not found |
+| 409 | Would demote the last remaining admin |
 
 ## Objects
 
@@ -341,7 +410,6 @@ List objects in a bucket, paginated.
       "checksum_sha256":  "<b64 32-byte digest>",
       "bucket":           "photos",
       "key":              "2024/05/cat.jpg",
-      "disk_path":        "/var/lib/y2qd/objects/photos/ab/cd/<uuid>.obj",
       "url_path":         "photos/2024/05/cat.jpg",
       "labels":           { "owner": "alice", "album": "vacation" },
       "cipher_size":      13477,
@@ -433,11 +501,66 @@ y2q search myalias/photos --query 'env == prod and tier != test'
 y2q search myalias/ --query 'name ^= "log-" or env =~ "prod|stage"'
 ```
 
+## Access control (ACL)
+
+Manage a bucket's owner and per-user grants. See [Authorization](#authorization) for the model. Viewing (`GET`) is allowed for the bucket owner, a global admin, or an auditor (who may view any bucket's ACL). Editing (`PUT`) requires the bucket owner or a global admin; transferring ownership additionally requires being the current owner or a global admin. Owner/ACL are deliberately *not* settable through the generic `PUT /api/v1/buckets/{bucket}/config` body, so that endpoint cannot be used to escalate privileges.
+
+### `GET /api/v1/buckets/{bucket}/acl`
+
+**Response (200):**
+```json
+{
+  "owner": "alice",
+  "grants": { "bob": "read", "carol": "write" }
+}
+```
+
+`owner` is `null` only for an unclaimed legacy bucket. `grants` maps username → `"read"` | `"write"` | `"writeonly"` | `"admin"`; the owner is never listed (they have implicit full control).
+
+| Code | Meaning |
+|---|---|
+| 200 | Owner and ACL |
+| 401 | Token missing or invalid |
+| 403 | Caller is not the owner / a global admin |
+| 404 | Bucket not found (or not visible to the caller) |
+
+### `PUT /api/v1/buckets/{bucket}/acl`
+
+Replace the ACL, and optionally transfer ownership by setting `owner`. The body fully replaces the existing `grants`.
+
+**Request:**
+```json
+{
+  "owner": "alice",
+  "grants": { "bob": "write" }
+}
+```
+
+A new `owner` must be an existing user; grantees are not checked for existence (a grant to an unknown user is inert, and validating it would leak which usernames exist). Granting to the current owner is rejected as redundant. **Response (200)** echoes the stored owner and ACL.
+
+| Code | Meaning |
+|---|---|
+| 200 | Updated owner and ACL |
+| 400 | Unknown grantee, empty username, or redundant owner grant |
+| 401 | Token missing or invalid |
+| 403 | Caller may not manage this ACL, or may not transfer ownership |
+| 404 | Bucket not found (or not visible to the caller) |
+
+CLI equivalents:
+```sh
+y2q admin acl get myalias photos
+y2q admin acl grant myalias photos bob write
+y2q admin acl revoke myalias photos bob
+y2q admin acl chown myalias photos alice
+```
+
 ## Admin
+
+Mutating admin endpoints (rebuild **start**, lock **clear**, all user management) require the `admin` role. Read-only admin endpoints (rebuild **status**, lock **list**, trace, user list) are also open to the `auditor` role. Non-admins get **403**.
 
 ### `POST /api/v1/rebuild`
 
-Start a metadata index rebuild in the background. Fire-and-forget.
+Start a metadata index rebuild in the background. Fire-and-forget. **Admin only.**
 
 **Response (202):**
 ```json
@@ -539,8 +662,9 @@ These are usually auth-gated. Set `[server] unauthenticated_metrics = true` to e
 | 206 | Partial Content (Range on a v2-encrypted or plaintext object) |
 | 400 | Bad bucket name, key, label, request body, or query parameter |
 | 401 | Auth missing/invalid, or login credentials wrong |
-| 404 | Object or user not found |
-| 409 | Conflict - object locked, rebuild already running, username taken, last-user deletion |
+| 403 | Authenticated but not permitted - not an admin, or lacks the bucket permission for this action (on a bucket you can see) |
+| 404 | Object or user not found; also a bucket you have no permission on (existence is hidden) |
+| 409 | Conflict - object locked, rebuild already running, username taken, last-user/last-admin deletion |
 | 416 | `Range` not satisfiable (inverted or out of bounds) |
 | 429 | Login lockout - see `Retry-After` |
 | 500 | Internal failure: encryption, decryption, index, or storage |
