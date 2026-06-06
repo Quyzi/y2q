@@ -6,9 +6,10 @@ use std::sync::Arc;
 use actix_web::{HttpResponse, web};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
-use y2q_core::{AnyStorage, ListOptions, Listing, MAX_LIST_LIMIT, Metadata};
+use y2q_core::{AnyStorage, BucketPermission, ListOptions, Listing, MAX_LIST_LIMIT, Metadata};
 
 use crate::auth::Authenticated;
+use crate::authz::authorize_bucket;
 use crate::error::{AppError, ErrorBody};
 
 /// Query-string parameters for `GET /{bucket}/`.
@@ -40,8 +41,6 @@ pub struct MetadataView {
     pub bucket: String,
     /// Object key within the bucket.
     pub key: String,
-    /// Absolute on-disk path of the object data file.
-    pub disk_path: String,
     /// Logical URL path: `"<bucket>/<key>"`.
     pub url_path: String,
     /// User-supplied labels attached to the object, as `(name, value)` pairs.
@@ -74,7 +73,6 @@ impl From<Metadata> for MetadataView {
             checksum_gxhash: m.checksum_gxhash,
             bucket: m.bucket,
             key: m.key,
-            disk_path: m.disk_path.to_string_lossy().into_owned(),
             url_path: m.url_path,
             labels: m.labels.into_iter().collect(),
             cipher_size: m.cipher_size,
@@ -125,9 +123,10 @@ pub async fn handle(
     path: web::Path<String>,
     query: web::Query<ListQuery>,
     storage: web::Data<Arc<AnyStorage>>,
-    _auth: Authenticated,
+    auth: Authenticated,
 ) -> Result<HttpResponse, AppError> {
     let bucket = path.into_inner();
+    authorize_bucket(&auth, &storage, &bucket, BucketPermission::Read).await?;
     let q = query.into_inner();
     let options = ListOptions {
         prefix: q.prefix,

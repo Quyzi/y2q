@@ -3,9 +3,10 @@
 use std::sync::Arc;
 
 use actix_web::{HttpRequest, HttpResponse, web};
-use y2q_core::{AnyStorage, Listing, PutOptions, SyncLevel};
+use y2q_core::{AnyStorage, BucketPermission, Listing, PutOptions, SyncLevel};
 
 use crate::auth::Authenticated;
+use crate::authz::{Decision, authorize_bucket, claim_ownership};
 use crate::cipher;
 use crate::config::LabelLimits;
 use crate::error::{AppError, ErrorBody};
@@ -66,6 +67,7 @@ pub async fn handle(
     auth: Authenticated,
 ) -> Result<HttpResponse, AppError> {
     let (bucket, key) = path.into_inner();
+    let decision = authorize_bucket(&auth, &storage, &bucket, BucketPermission::Write).await?;
     let labels = extract_labels(&req, limits.get_ref())?;
     let sync = parse_sync_header(&req, *default_sync.get_ref())?;
 
@@ -125,6 +127,12 @@ pub async fn handle(
         )
         .await
         .map_err(AppError::from)?;
+
+    // A PUT to a brand-new bucket implicitly creates it; record the writer as
+    // its owner so subsequent access is governed by ownership/ACL.
+    if matches!(decision, Decision::ClaimOwnership) {
+        claim_ownership(&storage, &bucket, &auth.username).await?;
+    }
 
     if was_overwrite {
         Ok(HttpResponse::Ok().finish())

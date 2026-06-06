@@ -395,6 +395,11 @@ pub enum AdminCmd {
         #[command(subcommand)]
         cmd: LocksCmd,
     },
+    /// Manage per-bucket ownership and access-control lists.
+    Acl {
+        #[command(subcommand)]
+        cmd: AclCmd,
+    },
     /// Stream live request/response trace from a server.
     Trace {
         alias: String,
@@ -412,6 +417,9 @@ pub enum UserCmd {
         username: String,
         #[arg(long, short)]
         password: Option<String>,
+        /// Global role for the new user: `admin` or `user` (default).
+        #[arg(long, default_value = "user")]
+        role: String,
     },
     /// List users.
     #[command(alias = "ls")]
@@ -419,6 +427,40 @@ pub enum UserCmd {
     /// Delete a user.
     #[command(alias = "rm")]
     Remove { alias: String, username: String },
+    /// Change a user's global role.
+    Role {
+        alias: String,
+        username: String,
+        /// New role: admin, user, readonly, writeonly, auditor, or disabled.
+        role: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum AclCmd {
+    /// Show a bucket's owner and grants.
+    #[command(alias = "show")]
+    Get { alias: String, bucket: String },
+    /// Grant a user read/write/admin access to a bucket.
+    Grant {
+        alias: String,
+        bucket: String,
+        username: String,
+        /// Permission level: `read`, `write`, or `admin`.
+        permission: String,
+    },
+    /// Revoke a user's access to a bucket.
+    Revoke {
+        alias: String,
+        bucket: String,
+        username: String,
+    },
+    /// Transfer ownership of a bucket to another user.
+    Chown {
+        alias: String,
+        bucket: String,
+        username: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]

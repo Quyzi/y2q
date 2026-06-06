@@ -173,6 +173,13 @@ lockout_seconds = 900  # 15 minutes
 # gaps between sessions without requiring a keystore unlock each time.
 keystore_idle_drop_seconds = 0
 
+# Enforce bucket ownership/ACLs and the global admin role. When true (default),
+# new buckets are private to their creator, access is governed by per-bucket
+# grants, and admin endpoints (user management, index rebuild, lock clearing,
+# trace) require an admin account. Set false for a single-user or migration
+# deployment where every authenticated user should have full access.
+enforce_authorization = true
+
 # ── Observability ─────────────────────────────────────────────────────────────
 [observability]
 

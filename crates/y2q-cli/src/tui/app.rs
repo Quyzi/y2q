@@ -2767,7 +2767,7 @@ impl App {
                         let client =
                             client_from_alias(profile, Some(token)).map_err(|e| e.to_string())?;
                         client
-                            .add_user(&username, &password)
+                            .add_user(&username, &password, None)
                             .await
                             .map_err(|e| e.to_string())?;
                         client.list_users().await.map_err(|e| e.to_string())
@@ -2831,7 +2831,6 @@ mod tests {
             checksum_gxhash: "h".into(),
             bucket: "b".into(),
             key: key.into(),
-            disk_path: "/d".into(),
             url_path: "/u".into(),
             labels: Default::default(),
             cipher_size: None,
@@ -2935,6 +2934,7 @@ mod tests {
             username: "bob".into(),
             created_at: 0,
             last_login: None,
+            role: "user".into(),
         }]);
         assert_eq!(app.handle_key(ch('d')), Action::Delete);
         assert!(matches!(
@@ -3244,6 +3244,7 @@ mod tests {
                 username: "u".into(),
                 created_at: 0,
                 last_login: None,
+                role: "user".into(),
             }],
         });
         assert_eq!(app.users_view.users.len(), 1);

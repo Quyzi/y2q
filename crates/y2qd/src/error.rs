@@ -31,6 +31,8 @@ pub struct ErrorBody {
 /// | `InvalidStaleLockThreshold`   | 400         |
 /// | `Locked`                      | 409         |
 /// | `RebuildAlreadyRunning`       | 409         |
+/// | `Forbidden`                   | 403         |
+/// | `InvalidAcl`                  | 400         |
 /// | `Index`                       | 500         |
 /// | `InternalError`               | 500         |
 /// | `KdfFailed`                   | 500         |
@@ -84,8 +86,10 @@ impl ResponseError for AppError {
             | CoreError::LabelValueTooLong { .. }
             | CoreError::TooManyLabels { .. }
             | CoreError::Query { .. }
+            | CoreError::InvalidAcl { .. }
             | CoreError::InvalidStaleLockThreshold { .. } => StatusCode::BAD_REQUEST,
             CoreError::Locked { .. } | CoreError::RebuildAlreadyRunning => StatusCode::CONFLICT,
+            CoreError::Forbidden { .. } => StatusCode::FORBIDDEN,
             CoreError::QuotaExceeded { .. } => StatusCode::PAYLOAD_TOO_LARGE,
             CoreError::Index { .. }
             | CoreError::InternalError { .. }

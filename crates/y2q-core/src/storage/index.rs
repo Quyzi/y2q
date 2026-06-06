@@ -351,6 +351,39 @@ impl MetadataIndex {
         })?
     }
 
+    /// Return whether `bucket` exists: either explicitly registered (possibly
+    /// empty) or holding at least one object. Cheap: an O(1) registry lookup
+    /// plus, on miss, a single range probe of the objects table.
+    pub async fn bucket_exists(&self, bucket: &str) -> Result<bool, Error> {
+        let db = self.db()?;
+        let bucket = bucket.to_owned();
+        tokio::task::spawn_blocking(move || -> Result<bool, Error> {
+            let txn = db.begin_read().map_err(map_redb)?;
+            {
+                let buckets = txn.open_table(BUCKETS).map_err(map_redb)?;
+                if buckets.get(bucket.as_bytes()).map_err(map_redb)?.is_some() {
+                    return Ok(true);
+                }
+            }
+            let objects = txn.open_table(OBJECTS).map_err(map_redb)?;
+            let prefix = encode_bucket_prefix(&bucket);
+            let mut iter = objects
+                .range::<&[u8]>(prefix.as_slice()..)
+                .map_err(map_redb)?;
+            if let Some(entry) = iter.next() {
+                let (k, _v) = entry.map_err(map_redb)?;
+                if k.value().starts_with(&prefix) {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        })
+        .await
+        .map_err(|e| Error::Index {
+            message: format!("join: {e}"),
+        })?
+    }
+
     /// Record `bucket` in the bucket registry so it lists even with no objects.
     /// Idempotent.
     pub async fn register_bucket(&self, bucket: &str) -> Result<(), Error> {

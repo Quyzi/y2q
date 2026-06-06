@@ -8,6 +8,7 @@ use utoipa::ToSchema;
 use y2q_core::{AnyStorage, Listing};
 
 use crate::auth::Authenticated;
+use crate::authz::bucket_readable;
 use crate::error::{AppError, ErrorBody};
 
 /// Response body for `GET /`.
@@ -32,8 +33,15 @@ pub struct ListBucketsResponse {
 )]
 pub async fn handle(
     storage: web::Data<Arc<AnyStorage>>,
-    _auth: Authenticated,
+    auth: Authenticated,
 ) -> Result<HttpResponse, AppError> {
-    let buckets = storage.list_buckets().await.map_err(AppError::from)?;
+    let all = storage.list_buckets().await.map_err(AppError::from)?;
+    // Hide buckets the caller has no read access to (admins see everything).
+    let mut buckets = Vec::with_capacity(all.len());
+    for b in all {
+        if bucket_readable(&auth, &storage, &b).await? {
+            buckets.push(b);
+        }
+    }
     Ok(HttpResponse::Ok().json(ListBucketsResponse { buckets }))
 }

@@ -10,13 +10,27 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use actix_web::{HttpResponse, web};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
-use y2q_core::crypto::{DecryptedKeystore, UserRecord, UserSummary, kdf};
+use y2q_core::crypto::{DecryptedKeystore, Role, UserRecord, UserSummary, kdf};
 
-use super::Authenticated;
 use super::error::AuthError;
 use super::session::{SessionInfo, compute_expiry};
 use super::state::AuthState;
 use super::users::validate as validate_username;
+use super::{AdminAuthenticated, AdminReadAuthenticated, Authenticated};
+
+/// Parse a role name (case-insensitive) into a [`Role`], with a clean 400 on a
+/// bad value rather than a raw JSON deserialization error.
+fn parse_role(s: &str) -> Result<Role, AuthError> {
+    match s.to_ascii_lowercase().as_str() {
+        "admin" => Ok(Role::Admin),
+        "user" => Ok(Role::User),
+        "readonly" => Ok(Role::ReadOnly),
+        "writeonly" => Ok(Role::WriteOnly),
+        "auditor" => Ok(Role::Auditor),
+        "disabled" => Ok(Role::Disabled),
+        _ => Err(AuthError::InvalidRole { role: s.to_owned() }),
+    }
+}
 
 fn record_login(result_label: &'static str, session_count: Option<usize>) {
     metrics::counter!(
@@ -63,6 +77,19 @@ pub struct ChangePasswordRequest {
 pub struct AddUserRequest {
     pub username: String,
     pub password: String,
+    /// Global role for the new user. Defaults to `user`. Only an administrator
+    /// can reach this endpoint, so only an administrator can mint another admin.
+    #[serde(default)]
+    #[schema(value_type = String, example = "user")]
+    pub role: Role,
+}
+
+/// `PUT /api/v1/users/{user}/role` request body.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct SetRoleRequest {
+    /// New global role: `admin`, `user`, `readonly`, `writeonly`, `auditor`, or
+    /// `disabled`.
+    pub role: String,
 }
 
 /// `GET /api/v1/users` response body.
@@ -77,6 +104,9 @@ pub struct UserView {
     pub username: String,
     pub created_at: u64,
     pub last_login: Option<u64>,
+    /// Global role: `"admin"` or `"user"`.
+    #[schema(value_type = String, example = "user")]
+    pub role: Role,
 }
 
 impl From<UserSummary> for UserView {
@@ -85,6 +115,7 @@ impl From<UserSummary> for UserView {
             username: s.username,
             created_at: s.created_at,
             last_login: s.last_login,
+            role: s.role,
         }
     }
 }
@@ -156,6 +187,12 @@ pub async fn login(
 
     match result {
         Ok((rec, sk)) => {
+            // A disabled account authenticates but may not obtain a session.
+            if rec.role == Role::Disabled {
+                record_login("disabled", None);
+                apply_floor(state.config.min_login_response_ms, started).await;
+                return Err(AuthError::AccountDisabled);
+            }
             // Successful auth — derive and install the MEK from the unwrapped
             // secret key (gates metadata encryption on login), then install SK
             // if absent and mint session.
@@ -166,6 +203,7 @@ pub async fn login(
 
             let info = SessionInfo {
                 username: rec.username.clone(),
+                role: rec.role,
                 created_at: SystemTime::now(),
                 expires_at,
             };
@@ -237,6 +275,7 @@ pub async fn refresh(
     )?;
     let info = SessionInfo {
         username: auth.username.clone(),
+        role: auth.role,
         created_at: SystemTime::now(),
         expires_at,
     };
@@ -318,6 +357,7 @@ pub async fn change_password(
         last_login: rec.last_login,
         kdf: new_params,
         wrapped_sk: wrapped,
+        role: rec.role,
     };
     state
         .user_store
@@ -340,14 +380,16 @@ pub async fn change_password(
     ),
     tag = "users",
 )]
-#[tracing::instrument(skip(state, auth, body), fields(actor = %auth.username, new_user = %body.username))]
+#[tracing::instrument(skip(state, auth, body), fields(actor = %auth.0.username, new_user = %body.username))]
 pub async fn add_user(
     state: web::Data<AuthState>,
-    auth: Authenticated,
+    auth: AdminAuthenticated,
     body: web::Json<AddUserRequest>,
 ) -> Result<HttpResponse, AuthError> {
+    let auth = auth.0;
     let username = body.username.clone();
     let password = body.password.clone();
+    let role = body.role;
     validate_username(&username)?;
     if password.is_empty() {
         return Err(AuthError::InvalidBody {
@@ -380,6 +422,7 @@ pub async fn add_user(
         last_login: None,
         kdf: params,
         wrapped_sk: wrapped,
+        role,
     };
     state
         .user_store
@@ -401,7 +444,7 @@ pub async fn add_user(
 #[tracing::instrument(skip(state, _auth))]
 pub async fn list_users(
     state: web::Data<AuthState>,
-    _auth: Authenticated,
+    _auth: AdminReadAuthenticated,
 ) -> Result<HttpResponse, AuthError> {
     let users = state
         .user_store
@@ -428,20 +471,28 @@ pub async fn list_users(
     ),
     tag = "users",
 )]
-#[tracing::instrument(skip(state, auth), fields(actor = %auth.username, target = %path))]
+#[tracing::instrument(skip(state, auth), fields(actor = %auth.0.username, target = %path))]
 pub async fn delete_user(
     state: web::Data<AuthState>,
-    auth: Authenticated,
+    auth: AdminAuthenticated,
     path: web::Path<String>,
 ) -> Result<HttpResponse, AuthError> {
-    let username = path.into_inner();
     let _ = &auth;
-    let count = state
+    let username = path.into_inner();
+    let users = state
         .user_store
-        .count()
+        .list()
         .map_err(|e| AuthError::Backend(e.to_string()))?;
-    if count <= 1 {
+    if users.len() <= 1 {
         return Err(AuthError::CannotDeleteLastUser);
+    }
+    // Refuse to remove the final administrator, which would lock everyone out
+    // of admin endpoints (user management, rebuild, locks, trace).
+    let target_is_admin = users
+        .iter()
+        .any(|u| u.username == username && u.role == Role::Admin);
+    if target_is_admin && users.iter().filter(|u| u.role == Role::Admin).count() <= 1 {
+        return Err(AuthError::CannotDeleteLastAdmin);
     }
     let removed = state
         .user_store
@@ -450,6 +501,69 @@ pub async fn delete_user(
     if !removed {
         return Err(AuthError::UserNotFound { username });
     }
+    Ok(HttpResponse::NoContent().finish())
+}
+
+/// `PUT /api/v1/users/{user}/role` — change a user's global role. Admin only.
+///
+/// Setting `disabled` suspends the account. The change takes effect immediately:
+/// the target's existing sessions are revoked, so it does not wait for session
+/// expiry. Refuses to demote the only remaining administrator.
+#[utoipa::path(
+    put,
+    path = "/api/v1/users/{user}/role",
+    request_body = SetRoleRequest,
+    params(("user" = String, Path, description = "Username whose role to change")),
+    responses(
+        (status = 204, description = "Role updated"),
+        (status = 400, description = "Invalid role"),
+        (status = 401, description = "Token missing/invalid"),
+        (status = 403, description = "Caller is not an admin"),
+        (status = 404, description = "User not found"),
+        (status = 409, description = "Would demote the last remaining administrator"),
+    ),
+    tag = "users",
+)]
+#[tracing::instrument(skip(state, auth, body), fields(actor = %auth.0.username, target = %path))]
+pub async fn set_role(
+    state: web::Data<AuthState>,
+    auth: AdminAuthenticated,
+    path: web::Path<String>,
+    body: web::Json<SetRoleRequest>,
+) -> Result<HttpResponse, AuthError> {
+    let _ = &auth;
+    let username = path.into_inner();
+    let new_role = parse_role(&body.role)?;
+
+    let mut rec = state
+        .user_store
+        .get(&username)
+        .map_err(|e| AuthError::Backend(e.to_string()))?
+        .ok_or_else(|| AuthError::UserNotFound {
+            username: username.clone(),
+        })?;
+
+    // Don't demote the only administrator.
+    if rec.role == Role::Admin && new_role != Role::Admin {
+        let admin_count = state
+            .user_store
+            .list()
+            .map_err(|e| AuthError::Backend(e.to_string()))?
+            .iter()
+            .filter(|u| u.role == Role::Admin)
+            .count();
+        if admin_count <= 1 {
+            return Err(AuthError::CannotDemoteLastAdmin);
+        }
+    }
+
+    rec.role = new_role;
+    state
+        .user_store
+        .upsert(&rec)
+        .map_err(|e| AuthError::Backend(e.to_string()))?;
+    // Apply immediately rather than at session expiry.
+    state.sessions.revoke_user(&username);
     Ok(HttpResponse::NoContent().finish())
 }
 

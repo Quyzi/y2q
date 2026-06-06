@@ -12,7 +12,7 @@ use serde::Serialize;
 use utoipa::ToSchema;
 use y2q_core::{AnyStorage, CacheRebuildStatus, StorageExt};
 
-use crate::auth::Authenticated;
+use crate::auth::{AdminAuthenticated, AdminReadAuthenticated};
 use crate::error::{AppError, ErrorBody};
 
 /// JSON body for `GET /api/v1/rebuild`.
@@ -83,7 +83,7 @@ pub struct RebuildStartResponse {
 )]
 pub async fn start(
     storage: web::Data<Arc<AnyStorage>>,
-    _auth: Authenticated,
+    _auth: AdminAuthenticated,
 ) -> Result<HttpResponse, AppError> {
     storage.rebuild_cache().await.map_err(AppError::from)?;
     Ok(HttpResponse::Accepted().json(RebuildStartResponse { status: "running" }))
@@ -104,7 +104,7 @@ pub async fn start(
 )]
 pub async fn status(
     storage: web::Data<Arc<AnyStorage>>,
-    _auth: Authenticated,
+    _auth: AdminReadAuthenticated,
 ) -> Result<HttpResponse, AppError> {
     let s = storage.rebuild_progress().await.map_err(AppError::from)?;
     Ok(HttpResponse::Ok().json(RebuildStatusResponse::from(s)))

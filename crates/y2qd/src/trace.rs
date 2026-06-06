@@ -13,7 +13,7 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
-use crate::auth::Authenticated;
+use crate::auth::AdminReadAuthenticated;
 use crate::request_id::RequestIdExt;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,7 +98,7 @@ pub async fn trace_middleware<B: MessageBody>(
 }
 
 /// `GET /api/v1/trace` — streams live trace events as Server-Sent Events.
-pub async fn stream(hub: web::Data<Arc<TraceHub>>, _auth: Authenticated) -> HttpResponse {
+pub async fn stream(hub: web::Data<Arc<TraceHub>>, _auth: AdminReadAuthenticated) -> HttpResponse {
     let rx = hub.subscribe();
     let event_stream = futures::stream::unfold(rx, |mut rx| async move {
         loop {

@@ -205,6 +205,7 @@ async fn dispatch_rest(command: Commands, mode: OutputMode) -> Result<(), CliErr
             AdminCmd::User { cmd } => cmd::users::run(cmd, mode).await,
             AdminCmd::Rebuild { cmd } => cmd::admin::rebuild(cmd, mode).await,
             AdminCmd::Locks { cmd } => cmd::admin::locks(cmd, mode).await,
+            AdminCmd::Acl { cmd } => cmd::acl::run(cmd, mode).await,
             AdminCmd::Trace { alias, errors } => cmd::admin::trace(&alias, errors).await,
         },
         // All remaining variants are handled in `run`.

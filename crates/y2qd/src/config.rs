@@ -343,6 +343,9 @@ fn default_lockout_seconds() -> u64 {
 fn default_keystore_idle_drop_seconds() -> u64 {
     0
 }
+fn default_enforce_authorization() -> bool {
+    true
+}
 
 /// User authentication / session settings.
 #[derive(Debug, Deserialize, Clone)]
@@ -374,6 +377,12 @@ pub struct AuthConfig {
     /// gaps between sessions; lower to bound the SK exposure window.
     #[serde(default = "default_keystore_idle_drop_seconds")]
     pub keystore_idle_drop_seconds: u64,
+    /// Enforce bucket ownership/ACL and the global admin role. When `false`,
+    /// any authenticated user has full access to every bucket and every admin
+    /// endpoint (the pre-authorization behavior) — intended for single-user or
+    /// migration deployments only.
+    #[serde(default = "default_enforce_authorization")]
+    pub enforce_authorization: bool,
 }
 
 fn default_max_labels() -> usize {

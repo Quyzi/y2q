@@ -93,6 +93,7 @@ impl AuthState {
             last_login: None,
             kdf: params,
             wrapped_sk,
+            role: y2q_core::crypto::Role::User,
         }
     }
 

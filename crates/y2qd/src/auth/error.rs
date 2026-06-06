@@ -28,6 +28,15 @@ pub enum AuthError {
     #[error("authentication token expired")]
     TokenExpired,
 
+    /// Caller is authenticated but lacks the global admin role required for
+    /// this endpoint.
+    #[error("administrator privileges required")]
+    Forbidden,
+
+    /// The account has been disabled by an administrator.
+    #[error("account disabled")]
+    AccountDisabled,
+
     /// Caller requested a session lifetime greater than `auth.max_ttl_seconds`.
     #[error("ttl_seconds out of range (max {max})")]
     TtlOutOfRange { max: u64 },
@@ -47,6 +56,20 @@ pub enum AuthError {
     /// `DELETE /api/v1/users/{user}` for the sole remaining user.
     #[error("cannot delete last remaining user")]
     CannotDeleteLastUser,
+
+    /// `DELETE /api/v1/users/{user}` would remove the only administrator,
+    /// locking everyone out of admin endpoints.
+    #[error("cannot delete the last remaining administrator")]
+    CannotDeleteLastAdmin,
+
+    /// A role change would demote the only administrator, locking everyone out
+    /// of admin endpoints.
+    #[error("cannot demote the last remaining administrator")]
+    CannotDemoteLastAdmin,
+
+    /// A role string was not one of the recognized roles.
+    #[error("invalid role: {role}")]
+    InvalidRole { role: String },
 
     /// Caller hit a protected endpoint before any user has logged in
     /// since the daemon started, so the SK isn't available in memory.
@@ -77,11 +100,16 @@ impl ResponseError for AuthError {
             | AuthError::TokenMissing
             | AuthError::TokenInvalid
             | AuthError::TokenExpired => StatusCode::UNAUTHORIZED,
+            AuthError::Forbidden | AuthError::AccountDisabled => StatusCode::FORBIDDEN,
             AuthError::LockedOut { .. } => StatusCode::TOO_MANY_REQUESTS,
             AuthError::TtlOutOfRange { .. }
             | AuthError::InvalidUsername { .. }
+            | AuthError::InvalidRole { .. }
             | AuthError::InvalidBody { .. } => StatusCode::BAD_REQUEST,
-            AuthError::UserExists { .. } | AuthError::CannotDeleteLastUser => StatusCode::CONFLICT,
+            AuthError::UserExists { .. }
+            | AuthError::CannotDeleteLastUser
+            | AuthError::CannotDeleteLastAdmin
+            | AuthError::CannotDemoteLastAdmin => StatusCode::CONFLICT,
             AuthError::UserNotFound { .. } => StatusCode::NOT_FOUND,
             AuthError::KeystoreUnavailable => StatusCode::SERVICE_UNAVAILABLE,
             AuthError::Backend(_) | AuthError::InternalState => StatusCode::INTERNAL_SERVER_ERROR,
@@ -119,6 +147,10 @@ mod tests {
             (AuthError::TokenMissing, S::UNAUTHORIZED),
             (AuthError::TokenInvalid, S::UNAUTHORIZED),
             (AuthError::TokenExpired, S::UNAUTHORIZED),
+            (AuthError::Forbidden, S::FORBIDDEN),
+            (AuthError::AccountDisabled, S::FORBIDDEN),
+            (AuthError::CannotDemoteLastAdmin, S::CONFLICT),
+            (AuthError::InvalidRole { role: "x".into() }, S::BAD_REQUEST),
             (
                 AuthError::LockedOut {
                     until: SystemTime::now(),
@@ -138,6 +170,7 @@ mod tests {
                 S::CONFLICT,
             ),
             (AuthError::CannotDeleteLastUser, S::CONFLICT),
+            (AuthError::CannotDeleteLastAdmin, S::CONFLICT),
             (
                 AuthError::UserNotFound {
                     username: "u".into(),

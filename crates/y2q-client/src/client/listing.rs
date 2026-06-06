@@ -54,6 +54,26 @@ impl Y2qClient {
         Ok(resp.json().await?)
     }
 
+    /// Fetch a bucket's owner and ACL.
+    pub async fn get_bucket_acl(&self, bucket: &str) -> Result<crate::model::AclBody, ClientError> {
+        let url = self.url(&format!("api/v1/buckets/{bucket}/acl"));
+        let resp = self.authed(self.inner.get(url)).send().await?;
+        let resp = Self::check_status(resp).await?;
+        Ok(resp.json().await?)
+    }
+
+    /// Replace a bucket's owner and ACL.
+    pub async fn set_bucket_acl(
+        &self,
+        bucket: &str,
+        acl: &crate::model::AclBody,
+    ) -> Result<crate::model::AclBody, ClientError> {
+        let url = self.url(&format!("api/v1/buckets/{bucket}/acl"));
+        let resp = self.authed(self.inner.put(url)).json(acl).send().await?;
+        let resp = Self::check_status(resp).await?;
+        Ok(resp.json().await?)
+    }
+
     pub async fn list_objects(
         &self,
         bucket: &str,

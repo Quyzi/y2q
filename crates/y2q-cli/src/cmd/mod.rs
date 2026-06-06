@@ -1,3 +1,4 @@
+pub mod acl;
 pub mod admin;
 pub mod alias;
 pub mod auth;

@@ -3,9 +3,10 @@
 use std::sync::Arc;
 
 use actix_web::{HttpResponse, web};
-use y2q_core::{AnyStorage, Storage};
+use y2q_core::{AnyStorage, BucketPermission, Storage};
 
 use crate::auth::Authenticated;
+use crate::authz::authorize_bucket;
 use crate::error::{AppError, ErrorBody};
 
 /// Retrieve object metadata without transferring the body.
@@ -49,9 +50,10 @@ use crate::error::{AppError, ErrorBody};
 pub async fn handle(
     path: web::Path<(String, String)>,
     storage: web::Data<Arc<AnyStorage>>,
-    _auth: Authenticated,
+    auth: Authenticated,
 ) -> Result<HttpResponse, AppError> {
     let (bucket, key) = path.into_inner();
+    authorize_bucket(&auth, &storage, &bucket, BucketPermission::Read).await?;
     let meta = storage
         .describe(&bucket, &key)
         .await

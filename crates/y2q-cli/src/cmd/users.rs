@@ -14,6 +14,7 @@ pub async fn run(cmd: UserCmd, mode: OutputMode) -> Result<(), CliError> {
             alias,
             username,
             password,
+            role,
         } => {
             let pw = if let Some(p) = password {
                 Zeroizing::new(p)
@@ -24,11 +25,11 @@ pub async fn run(cmd: UserCmd, mode: OutputMode) -> Result<(), CliError> {
                 )
             };
             let client = make_client(&alias).await?;
-            crate::ops::admin::add_user(&client, &username, pw.as_str()).await?;
+            crate::ops::admin::add_user(&client, &username, pw.as_str(), Some(&role)).await?;
             if mode == OutputMode::Json {
-                print_json(&serde_json::json!({ "created": username }));
+                print_json(&serde_json::json!({ "created": username, "role": role }));
             } else {
-                println!("Created user `{username}`");
+                println!("Created user `{username}` ({role})");
             }
         }
 
@@ -43,12 +44,17 @@ pub async fn run(cmd: UserCmd, mode: OutputMode) -> Result<(), CliError> {
                     .map(|u| {
                         vec![
                             u.username.clone(),
+                            if u.role.is_empty() {
+                                "-".into()
+                            } else {
+                                u.role.clone()
+                            },
                             fmt_ns(u.created_at),
                             u.last_login.map(fmt_ns).unwrap_or_else(|| "never".into()),
                         ]
                     })
                     .collect();
-                print_table(&["USERNAME", "CREATED", "LAST_LOGIN"], &rows);
+                print_table(&["USERNAME", "ROLE", "CREATED", "LAST_LOGIN"], &rows);
             }
         }
 
@@ -59,6 +65,20 @@ pub async fn run(cmd: UserCmd, mode: OutputMode) -> Result<(), CliError> {
                 print_json(&serde_json::json!({ "deleted": username }));
             } else {
                 println!("Deleted user `{username}`");
+            }
+        }
+
+        UserCmd::Role {
+            alias,
+            username,
+            role,
+        } => {
+            let client = make_client(&alias).await?;
+            crate::ops::admin::set_user_role(&client, &username, &role).await?;
+            if mode == OutputMode::Json {
+                print_json(&serde_json::json!({ "user": username, "role": role }));
+            } else {
+                println!("Set role of `{username}` to {role}");
             }
         }
     }

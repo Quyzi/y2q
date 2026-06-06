@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 use y2q_core::{AnyStorage, Error as CoreError, StaleLock, StorageExt};
 
-use crate::auth::Authenticated;
+use crate::auth::{AdminAuthenticated, AdminReadAuthenticated};
 use crate::error::{AppError, ErrorBody};
 
 /// Query parameters for `GET` and `DELETE` on `/api/v1/locks`.
@@ -71,7 +71,7 @@ pub struct ClearStaleLocksResponse {
 pub async fn list(
     storage: web::Data<Arc<AnyStorage>>,
     query: web::Query<LocksQuery>,
-    _auth: Authenticated,
+    _auth: AdminReadAuthenticated,
 ) -> Result<HttpResponse, AppError> {
     let now = SystemTime::now();
     let cutoff = parse_older_than(&query.older_than, now)?;
@@ -101,7 +101,7 @@ pub async fn list(
 pub async fn clear(
     storage: web::Data<Arc<AnyStorage>>,
     query: web::Query<LocksQuery>,
-    _auth: Authenticated,
+    _auth: AdminAuthenticated,
 ) -> Result<HttpResponse, AppError> {
     let now = SystemTime::now();
     let cutoff = parse_older_than(&query.older_than, now)?;

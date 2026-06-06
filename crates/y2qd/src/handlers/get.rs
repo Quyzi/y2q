@@ -12,9 +12,10 @@ use actix_web::http::header;
 use actix_web::{HttpRequest, HttpResponse, web};
 use bytes::{Bytes, BytesMut};
 use y2q_core::crypto::envelope;
-use y2q_core::{AnyStorage, Storage};
+use y2q_core::{AnyStorage, BucketPermission, Storage};
 
 use crate::auth::Authenticated;
+use crate::authz::authorize_bucket;
 use crate::cipher;
 use crate::error::{AppError, ErrorBody};
 
@@ -59,6 +60,7 @@ pub async fn handle(
     auth: Authenticated,
 ) -> Result<HttpResponse, AppError> {
     let (bucket, key) = path.into_inner();
+    authorize_bucket(&auth, &storage, &bucket, BucketPermission::Read).await?;
     let range_header = req
         .headers()
         .get(header::RANGE)

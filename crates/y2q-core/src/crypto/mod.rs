@@ -29,7 +29,7 @@ pub use metadata_key::{
     decrypt_meta, derive_index_file_key, derive_index_key, derive_mek, derive_path_key,
     encrypt_meta, prf,
 };
-pub use user_store::{UserRecord, UserStore, UserSummary};
+pub use user_store::{Role, UserRecord, UserStore, UserSummary};
 
 use crate::Error;
 

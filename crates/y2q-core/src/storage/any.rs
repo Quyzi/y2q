@@ -114,6 +114,14 @@ impl Listing for AnyStorage {
         }
     }
 
+    async fn bucket_exists(&self, bucket: &str) -> Result<bool, Error> {
+        match self {
+            Self::Filesystem(s) => s.bucket_exists(bucket).await,
+            #[cfg(target_os = "linux")]
+            Self::Uring(s) => s.bucket_exists(bucket).await,
+        }
+    }
+
     async fn list_objects(&self, bucket: &str, options: ListOptions) -> Result<ListPage, Error> {
         match self {
             Self::Filesystem(s) => s.list_objects(bucket, options).await,

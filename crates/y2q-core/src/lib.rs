@@ -372,6 +372,24 @@ pub enum Error {
         incoming: u64,
     },
 
+    /// The authenticated caller is not permitted to perform the requested
+    /// action on `bucket`. Produced by the daemon's authorization layer (the
+    /// caller can already see the bucket but lacks the required permission
+    /// level); storage operations themselves never raise this.
+    #[error("forbidden: insufficient permission on bucket `{bucket}`")]
+    Forbidden {
+        /// Bucket the caller lacked sufficient permission for.
+        bucket: String,
+    },
+
+    /// A bucket ACL update was rejected (unknown grantee, empty username, or a
+    /// redundant grant to the owner). Produced by the daemon's ACL endpoint.
+    #[error("invalid acl: {reason}")]
+    InvalidAcl {
+        /// Human-readable reason the ACL update was rejected.
+        reason: String,
+    },
+
     /// `pubkey.json` is missing — the daemon cannot serve traffic until
     /// first-run setup completes.
     #[error("keystore not found at {path}")]
@@ -509,6 +527,25 @@ pub trait Storage {
     async fn set_labels(&self, bucket: &str, key: &str, labels: LabelSet) -> Result<(), Error>;
 }
 
+/// Access level a user may hold on a bucket, expressed as a set of verb
+/// capabilities rather than a strict ladder (because [`WriteOnly`](Self::WriteOnly)
+/// grants write without read). The daemon resolves an action against these
+/// capabilities; see `y2qd`'s `authz` module.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Hash)]
+#[serde(rename_all = "lowercase")]
+pub enum BucketPermission {
+    /// Read objects, list, and read bucket config.
+    Read,
+    /// Read plus write/overwrite/delete objects and tags.
+    Write,
+    /// Write/delete objects and tags but *not* read or list — a per-bucket
+    /// drop-box.
+    WriteOnly,
+    /// Everything `Write` allows, plus delete the bucket, edit its config, and
+    /// manage its ACL.
+    Admin,
+}
+
 /// Per-bucket configuration persisted as a JSON sidecar in the bucket
 /// directory. Every field is optional so the file stays forward-compatible and
 /// an absent file deserializes to all-`None` defaults.
@@ -526,6 +563,15 @@ pub struct BucketConfig {
     /// (`Access-Control-Allow-Origin`). `*` or a specific origin.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cors_allow_origin: Option<String>,
+    /// Username of the bucket owner. `None` means the bucket predates the
+    /// ownership system (or was created before an owner was assigned): such a
+    /// bucket is accessible only to global admins until one claims it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    /// Per-user access grants. The owner and global admins are not listed here;
+    /// they have implicit full access. Absent/empty for legacy configs.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub acl: BTreeMap<String, BucketPermission>,
 }
 
 /// Enumerate buckets and the objects within them.
@@ -538,6 +584,12 @@ pub trait Listing: Storage {
     /// that contain at least one object as well as empty buckets created
     /// explicitly via [`create_bucket`](Listing::create_bucket).
     async fn list_buckets(&self) -> Result<Vec<String>, Error>;
+
+    /// Return whether `bucket` currently exists (registered empty or holding at
+    /// least one object). Cheaper than scanning [`list_buckets`](Listing::list_buckets);
+    /// used by the daemon's authorization layer to distinguish a brand-new
+    /// bucket (which the caller may claim) from an existing unowned one.
+    async fn bucket_exists(&self, bucket: &str) -> Result<bool, Error>;
 
     /// Return one page of objects in `bucket`, filtered and paginated by
     /// `options`. Results are sorted ascending by key.
@@ -628,4 +680,37 @@ pub trait StorageExt: Storage {
     /// unlink. The scan / unlink pair is not atomic across the tree; see
     /// [`storage::locks`] for race semantics.
     async fn clear_stale_locks(&self, older_than: SystemTime) -> Result<u64, Error>;
+}
+
+#[cfg(test)]
+mod bucket_config_tests {
+    use super::{BucketConfig, BucketPermission};
+
+    #[test]
+    fn legacy_config_without_owner_or_acl_is_unowned() {
+        // A bucket.json written before the ownership system has neither field.
+        let cfg: BucketConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(cfg.owner, None);
+        assert!(cfg.acl.is_empty());
+    }
+
+    #[test]
+    fn owner_and_acl_round_trip() {
+        let cfg: BucketConfig =
+            serde_json::from_str(r#"{"owner":"alice","acl":{"bob":"read","carol":"admin"}}"#)
+                .unwrap();
+        assert_eq!(cfg.owner.as_deref(), Some("alice"));
+        assert_eq!(cfg.acl.get("bob"), Some(&BucketPermission::Read));
+        assert_eq!(cfg.acl.get("carol"), Some(&BucketPermission::Admin));
+    }
+
+    #[test]
+    fn permission_serializes_lowercase() {
+        assert_eq!(
+            serde_json::to_string(&BucketPermission::Write).unwrap(),
+            "\"write\""
+        );
+        let p: BucketPermission = serde_json::from_str("\"admin\"").unwrap();
+        assert_eq!(p, BucketPermission::Admin);
+    }
 }
