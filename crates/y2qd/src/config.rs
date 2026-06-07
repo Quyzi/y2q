@@ -664,9 +664,30 @@ pub struct ClusterConfig {
     /// `Y2QD_CLUSTER__UNLOCK_SECRET`.
     #[serde(default)]
     pub unlock_secret_file: String,
+    /// User whose record the provisioned unlock secret unwraps at boot to
+    /// recover the deployment SK. Default: `"root"`.
+    #[serde(default = "default_unlock_user")]
+    pub unlock_user: String,
+    /// Known peers (id + base URL) the controller can dial. The bootstrap node
+    /// adds these as learners and promotes those in `raft.voter_seeds`.
+    #[serde(default)]
+    pub peers: Vec<PeerConfig>,
     /// Embedded raft control-plane tuning.
     #[serde(default)]
     pub raft: RaftConfig,
+}
+
+/// A configured peer node.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PeerConfig {
+    /// The peer's node id (`u64`).
+    pub id: u64,
+    /// The peer's base URL, e.g. `https://10.0.0.2:8443`.
+    pub url: String,
+}
+
+fn default_unlock_user() -> String {
+    "root".to_string()
 }
 
 impl Default for ClusterConfig {
@@ -687,6 +708,8 @@ impl Default for ClusterConfig {
             health_fail_threshold: default_health_fail_threshold(),
             unlock: default_cluster_unlock(),
             unlock_secret_file: String::new(),
+            unlock_user: default_unlock_user(),
+            peers: Vec::new(),
             raft: RaftConfig::default(),
         }
     }

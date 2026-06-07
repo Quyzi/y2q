@@ -5874,6 +5874,7 @@ dependencies = [
  "metrics",
  "metrics-exporter-prometheus",
  "metrics-rs-dashboard-actix",
+ "openraft",
  "pyroscope",
  "rand 0.8.6",
  "rustls",
@@ -5890,6 +5891,7 @@ dependencies = [
  "utoipa",
  "utoipa-swagger-ui",
  "uuid",
+ "y2q-cluster",
  "y2q-core",
  "zeroize",
 ]

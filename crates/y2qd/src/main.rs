@@ -83,6 +83,7 @@ mod auth;
 mod authz;
 mod cipher;
 mod cli;
+mod cluster;
 mod config;
 mod error;
 mod handlers;
@@ -361,6 +362,19 @@ async fn main() -> std::io::Result<()> {
         mek_ready.clone(),
     ));
 
+    // Build the cluster runtime (control plane) when clustering is enabled. This
+    // provisions the MEK at boot from the configured unlock user so the node can
+    // serve peer-forwarded writes without an interactive login.
+    let cluster_runtime: Option<web::Data<cluster::ClusterRuntime>> = if cfg.cluster.enabled {
+        let rt = cluster::build_runtime(&cfg, auth_state.get_ref())
+            .await
+            .map_err(|e| std::io::Error::other(format!("cluster startup: {e}")))?;
+        Some(web::Data::new(rt))
+    } else {
+        None
+    };
+    let cluster_enabled = cfg.cluster.enabled;
+
     // Background sweeper for expired sessions + idle-keystore drop.
     {
         let auth_state = auth_state.clone();
@@ -373,8 +387,12 @@ async fn main() -> std::io::Result<()> {
                     tracing::debug!(removed, "swept expired sessions");
                 }
                 // When the idle keystore drop fires, zeroize the MEK too so no
-                // metadata key lingers in memory while no session is active.
-                if auth_state.keystore.reconcile(&auth_state.sessions) {
+                // metadata key lingers in memory while no session is active. In
+                // cluster mode the MEK is provisioned for the process lifetime,
+                // so an idle session SK may still be dropped but the MEK must NOT
+                // be cleared — peer-forwarded writes depend on it.
+                let dropped = auth_state.keystore.reconcile(&auth_state.sessions);
+                if dropped && !cluster_enabled {
                     auth_state.storage.clear_mek();
                     tracing::debug!("idle: dropped secret key and zeroized MEK");
                 }
@@ -498,6 +516,12 @@ async fn main() -> std::io::Result<()> {
             .app_data(encryption_params.clone())
             .app_data(auth_state.clone())
             .app_data(web::PayloadConfig::new(max_body_bytes));
+        // Register cluster routes before handlers::configure so the specific
+        // /internal/v1 and /api/v1/cluster paths win over the greedy object
+        // route. Only present when clustering is enabled.
+        if let Some(rt) = &cluster_runtime {
+            app = app.app_data(rt.clone()).configure(cluster::configure);
+        }
         // Swagger UI and metrics dashboard are unauthenticated (actix doesn't
         // make it easy to wrap third-party scopes with our extractor). Only
         // register them when the operator has explicitly opted in.
