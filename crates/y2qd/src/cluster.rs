@@ -30,8 +30,8 @@ use zeroize::Zeroizing;
 use y2q_cluster::control::raft_impl::TypeConfig;
 use y2q_cluster::transport::internal_client::CLUSTER_AUTH_HEADER;
 use y2q_cluster::{
-    Controller, ControllerConfig, DistributedStorage, HttpRaftNetworkFactory, InternalClient,
-    InternalTlsOptions, PREPARE_META_HEADER, PrepareMeta, resolve_node_id,
+    ControlCmd, Controller, ControllerConfig, DistributedStorage, HttpRaftNetworkFactory,
+    InternalClient, InternalTlsOptions, PREPARE_META_HEADER, PrepareMeta, resolve_node_id,
 };
 use y2q_core::AnyStorage;
 use y2q_core::crypto::kdf;
@@ -45,6 +45,12 @@ pub struct ClusterRuntime {
     pub controller: Arc<Controller>,
     /// The CRAQ data-plane handle (chain routing + replicated writes).
     pub distributed: Arc<DistributedStorage>,
+    /// Internal HTTP client for peer RPC (used to attest a candidate's identity
+    /// on admission).
+    client: Arc<InternalClient>,
+    /// This node's deployment public-key fingerprint. The leader admits a peer
+    /// only if it attests the same fingerprint (the shared-MEK invariant).
+    fingerprint: String,
     /// This node's id.
     pub node_id: u64,
     /// Shared secret used to authenticate peer requests (when `auth_mode` is
@@ -152,20 +158,23 @@ pub async fn build_runtime(
     let distributed = Arc::new(DistributedStorage::new(
         storage,
         Arc::clone(&controller),
-        client,
+        Arc::clone(&client),
         node_id,
         cfg.cluster.replication_factor,
         cfg.cluster.virtual_nodes_per_node,
-        cfg.server.tls.enabled,
     ));
 
+    let fingerprint = auth_state.public_keystore.fingerprint.clone();
+
     if cfg.cluster.raft.bootstrap {
-        bootstrap(&controller, cfg, node_id).await;
+        bootstrap(&controller, &client, cfg, node_id, fingerprint.clone()).await;
     }
 
     Ok(ClusterRuntime {
         controller,
         distributed,
+        client,
+        fingerprint,
         node_id,
         shared_secret: shared_secret.map(Zeroizing::new),
         auth_mode: cfg.cluster.auth,
@@ -221,11 +230,21 @@ fn read_unlock_secret(cfg: &Config) -> std::io::Result<Zeroizing<String>> {
 }
 
 /// Initialize a single-node cluster on the bootstrap node, then spawn a task
-/// that adds the configured peers as learners and promotes the voter set.
-async fn bootstrap(controller: &Arc<Controller>, cfg: &Config, node_id: u64) {
+/// that registers this node, admits the configured peers (verifying each one's
+/// deployment-key fingerprint), and promotes the voter set.
+async fn bootstrap(
+    controller: &Arc<Controller>,
+    client: &Arc<InternalClient>,
+    cfg: &Config,
+    node_id: u64,
+    fingerprint: String,
+) {
     let self_url = node_base_url(cfg);
     match controller
-        .initialize(BTreeMap::from([(node_id, BasicNode::new(self_url))]))
+        .initialize(BTreeMap::from([(
+            node_id,
+            BasicNode::new(self_url.clone()),
+        )]))
         .await
     {
         Ok(()) => tracing::info!(node_id, "cluster initialized (single-node)"),
@@ -234,27 +253,60 @@ async fn bootstrap(controller: &Arc<Controller>, cfg: &Config, node_id: u64) {
     }
 
     let controller = Arc::clone(controller);
+    let client = Arc::clone(client);
     let peers = cfg.cluster.peers.clone();
     let voter_seeds: BTreeSet<u64> = cfg.cluster.raft.voter_seeds.iter().copied().collect();
     tokio::spawn(async move {
-        // Add each peer as a learner, retrying until it is reachable.
+        // Register self in the control state so routing sees this node and its
+        // fingerprint. Retry until this node has won leadership (propose only
+        // succeeds on the leader).
+        loop {
+            match controller
+                .propose(ControlCmd::AddNode {
+                    node_id,
+                    addr: self_url.clone(),
+                    fingerprint: fingerprint.clone(),
+                })
+                .await
+            {
+                Ok(_) => {
+                    tracing::info!(node_id, "registered self in cluster control state");
+                    break;
+                }
+                Err(e) => {
+                    tracing::debug!(error = %e, "self AddNode not yet applied (awaiting leadership)");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            }
+        }
+
+        // Admit each peer: verify its attested fingerprint, then add it as a
+        // learner and record it in the control state. Retry until reachable.
         for peer in &peers {
             loop {
-                match controller
-                    .add_learner(peer.id, BasicNode::new(peer.url.clone()))
-                    .await
+                match verify_and_admit(&controller, &client, &fingerprint, peer.id, &peer.url).await
                 {
                     Ok(()) => {
-                        tracing::info!(peer = peer.id, url = %peer.url, "added cluster learner");
+                        tracing::info!(peer = peer.id, url = %peer.url, "admitted cluster peer");
+                        break;
+                    }
+                    Err(AdmitError::Fingerprint { expected, actual }) => {
+                        // A keystore mismatch is not transient: refuse and stop
+                        // retrying this peer (it would silently diverge).
+                        tracing::error!(
+                            peer = peer.id, url = %peer.url, %expected, %actual,
+                            "REFUSING cluster peer: deployment-key fingerprint mismatch"
+                        );
                         break;
                     }
                     Err(e) => {
-                        tracing::warn!(peer = peer.id, error = %e, "add_learner failed; retrying");
+                        tracing::warn!(peer = peer.id, error = %e, "admit failed; retrying");
                         tokio::time::sleep(Duration::from_secs(1)).await;
                     }
                 }
             }
         }
+
         // Promote the voting quorum (always including self when a set is given).
         if !voter_seeds.is_empty() {
             let mut voters = voter_seeds.clone();
@@ -265,6 +317,81 @@ async fn bootstrap(controller: &Arc<Controller>, cfg: &Config, node_id: u64) {
             }
         }
     });
+}
+
+/// Failure reasons when the leader tries to admit a candidate node.
+#[derive(thiserror::Error, Debug)]
+enum AdmitError {
+    /// The candidate could not be probed for its identity.
+    #[error("probe {url}: {error}")]
+    Probe {
+        /// Candidate base URL.
+        url: String,
+        /// Underlying transport error.
+        error: String,
+    },
+    /// The candidate attested a different deployment-key fingerprint, so it does
+    /// not share the cluster's key hierarchy (the shared-MEK invariant). Admitting
+    /// it would make it store data no one else can read and serve reads no one
+    /// else wrote.
+    #[error("fingerprint mismatch (expected {expected}, got {actual})")]
+    Fingerprint {
+        /// This cluster's deployment-key fingerprint.
+        expected: String,
+        /// The fingerprint the candidate attested.
+        actual: String,
+    },
+    /// The raft membership change failed.
+    #[error("raft: {0}")]
+    Raft(String),
+}
+
+/// Admit a candidate into the cluster: probe its `/internal/v1/health` over the
+/// authenticated peer channel, reject it unless it attests this cluster's
+/// deployment-key fingerprint, then add it as a learner and record it (with its
+/// fingerprint and URL) in the replicated control state.
+///
+/// The fingerprint is attested by the candidate over the shared-secret/mTLS
+/// channel; it primarily catches an operator pointing a node at the wrong
+/// keystore. It is not a substitute for the peer-auth credential, and a peer that
+/// already holds the credential could attest a fingerprint it does not truly
+/// possess — but without the matching secret key it still cannot decrypt or
+/// commit, so it self-excludes functionally.
+async fn verify_and_admit(
+    controller: &Controller,
+    client: &InternalClient,
+    expected_fp: &str,
+    id: u64,
+    url: &str,
+) -> Result<(), AdmitError> {
+    let health: HealthResp = client
+        .get_json(&format!("{url}/internal/v1/health"))
+        .await
+        .map_err(|e| AdmitError::Probe {
+            url: url.to_string(),
+            error: e.to_string(),
+        })?;
+
+    if health.fingerprint != expected_fp {
+        return Err(AdmitError::Fingerprint {
+            expected: expected_fp.to_string(),
+            actual: health.fingerprint,
+        });
+    }
+
+    controller
+        .add_learner(id, BasicNode::new(url.to_string()))
+        .await
+        .map_err(|e| AdmitError::Raft(e.to_string()))?;
+    controller
+        .propose(ControlCmd::AddNode {
+            node_id: id,
+            addr: url.to_string(),
+            fingerprint: health.fingerprint,
+        })
+        .await
+        .map_err(|e| AdmitError::Raft(e.to_string()))?;
+    Ok(())
 }
 
 /// The base URL this node advertises (`scheme://advertise_addr`).
@@ -430,16 +557,30 @@ async fn prepare(
     Ok(HttpResponse::Ok().json(resp))
 }
 
-/// Peer liveness + basic status.
+/// Liveness + identity returned from `/internal/v1/health`. The `fingerprint`
+/// lets the leader attest a candidate's deployment key before admitting it.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct HealthResp {
+    /// This node's id.
+    pub node_id: u64,
+    /// Committed global epoch.
+    pub epoch: u64,
+    /// Whether this node currently believes it is the leader.
+    pub is_leader: bool,
+    /// This node's deployment public-key fingerprint (SHA-256 hex).
+    pub fingerprint: String,
+}
+
+/// Peer liveness + identity (used for admission fingerprint attestation).
 async fn health(rt: web::Data<ClusterRuntime>, _peer: ClusterPeer) -> HttpResponse {
     let epoch = rt.controller.control_state().await.epoch;
     let is_leader = rt.controller.is_leader().await;
-    HttpResponse::Ok().json(serde_json::json!({
-        "status": "ok",
-        "node_id": rt.node_id,
-        "epoch": epoch,
-        "is_leader": is_leader,
-    }))
+    HttpResponse::Ok().json(HealthResp {
+        node_id: rt.node_id,
+        epoch,
+        is_leader,
+        fingerprint: rt.fingerprint.clone(),
+    })
 }
 
 /// Operator-facing cluster status (admin).
@@ -474,18 +615,30 @@ pub struct JoinResponse {
     pub voter: bool,
 }
 
-/// Add a node to the cluster (admin). Runs on the leader: adds the node as a
-/// learner and, if `voter`, promotes it into the voting membership.
+/// Add a node to the cluster (admin). Runs on the leader: verifies the
+/// candidate's deployment-key fingerprint, adds it as a learner, records it in
+/// the control state, and (if `voter`) promotes it into the voting membership.
+///
+/// A fingerprint mismatch is rejected with 403 (the candidate does not share the
+/// cluster's key hierarchy); transient probe/raft failures return 502.
 async fn join(
     rt: web::Data<ClusterRuntime>,
     _auth: AdminAuthenticated,
     body: web::Json<JoinRequest>,
 ) -> Result<HttpResponse, actix_web::Error> {
     let req = body.into_inner();
-    rt.controller
-        .add_learner(req.id, BasicNode::new(req.url.clone()))
-        .await
-        .map_err(|e| actix_web::error::ErrorBadGateway(format!("add_learner: {e}")))?;
+    verify_and_admit(
+        &rt.controller,
+        &rt.client,
+        &rt.fingerprint,
+        req.id,
+        &req.url,
+    )
+    .await
+    .map_err(|e| match e {
+        AdmitError::Fingerprint { .. } => actix_web::error::ErrorForbidden(e.to_string()),
+        _ => actix_web::error::ErrorBadGateway(e.to_string()),
+    })?;
 
     if req.voter {
         let mut voters: BTreeSet<u64> = rt
@@ -547,5 +700,35 @@ mod tests {
             auth_mode: ClusterAuth::Mtls,
         };
         assert!(a.check(None));
+    }
+
+    /// The health response (the admission attestation channel) round-trips so the
+    /// leader can decode a candidate's fingerprint.
+    #[test]
+    fn health_resp_round_trips_with_fingerprint() {
+        let h = HealthResp {
+            node_id: 5,
+            epoch: 9,
+            is_leader: true,
+            fingerprint: "deadbeef".to_string(),
+        };
+        let bytes = serde_json::to_vec(&h).unwrap();
+        let back: HealthResp = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(back.fingerprint, "deadbeef");
+        assert_eq!(back.node_id, 5);
+        assert!(back.is_leader);
+    }
+
+    /// A fingerprint mismatch renders an unambiguous, non-transient error so the
+    /// admit path rejects (403) rather than retrying forever.
+    #[test]
+    fn fingerprint_mismatch_is_distinct_error() {
+        let e = AdmitError::Fingerprint {
+            expected: "aaaa".to_string(),
+            actual: "bbbb".to_string(),
+        };
+        assert!(matches!(e, AdmitError::Fingerprint { .. }));
+        assert!(e.to_string().contains("expected aaaa"));
+        assert!(e.to_string().contains("got bbbb"));
     }
 }
