@@ -5,10 +5,16 @@
 //! and commits the resulting updates via [`compute_resplice`]. Object data never
 //! enters the log.
 //!
-//! Phase B1 (this module so far): the pure domain types and apply/re-splice
-//! logic. The redb-backed openraft storage, the raft network, and the
-//! [`Controller`] runtime land in subsequent steps.
+//! The redb-backed openraft storage ([`store`]) and the [`raft_impl`] type
+//! configuration are implemented. The raft network and the `Controller` runtime
+//! land in subsequent steps.
 
+pub mod controller;
+pub mod raft_impl;
+pub mod store;
 pub mod types;
 
+pub use controller::{Controller, ControllerConfig, ControllerError};
+pub use raft_impl::{Raft, TypeConfig};
+pub use store::{LogStore, StateMachineStore, open};
 pub use types::{ControlCmd, ControlResp, ControlState, NodeMeta, NodeStatus, compute_resplice};
