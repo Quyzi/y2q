@@ -41,6 +41,7 @@ indexmap                    = { version = "2", features = ["serde"] }
 libc                        = "0.2"
 metrics                     = "0.24"
 metrics-exporter-prometheus = "0.17"
+openraft                    = { version = "0.9", features = ["serde"] }
 metrics-rs-dashboard-actix  = "0.1"
 papaya                      = "0.1"
 pest                        = "2"

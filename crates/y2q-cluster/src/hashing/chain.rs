@@ -71,6 +71,11 @@ impl ChainTable {
     pub fn is_empty(&self) -> bool {
         self.chains.is_empty()
     }
+
+    /// Iterate over pinned chains as `(chain_id, entry)`, ascending by id.
+    pub fn iter(&self) -> impl Iterator<Item = (u64, &ChainEntry)> {
+        self.chains.iter().map(|(&id, entry)| (id, entry))
+    }
 }
 
 /// Determine `this` node's [`Role`] in `chain` (ordered HEAD..TAIL).
