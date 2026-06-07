@@ -105,6 +105,27 @@ impl InternalClient {
         self.decode(url, resp).await
     }
 
+    /// POST a streaming `body` to `url` with extra `headers` and decode the JSON
+    /// response. Used by the data plane to relay a ciphertext envelope to the
+    /// next chain member without buffering it.
+    pub async fn post_stream<Resp: DeserializeOwned>(
+        &self,
+        url: &str,
+        headers: &[(&str, String)],
+        body: reqwest::Body,
+    ) -> Result<Resp, TransportError> {
+        let mut rb = self.http.post(url).body(body);
+        for (name, value) in headers {
+            rb = rb.header(*name, value);
+        }
+        let rb = self.auth(rb);
+        let resp = rb.send().await.map_err(|e| TransportError::Request {
+            url: url.to_string(),
+            error: e.to_string(),
+        })?;
+        self.decode(url, resp).await
+    }
+
     /// GET `url` and decode the JSON response.
     pub async fn get_json<Resp: DeserializeOwned>(
         &self,

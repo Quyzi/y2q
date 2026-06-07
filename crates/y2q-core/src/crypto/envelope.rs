@@ -79,7 +79,13 @@ const FORMAT_VER_V2: u16 = 2;
 /// decryption never depends on this constant.
 pub const DEFAULT_CHUNK_SIZE_BYTES: usize = 4 << 20;
 /// Byte offset of `plaintext_len` inside the v2 fixed header.
-const V2_PLAINTEXT_LEN_OFFSET: u64 = 20;
+///
+/// Public so cluster replicas can backfill this field verbatim: the CRAQ HEAD
+/// patches it locally at `finish()` but does not forward the patch down-chain
+/// (the [`Tee`](crate::storage::streaming_sink::StreamingSink::Tee) only mirrors
+/// appends), so a downstream node applies the same patch from a PREPARE header
+/// to keep its on-disk envelope byte-identical.
+pub const V2_PLAINTEXT_LEN_OFFSET: u64 = 20;
 
 // ── shared constants ─────────────────────────────────────────────────────────
 

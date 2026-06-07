@@ -15,8 +15,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use actix_web::{
-    FromRequest, HttpRequest, HttpResponse, dev::Payload, error::ErrorUnauthorized, web,
+    FromRequest, HttpRequest, HttpResponse,
+    dev::Payload,
+    error::{ErrorBadGateway, ErrorBadRequest, ErrorUnauthorized},
+    web,
 };
+use bytes::Bytes;
 use openraft::BasicNode;
 use openraft::raft::{AppendEntriesRequest, InstallSnapshotRequest, VoteRequest};
 use serde::{Deserialize, Serialize};
@@ -26,9 +30,10 @@ use zeroize::Zeroizing;
 use y2q_cluster::control::raft_impl::TypeConfig;
 use y2q_cluster::transport::internal_client::CLUSTER_AUTH_HEADER;
 use y2q_cluster::{
-    Controller, ControllerConfig, HttpRaftNetworkFactory, InternalClient, InternalTlsOptions,
-    resolve_node_id,
+    Controller, ControllerConfig, DistributedStorage, HttpRaftNetworkFactory, InternalClient,
+    InternalTlsOptions, PREPARE_META_HEADER, PrepareMeta, resolve_node_id,
 };
+use y2q_core::AnyStorage;
 use y2q_core::crypto::kdf;
 
 use crate::auth::{AdminAuthenticated, AuthState};
@@ -38,6 +43,8 @@ use crate::config::{ClusterAuth, Config};
 pub struct ClusterRuntime {
     /// The embedded raft controller.
     pub controller: Arc<Controller>,
+    /// The CRAQ data-plane handle (chain routing + replicated writes).
+    pub distributed: Arc<DistributedStorage>,
     /// This node's id.
     pub node_id: u64,
     /// Shared secret used to authenticate peer requests (when `auth_mode` is
@@ -96,6 +103,7 @@ impl FromRequest for ClusterPeer {
 pub async fn build_runtime(
     cfg: &Config,
     auth_state: &AuthState,
+    storage: Arc<AnyStorage>,
 ) -> std::io::Result<ClusterRuntime> {
     provision_mek(auth_state, cfg)?;
 
@@ -125,7 +133,7 @@ pub async fn build_runtime(
             .map_err(|e| std::io::Error::other(format!("internal client: {e}")))?,
     );
 
-    let factory = HttpRaftNetworkFactory::new(client);
+    let factory = HttpRaftNetworkFactory::new(Arc::clone(&client));
     let ccfg = ControllerConfig {
         heartbeat_interval_ms: cfg.cluster.raft.heartbeat_interval_ms,
         election_timeout_min_ms: cfg.cluster.raft.election_timeout_min_ms,
@@ -141,12 +149,23 @@ pub async fn build_runtime(
 
     tracing::info!(node_id, raft_dir = %raft_dir.display(), "cluster controller started");
 
+    let distributed = Arc::new(DistributedStorage::new(
+        storage,
+        Arc::clone(&controller),
+        client,
+        node_id,
+        cfg.cluster.replication_factor,
+        cfg.cluster.virtual_nodes_per_node,
+        cfg.server.tls.enabled,
+    ));
+
     if cfg.cluster.raft.bootstrap {
         bootstrap(&controller, cfg, node_id).await;
     }
 
     Ok(ClusterRuntime {
         controller,
+        distributed,
         node_id,
         shared_secret: shared_secret.map(Zeroizing::new),
         auth_mode: cfg.cluster.auth,
@@ -335,6 +354,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
     cfg.service(web::resource("/internal/v1/raft/append").route(web::post().to(raft_append)));
     cfg.service(web::resource("/internal/v1/raft/vote").route(web::post().to(raft_vote)));
     cfg.service(web::resource("/internal/v1/raft/snapshot").route(web::post().to(raft_snapshot)));
+    cfg.service(web::resource("/internal/v1/prepare").route(web::post().to(prepare)));
     cfg.service(web::resource("/internal/v1/health").route(web::get().to(health)));
     cfg.service(web::resource("/api/v1/cluster/status").route(web::get().to(status)));
     cfg.service(web::resource("/api/v1/cluster/join").route(web::post().to(join)));
@@ -369,6 +389,45 @@ async fn raft_snapshot(
         .install_snapshot(body.into_inner())
         .await;
     HttpResponse::Ok().json(res)
+}
+
+/// Receive a CRAQ PREPARE: stream the ciphertext envelope from the request body
+/// into the data plane, which writes it locally, relays it down-chain, and
+/// commits once the downstream sub-chain commits. The `X-Y2Q-Prepare` header
+/// carries the [`PrepareMeta`] the replica persists alongside the bytes.
+async fn prepare(
+    rt: web::Data<ClusterRuntime>,
+    _peer: ClusterPeer,
+    req: HttpRequest,
+    mut payload: web::Payload,
+) -> Result<HttpResponse, actix_web::Error> {
+    let meta_raw = req
+        .headers()
+        .get(PREPARE_META_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| ErrorBadRequest("missing X-Y2Q-Prepare header"))?;
+    let meta: PrepareMeta = serde_json::from_str(meta_raw)
+        .map_err(|e| ErrorBadRequest(format!("bad prepare meta: {e}")))?;
+
+    // Drain the request body into a bounded channel the data plane consumes, so
+    // the envelope streams through without being buffered whole.
+    let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(8);
+    let feeder = async {
+        use futures::StreamExt as _;
+        while let Some(chunk) = payload.next().await {
+            let chunk = chunk.map_err(|e| ErrorBadRequest(format!("read body: {e}")))?;
+            if tx.send(chunk).await.is_err() {
+                break; // receiver gone (accept_prepare returned early with an error)
+            }
+        }
+        Ok::<(), actix_web::Error>(())
+    };
+    let accept = rt.distributed.accept_prepare(meta, rx);
+
+    let (feed_res, accept_res) = tokio::join!(feeder, accept);
+    feed_res?;
+    let resp = accept_res.map_err(|e| ErrorBadGateway(format!("prepare: {e}")))?;
+    Ok(HttpResponse::Ok().json(resp))
 }
 
 /// Peer liveness + basic status.

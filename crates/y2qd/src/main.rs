@@ -366,9 +366,13 @@ async fn main() -> std::io::Result<()> {
     // provisions the MEK at boot from the configured unlock user so the node can
     // serve peer-forwarded writes without an interactive login.
     let cluster_runtime: Option<web::Data<cluster::ClusterRuntime>> = if cfg.cluster.enabled {
-        let rt = cluster::build_runtime(&cfg, auth_state.get_ref())
-            .await
-            .map_err(|e| std::io::Error::other(format!("cluster startup: {e}")))?;
+        let rt = cluster::build_runtime(
+            &cfg,
+            auth_state.get_ref(),
+            Arc::clone(storage_data.as_ref()),
+        )
+        .await
+        .map_err(|e| std::io::Error::other(format!("cluster startup: {e}")))?;
         Some(web::Data::new(rt))
     } else {
         None

@@ -11,6 +11,7 @@
 //! control plane, the CRAQ data plane, and the internal HTTP transport.
 
 pub mod control;
+pub mod data;
 pub mod hashing;
 pub mod identity;
 pub mod transport;
@@ -18,6 +19,11 @@ pub mod transport;
 pub use control::{
     ControlCmd, ControlResp, ControlState, Controller, ControllerConfig, ControllerError, NodeMeta,
     NodeStatus, compute_resplice,
+};
+pub use data::wire::PREPARE_META_HEADER;
+pub use data::{
+    ChainRoute, DataError, DistributedStorage, PendingWrites, PrepareMeta, PrepareResp,
+    resolve_route,
 };
 pub use hashing::chain::{ChainEntry, ChainTable, Role};
 pub use hashing::ring::{Ring, chain_id};
