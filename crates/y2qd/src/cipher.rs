@@ -108,8 +108,12 @@ pub fn is_encrypted_envelope(bytes: &[u8]) -> bool {
 /// starts. Pass the value returned by
 /// [`AnyStorage::begin_streaming_put`]: `0` for the filesystem backend, `64`
 /// for the uring backend.
+///
+/// Only the deployment **public** key is needed (ML-KEM encapsulation), so this
+/// works both on the client PUT path (from the logged-in keystore) and on the
+/// cluster HEAD path (from the provisioned public keystore, no login).
 pub async fn stream_encrypt_for_put(
-    keystore: &DecryptedKeystore,
+    public_key: &[u8],
     mut stream: actix_web::web::Payload,
     sink: StreamingSink,
     bucket: &str,
@@ -119,15 +123,14 @@ pub async fn stream_encrypt_for_put(
 ) -> Result<(StreamingSink, PlaintextMetrics, CipherMetadata), AppError> {
     use futures::StreamExt;
 
-    let mut session =
-        envelope::EncryptSession::new(sink, &keystore.public.public_key, write_offset, chunk_size)
-            .await
-            .map_err(|_| {
-                AppError(y2q_core::Error::EncryptionFailed {
-                    bucket: bucket.to_owned(),
-                    key: key.to_owned(),
-                })
-            })?;
+    let mut session = envelope::EncryptSession::new(sink, public_key, write_offset, chunk_size)
+        .await
+        .map_err(|_| {
+            AppError(y2q_core::Error::EncryptionFailed {
+                bucket: bucket.to_owned(),
+                key: key.to_owned(),
+            })
+        })?;
 
     let mut hasher = StreamChecksum::new();
     let mut plaintext_size: u64 = 0;

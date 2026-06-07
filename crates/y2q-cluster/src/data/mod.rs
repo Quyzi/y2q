@@ -142,6 +142,45 @@ impl DistributedStorage {
         state.nodes.get(&id).map(|meta| meta.addr.clone())
     }
 
+    /// Public lookup of a node's advertised base URL (used to proxy a client PUT
+    /// to the chain HEAD).
+    pub async fn peer_url(&self, id: NodeId) -> Option<String> {
+        let state = self.controller.control_state().await;
+        self.peer_base_url(&state, id)
+    }
+
+    /// Forward an already-committed envelope from this node (the HEAD) to the next
+    /// chain member, which relays it through the rest of the chain. `body` yields
+    /// the verbatim envelope bytes. Returns the downstream commit response, or
+    /// `None` when this node has no successor (a solo chain — nothing to do).
+    pub async fn forward_to_next(
+        &self,
+        meta: &PrepareMeta,
+        body: mpsc::Receiver<Bytes>,
+    ) -> Result<Option<PrepareResp>, DataError> {
+        let state = self.controller.control_state().await;
+        let route = resolve_route(
+            &state,
+            &meta.bucket,
+            &meta.key,
+            self.replication_factor,
+            self.virtual_nodes_per_node,
+        );
+        match route.next_after(self.node_id) {
+            Some(next_id) => {
+                let url =
+                    self.peer_base_url(&state, next_id)
+                        .ok_or_else(|| DataError::NoChain {
+                            bucket: meta.bucket.clone(),
+                            key: meta.key.clone(),
+                        })?;
+                let resp = forward_prepare(&self.client, &url, meta, body).await?;
+                Ok(Some(resp))
+            }
+            None => Ok(None),
+        }
+    }
+
     /// Receive a PREPARE: write the ciphertext envelope verbatim to the local
     /// backend, relay it to the next chain member (if any), and commit once the
     /// downstream sub-chain has committed. Returns the TAIL's overwrite verdict.

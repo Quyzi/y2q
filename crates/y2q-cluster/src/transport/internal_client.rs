@@ -126,6 +126,24 @@ impl InternalClient {
         self.decode(url, resp).await
     }
 
+    /// POST a body streamed from `rx` (each `Bytes` becomes a body chunk) to `url`
+    /// with extra `headers`, and decode the JSON response. Lets callers in crates
+    /// without a `reqwest` dependency stream a request body via a channel.
+    pub async fn post_stream_rx<Resp: DeserializeOwned>(
+        &self,
+        url: &str,
+        headers: &[(&str, String)],
+        rx: tokio::sync::mpsc::Receiver<bytes::Bytes>,
+    ) -> Result<Resp, TransportError> {
+        let stream = futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv()
+                .await
+                .map(|b| (Ok::<bytes::Bytes, std::io::Error>(b), rx))
+        });
+        self.post_stream(url, headers, reqwest::Body::wrap_stream(stream))
+            .await
+    }
+
     /// GET `url` and decode the JSON response.
     pub async fn get_json<Resp: DeserializeOwned>(
         &self,
