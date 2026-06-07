@@ -13,11 +13,16 @@
 pub mod control;
 pub mod hashing;
 pub mod identity;
+pub mod transport;
 
-pub use control::{ControlCmd, ControlResp, ControlState, NodeMeta, NodeStatus, compute_resplice};
+pub use control::{
+    ControlCmd, ControlResp, ControlState, Controller, ControllerConfig, ControllerError, NodeMeta,
+    NodeStatus, compute_resplice,
+};
 pub use hashing::chain::{ChainEntry, ChainTable, Role};
 pub use hashing::ring::{Ring, chain_id};
 pub use identity::{IdentityError, NodeId, resolve_node_id};
+pub use transport::{HttpRaftNetworkFactory, InternalClient, InternalTlsOptions, TransportError};
 
 /// Top-level cluster error.
 #[derive(thiserror::Error, Debug)]
