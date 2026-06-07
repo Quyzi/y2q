@@ -10,9 +10,11 @@
 //! consistent-hash chain mapping ([`hashing`]). Later phases add the raft
 //! control plane, the CRAQ data plane, and the internal HTTP transport.
 
+pub mod control;
 pub mod hashing;
 pub mod identity;
 
+pub use control::{ControlCmd, ControlResp, ControlState, NodeMeta, NodeStatus, compute_resplice};
 pub use hashing::chain::{ChainEntry, ChainTable, Role};
 pub use hashing::ring::{Ring, chain_id};
 pub use identity::{IdentityError, NodeId, resolve_node_id};
