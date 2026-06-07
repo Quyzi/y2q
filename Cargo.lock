@@ -5363,6 +5363,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "y2q-cluster"
+version = "0.1.0"
+dependencies = [
+ "gxhash",
+ "rand 0.8.6",
+ "serde",
+ "tempfile",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "y2q-config"
 version = "0.1.0"
 dependencies = [
