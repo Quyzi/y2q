@@ -3,11 +3,13 @@
 use std::sync::Arc;
 
 use actix_web::{HttpRequest, HttpResponse, web};
+use y2q_cluster::Role;
 use y2q_core::{AnyStorage, BucketPermission, Listing, PutOptions, SyncLevel};
 
 use crate::auth::Authenticated;
 use crate::authz::{Decision, authorize_bucket, claim_ownership};
 use crate::cipher;
+use crate::cluster::{self, ClusterRuntime};
 use crate::config::LabelLimits;
 use crate::error::{AppError, ErrorBody};
 use crate::handlers::labels::extract_labels;
@@ -64,6 +66,7 @@ pub async fn handle(
     limits: web::Data<LabelLimits>,
     default_sync: web::Data<SyncLevel>,
     encryption: web::Data<crate::config::EncryptionParams>,
+    cluster: Option<web::Data<ClusterRuntime>>,
     auth: Authenticated,
 ) -> Result<HttpResponse, AppError> {
     let (bucket, key) = path.into_inner();
@@ -98,13 +101,66 @@ pub async fn handle(
         }
     }
 
+    // Clustered: route the write through the chain instead of writing locally.
+    // The contact node either is the HEAD (encrypt + replicate here) or proxies
+    // the plaintext to the HEAD. Reads still come from the local copy (works at
+    // replication_factor == node count; apportioned reads land in a later phase).
+    if let Some(rt) = cluster.as_ref() {
+        let route = rt.distributed.route(&bucket, &key).await;
+        let was_overwrite = match route.role(rt.node_id) {
+            // This node owns the HEAD: encrypt once and replicate down-chain.
+            Role::Head | Role::Solo => {
+                cluster::head_write(
+                    rt,
+                    &bucket,
+                    &key,
+                    payload,
+                    labels,
+                    sync,
+                    encryption.chunk_size_bytes,
+                )
+                .await?
+            }
+            // Not the HEAD: forward the plaintext to the HEAD over the peer channel.
+            Role::Middle | Role::Tail | Role::NotInChain => {
+                let head_id = route.head().ok_or_else(|| {
+                    AppError(y2q_core::Error::InternalError {
+                        bucket: bucket.clone(),
+                        key: key.clone(),
+                        operation: "cluster put".to_owned(),
+                        message: "no chain head (cluster has no active members)".to_owned(),
+                    })
+                })?;
+                let head_url = rt.distributed.peer_url(head_id).await.ok_or_else(|| {
+                    AppError(y2q_core::Error::InternalError {
+                        bucket: bucket.clone(),
+                        key: key.clone(),
+                        operation: "cluster put".to_owned(),
+                        message: format!("head node {head_id} has no known address"),
+                    })
+                })?;
+                cluster::proxy_put_to_head(rt, &head_url, &bucket, &key, payload, &labels, sync)
+                    .await?
+            }
+        };
+
+        if matches!(decision, Decision::ClaimOwnership) {
+            claim_ownership(&storage, &bucket, &auth.username).await?;
+        }
+        return Ok(if was_overwrite {
+            HttpResponse::Ok().finish()
+        } else {
+            HttpResponse::Created().finish()
+        });
+    }
+
     let (guard, sink, write_offset) = storage
         .begin_streaming_put(&bucket, &key)
         .await
         .map_err(AppError::from)?;
 
     let (sink, plaintext_metrics, cipher_metadata) = cipher::stream_encrypt_for_put(
-        &auth.keystore,
+        &auth.keystore.public.public_key,
         payload,
         sink,
         &bucket,

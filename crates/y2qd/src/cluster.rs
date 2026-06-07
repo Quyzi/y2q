@@ -31,13 +31,16 @@ use y2q_cluster::control::raft_impl::TypeConfig;
 use y2q_cluster::transport::internal_client::CLUSTER_AUTH_HEADER;
 use y2q_cluster::{
     ControlCmd, Controller, ControllerConfig, DistributedStorage, HttpRaftNetworkFactory,
-    InternalClient, InternalTlsOptions, PREPARE_META_HEADER, PrepareMeta, resolve_node_id,
+    InternalClient, InternalTlsOptions, PREPARE_META_HEADER, PrepareMeta, chain_id,
+    resolve_node_id,
 };
-use y2q_core::AnyStorage;
 use y2q_core::crypto::kdf;
+use y2q_core::{AnyStorage, LabelSet, PutOptions, Storage, SyncLevel};
 
 use crate::auth::{AdminAuthenticated, AuthState};
+use crate::cipher;
 use crate::config::{ClusterAuth, Config};
+use crate::error::AppError;
 
 /// Long-lived cluster runtime, shared with handlers via `web::Data`.
 pub struct ClusterRuntime {
@@ -51,6 +54,9 @@ pub struct ClusterRuntime {
     /// This node's deployment public-key fingerprint. The leader admits a peer
     /// only if it attests the same fingerprint (the shared-MEK invariant).
     fingerprint: String,
+    /// Deployment public key, used to encrypt at the HEAD without a login (the
+    /// MEK is provisioned at boot; encryption only needs the public key).
+    public_key: Arc<Vec<u8>>,
     /// This node's id.
     pub node_id: u64,
     /// Shared secret used to authenticate peer requests (when `auth_mode` is
@@ -165,6 +171,7 @@ pub async fn build_runtime(
     ));
 
     let fingerprint = auth_state.public_keystore.fingerprint.clone();
+    let public_key = Arc::clone(&auth_state.public_keystore.public_key);
 
     if cfg.cluster.raft.bootstrap {
         bootstrap(&controller, &client, cfg, node_id, fingerprint.clone()).await;
@@ -175,6 +182,7 @@ pub async fn build_runtime(
         distributed,
         client,
         fingerprint,
+        public_key,
         node_id,
         shared_secret: shared_secret.map(Zeroizing::new),
         auth_mode: cfg.cluster.auth,
@@ -472,6 +480,224 @@ fn internal_tls_options(cfg: &Config) -> std::io::Result<InternalTlsOptions> {
 }
 
 // ---------------------------------------------------------------------------
+// Distributed write path
+// ---------------------------------------------------------------------------
+
+/// Window size for streaming a committed envelope to the next chain member.
+const REPLICATE_WINDOW: u64 = 4 << 20;
+
+/// Run the CRAQ HEAD write: encrypt the plaintext once into the local backend,
+/// commit it, then replicate the committed envelope down the chain. Returns
+/// whether an existing object was overwritten.
+///
+/// The HEAD commits before replicating (HEAD-first ordering): on a downstream
+/// failure the object is committed here but under-replicated until back-fill
+/// (Phase E). Strict TAIL-first ordering arrives with versioning in Phase D.
+pub async fn head_write(
+    rt: &ClusterRuntime,
+    bucket: &str,
+    key: &str,
+    payload: web::Payload,
+    labels: LabelSet,
+    sync: SyncLevel,
+    chunk_size: usize,
+) -> Result<bool, AppError> {
+    let local = rt.distributed.local();
+
+    let (guard, sink, write_offset) = local
+        .begin_streaming_put(bucket, key)
+        .await
+        .map_err(AppError::from)?;
+    let (sink, pm, cm) = cipher::stream_encrypt_for_put(
+        &rt.public_key,
+        payload,
+        sink,
+        bucket,
+        key,
+        write_offset,
+        chunk_size,
+    )
+    .await?;
+
+    // Capture the metadata the replicas must persist before the values move into
+    // the local commit.
+    let label_vec: Vec<(String, String)> = labels.iter().cloned().collect();
+    let plaintext_size = pm.size;
+    let checksum_gxhash_b64 = pm.checksum_gxhash_b64.clone();
+    let cipher_size = cm.cipher_size;
+    let cipher_sha256_b64 = cm.cipher_sha256_b64.clone();
+    let kem_alg = cm.kem_alg.clone();
+    let aead_alg = cm.aead_alg.clone();
+    let envelope_version = cm.envelope_version;
+
+    let overwrite = guard
+        .commit(
+            sink,
+            PutOptions {
+                labels,
+                sync,
+                ..Default::default()
+            },
+            pm,
+            cm,
+        )
+        .await
+        .map_err(AppError::from)?;
+
+    // The padded v2 `plaintext_len` lives at offset 20 of the envelope; read it
+    // back so replicas can patch their copy to be byte-identical.
+    let plaintext_len = read_plaintext_len(local, bucket, key).await?;
+
+    let route = rt.distributed.route(bucket, key).await;
+    let meta = PrepareMeta {
+        bucket: bucket.to_owned(),
+        key: key.to_owned(),
+        chain_id: chain_id(bucket, key),
+        epoch: route.epoch,
+        plaintext_len,
+        plaintext_size,
+        checksum_gxhash_b64,
+        cipher_size,
+        cipher_sha256_b64,
+        kem_alg,
+        aead_alg,
+        envelope_version,
+        sync_durable: sync == SyncLevel::Durable,
+        labels: label_vec,
+    };
+
+    // Replicate the committed envelope to the rest of the chain (no-op for a solo
+    // chain). Stream it in bounded windows so large objects do not buffer whole.
+    let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(8);
+    let feeder = stream_envelope_windows(local, bucket, key, cipher_size, tx);
+    let forward = rt.distributed.forward_to_next(&meta, rx);
+    let (feed_res, fwd_res) = tokio::join!(feeder, forward);
+    feed_res?;
+    fwd_res.map_err(|e| {
+        AppError(y2q_core::Error::InternalError {
+            bucket: bucket.to_owned(),
+            key: key.to_owned(),
+            operation: "replicate".to_owned(),
+            message: e.to_string(),
+        })
+    })?;
+
+    Ok(overwrite)
+}
+
+/// Read the 8-byte v2 `plaintext_len` field (envelope offset 20) of a committed
+/// object.
+async fn read_plaintext_len(local: &AnyStorage, bucket: &str, key: &str) -> Result<u64, AppError> {
+    let bytes = local
+        .get_range(bucket, key, (20u64..=27u64).into())
+        .await
+        .map_err(AppError::from)?;
+    if bytes.len() < 8 {
+        return Err(AppError(y2q_core::Error::InternalError {
+            bucket: bucket.to_owned(),
+            key: key.to_owned(),
+            operation: "replicate".to_owned(),
+            message: "short envelope reading plaintext_len".to_owned(),
+        }));
+    }
+    Ok(u64::from_be_bytes(bytes[..8].try_into().unwrap()))
+}
+
+/// Stream a committed object's envelope to `tx` in bounded windows.
+async fn stream_envelope_windows(
+    local: &AnyStorage,
+    bucket: &str,
+    key: &str,
+    cipher_size: u64,
+    tx: tokio::sync::mpsc::Sender<Bytes>,
+) -> Result<(), AppError> {
+    let mut off = 0u64;
+    while off < cipher_size {
+        let end = (off + REPLICATE_WINDOW - 1).min(cipher_size - 1);
+        let window = local
+            .get_range(bucket, key, (off..=end).into())
+            .await
+            .map_err(AppError::from)?;
+        off = end + 1;
+        if tx.send(window).await.is_err() {
+            break; // forward task ended (downstream error)
+        }
+    }
+    Ok(())
+}
+
+/// Header carrying the JSON [`InternalPutMeta`] on a contact-node → HEAD plaintext
+/// forward.
+const CLUSTER_PUT_HEADER: &str = "X-Y2Q-Cluster-Put";
+
+/// Metadata for a peer-forwarded plaintext PUT (contact node is not the HEAD).
+#[derive(Debug, Serialize, Deserialize)]
+struct InternalPutMeta {
+    bucket: String,
+    key: String,
+    labels: Vec<(String, String)>,
+    sync_durable: bool,
+}
+
+/// Response body of the internal plaintext PUT.
+#[derive(Debug, Serialize, Deserialize)]
+struct PutResp {
+    overwrite: bool,
+}
+
+/// Proxy a client PUT's plaintext to the chain HEAD over the authenticated peer
+/// channel (used when the contact node is not the HEAD). The HEAD encrypts,
+/// commits, and replicates; this returns its overwrite verdict.
+pub async fn proxy_put_to_head(
+    rt: &ClusterRuntime,
+    head_url: &str,
+    bucket: &str,
+    key: &str,
+    mut payload: web::Payload,
+    labels: &LabelSet,
+    sync: SyncLevel,
+) -> Result<bool, AppError> {
+    let meta = InternalPutMeta {
+        bucket: bucket.to_owned(),
+        key: key.to_owned(),
+        labels: labels.iter().cloned().collect(),
+        sync_durable: sync == SyncLevel::Durable,
+    };
+    let meta_json = serde_json::to_string(&meta).map_err(|e| internal_err(bucket, key, e))?;
+
+    // Drain the client body into a channel so the cluster transport (which owns
+    // the reqwest dependency) can stream it to the HEAD without buffering.
+    let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(8);
+    let feeder = async {
+        use futures::StreamExt as _;
+        while let Some(chunk) = payload.next().await {
+            let chunk = chunk.map_err(|e| internal_err(bucket, key, e))?;
+            if tx.send(chunk).await.is_err() {
+                break;
+            }
+        }
+        Ok::<(), AppError>(())
+    };
+    let url = format!("{head_url}/internal/v1/put");
+    let headers = [(CLUSTER_PUT_HEADER, meta_json)];
+    let send = rt.client.post_stream_rx::<PutResp>(&url, &headers, rx);
+    let (feed_res, send_res) = tokio::join!(feeder, send);
+    feed_res?;
+    let resp = send_res.map_err(|e| internal_err(bucket, key, e))?;
+    Ok(resp.overwrite)
+}
+
+/// Build a generic 500 `AppError` for a cluster write failure.
+fn internal_err(bucket: &str, key: &str, e: impl std::fmt::Display) -> AppError {
+    AppError(y2q_core::Error::InternalError {
+        bucket: bucket.to_owned(),
+        key: key.to_owned(),
+        operation: "cluster put".to_owned(),
+        message: e.to_string(),
+    })
+}
+
+// ---------------------------------------------------------------------------
 // HTTP handlers
 // ---------------------------------------------------------------------------
 
@@ -482,6 +708,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
     cfg.service(web::resource("/internal/v1/raft/vote").route(web::post().to(raft_vote)));
     cfg.service(web::resource("/internal/v1/raft/snapshot").route(web::post().to(raft_snapshot)));
     cfg.service(web::resource("/internal/v1/prepare").route(web::post().to(prepare)));
+    cfg.service(web::resource("/internal/v1/put").route(web::post().to(internal_put)));
     cfg.service(web::resource("/internal/v1/health").route(web::get().to(health)));
     cfg.service(web::resource("/api/v1/cluster/status").route(web::get().to(status)));
     cfg.service(web::resource("/api/v1/cluster/join").route(web::post().to(join)));
@@ -555,6 +782,41 @@ async fn prepare(
     feed_res?;
     let resp = accept_res.map_err(|e| ErrorBadGateway(format!("prepare: {e}")))?;
     Ok(HttpResponse::Ok().json(resp))
+}
+
+/// Receive a peer-forwarded plaintext PUT (the contact node was not the HEAD).
+/// This node is the HEAD: encrypt, commit, and replicate down the chain.
+async fn internal_put(
+    rt: web::Data<ClusterRuntime>,
+    _peer: ClusterPeer,
+    req: HttpRequest,
+    payload: web::Payload,
+    encryption: web::Data<crate::config::EncryptionParams>,
+) -> Result<HttpResponse, actix_web::Error> {
+    let raw = req
+        .headers()
+        .get(CLUSTER_PUT_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| ErrorBadRequest("missing X-Y2Q-Cluster-Put header"))?;
+    let m: InternalPutMeta =
+        serde_json::from_str(raw).map_err(|e| ErrorBadRequest(format!("bad put meta: {e}")))?;
+    let labels: LabelSet = m.labels.into_iter().collect();
+    let sync = if m.sync_durable {
+        SyncLevel::Durable
+    } else {
+        SyncLevel::BestEffort
+    };
+    let overwrite = head_write(
+        &rt,
+        &m.bucket,
+        &m.key,
+        payload,
+        labels,
+        sync,
+        encryption.chunk_size_bytes,
+    )
+    .await?;
+    Ok(HttpResponse::Ok().json(PutResp { overwrite }))
 }
 
 /// Liveness + identity returned from `/internal/v1/health`. The `fingerprint`
