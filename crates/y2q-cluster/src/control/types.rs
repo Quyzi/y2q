@@ -33,10 +33,11 @@ pub enum NodeStatus {
 /// Per-node metadata replicated through raft.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeMeta {
-    /// `host:port` other nodes dial for the internal API.
+    /// Full base URL (`scheme://host:port`) other nodes dial for the internal
+    /// API; the data plane appends the endpoint path to it.
     pub addr: String,
-    /// Deployment public-key fingerprint. The controller refuses to admit a
-    /// node whose fingerprint differs, guarding the shared-MEK invariant.
+    /// Deployment public-key fingerprint (SHA-256 hex). The controller refuses to
+    /// admit a node whose fingerprint differs, guarding the shared-MEK invariant.
     pub fingerprint: String,
     /// Current liveness/role status.
     pub status: NodeStatus,

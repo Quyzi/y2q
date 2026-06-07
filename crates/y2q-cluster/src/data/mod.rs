@@ -86,13 +86,11 @@ pub struct DistributedStorage {
     node_id: NodeId,
     replication_factor: usize,
     virtual_nodes_per_node: u32,
-    scheme: &'static str,
     pending: PendingWrites,
 }
 
 impl DistributedStorage {
-    /// Construct a distributed storage handle. `https` selects the scheme used to
-    /// build peer base URLs from their advertised `host:port`.
+    /// Construct a distributed storage handle.
     pub fn new(
         local: Arc<AnyStorage>,
         controller: Arc<Controller>,
@@ -100,7 +98,6 @@ impl DistributedStorage {
         node_id: NodeId,
         replication_factor: usize,
         virtual_nodes_per_node: u32,
-        https: bool,
     ) -> Self {
         Self {
             local,
@@ -109,7 +106,6 @@ impl DistributedStorage {
             node_id,
             replication_factor,
             virtual_nodes_per_node,
-            scheme: if https { "https" } else { "http" },
             pending: PendingWrites::new(),
         }
     }
@@ -141,12 +137,9 @@ impl DistributedStorage {
         )
     }
 
-    /// Build a peer's base URL (`scheme://addr`) from the control state.
+    /// A peer's base URL from the control state (the full `addr` it advertised).
     fn peer_base_url(&self, state: &ControlState, id: NodeId) -> Option<String> {
-        state
-            .nodes
-            .get(&id)
-            .map(|meta| format!("{}://{}", self.scheme, meta.addr))
+        state.nodes.get(&id).map(|meta| meta.addr.clone())
     }
 
     /// Receive a PREPARE: write the ciphertext envelope verbatim to the local
