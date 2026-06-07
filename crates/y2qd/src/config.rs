@@ -27,6 +27,10 @@ pub struct Config {
     /// Logging and metrics settings.
     #[serde(default)]
     pub observability: ObservabilityConfig,
+    /// Distributed clustering settings. Disabled by default; when disabled the
+    /// daemon behaves exactly as a single node.
+    #[serde(default)]
+    pub cluster: ClusterConfig,
 }
 
 /// Log output format.
@@ -480,6 +484,214 @@ impl From<&StorageConfig> for LabelLimits {
     }
 }
 
+/// Inter-node read consistency mode for clustered reads.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ClusterConsistency {
+    /// Linearizable reads: a node holding an in-flight (dirty) version queries
+    /// the chain TAIL for the committed version before answering. Default.
+    #[default]
+    Strong,
+    /// Serve the local committed copy even if a newer write is in flight.
+    /// Cheapest, may return stale data.
+    Eventual,
+    /// Serve the local committed copy if it is fresh within
+    /// `eventual_bound_ms`; otherwise fall back to a version query.
+    EventualBounded,
+}
+
+/// Peer-to-peer authentication mechanism for the internal cluster API.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ClusterAuth {
+    /// HMAC/bearer of a shared secret. Simplest to bring up. Default.
+    #[default]
+    SharedSecret,
+    /// Mutual TLS using the existing server `client_ca_path` and a client
+    /// identity. Recommended production posture.
+    Mtls,
+}
+
+/// Whether a node participates in the raft voting quorum.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum RaftRole {
+    /// Voter iff this node's id is in `voter_seeds`, else a learner. Default.
+    #[default]
+    Auto,
+    /// Always a voting member of the controller quorum.
+    Voter,
+    /// Always a non-voting learner (receives the log, never votes).
+    Learner,
+}
+
+fn default_replication_factor() -> usize {
+    3
+}
+fn default_virtual_nodes_per_node() -> u32 {
+    256
+}
+fn default_eventual_bound_ms() -> u64 {
+    2000
+}
+fn default_prepare_timeout_ms() -> u64 {
+    30_000
+}
+fn default_ack_timeout_ms() -> u64 {
+    30_000
+}
+fn default_health_probe_interval_ms() -> u64 {
+    1000
+}
+fn default_health_fail_threshold() -> u32 {
+    3
+}
+fn default_cluster_unlock() -> String {
+    "provisioned".to_string()
+}
+fn default_raft_heartbeat_ms() -> u64 {
+    250
+}
+fn default_raft_election_min_ms() -> u64 {
+    1000
+}
+fn default_raft_election_max_ms() -> u64 {
+    1500
+}
+
+/// Embedded raft control-plane tuning.
+// Several fields are part of the deserialized config schema but are not read
+// until the cluster runtime is wired in a later phase; allow until then.
+#[allow(dead_code)]
+#[derive(Debug, Deserialize)]
+pub struct RaftConfig {
+    /// Leader heartbeat interval (ms). Default: 250.
+    #[serde(default = "default_raft_heartbeat_ms")]
+    pub heartbeat_interval_ms: u64,
+    /// Lower bound of the randomized election timeout (ms). Default: 1000.
+    #[serde(default = "default_raft_election_min_ms")]
+    pub election_timeout_min_ms: u64,
+    /// Upper bound of the randomized election timeout (ms). Default: 1500.
+    #[serde(default = "default_raft_election_max_ms")]
+    pub election_timeout_max_ms: u64,
+    /// Directory for the raft log/state-machine db and the persisted node id.
+    /// Empty => `<storage.base_path>/_y2q_raft`.
+    #[serde(default)]
+    pub log_dir: String,
+    /// Set `true` on exactly one node's first boot to initialize a single-node
+    /// raft cluster; other nodes join it.
+    #[serde(default)]
+    pub bootstrap: bool,
+    /// Voter/learner selection strategy. Default: `auto` (use `voter_seeds`).
+    #[serde(default)]
+    pub role: RaftRole,
+    /// Node ids forming the voting controller quorum (size 3/5/7). Every node
+    /// should be configured with the same list so all agree on the quorum.
+    #[serde(default)]
+    pub voter_seeds: Vec<u64>,
+}
+
+impl Default for RaftConfig {
+    fn default() -> Self {
+        Self {
+            heartbeat_interval_ms: default_raft_heartbeat_ms(),
+            election_timeout_min_ms: default_raft_election_min_ms(),
+            election_timeout_max_ms: default_raft_election_max_ms(),
+            log_dir: String::new(),
+            bootstrap: false,
+            role: RaftRole::Auto,
+            voter_seeds: Vec::new(),
+        }
+    }
+}
+
+/// Distributed clustering settings.
+///
+/// The entire `[cluster]` section is optional and every field is defaulted, so
+/// an existing `config.toml` with no `[cluster]` block deserializes to a
+/// disabled cluster — single-node behavior, unchanged.
+// Several fields are part of the deserialized config schema but are not read
+// until the cluster runtime is wired in a later phase; allow until then.
+#[allow(dead_code)]
+#[derive(Debug, Deserialize)]
+pub struct ClusterConfig {
+    /// Master switch. `false` (default) => single node, zero clustering.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Optional explicit node id (`u64`). Empty => derive and persist one.
+    #[serde(default)]
+    pub node_id: String,
+    /// `host:port` other nodes dial for the `/internal/v1` API. Required when
+    /// `enabled`.
+    #[serde(default)]
+    pub advertise_addr: String,
+    /// Chain length `R` (number of replicas per object). Clamped to membership.
+    #[serde(default = "default_replication_factor")]
+    pub replication_factor: usize,
+    /// Virtual nodes per node on the consistent-hash ring.
+    #[serde(default = "default_virtual_nodes_per_node")]
+    pub virtual_nodes_per_node: u32,
+    /// Read consistency mode. Default: `strong`.
+    #[serde(default)]
+    pub consistency: ClusterConsistency,
+    /// Freshness window (ms) for `eventual-bounded` reads.
+    #[serde(default = "default_eventual_bound_ms")]
+    pub eventual_bound_ms: u64,
+    /// Per-hop PREPARE forward timeout (ms).
+    #[serde(default = "default_prepare_timeout_ms")]
+    pub prepare_timeout_ms: u64,
+    /// HEAD wait for the full-chain commit ACK (ms).
+    #[serde(default = "default_ack_timeout_ms")]
+    pub ack_timeout_ms: u64,
+    /// Peer authentication mechanism. Default: `shared-secret`.
+    #[serde(default)]
+    pub auth: ClusterAuth,
+    /// Shared secret for `shared-secret` auth. Prefer `Y2QD_CLUSTER__SHARED_SECRET`.
+    #[serde(default)]
+    pub shared_secret: String,
+    /// Interval between peer health probes (ms).
+    #[serde(default = "default_health_probe_interval_ms")]
+    pub health_probe_interval_ms: u64,
+    /// Consecutive failed probes before a peer is reported suspect/down.
+    #[serde(default = "default_health_fail_threshold")]
+    pub health_fail_threshold: u32,
+    /// MEK unlock strategy. Only `"provisioned"` is implemented: the SK is
+    /// unwrapped at boot from a provisioned secret so the node can commit
+    /// peer-forwarded writes unattended.
+    #[serde(default = "default_cluster_unlock")]
+    pub unlock: String,
+    /// Path to a file holding the provisioned unlock secret. Alternatively set
+    /// `Y2QD_CLUSTER__UNLOCK_SECRET`.
+    #[serde(default)]
+    pub unlock_secret_file: String,
+    /// Embedded raft control-plane tuning.
+    #[serde(default)]
+    pub raft: RaftConfig,
+}
+
+impl Default for ClusterConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            node_id: String::new(),
+            advertise_addr: String::new(),
+            replication_factor: default_replication_factor(),
+            virtual_nodes_per_node: default_virtual_nodes_per_node(),
+            consistency: ClusterConsistency::Strong,
+            eventual_bound_ms: default_eventual_bound_ms(),
+            prepare_timeout_ms: default_prepare_timeout_ms(),
+            ack_timeout_ms: default_ack_timeout_ms(),
+            auth: ClusterAuth::SharedSecret,
+            shared_secret: String::new(),
+            health_probe_interval_ms: default_health_probe_interval_ms(),
+            health_fail_threshold: default_health_fail_threshold(),
+            unlock: default_cluster_unlock(),
+            unlock_secret_file: String::new(),
+            raft: RaftConfig::default(),
+        }
+    }
+}
+
 impl Config {
     /// Load configuration from the TOML file named by `--config` (default: `config.toml`),
     /// then layer `Y2QD_*` environment variables, then any `--set KEY=VALUE` overrides
@@ -515,8 +727,72 @@ impl Config {
         validate_envelope_chunk_size(cfg.crypto.envelope_chunk_size_bytes)
             .map_err(|msg| Box::new(figment::Error::from(msg)))?;
 
+        validate_cluster(&cfg).map_err(|msg| Box::new(figment::Error::from(msg)))?;
+
         Ok(cfg)
     }
+}
+
+/// Validate the `[cluster]` section against the surrounding [`Config`]. A
+/// disabled cluster passes unconditionally.
+fn validate_cluster(cfg: &Config) -> Result<(), String> {
+    validate_cluster_section(&cfg.cluster, cfg.server.tls.client_ca_path.is_some())
+}
+
+/// Pure validation of a [`ClusterConfig`]. `has_client_ca` reports whether
+/// `server.tls.client_ca_path` is set (needed only for the mTLS cross-check).
+/// Secrets are accepted either inline or via the documented env vars.
+fn validate_cluster_section(c: &ClusterConfig, has_client_ca: bool) -> Result<(), String> {
+    if !c.enabled {
+        return Ok(());
+    }
+    if c.advertise_addr.trim().is_empty() {
+        return Err("cluster.advertise_addr is required when cluster.enabled".to_string());
+    }
+    if !c.node_id.trim().is_empty() && c.node_id.trim().parse::<u64>().is_err() {
+        return Err(format!(
+            "cluster.node_id = {:?} must be a u64 (or empty to derive one)",
+            c.node_id
+        ));
+    }
+    if c.replication_factor < 1 {
+        return Err("cluster.replication_factor must be >= 1".to_string());
+    }
+    if c.virtual_nodes_per_node == 0 {
+        return Err("cluster.virtual_nodes_per_node must be >= 1".to_string());
+    }
+    if c.auth == ClusterAuth::SharedSecret
+        && c.shared_secret.trim().is_empty()
+        && std::env::var("Y2QD_CLUSTER__SHARED_SECRET").is_err()
+    {
+        return Err(
+            "cluster.shared_secret (or Y2QD_CLUSTER__SHARED_SECRET) is required when \
+             cluster.auth = shared-secret"
+                .to_string(),
+        );
+    }
+    if c.auth == ClusterAuth::Mtls && !has_client_ca {
+        return Err(
+            "cluster.auth = mtls requires server.tls.client_ca_path for peer verification"
+                .to_string(),
+        );
+    }
+    if c.unlock != "provisioned" {
+        return Err(format!(
+            "cluster.unlock = {:?} is unsupported; only \"provisioned\" is implemented",
+            c.unlock
+        ));
+    }
+    if c.unlock_secret_file.trim().is_empty()
+        && std::env::var("Y2QD_CLUSTER__UNLOCK_SECRET").is_err()
+    {
+        return Err(
+            "cluster provisioned unlock requires cluster.unlock_secret_file or \
+             Y2QD_CLUSTER__UNLOCK_SECRET"
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 /// Enforce the accepted bounds for `crypto.envelope_chunk_size_bytes`.
@@ -584,5 +860,92 @@ mod tests {
         assert!(validate_envelope_chunk_size(ENVELOPE_CHUNK_SIZE_MIN - 1).is_err());
         assert!(validate_envelope_chunk_size(ENVELOPE_CHUNK_SIZE_MAX + 1).is_err());
         assert!(validate_envelope_chunk_size(0).is_err());
+    }
+
+    #[test]
+    fn disabled_cluster_always_passes() {
+        let c = ClusterConfig::default();
+        assert!(!c.enabled);
+        assert!(validate_cluster_section(&c, false).is_ok());
+    }
+
+    /// A fully-specified, enabled cluster (shared secret inline) validates.
+    fn enabled_cluster() -> ClusterConfig {
+        ClusterConfig {
+            enabled: true,
+            advertise_addr: "10.0.0.1:8443".to_string(),
+            shared_secret: "s3cret".to_string(),
+            unlock_secret_file: "/etc/y2q/unlock".to_string(),
+            ..ClusterConfig::default()
+        }
+    }
+
+    #[test]
+    fn enabled_cluster_with_required_fields_passes() {
+        assert!(validate_cluster_section(&enabled_cluster(), false).is_ok());
+    }
+
+    #[test]
+    fn enabled_cluster_requires_advertise_addr() {
+        let c = ClusterConfig {
+            advertise_addr: String::new(),
+            ..enabled_cluster()
+        };
+        assert!(validate_cluster_section(&c, false).is_err());
+    }
+
+    #[test]
+    fn shared_secret_required_for_shared_secret_auth() {
+        let c = ClusterConfig {
+            shared_secret: String::new(),
+            ..enabled_cluster()
+        };
+        // Only valid if the env var is set; in its absence this must fail.
+        if std::env::var("Y2QD_CLUSTER__SHARED_SECRET").is_err() {
+            assert!(validate_cluster_section(&c, false).is_err());
+        }
+    }
+
+    #[test]
+    fn mtls_requires_client_ca() {
+        let c = ClusterConfig {
+            auth: ClusterAuth::Mtls,
+            ..enabled_cluster()
+        };
+        assert!(validate_cluster_section(&c, false).is_err());
+        assert!(validate_cluster_section(&c, true).is_ok());
+    }
+
+    #[test]
+    fn non_u64_node_id_rejected() {
+        let c = ClusterConfig {
+            node_id: "node-a".to_string(),
+            ..enabled_cluster()
+        };
+        assert!(validate_cluster_section(&c, false).is_err());
+        let c = ClusterConfig {
+            node_id: "7".to_string(),
+            ..enabled_cluster()
+        };
+        assert!(validate_cluster_section(&c, false).is_ok());
+    }
+
+    #[test]
+    fn unsupported_unlock_rejected() {
+        let c = ClusterConfig {
+            unlock: "login-primed".to_string(),
+            ..enabled_cluster()
+        };
+        assert!(validate_cluster_section(&c, false).is_err());
+    }
+
+    #[test]
+    fn cluster_consistency_parses_kebab_case() {
+        use figment::{Figment, providers::Serialized};
+        let v: ClusterConsistency = Figment::new()
+            .merge(Serialized::default("c", "eventual-bounded"))
+            .extract_inner("c")
+            .unwrap();
+        assert_eq!(v, ClusterConsistency::EventualBounded);
     }
 }

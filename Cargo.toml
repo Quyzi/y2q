@@ -3,6 +3,7 @@ members = [
     "crates/y2q-behavior",
     "crates/y2q-cli",
     "crates/y2q-client",
+    "crates/y2q-cluster",
     "crates/y2q-config",
     "crates/y2q-core",
     "crates/y2q-warp",

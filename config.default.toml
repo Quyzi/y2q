@@ -209,3 +209,39 @@ sample_rate = 100   # pprof sampling rate in Hz
 # Grafana Cloud credentials. Omit (or comment out) for unauthenticated servers.
 # basic_auth_user     = "123456"   # numeric user ID shown in the Grafana Cloud UI
 # basic_auth_password = "glc_..."  # Grafana Cloud API token with profiling write scope
+
+# ---------------------------------------------------------------------------
+# [cluster] — distributed storage (CRAQ data plane + embedded raft control plane)
+#
+# Disabled by default: with `enabled = false` the daemon runs as a single node
+# with no clustering behavior whatsoever. The whole section is optional and every
+# key is defaulted. Enabling clustering requires the SAME deployment keystore on
+# every node (the metadata key is derived deterministically from it).
+# ---------------------------------------------------------------------------
+[cluster]
+enabled = false                  # master switch; false => single node
+
+# node_id          = ""          # explicit u64 id; empty => derive + persist one
+# advertise_addr   = ""          # host:port peers dial for the internal API (required when enabled)
+replication_factor     = 3       # R = chain length (replicas per object); clamped to membership
+virtual_nodes_per_node = 256     # consistent-hash ring smoothing
+consistency            = "strong" # strong | eventual | eventual-bounded
+eventual_bound_ms      = 2000    # freshness window for eventual-bounded reads
+prepare_timeout_ms     = 30000   # per-hop PREPARE forward timeout
+ack_timeout_ms         = 30000   # HEAD wait for full-chain commit
+auth                   = "shared-secret" # shared-secret | mtls
+# shared_secret    = ""          # prefer Y2QD_CLUSTER__SHARED_SECRET
+health_probe_interval_ms = 1000
+health_fail_threshold    = 3     # consecutive failed probes before suspect/down
+unlock                 = "provisioned" # SK unwrapped at boot so peer writes commit unattended
+# unlock_secret_file = ""        # or set Y2QD_CLUSTER__UNLOCK_SECRET
+
+# Embedded raft control plane (replicates only topology + auth/bucket metadata).
+[cluster.raft]
+heartbeat_interval_ms  = 250
+election_timeout_min_ms = 1000
+election_timeout_max_ms = 1500
+# log_dir  = ""                  # empty => <storage.base_path>/_y2q_raft
+bootstrap = false                # true on exactly ONE node's first boot
+role      = "auto"               # auto (use voter_seeds) | voter | learner
+voter_seeds = []                 # node ids forming the voting quorum (size 3/5/7)
