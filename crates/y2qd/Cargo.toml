@@ -23,6 +23,7 @@ gxhash                      = { workspace = true }
 metrics                     = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
 metrics-rs-dashboard-actix  = { workspace = true }
+openraft                    = { workspace = true }
 pyroscope                   = { version = "2.0.0", features = ["backend-pprof-rs"], optional = true }
 rand                        = { workspace = true }
 rustls                      = { workspace = true }
@@ -39,5 +40,6 @@ tracing-subscriber          = { workspace = true }
 utoipa                      = { workspace = true }
 utoipa-swagger-ui           = { workspace = true }
 uuid                        = { workspace = true }
+y2q-cluster                 = { path = "../y2q-cluster" }
 y2q-core                    = { path = "../y2q-core" }
 zeroize                     = { workspace = true }
