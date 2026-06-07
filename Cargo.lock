@@ -5759,6 +5759,8 @@ name = "y2q-cluster"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "dashmap",
+ "futures",
  "gxhash",
  "openraft",
  "rand 0.8.6",
@@ -5773,6 +5775,7 @@ dependencies = [
  "tokio",
  "tracing",
  "webpki-roots 0.26.11",
+ "y2q-core",
  "zeroize",
 ]
 
