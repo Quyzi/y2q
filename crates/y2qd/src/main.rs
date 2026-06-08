@@ -507,6 +507,14 @@ async fn main() -> std::io::Result<()> {
                     Matcher::Suffix(observability::STORAGE_DURATION_METRIC_SUFFIX.to_string()),
                     observability::STORAGE_DURATION_BUCKETS_MILLIS,
                 ),
+                (
+                    Matcher::Full(observability::CLUSTER_PREPARE_HOP_DURATION.to_string()),
+                    observability::DURATION_BUCKETS_MILLIS,
+                ),
+                (
+                    Matcher::Full(observability::CLUSTER_COMMIT_DURATION.to_string()),
+                    observability::DURATION_BUCKETS_MILLIS,
+                ),
             ],
         };
         let dashboard_scope = create_metrics_actx_scope(&dashboard_input)

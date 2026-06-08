@@ -320,6 +320,7 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
         Ok((sm.last_applied, sm.last_membership.clone()))
     }
 
+    #[tracing::instrument(skip_all, name = "raft.apply")]
     async fn apply<I>(&mut self, entries: I) -> Result<Vec<ControlResp>, StorageError<NodeId>>
     where
         I: IntoIterator<Item = Entry<TypeConfig>> + OptionalSend,

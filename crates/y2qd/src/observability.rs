@@ -46,6 +46,36 @@ pub const SESSIONS_ACTIVE: &str = "y2qd_sessions_active";
 /// receiver's committed epoch (stale-topology fence).
 pub const CLUSTER_STALE_EPOCH_REJECTIONS: &str = "y2qd_cluster_stale_epoch_rejections_total";
 
+// --- Cluster (distributed storage) metrics ---
+//
+// Emitted only when `[cluster] enabled = true`. Names are matched for histogram
+// bucketing in `main.rs`; the gauges are refreshed each maintenance tick.
+
+/// Per-hop CRAQ PREPARE service latency at a chain member (histogram, ms),
+/// labelled `result` = ok | err.
+pub const CLUSTER_PREPARE_HOP_DURATION: &str = "y2qd_cluster_prepare_hop_duration_milliseconds";
+/// Full-chain commit latency measured at the contact/HEAD node (histogram, ms),
+/// labelled `result` = ok | err.
+pub const CLUSTER_COMMIT_DURATION: &str = "y2qd_cluster_commit_duration_milliseconds";
+/// CRAQ version queries served by a chain TAIL (counter).
+pub const CLUSTER_VERSION_QUERIES: &str = "y2qd_cluster_version_queries_total";
+/// Apportioned reads, labelled `kind` = local | remote (counter).
+pub const CLUSTER_READS: &str = "y2qd_cluster_reads_total";
+/// Backfill objects fetched by a recovering node (counter).
+pub const CLUSTER_BACKFILL_OBJECTS: &str = "y2qd_cluster_backfill_objects_total";
+/// Backfill envelope bytes served to recovering peers (counter).
+pub const CLUSTER_BACKFILL_BYTES_SERVED: &str = "y2qd_cluster_backfill_bytes_served_total";
+/// Raft term observed by this node (gauge).
+pub const CLUSTER_RAFT_TERM: &str = "y2qd_cluster_raft_term";
+/// 1 if this node currently believes it is the raft leader, else 0 (gauge).
+pub const CLUSTER_IS_LEADER: &str = "y2qd_cluster_is_leader";
+/// Highest raft log index applied to this node's state machine (gauge).
+pub const CLUSTER_RAFT_LAST_APPLIED: &str = "y2qd_cluster_raft_last_applied";
+/// Committed cluster topology epoch (gauge).
+pub const CLUSTER_EPOCH: &str = "y2qd_cluster_epoch";
+/// Number of nodes the committed control state lists as Active (gauge).
+pub const CLUSTER_ACTIVE_NODES: &str = "y2qd_cluster_active_nodes";
+
 /// Bucket boundaries for both payload-size histograms, in bytes.
 /// Spans small JSON bodies (~256 B) through the default 256 MiB upload cap.
 pub const PAYLOAD_BUCKETS_BYTES: &[f64] = &[
@@ -126,6 +156,46 @@ pub fn describe_metrics() {
     describe_counter!(
         CLUSTER_STALE_EPOCH_REJECTIONS,
         "Internal cluster requests rejected because their epoch predated the receiver's committed epoch"
+    );
+    describe_histogram!(
+        CLUSTER_PREPARE_HOP_DURATION,
+        Unit::Milliseconds,
+        "Per-hop CRAQ PREPARE service latency at a chain member, labelled by result"
+    );
+    describe_histogram!(
+        CLUSTER_COMMIT_DURATION,
+        Unit::Milliseconds,
+        "Full-chain CRAQ commit latency measured at the contact/HEAD node, labelled by result"
+    );
+    describe_counter!(
+        CLUSTER_VERSION_QUERIES,
+        "CRAQ version queries served by a chain TAIL"
+    );
+    describe_counter!(
+        CLUSTER_READS,
+        "Apportioned reads served, labelled local vs remote (proxied to the TAIL)"
+    );
+    describe_counter!(
+        CLUSTER_BACKFILL_OBJECTS,
+        "Objects fetched by a recovering node during back-fill"
+    );
+    describe_counter!(
+        CLUSTER_BACKFILL_BYTES_SERVED,
+        "Envelope bytes served to recovering peers during back-fill"
+    );
+    metrics::describe_gauge!(CLUSTER_RAFT_TERM, "Current raft term observed by this node");
+    metrics::describe_gauge!(
+        CLUSTER_IS_LEADER,
+        "1 if this node currently believes it is the raft leader, else 0"
+    );
+    metrics::describe_gauge!(
+        CLUSTER_RAFT_LAST_APPLIED,
+        "Highest raft log index applied to this node's state machine"
+    );
+    metrics::describe_gauge!(CLUSTER_EPOCH, "Committed cluster topology epoch");
+    metrics::describe_gauge!(
+        CLUSTER_ACTIVE_NODES,
+        "Number of nodes the committed control state lists as Active"
     );
 }
 
