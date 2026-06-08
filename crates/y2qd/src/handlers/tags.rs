@@ -21,6 +21,7 @@ use y2q_core::{AnyStorage, BucketPermission, Storage};
 use super::labels::extract_labels;
 use crate::auth::Authenticated;
 use crate::authz::authorize_bucket;
+use crate::cluster::{self, ClusterRuntime};
 use crate::config::LabelLimits;
 use crate::error::{AppError, ErrorBody};
 
@@ -65,6 +66,7 @@ pub async fn handle(
     req: HttpRequest,
     storage: web::Data<Arc<AnyStorage>>,
     limits: web::Data<LabelLimits>,
+    cluster: Option<web::Data<ClusterRuntime>>,
     auth: Authenticated,
 ) -> Result<HttpResponse, AppError> {
     let (bucket, key) = path.into_inner();
@@ -103,10 +105,17 @@ pub async fn handle(
         }
     };
 
-    storage
-        .set_labels(&bucket, &key, final_labels.clone())
-        .await
-        .map_err(AppError::from)?;
+    // Clustered: apply the final label set across the chain. Otherwise write
+    // locally. The final set is computed once here and applied verbatim at every
+    // replica so they stay identical.
+    if let Some(rt) = cluster.as_ref() {
+        cluster::chain_set_labels(rt, &bucket, &key, &final_labels).await?;
+    } else {
+        storage
+            .set_labels(&bucket, &key, final_labels.clone())
+            .await
+            .map_err(AppError::from)?;
+    }
 
     Ok(HttpResponse::Ok().json(SetTagsResponse {
         bucket,

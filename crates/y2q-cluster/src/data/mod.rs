@@ -26,7 +26,7 @@ use tokio::sync::mpsc;
 
 use y2q_core::crypto::envelope;
 use y2q_core::storage::streaming_sink::StreamingSink;
-use y2q_core::{AnyStorage, AnyStreamingPutGuard};
+use y2q_core::{AnyStorage, AnyStreamingPutGuard, Storage};
 
 use crate::control::Controller;
 use crate::control::types::ControlState;
@@ -37,7 +37,7 @@ use crate::transport::TransportError;
 
 pub use pending::{Pending, PendingGuard, PendingWrites};
 pub use route::{ChainRoute, resolve_route};
-pub use wire::{PREPARE_META_HEADER, PrepareMeta, PrepareResp};
+pub use wire::{MutateMeta, MutateOp, MutateResp, PREPARE_META_HEADER, PrepareMeta, PrepareResp};
 
 /// Bounded depth of the per-hop forward channel. A few in-flight chunks gives
 /// pipelining without letting a slow downstream make an upstream node buffer the
@@ -147,6 +147,75 @@ impl DistributedStorage {
     pub async fn peer_url(&self, id: NodeId) -> Option<String> {
         let state = self.controller.control_state().await;
         self.peer_base_url(&state, id)
+    }
+
+    /// Apply a non-PUT mutation (DELETE / set-labels) locally and relay it to the
+    /// next chain member. Called on each member as the mutation walks the chain;
+    /// the HEAD's `existed` verdict is returned. Marks the key dirty for the
+    /// duration.
+    pub async fn accept_mutate(&self, meta: MutateMeta) -> Result<MutateResp, DataError> {
+        let _pending = self.pending.begin(&meta.bucket, &meta.key, meta.epoch);
+        let state = self.controller.control_state().await;
+        let route = resolve_route(
+            &state,
+            &meta.bucket,
+            &meta.key,
+            self.replication_factor,
+            self.virtual_nodes_per_node,
+        );
+        if matches!(route.role(self.node_id), Role::NotInChain) {
+            return Err(DataError::NotMember {
+                bucket: meta.bucket,
+                key: meta.key,
+            });
+        }
+
+        let existed = self.apply_mutate(&meta).await?;
+
+        if let Some(next_id) = route.next_after(self.node_id) {
+            let url = self
+                .peer_base_url(&state, next_id)
+                .ok_or_else(|| DataError::NoChain {
+                    bucket: meta.bucket.clone(),
+                    key: meta.key.clone(),
+                })?;
+            let _down: MutateResp = self
+                .client
+                .post_json(&format!("{url}/internal/v1/mutate"), &meta)
+                .await?;
+        }
+        Ok(MutateResp { existed })
+    }
+
+    /// Apply a mutation to the local backend.
+    async fn apply_mutate(&self, meta: &MutateMeta) -> Result<bool, DataError> {
+        match &meta.op {
+            MutateOp::Delete => match self.local.delete(&meta.bucket, &meta.key).await {
+                Ok(_) => Ok(true),
+                Err(y2q_core::Error::NotFound { .. }) => Ok(false),
+                Err(e) => Err(e.into()),
+            },
+            MutateOp::SetLabels { labels } => {
+                self.local
+                    .set_labels(&meta.bucket, &meta.key, labels.iter().cloned().collect())
+                    .await?;
+                Ok(true)
+            }
+        }
+    }
+
+    /// Send a mutation to a peer's `/internal/v1/mutate` (used when the contact
+    /// node is not the HEAD: it forwards to the HEAD, which walks the chain).
+    pub async fn send_mutate(
+        &self,
+        base_url: &str,
+        meta: &MutateMeta,
+    ) -> Result<MutateResp, DataError> {
+        let resp = self
+            .client
+            .post_json(&format!("{base_url}/internal/v1/mutate"), meta)
+            .await?;
+        Ok(resp)
     }
 
     /// Forward an already-committed envelope from this node (the HEAD) to the next

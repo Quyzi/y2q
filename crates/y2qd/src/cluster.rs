@@ -30,9 +30,9 @@ use zeroize::Zeroizing;
 use y2q_cluster::control::raft_impl::TypeConfig;
 use y2q_cluster::transport::internal_client::CLUSTER_AUTH_HEADER;
 use y2q_cluster::{
-    ControlCmd, Controller, ControllerConfig, DistributedStorage, HttpRaftNetworkFactory,
-    InternalClient, InternalTlsOptions, PREPARE_META_HEADER, PrepareMeta, chain_id,
-    resolve_node_id,
+    ChainRoute, ControlCmd, Controller, ControllerConfig, DistributedStorage,
+    HttpRaftNetworkFactory, InternalClient, InternalTlsOptions, MutateMeta, MutateOp, MutateResp,
+    PREPARE_META_HEADER, PrepareMeta, Role, chain_id, resolve_node_id,
 };
 use y2q_core::crypto::kdf;
 use y2q_core::{AnyStorage, LabelSet, PutOptions, Storage, SyncLevel};
@@ -697,6 +697,88 @@ fn internal_err(bucket: &str, key: &str, e: impl std::fmt::Display) -> AppError 
     })
 }
 
+/// Map a data-plane error to an `AppError`, preserving a wrapped core error
+/// (so e.g. `NotFound` from a label set on a missing object still becomes 404).
+fn map_data_err(bucket: &str, key: &str, e: y2q_cluster::DataError) -> AppError {
+    match e {
+        y2q_cluster::DataError::Storage(core) => AppError(core),
+        other => internal_err(bucket, key, other),
+    }
+}
+
+/// Dispatch a chain mutation: apply+relay locally when this node is the HEAD,
+/// otherwise forward it to the HEAD (which walks the chain).
+async fn dispatch_mutate(
+    rt: &ClusterRuntime,
+    route: &ChainRoute,
+    meta: MutateMeta,
+) -> Result<MutateResp, AppError> {
+    let bucket = meta.bucket.clone();
+    let key = meta.key.clone();
+    match route.role(rt.node_id) {
+        Role::Head | Role::Solo => rt
+            .distributed
+            .accept_mutate(meta)
+            .await
+            .map_err(|e| map_data_err(&bucket, &key, e)),
+        Role::Middle | Role::Tail | Role::NotInChain => {
+            let head_id = route.head().ok_or_else(|| {
+                internal_err(
+                    &bucket,
+                    &key,
+                    "no chain head (cluster has no active members)",
+                )
+            })?;
+            let head_url = rt.distributed.peer_url(head_id).await.ok_or_else(|| {
+                internal_err(
+                    &bucket,
+                    &key,
+                    format!("head node {head_id} has no known address"),
+                )
+            })?;
+            rt.distributed
+                .send_mutate(&head_url, &meta)
+                .await
+                .map_err(|e| map_data_err(&bucket, &key, e))
+        }
+    }
+}
+
+/// Route a DELETE through the chain. Returns whether the object existed.
+pub async fn chain_delete(rt: &ClusterRuntime, bucket: &str, key: &str) -> Result<bool, AppError> {
+    let route = rt.distributed.route(bucket, key).await;
+    let meta = MutateMeta {
+        bucket: bucket.to_owned(),
+        key: key.to_owned(),
+        chain_id: chain_id(bucket, key),
+        epoch: route.epoch,
+        op: MutateOp::Delete,
+    };
+    Ok(dispatch_mutate(rt, &route, meta).await?.existed)
+}
+
+/// Route a label-set replacement through the chain; `final_labels` is applied
+/// verbatim at every member.
+pub async fn chain_set_labels(
+    rt: &ClusterRuntime,
+    bucket: &str,
+    key: &str,
+    final_labels: &LabelSet,
+) -> Result<(), AppError> {
+    let route = rt.distributed.route(bucket, key).await;
+    let meta = MutateMeta {
+        bucket: bucket.to_owned(),
+        key: key.to_owned(),
+        chain_id: chain_id(bucket, key),
+        epoch: route.epoch,
+        op: MutateOp::SetLabels {
+            labels: final_labels.iter().cloned().collect(),
+        },
+    };
+    dispatch_mutate(rt, &route, meta).await?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // HTTP handlers
 // ---------------------------------------------------------------------------
@@ -709,6 +791,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
     cfg.service(web::resource("/internal/v1/raft/snapshot").route(web::post().to(raft_snapshot)));
     cfg.service(web::resource("/internal/v1/prepare").route(web::post().to(prepare)));
     cfg.service(web::resource("/internal/v1/put").route(web::post().to(internal_put)));
+    cfg.service(web::resource("/internal/v1/mutate").route(web::post().to(mutate)));
     cfg.service(web::resource("/internal/v1/health").route(web::get().to(health)));
     cfg.service(web::resource("/api/v1/cluster/status").route(web::get().to(status)));
     cfg.service(web::resource("/api/v1/cluster/join").route(web::post().to(join)));
@@ -817,6 +900,21 @@ async fn internal_put(
     )
     .await?;
     Ok(HttpResponse::Ok().json(PutResp { overwrite }))
+}
+
+/// Receive a chain mutation (DELETE / set-labels): apply it locally and relay it
+/// to the next chain member.
+async fn mutate(
+    rt: web::Data<ClusterRuntime>,
+    _peer: ClusterPeer,
+    body: web::Json<MutateMeta>,
+) -> Result<HttpResponse, actix_web::Error> {
+    let resp = rt
+        .distributed
+        .accept_mutate(body.into_inner())
+        .await
+        .map_err(|e| ErrorBadGateway(format!("mutate: {e}")))?;
+    Ok(HttpResponse::Ok().json(resp))
 }
 
 /// Liveness + identity returned from `/internal/v1/health`. The `fingerprint`
