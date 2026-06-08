@@ -33,6 +33,8 @@ fn make_meta(bucket: &str, key: &str) -> Metadata {
         kem_alg: None,
         aead_alg: None,
         envelope_version: None,
+        version: None,
+        committed_at: None,
     }
 }
 

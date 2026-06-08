@@ -23,7 +23,7 @@ pub use control::{
 pub use data::wire::PREPARE_META_HEADER;
 pub use data::{
     ChainRoute, DataError, DistributedStorage, LabelMode, MutateMeta, MutateOp, MutateResp,
-    PendingWrites, PrepareMeta, PrepareResp, resolve_route,
+    PendingWrites, PrepareMeta, PrepareResp, ReadConsistency, ReadPlan, VersionResp, resolve_route,
 };
 pub use hashing::chain::{ChainEntry, ChainTable, Role};
 pub use hashing::ring::{Ring, chain_id};

@@ -144,6 +144,19 @@ pub struct Metadata {
     /// legacy plaintext objects.
     #[serde(default)]
     pub envelope_version: Option<u16>,
+    /// CRAQ object version: a per-object monotonic counter assigned by the
+    /// chain HEAD and persisted identically on every replica. `None` for
+    /// single-node objects and legacy objects written before clustering (read
+    /// as clean v0). Distinct from [`envelope_version`](Self::envelope_version)
+    /// (the on-disk crypto format) and the container format version.
+    #[serde(default)]
+    pub version: Option<u64>,
+    /// Nanoseconds since the Unix epoch when this replica committed the object's
+    /// current version locally. Used by the `eventual-bounded` read mode to
+    /// decide whether the local copy is fresh enough to serve without a version
+    /// query. `None` outside of cluster writes.
+    #[serde(default)]
+    pub committed_at: Option<u64>,
 }
 
 /// Durability guarantee a PUT should provide before returning success.
@@ -189,6 +202,11 @@ pub struct PutOptions {
     /// ciphertext-side fields the backend should attach to the metadata
     /// sidecar (cipher_size, kem/aead alg, envelope_version, cipher_sha256).
     pub cipher_metadata: Option<CipherMetadata>,
+    /// CRAQ object version to stamp into [`Metadata::version`]. Set by the chain
+    /// HEAD (and carried verbatim to replicas) so every copy of a version agrees.
+    /// Honored only by the streaming-PUT commit path (the cluster write path);
+    /// the buffered [`Storage::put`] path ignores it and writes `None`.
+    pub version: Option<u64>,
 }
 
 /// Plaintext-derived size and checksum supplied by the daemon when it has
@@ -680,6 +698,44 @@ pub trait StorageExt: Storage {
     /// unlink. The scan / unlink pair is not atomic across the tree; see
     /// [`storage::locks`] for race semantics.
     async fn clear_stale_locks(&self, older_than: SystemTime) -> Result<u64, Error>;
+}
+
+#[cfg(test)]
+mod metadata_tests {
+    use super::Metadata;
+
+    /// Metadata written before clustering (no `version`/`committed_at`) still
+    /// deserializes, defaulting both new fields to `None` (clean v0).
+    #[test]
+    fn legacy_metadata_without_version_defaults_to_none() {
+        let json = r#"{
+            "created": 1, "modified": 2, "size": 10,
+            "checksum_gxhash": "AAAAAAAAAAA=",
+            "bucket": "b", "key": "k",
+            "disk_path": "/tmp/x.obj", "url_path": "b/k"
+        }"#;
+        let md: Metadata = serde_json::from_str(json).unwrap();
+        assert_eq!(md.version, None);
+        assert_eq!(md.committed_at, None);
+    }
+
+    /// A versioned object round-trips through JSON with both fields preserved.
+    #[test]
+    fn versioned_metadata_round_trips() {
+        let json = r#"{
+            "created": 1, "modified": 2, "size": 10,
+            "checksum_gxhash": "AAAAAAAAAAA=",
+            "bucket": "b", "key": "k",
+            "disk_path": "/tmp/x.obj", "url_path": "b/k",
+            "version": 7, "committed_at": 123456789
+        }"#;
+        let md: Metadata = serde_json::from_str(json).unwrap();
+        assert_eq!(md.version, Some(7));
+        assert_eq!(md.committed_at, Some(123_456_789));
+        let back: Metadata = serde_json::from_slice(&serde_json::to_vec(&md).unwrap()).unwrap();
+        assert_eq!(back.version, Some(7));
+        assert_eq!(back.committed_at, Some(123_456_789));
+    }
 }
 
 #[cfg(test)]

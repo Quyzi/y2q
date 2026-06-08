@@ -579,6 +579,10 @@ async fn do_put(
         kem_alg,
         aead_alg,
         envelope_version,
+        // Buffered put is not a cluster write path; CRAQ versions are assigned
+        // only on the streaming commit path.
+        version: None,
+        committed_at: None,
     };
 
     let meta_json = serde_json::to_vec(&metadata)

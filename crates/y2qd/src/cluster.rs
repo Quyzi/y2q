@@ -32,14 +32,15 @@ use y2q_cluster::transport::internal_client::CLUSTER_AUTH_HEADER;
 use y2q_cluster::{
     ChainRoute, ControlCmd, Controller, ControllerConfig, DistributedStorage,
     HttpRaftNetworkFactory, InternalClient, InternalTlsOptions, LabelMode, MutateMeta, MutateOp,
-    MutateResp, PREPARE_META_HEADER, PrepareMeta, Role, chain_id, resolve_node_id,
+    MutateResp, PREPARE_META_HEADER, PrepareMeta, ReadConsistency, ReadPlan, Role, VersionResp,
+    chain_id, resolve_node_id,
 };
-use y2q_core::crypto::kdf;
-use y2q_core::{AnyStorage, LabelSet, PutOptions, Storage, SyncLevel};
+use y2q_core::crypto::{envelope, kdf};
+use y2q_core::{AnyStorage, AnyStreamingPutGuard, LabelSet, PutOptions, Storage, SyncLevel};
 
 use crate::auth::{AdminAuthenticated, AuthState};
 use crate::cipher;
-use crate::config::{ClusterAuth, Config};
+use crate::config::{ClusterAuth, ClusterConsistency, Config};
 use crate::error::AppError;
 
 /// Long-lived cluster runtime, shared with handlers via `web::Data`.
@@ -64,6 +65,8 @@ pub struct ClusterRuntime {
     shared_secret: Option<Zeroizing<String>>,
     /// Peer authentication mode in effect.
     auth_mode: ClusterAuth,
+    /// Read consistency applied to apportioned GETs.
+    pub read_consistency: ReadConsistency,
 }
 
 impl ClusterRuntime {
@@ -186,7 +189,19 @@ pub async fn build_runtime(
         node_id,
         shared_secret: shared_secret.map(Zeroizing::new),
         auth_mode: cfg.cluster.auth,
+        read_consistency: read_consistency(cfg),
     })
+}
+
+/// Map the configured consistency mode to the data-plane [`ReadConsistency`].
+fn read_consistency(cfg: &Config) -> ReadConsistency {
+    match cfg.cluster.consistency {
+        ClusterConsistency::Strong => ReadConsistency::Strong,
+        ClusterConsistency::Eventual => ReadConsistency::Eventual,
+        ClusterConsistency::EventualBounded => ReadConsistency::EventualBounded {
+            bound_ms: cfg.cluster.eventual_bound_ms,
+        },
+    }
 }
 
 /// Unwrap the deployment SK from the configured `unlock_user`'s record using the
@@ -486,13 +501,16 @@ fn internal_tls_options(cfg: &Config) -> std::io::Result<InternalTlsOptions> {
 /// Window size for streaming a committed envelope to the next chain member.
 const REPLICATE_WINDOW: u64 = 4 << 20;
 
-/// Run the CRAQ HEAD write: encrypt the plaintext once into the local backend,
-/// commit it, then replicate the committed envelope down the chain. Returns
-/// whether an existing object was overwritten.
+/// Run the CRAQ HEAD write: encrypt the plaintext once into a local `.tmp`,
+/// replicate the staged envelope down the chain, and commit locally **only
+/// after** the downstream sub-chain has committed. Returns whether an existing
+/// object was overwritten.
 ///
-/// The HEAD commits before replicating (HEAD-first ordering): on a downstream
-/// failure the object is committed here but under-replicated until back-fill
-/// (Phase E). Strict TAIL-first ordering arrives with versioning in Phase D.
+/// TAIL-first ordering: the TAIL is the commit point. The key is marked dirty
+/// for the whole replicate-then-commit window so a concurrent strong read here
+/// version-queries the TAIL rather than serving the still-old `.obj`; and a
+/// downstream failure aborts the write (the `.tmp` is dropped, nothing renamed)
+/// instead of committing an under-replicated copy — no torn or dirty reads.
 pub async fn head_write(
     rt: &ClusterRuntime,
     bucket: &str,
@@ -503,6 +521,17 @@ pub async fn head_write(
     chunk_size: usize,
 ) -> Result<bool, AppError> {
     let local = rt.distributed.local();
+
+    // Assign the next CRAQ version from this HEAD's committed copy (clean v0 when
+    // the key is new or predates versioning). The chain order, not this counter,
+    // is what makes CRAQ correct; the counter lets reads compare copies.
+    let prior_version = local
+        .describe(bucket, key)
+        .await
+        .ok()
+        .and_then(|m| m.version)
+        .unwrap_or(0);
+    let version = prior_version + 1;
 
     let (guard, sink, write_offset) = local
         .begin_streaming_put(bucket, key)
@@ -519,34 +548,13 @@ pub async fn head_write(
     )
     .await?;
 
-    // Capture the metadata the replicas must persist before the values move into
-    // the local commit.
+    // Metadata the replicas persist. The padded v2 `plaintext_len` at envelope
+    // offset 20 is `padme_len(plaintext_size)` (what `EncryptSession::finish`
+    // patched), so derive it directly instead of reading the staged bytes back.
     let label_vec: Vec<(String, String)> = labels.iter().cloned().collect();
     let plaintext_size = pm.size;
-    let checksum_gxhash_b64 = pm.checksum_gxhash_b64.clone();
     let cipher_size = cm.cipher_size;
-    let cipher_sha256_b64 = cm.cipher_sha256_b64.clone();
-    let kem_alg = cm.kem_alg.clone();
-    let aead_alg = cm.aead_alg.clone();
-    let envelope_version = cm.envelope_version;
-
-    let overwrite = guard
-        .commit(
-            sink,
-            PutOptions {
-                labels,
-                sync,
-                ..Default::default()
-            },
-            pm,
-            cm,
-        )
-        .await
-        .map_err(AppError::from)?;
-
-    // The padded v2 `plaintext_len` lives at offset 20 of the envelope; read it
-    // back so replicas can patch their copy to be byte-identical.
-    let plaintext_len = read_plaintext_len(local, bucket, key).await?;
+    let plaintext_len = envelope::padme_len(plaintext_size);
 
     let route = rt.distributed.route(bucket, key).await;
     let meta = PrepareMeta {
@@ -554,22 +562,30 @@ pub async fn head_write(
         key: key.to_owned(),
         chain_id: chain_id(bucket, key),
         epoch: route.epoch,
+        version,
         plaintext_len,
         plaintext_size,
-        checksum_gxhash_b64,
+        checksum_gxhash_b64: pm.checksum_gxhash_b64.clone(),
         cipher_size,
-        cipher_sha256_b64,
-        kem_alg,
-        aead_alg,
-        envelope_version,
+        cipher_sha256_b64: cm.cipher_sha256_b64.clone(),
+        kem_alg: cm.kem_alg.clone(),
+        aead_alg: cm.aead_alg.clone(),
+        envelope_version: cm.envelope_version,
         sync_durable: sync == SyncLevel::Durable,
         labels: label_vec,
     };
 
-    // Replicate the committed envelope to the rest of the chain (no-op for a solo
-    // chain). Stream it in bounded windows so large objects do not buffer whole.
+    // Mark dirty for the tail-first window: until the local commit below, the
+    // committed `.obj` still holds the prior version, so a concurrent strong read
+    // must version-query the TAIL rather than serve it.
+    let _pending = rt.distributed.pending().begin(bucket, key, route.epoch);
+
+    // Replicate the STAGED envelope to the rest of the chain and await the full
+    // downstream commit (no-op `Ok(None)` for a solo chain). Stream it in bounded
+    // windows read from the uncommitted `.tmp` so large objects do not buffer
+    // whole.
     let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(8);
-    let feeder = stream_envelope_windows(local, bucket, key, cipher_size, tx);
+    let feeder = stream_staged_windows(&guard, write_offset, cipher_size, tx);
     let forward = rt.distributed.forward_to_next(&meta, rx);
     let (feed_res, fwd_res) = tokio::join!(feeder, forward);
     feed_res?;
@@ -582,43 +598,43 @@ pub async fn head_write(
         })
     })?;
 
+    // Downstream committed: now promote this HEAD's copy (the commit point has
+    // already passed at the TAIL, so the HEAD is last, as CRAQ prescribes).
+    let overwrite = guard
+        .commit(
+            sink,
+            PutOptions {
+                labels,
+                sync,
+                version: Some(version),
+                ..Default::default()
+            },
+            pm,
+            cm,
+        )
+        .await
+        .map_err(AppError::from)?;
+
     Ok(overwrite)
 }
 
-/// Read the 8-byte v2 `plaintext_len` field (envelope offset 20) of a committed
-/// object.
-async fn read_plaintext_len(local: &AnyStorage, bucket: &str, key: &str) -> Result<u64, AppError> {
-    let bytes = local
-        .get_range(bucket, key, (20u64..=27u64).into())
-        .await
-        .map_err(AppError::from)?;
-    if bytes.len() < 8 {
-        return Err(AppError(y2q_core::Error::InternalError {
-            bucket: bucket.to_owned(),
-            key: key.to_owned(),
-            operation: "replicate".to_owned(),
-            message: "short envelope reading plaintext_len".to_owned(),
-        }));
-    }
-    Ok(u64::from_be_bytes(bytes[..8].try_into().unwrap()))
-}
-
-/// Stream a committed object's envelope to `tx` in bounded windows.
-async fn stream_envelope_windows(
-    local: &AnyStorage,
-    bucket: &str,
-    key: &str,
+/// Stream a staged (uncommitted) object's envelope to `tx` in bounded windows,
+/// read from the HEAD's `.tmp` before commit. `write_offset` is the file offset
+/// at which the envelope begins (the 64-byte container header precedes it).
+async fn stream_staged_windows(
+    guard: &AnyStreamingPutGuard,
+    write_offset: u64,
     cipher_size: u64,
     tx: tokio::sync::mpsc::Sender<Bytes>,
 ) -> Result<(), AppError> {
     let mut off = 0u64;
     while off < cipher_size {
-        let end = (off + REPLICATE_WINDOW - 1).min(cipher_size - 1);
-        let window = local
-            .get_range(bucket, key, (off..=end).into())
+        let len = REPLICATE_WINDOW.min(cipher_size - off);
+        let window = guard
+            .read_staged_range(write_offset + off, len)
             .await
             .map_err(AppError::from)?;
-        off = end + 1;
+        off += len;
         if tx.send(window).await.is_err() {
             break; // forward task ended (downstream error)
         }
@@ -757,6 +773,16 @@ pub async fn chain_delete(rt: &ClusterRuntime, bucket: &str, key: &str) -> Resul
     Ok(dispatch_mutate(rt, &route, meta).await?.existed)
 }
 
+/// Decide how to serve an apportioned read of `(bucket, key)` under the
+/// configured consistency mode: serve the local committed copy, or fetch the
+/// committed envelope from the chain TAIL ([`ReadPlan::Remote`]).
+pub async fn plan_read(rt: &ClusterRuntime, bucket: &str, key: &str) -> Result<ReadPlan, AppError> {
+    rt.distributed
+        .plan_read(bucket, key, rt.read_consistency)
+        .await
+        .map_err(|e| map_data_err(bucket, key, e))
+}
+
 /// Route a label edit through the chain. The HEAD resolves `mode`/`incoming`
 /// against its committed copy and applies the resolved set verbatim at every
 /// member; the resolved set is returned for the HTTP response.
@@ -792,6 +818,8 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
     cfg.service(web::resource("/internal/v1/prepare").route(web::post().to(prepare)));
     cfg.service(web::resource("/internal/v1/put").route(web::post().to(internal_put)));
     cfg.service(web::resource("/internal/v1/mutate").route(web::post().to(mutate)));
+    cfg.service(web::resource("/internal/v1/version").route(web::get().to(version)));
+    cfg.service(web::resource("/internal/v1/read").route(web::get().to(internal_read)));
     cfg.service(web::resource("/internal/v1/health").route(web::get().to(health)));
     cfg.service(web::resource("/api/v1/cluster/status").route(web::get().to(status)));
     cfg.service(web::resource("/api/v1/cluster/join").route(web::post().to(join)));
@@ -915,6 +943,56 @@ async fn mutate(
         .await
         .map_err(|e| ErrorBadGateway(format!("mutate: {e}")))?;
     Ok(HttpResponse::Ok().json(resp))
+}
+
+/// Query params for [`version`].
+#[derive(Debug, Deserialize)]
+struct VersionParams {
+    /// Target bucket.
+    bucket: String,
+    /// Target key.
+    key: String,
+}
+
+/// Answer a CRAQ version query with this node's locally-committed version for
+/// `(bucket, key)`. The data-plane read path directs these at the chain TAIL,
+/// whose committed version is authoritative (the CRAQ commit point).
+async fn version(
+    rt: web::Data<ClusterRuntime>,
+    _peer: ClusterPeer,
+    q: web::Query<VersionParams>,
+) -> HttpResponse {
+    let version = rt
+        .distributed
+        .local_committed_version(&q.bucket, &q.key)
+        .await;
+    HttpResponse::Ok().json(VersionResp { version })
+}
+
+/// Serve this node's committed ciphertext envelope for `(bucket, key)` to a peer
+/// (the apportioned read fetch). The envelope is returned verbatim — the peer
+/// decrypts it with the user keystore (this node dropped the deployment SK after
+/// deriving the MEK). The `X-Y2Q-Size` header carries the true plaintext size
+/// for the caller's padding trim.
+async fn internal_read(
+    rt: web::Data<ClusterRuntime>,
+    _peer: ClusterPeer,
+    q: web::Query<VersionParams>,
+) -> Result<HttpResponse, actix_web::Error> {
+    let local = rt.distributed.local();
+    let object = local.get(&q.bucket, &q.key).await.map_err(|e| match e {
+        y2q_core::Error::NotFound { .. } => actix_web::error::ErrorNotFound(e.to_string()),
+        other => actix_web::error::ErrorBadGateway(other.to_string()),
+    })?;
+    let size = local
+        .describe(&q.bucket, &q.key)
+        .await
+        .map(|m| m.size)
+        .unwrap_or(0);
+    Ok(HttpResponse::Ok()
+        .insert_header(("X-Y2Q-Size", size.to_string()))
+        .content_type("application/octet-stream")
+        .body(object.into_inner()))
 }
 
 /// Liveness + identity returned from `/internal/v1/health`. The `fingerprint`

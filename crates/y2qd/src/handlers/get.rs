@@ -17,6 +17,7 @@ use y2q_core::{AnyStorage, BucketPermission, Storage};
 use crate::auth::Authenticated;
 use crate::authz::authorize_bucket;
 use crate::cipher;
+use crate::cluster::{self, ClusterRuntime};
 use crate::error::{AppError, ErrorBody};
 
 /// AES-256-GCM authentication tag length appended to each v2 chunk on disk.
@@ -57,6 +58,7 @@ pub async fn handle(
     path: web::Path<(String, String)>,
     req: HttpRequest,
     storage: web::Data<Arc<AnyStorage>>,
+    cluster: Option<web::Data<ClusterRuntime>>,
     auth: Authenticated,
 ) -> Result<HttpResponse, AppError> {
     let (bucket, key) = path.into_inner();
@@ -66,6 +68,16 @@ pub async fn handle(
         .get(header::RANGE)
         .and_then(|h| h.to_str().ok())
         .and_then(parse_byte_range);
+
+    // Clustered: an apportioned read either serves this node's local committed
+    // copy (fall through) or fetches the committed envelope from the chain TAIL,
+    // which is then decrypted here with the user keystore.
+    if let Some(rt) = cluster.as_ref()
+        && let y2q_cluster::ReadPlan::Remote { envelope, size } =
+            cluster::plan_read(rt, &bucket, &key).await?
+    {
+        return serve_remote_envelope(envelope, size, range_header, &auth, &bucket, &key);
+    }
 
     // No Range header: return the full object (decrypting in place if encrypted).
     let Some((start, end)) = range_header else {
@@ -173,6 +185,46 @@ pub async fn handle(
             Ok(partial_content(start, end, size, body))
         }
     }
+}
+
+/// Serve a committed ciphertext `envelope` fetched from a peer (the chain TAIL)
+/// for an apportioned read: decrypt it with the user keystore, trim Padmé
+/// padding to the true plaintext `size`, then answer the full body or the
+/// requested byte range. Range requests decrypt the whole envelope and slice the
+/// plaintext (the chunk-addressable fast path is local-only).
+fn serve_remote_envelope(
+    envelope: Bytes,
+    size: u64,
+    range: Option<(u64, u64)>,
+    auth: &Authenticated,
+    bucket: &str,
+    key: &str,
+) -> Result<HttpResponse, AppError> {
+    let plaintext: Bytes = if cipher::is_encrypted_envelope(&envelope) {
+        let buf = BytesMut::from(envelope.as_ref());
+        let pt = cipher::decrypt_after_get(&auth.keystore, bucket, key, buf)?;
+        if pt.len() as u64 > size {
+            pt.slice(0..size as usize)
+        } else {
+            pt
+        }
+    } else {
+        // Legacy plaintext object (pre-encryption) stored verbatim.
+        envelope
+    };
+
+    let Some((start, end)) = range else {
+        return Ok(HttpResponse::Ok()
+            .content_type("application/octet-stream")
+            .body(plaintext));
+    };
+
+    let total = plaintext.len() as u64;
+    if start > end || start >= total || end >= total {
+        return Ok(range_not_satisfiable(total));
+    }
+    let body = plaintext.slice(start as usize..end as usize + 1);
+    Ok(partial_content(start, end, total, body))
 }
 
 /// Build a 206 Partial Content response for `[start, end]` of a `total`-byte object.
