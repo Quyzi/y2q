@@ -590,6 +590,7 @@ impl DistributedStorage {
     /// node should hold (prospectively) and is missing or behind on, pull and
     /// commit it. Returns the number of objects fetched (0 ⇒ nothing was
     /// missing this sweep — i.e. caught up).
+    #[tracing::instrument(skip_all, name = "cluster.backfill")]
     pub async fn backfill_pass(&self) -> Result<usize, DataError> {
         let state = self.controller.control_state().await;
         let epoch = state.epoch;

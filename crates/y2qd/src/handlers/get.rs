@@ -19,6 +19,7 @@ use crate::authz::authorize_bucket;
 use crate::cipher;
 use crate::cluster::{self, ClusterRuntime};
 use crate::error::{AppError, ErrorBody};
+use crate::observability;
 
 /// AES-256-GCM authentication tag length appended to each v2 chunk on disk.
 const TAG_LEN: u64 = 16;
@@ -72,11 +73,17 @@ pub async fn handle(
     // Clustered: an apportioned read either serves this node's local committed
     // copy (fall through) or fetches the committed envelope from the chain TAIL,
     // which is then decrypted here with the user keystore.
-    if let Some(rt) = cluster.as_ref()
-        && let y2q_cluster::ReadPlan::Remote { envelope, size } =
-            cluster::plan_read(rt, &bucket, &key).await?
-    {
-        return serve_remote_envelope(envelope, size, range_header, &auth, &bucket, &key);
+    if let Some(rt) = cluster.as_ref() {
+        match cluster::plan_read(rt, &bucket, &key).await? {
+            y2q_cluster::ReadPlan::Remote { envelope, size } => {
+                metrics::counter!(observability::CLUSTER_READS, "kind" => "remote").increment(1);
+                return serve_remote_envelope(envelope, size, range_header, &auth, &bucket, &key);
+            }
+            y2q_cluster::ReadPlan::Local => {
+                metrics::counter!(observability::CLUSTER_READS, "kind" => "local").increment(1);
+                // Fall through to the local serving path below.
+            }
+        }
     }
 
     // No Range header: return the full object (decrypting in place if encrypted).

@@ -234,6 +234,10 @@ pub fn spawn_maintenance(rt: web::Data<ClusterRuntime>, interval_ms: u64, fail_t
             tokio::time::sleep(interval).await;
             let state = rt.controller.control_state().await;
 
+            // Refresh the cluster gauges every tick on every node so `/metrics`
+            // tracks raft term/leadership/epoch and chain health continuously.
+            record_cluster_gauges(&rt, &state).await;
+
             // Self-recovery runs on every node regardless of leadership.
             run_self_recovery(&rt, &state).await;
 
@@ -283,12 +287,31 @@ async fn run_self_recovery(rt: &ClusterRuntime, state: &y2q_cluster::ControlStat
                     rt.backfill_caught_up.store(true, Ordering::Relaxed);
                     tracing::info!("cluster maintenance: back-fill caught up; awaiting promotion");
                 }
-                Ok(n) => tracing::info!(fetched = n, "cluster maintenance: back-fill sweep"),
+                Ok(n) => {
+                    metrics::counter!(crate::observability::CLUSTER_BACKFILL_OBJECTS)
+                        .increment(n as u64);
+                    tracing::info!(fetched = n, "cluster maintenance: back-fill sweep");
+                }
                 Err(e) => tracing::warn!(error = %e, "cluster maintenance: back-fill sweep failed"),
             }
         }
         _ => {}
     }
+}
+
+/// Refresh the cluster gauges from this node's raft + control state. Called every
+/// maintenance tick on every node so `/metrics` always reflects current topology.
+async fn record_cluster_gauges(rt: &ClusterRuntime, state: &y2q_cluster::ControlState) {
+    let raft_metrics = rt.controller.raft().metrics().borrow().clone();
+    let term = raft_metrics.current_term;
+    let last_applied = raft_metrics.last_applied.map(|l| l.index).unwrap_or(0);
+    let is_leader = rt.controller.is_leader().await;
+    metrics::gauge!(crate::observability::CLUSTER_RAFT_TERM).set(term as f64);
+    metrics::gauge!(crate::observability::CLUSTER_RAFT_LAST_APPLIED).set(last_applied as f64);
+    metrics::gauge!(crate::observability::CLUSTER_IS_LEADER).set(if is_leader { 1.0 } else { 0.0 });
+    metrics::gauge!(crate::observability::CLUSTER_EPOCH).set(state.epoch as f64);
+    metrics::gauge!(crate::observability::CLUSTER_ACTIVE_NODES)
+        .set(state.active_nodes().len() as f64);
 }
 
 /// Drive one peer through the liveness state machine from a probe result. The
@@ -649,17 +672,40 @@ fn internal_tls_options(cfg: &Config) -> std::io::Result<InternalTlsOptions> {
 /// Window size for streaming a committed envelope to the next chain member.
 const REPLICATE_WINDOW: u64 = 4 << 20;
 
-/// Run the CRAQ HEAD write: encrypt the plaintext once into a local `.tmp`,
+/// Run the CRAQ HEAD write, timing the full-chain commit. Returns whether an
+/// existing object was overwritten. The HEAD is where the whole chain's commit
+/// latency is observable, so it records [`CLUSTER_COMMIT_DURATION`].
+///
+/// [`CLUSTER_COMMIT_DURATION`]: crate::observability::CLUSTER_COMMIT_DURATION
+pub async fn head_write(
+    rt: &ClusterRuntime,
+    bucket: &str,
+    key: &str,
+    payload: web::Payload,
+    labels: LabelSet,
+    sync: SyncLevel,
+    chunk_size: usize,
+) -> Result<bool, AppError> {
+    let started = std::time::Instant::now();
+    let res = head_write_inner(rt, bucket, key, payload, labels, sync, chunk_size).await;
+    let elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0;
+    let result = if res.is_ok() { "ok" } else { "err" };
+    metrics::histogram!(crate::observability::CLUSTER_COMMIT_DURATION, "result" => result)
+        .record(elapsed_ms);
+    res
+}
+
+/// The CRAQ HEAD write: encrypt the plaintext once into a local `.tmp`,
 /// replicate the staged envelope down the chain, and commit locally **only
-/// after** the downstream sub-chain has committed. Returns whether an existing
-/// object was overwritten.
+/// after** the downstream sub-chain has committed.
 ///
 /// TAIL-first ordering: the TAIL is the commit point. The key is marked dirty
 /// for the whole replicate-then-commit window so a concurrent strong read here
 /// version-queries the TAIL rather than serving the still-old `.obj`; and a
 /// downstream failure aborts the write (the `.tmp` is dropped, nothing renamed)
 /// instead of committing an under-replicated copy — no torn or dirty reads.
-pub async fn head_write(
+#[tracing::instrument(skip_all, name = "cluster.commit", fields(bucket = %bucket, key = %key))]
+async fn head_write_inner(
     rt: &ClusterRuntime,
     bucket: &str,
     key: &str,
@@ -1055,6 +1101,7 @@ async fn fence_epoch(rt: &ClusterRuntime, msg_epoch: u64) -> Result<(), actix_we
 /// into the data plane, which writes it locally, relays it down-chain, and
 /// commits once the downstream sub-chain commits. The `X-Y2Q-Prepare` header
 /// carries the [`PrepareMeta`] the replica persists alongside the bytes.
+#[tracing::instrument(skip_all, name = "cluster.prepare")]
 async fn prepare(
     rt: web::Data<ClusterRuntime>,
     _peer: ClusterPeer,
@@ -1088,7 +1135,16 @@ async fn prepare(
     };
     let accept = rt.distributed.accept_prepare(meta, rx);
 
+    let started = std::time::Instant::now();
     let (feed_res, accept_res) = tokio::join!(feeder, accept);
+    let elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0;
+    let result = if feed_res.is_ok() && accept_res.is_ok() {
+        "ok"
+    } else {
+        "err"
+    };
+    metrics::histogram!(crate::observability::CLUSTER_PREPARE_HOP_DURATION, "result" => result)
+        .record(elapsed_ms);
     feed_res?;
     let resp = accept_res.map_err(|e| ErrorBadGateway(format!("prepare: {e}")))?;
     Ok(HttpResponse::Ok().json(resp))
@@ -1159,11 +1215,13 @@ struct VersionParams {
 /// Answer a CRAQ version query with this node's locally-committed version for
 /// `(bucket, key)`. The data-plane read path directs these at the chain TAIL,
 /// whose committed version is authoritative (the CRAQ commit point).
+#[tracing::instrument(skip_all, name = "cluster.version_query")]
 async fn version(
     rt: web::Data<ClusterRuntime>,
     _peer: ClusterPeer,
     q: web::Query<VersionParams>,
 ) -> HttpResponse {
+    metrics::counter!(crate::observability::CLUSTER_VERSION_QUERIES).increment(1);
     let version = rt
         .distributed
         .local_committed_version(&q.bucket, &q.key)
@@ -1291,10 +1349,13 @@ async fn backfill_object(
     };
     let meta_json =
         serde_json::to_string(&meta).map_err(|e| ErrorBadGateway(format!("encode meta: {e}")))?;
+    let envelope = object.into_inner();
+    metrics::counter!(crate::observability::CLUSTER_BACKFILL_BYTES_SERVED)
+        .increment(envelope.len() as u64);
     Ok(HttpResponse::Ok()
         .insert_header((BACKFILL_META_HEADER, meta_json))
         .content_type("application/octet-stream")
-        .body(object.into_inner()))
+        .body(envelope))
 }
 
 /// Liveness + identity returned from `/internal/v1/health`. The `fingerprint`
