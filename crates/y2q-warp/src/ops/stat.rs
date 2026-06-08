@@ -27,5 +27,6 @@ pub async fn stat_op(client: &Y2qClient, bucket: &str, key: &str, run_id: &str) 
         bytes: 0,
         key: format!("{bucket}/{key}"),
         error: result.err().map(|e| e.to_string()),
+        node: String::new(),
     }
 }

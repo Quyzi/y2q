@@ -18,6 +18,11 @@ pub struct OpRecord {
     /// "{bucket}/{key}"
     pub key: String,
     pub error: Option<String>,
+    /// Contact node this operation was sent to (the round-robin endpoint label,
+    /// e.g. "0", "1"). Empty for single-node runs and legacy CSVs without the
+    /// column.
+    #[serde(default)]
+    pub node: String,
 }
 
 impl OpRecord {

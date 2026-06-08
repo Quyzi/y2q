@@ -36,5 +36,6 @@ pub async fn put_op(
         bytes: if result.is_ok() { size } else { 0 },
         key: format!("{bucket}/{key}"),
         error: result.err().map(|e| e.to_string()),
+        node: String::new(),
     }
 }

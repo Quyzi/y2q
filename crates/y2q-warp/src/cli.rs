@@ -18,6 +18,13 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "PATH")]
     pub ca_cert: Option<std::path::PathBuf>,
 
+    /// Additional cluster node base URLs to fan the workload across (repeatable).
+    /// The `alias` provides node 0; each `--node` URL is an extra contact node,
+    /// reached with the alias's credentials and TLS (each logs in separately for
+    /// its own node-local token). Workers round-robin across all nodes.
+    #[arg(long = "node", global = true, value_name = "URL")]
+    pub node: Vec<String>,
+
     #[command(subcommand)]
     pub command: Commands,
 }

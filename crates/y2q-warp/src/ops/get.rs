@@ -37,6 +37,7 @@ pub async fn get_op(
                 bytes: 0,
                 key: format!("{bucket}/{key}"),
                 error: Some(e.to_string()),
+                node: String::new(),
             };
         }
         Ok(r) => r,
@@ -55,6 +56,7 @@ pub async fn get_op(
             bytes: 0,
             key: format!("{bucket}/{key}"),
             error: Some(format!("HTTP {status}")),
+            node: String::new(),
         };
     }
 
@@ -87,5 +89,6 @@ pub async fn get_op(
         bytes: total_bytes,
         key: format!("{bucket}/{key}"),
         error,
+        node: String::new(),
     }
 }
