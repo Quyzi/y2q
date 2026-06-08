@@ -18,6 +18,7 @@ use y2q_core::{
 use super::list_objects::{ListObjectsResponse, MetadataView};
 use crate::auth::Authenticated;
 use crate::authz::{authorize_bucket, bucket_readable};
+use crate::cluster::{self, ClusterRuntime};
 use crate::error::{AppError, ErrorBody};
 
 /// Continuation cursor for cross-bucket search, mirroring the core index's
@@ -70,6 +71,7 @@ pub struct SearchQuery {
 pub async fn handle(
     query: web::Query<SearchQuery>,
     storage: web::Data<Arc<AnyStorage>>,
+    cluster: Option<web::Data<ClusterRuntime>>,
     auth: Authenticated,
 ) -> Result<HttpResponse, AppError> {
     let q = query.into_inner();
@@ -81,18 +83,19 @@ pub async fn handle(
     // readable and the cursor stays within a bucket the caller can see.
     if let Some(b) = q.bucket.as_deref() {
         authorize_bucket(&auth, &storage, b, BucketPermission::Read).await?;
-        let page = storage
-            .search_objects(
-                &parsed,
-                Some(b),
-                ListOptions {
-                    prefix: q.prefix,
-                    after: q.after,
-                    limit: user_limit,
-                },
-            )
-            .await
-            .map_err(AppError::from)?;
+        let opts = ListOptions {
+            prefix: q.prefix,
+            after: q.after,
+            limit: user_limit,
+        };
+        let page = if let Some(rt) = cluster.as_ref() {
+            cluster::scatter_list(rt, Some(b), Some(&q.q), &opts).await?
+        } else {
+            storage
+                .search_objects(&parsed, Some(b), opts)
+                .await
+                .map_err(AppError::from)?
+        };
         return Ok(HttpResponse::Ok().json(ListObjectsResponse {
             items: page.items.into_iter().map(MetadataView::from).collect(),
             next: page.next,
@@ -102,18 +105,19 @@ pub async fn handle(
     // Cross-bucket search. Admins and auditors can read every bucket, so the
     // core cursor is safe to expose and no filtering is required.
     if auth.is_admin_or_auditor() {
-        let page = storage
-            .search_objects(
-                &parsed,
-                None,
-                ListOptions {
-                    prefix: q.prefix,
-                    after: q.after,
-                    limit: user_limit,
-                },
-            )
-            .await
-            .map_err(AppError::from)?;
+        let opts = ListOptions {
+            prefix: q.prefix,
+            after: q.after,
+            limit: user_limit,
+        };
+        let page = if let Some(rt) = cluster.as_ref() {
+            cluster::scatter_list(rt, None, Some(&q.q), &opts).await?
+        } else {
+            storage
+                .search_objects(&parsed, None, opts)
+                .await
+                .map_err(AppError::from)?
+        };
         return Ok(HttpResponse::Ok().json(ListObjectsResponse {
             items: page.items.into_iter().map(MetadataView::from).collect(),
             next: page.next,
@@ -125,18 +129,19 @@ pub async fn handle(
     // results in the daemon. The continuation cursor is built only from a
     // visible item, so it never leaks a hidden bucket name or object key.
     let lim = user_limit.unwrap_or(DEFAULT_LIST_LIMIT);
-    let raw = storage
-        .search_objects(
-            &parsed,
-            None,
-            ListOptions {
-                prefix: q.prefix,
-                after: q.after,
-                limit: Some(MAX_LIST_LIMIT),
-            },
-        )
-        .await
-        .map_err(AppError::from)?;
+    let wide = ListOptions {
+        prefix: q.prefix,
+        after: q.after,
+        limit: Some(MAX_LIST_LIMIT),
+    };
+    let raw = if let Some(rt) = cluster.as_ref() {
+        cluster::scatter_list(rt, None, Some(&q.q), &wide).await?
+    } else {
+        storage
+            .search_objects(&parsed, None, wide)
+            .await
+            .map_err(AppError::from)?
+    };
     let more_raw = raw.next.is_some();
 
     let mut readable: HashMap<String, bool> = HashMap::new();
