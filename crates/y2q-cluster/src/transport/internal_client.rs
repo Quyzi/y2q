@@ -209,6 +209,40 @@ impl InternalClient {
         Ok((bytes, size))
     }
 
+    /// GET `url` with query `params` and return the raw response body plus the
+    /// value of response header `header` (if present). Used by backfill to fetch
+    /// a committed envelope alongside the JSON metadata needed to commit it.
+    pub async fn get_bytes_and_header(
+        &self,
+        url: &str,
+        params: &[(&str, &str)],
+        header: &str,
+    ) -> Result<(bytes::Bytes, Option<String>), TransportError> {
+        let rb = self.auth(self.http.get(url).query(params));
+        let resp = rb.send().await.map_err(|e| TransportError::Request {
+            url: url.to_string(),
+            error: e.to_string(),
+        })?;
+        let status = resp.status();
+        if !status.is_success() {
+            let message = resp.text().await.unwrap_or_default();
+            return Err(TransportError::Status {
+                status: status.as_u16(),
+                message,
+            });
+        }
+        let header_val = resp
+            .headers()
+            .get(header)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+        let bytes = resp.bytes().await.map_err(|e| TransportError::Decode {
+            url: url.to_string(),
+            error: e.to_string(),
+        })?;
+        Ok((bytes, header_val))
+    }
+
     async fn decode<Resp: DeserializeOwned>(
         &self,
         url: &str,

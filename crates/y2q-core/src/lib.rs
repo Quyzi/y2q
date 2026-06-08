@@ -690,13 +690,14 @@ pub trait StorageExt: Storage {
     /// [`StorageExt::clear_stale_locks`].
     async fn list_stale_locks(&self, older_than: SystemTime) -> Result<Vec<StaleLock>, Error>;
 
-    /// Delete every `.lock` sidecar older than `older_than`. Returns the
-    /// number of files successfully removed.
+    /// Release every stale write lock older than `older_than`, and as part of the
+    /// same sweep remove orphan `*.tmp` staging files (left only by a hard crash
+    /// mid-PUT) whose mtime is older than `older_than`. Returns the combined count
+    /// of locks released plus tmp files removed.
     ///
-    /// `ENOENT` on the unlink is treated as success — another worker may
-    /// have legitimately released the lock between the scan and the
-    /// unlink. The scan / unlink pair is not atomic across the tree; see
-    /// [`storage::locks`] for race semantics.
+    /// An in-flight write's tmp has a fresh mtime, so a sane `older_than` never
+    /// races an active PUT. The scan / unlink pair is not atomic across the tree;
+    /// see [`storage::locks`] for lock race semantics.
     async fn clear_stale_locks(&self, older_than: SystemTime) -> Result<u64, Error>;
 }
 

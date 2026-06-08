@@ -26,11 +26,12 @@ use tokio::sync::mpsc;
 
 use y2q_core::crypto::envelope;
 use y2q_core::storage::streaming_sink::StreamingSink;
-use y2q_core::{AnyStorage, AnyStreamingPutGuard, Storage};
+use y2q_core::{AnyStorage, AnyStreamingPutGuard, ListOptions, Listing, MAX_LIST_LIMIT, Storage};
 
 use crate::control::Controller;
-use crate::control::types::ControlState;
+use crate::control::types::{ControlState, NodeStatus};
 use crate::hashing::chain::Role;
+use crate::hashing::ring::{Ring, chain_id};
 use crate::identity::NodeId;
 use crate::transport::InternalClient;
 use crate::transport::TransportError;
@@ -38,8 +39,8 @@ use crate::transport::TransportError;
 pub use pending::{Pending, PendingGuard, PendingWrites};
 pub use route::{ChainRoute, resolve_route};
 pub use wire::{
-    LabelMode, MutateMeta, MutateOp, MutateResp, PREPARE_META_HEADER, PrepareMeta, PrepareResp,
-    VersionResp,
+    BACKFILL_META_HEADER, BackfillEntry, BackfillManifest, BackfillObjectMeta, LabelMode,
+    MutateMeta, MutateOp, MutateResp, PREPARE_META_HEADER, PrepareMeta, PrepareResp, VersionResp,
 };
 
 /// Bounded depth of the per-hop forward channel. A few in-flight chunks gives
@@ -400,6 +401,138 @@ impl DistributedStorage {
         now.saturating_sub(committed_at) <= bound_ms.saturating_mul(1_000_000)
     }
 
+    /// List every object this node holds locally, for a peer's backfill diff.
+    /// Unpaged (one response); paging is a future refinement for large stores.
+    pub async fn local_manifest(&self) -> Result<BackfillManifest, DataError> {
+        let buckets = self.local.list_buckets().await?;
+        let mut entries = Vec::new();
+        for bucket in buckets {
+            let mut after: Option<String> = None;
+            loop {
+                let page = self
+                    .local
+                    .list_objects(
+                        &bucket,
+                        ListOptions {
+                            after: after.clone(),
+                            limit: Some(MAX_LIST_LIMIT),
+                            ..Default::default()
+                        },
+                    )
+                    .await?;
+                for md in &page.items {
+                    entries.push(BackfillEntry {
+                        bucket: md.bucket.clone(),
+                        key: md.key.clone(),
+                        version: md.version,
+                        cipher_sha256: md.cipher_sha256.clone(),
+                    });
+                }
+                match page.next {
+                    Some(n) => after = Some(n),
+                    None => break,
+                }
+            }
+        }
+        Ok(BackfillManifest { entries })
+    }
+
+    /// Whether this node *would* hold `(bucket, key)` once Active, computed from
+    /// the ring over the active membership **plus this node** (so a Recovering
+    /// node — excluded from the active ring — still discovers what to pull).
+    fn prospective_holds(&self, state: &ControlState, bucket: &str, key: &str) -> bool {
+        let mut members = state.active_nodes();
+        if !members.contains(&self.node_id) {
+            members.push(self.node_id);
+            members.sort_unstable();
+        }
+        let ring = Ring::new(&members, self.virtual_nodes_per_node);
+        ring.chain_for_id(chain_id(bucket, key), self.replication_factor)
+            .contains(&self.node_id)
+    }
+
+    /// Pull a single object's committed envelope from `peer_url` and commit a
+    /// byte-identical replica at the carried version (TAIL/solo commit path).
+    async fn backfill_object(
+        &self,
+        peer_url: &str,
+        bucket: &str,
+        key: &str,
+        epoch: u64,
+    ) -> Result<(), DataError> {
+        let (envelope, header) = self
+            .client
+            .get_bytes_and_header(
+                &format!("{peer_url}/internal/v1/backfill/object"),
+                &[("bucket", bucket), ("key", key)],
+                wire::BACKFILL_META_HEADER,
+            )
+            .await
+            .map_err(map_fetch_err)?;
+        let header =
+            header.ok_or_else(|| DataError::Io("backfill object missing meta header".into()))?;
+        let meta: BackfillObjectMeta =
+            serde_json::from_str(&header).map_err(|e| DataError::Io(e.to_string()))?;
+        let pmeta = meta.to_prepare(bucket, key, chain_id(bucket, key), epoch);
+
+        let (tx, rx) = mpsc::channel::<Bytes>(4);
+        tokio::spawn(async move {
+            let _ = tx.send(envelope).await;
+        });
+        let (guard, sink) = stage_envelope(&self.local, &pmeta, rx, None).await?;
+        commit_staged(guard, sink, &pmeta).await?;
+        Ok(())
+    }
+
+    /// Run one backfill sweep: for every object an Active peer holds that this
+    /// node should hold (prospectively) and is missing or behind on, pull and
+    /// commit it. Returns the number of objects fetched (0 ⇒ nothing was
+    /// missing this sweep — i.e. caught up).
+    pub async fn backfill_pass(&self) -> Result<usize, DataError> {
+        let state = self.controller.control_state().await;
+        let epoch = state.epoch;
+        let peers: Vec<String> = state
+            .nodes
+            .iter()
+            .filter(|(id, meta)| **id != self.node_id && meta.status == NodeStatus::Active)
+            .map(|(_, meta)| meta.addr.clone())
+            .collect();
+
+        let mut fetched = 0usize;
+        for url in peers {
+            let manifest: BackfillManifest = match self
+                .client
+                .get_json(&format!("{url}/internal/v1/backfill/manifest"))
+                .await
+            {
+                Ok(m) => m,
+                Err(_) => continue, // peer unreachable this sweep; try the rest
+            };
+            for entry in manifest.entries {
+                if !self.prospective_holds(&state, &entry.bucket, &entry.key) {
+                    continue;
+                }
+                let local = self
+                    .local
+                    .describe(&entry.bucket, &entry.key)
+                    .await
+                    .ok()
+                    .map(|m| (m.version, m.cipher_sha256));
+                if !need_backfill(local, entry.version, &entry.cipher_sha256) {
+                    continue;
+                }
+                if self
+                    .backfill_object(&url, &entry.bucket, &entry.key, epoch)
+                    .await
+                    .is_ok()
+                {
+                    fetched += 1;
+                }
+            }
+        }
+        Ok(fetched)
+    }
+
     /// Apply a non-PUT mutation (DELETE / label edit) locally and relay it to the
     /// next chain member. Called on each member as the mutation walks the chain.
     ///
@@ -612,6 +745,32 @@ impl DistributedStorage {
     }
 }
 
+/// Whether a recovering node must pull `(version, sha)` from a peer, given its
+/// own copy (`local`, `None` ⇒ object absent locally). Pulls when missing,
+/// behind, or same-version with a divergent ciphertext digest.
+fn need_backfill(
+    local: Option<(Option<u64>, Option<String>)>,
+    entry_version: Option<u64>,
+    entry_sha: &Option<String>,
+) -> bool {
+    let Some((lv, lsha)) = local else {
+        return true; // absent locally
+    };
+    let lv = lv.unwrap_or(0);
+    let ev = entry_version.unwrap_or(0);
+    if lv < ev {
+        return true; // behind
+    }
+    if lv == ev {
+        // Same version: refetch only if both digests are known and differ.
+        if let (Some(a), Some(b)) = (&lsha, entry_sha) {
+            return a != b;
+        }
+        return false;
+    }
+    false // local is ahead
+}
+
 /// Map a peer object-fetch transport error: a `404` from the TAIL becomes a
 /// typed not-found (so the read surfaces as 404, not 500); other errors pass
 /// through as transport failures.
@@ -739,6 +898,44 @@ mod tests {
             let _ = tx.send(owned).await;
         });
         rx
+    }
+
+    /// The pure backfill decision covers absent / behind / same-version /
+    /// digest-mismatch / ahead cases.
+    #[test]
+    fn need_backfill_matrix() {
+        // Absent locally -> always pull.
+        assert!(need_backfill(None, Some(3), &Some("x".into())));
+        // Behind -> pull.
+        assert!(need_backfill(
+            Some((Some(2), Some("a".into()))),
+            Some(3),
+            &Some("b".into())
+        ));
+        // Same version, matching digest -> skip.
+        assert!(!need_backfill(
+            Some((Some(3), Some("a".into()))),
+            Some(3),
+            &Some("a".into())
+        ));
+        // Same version, divergent digest -> pull.
+        assert!(need_backfill(
+            Some((Some(3), Some("a".into()))),
+            Some(3),
+            &Some("b".into())
+        ));
+        // Same version, digest unknown on a side -> skip (cannot tell).
+        assert!(!need_backfill(
+            Some((Some(3), None)),
+            Some(3),
+            &Some("a".into())
+        ));
+        // Local ahead -> skip.
+        assert!(!need_backfill(
+            Some((Some(5), Some("a".into()))),
+            Some(3),
+            &Some("b".into())
+        ));
     }
 
     /// The pure read decision covers every consistency mode against the

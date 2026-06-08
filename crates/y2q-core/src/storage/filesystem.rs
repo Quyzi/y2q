@@ -1551,8 +1551,64 @@ impl StorageExt for FilesystemStorage {
     }
 
     async fn clear_stale_locks(&self, older_than: SystemTime) -> Result<u64, Error> {
-        Ok(self.locks.clear_stale(older_than))
+        let locks = self.locks.clear_stale(older_than);
+        // Fold in orphan `.tmp` GC: a hard crash mid-PUT leaves a staging file
+        // the guard's Drop never ran on. Count it toward the swept total.
+        let tmp = clear_orphan_tmp_files(&self.base_path, older_than)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "orphan tmp sweep failed; continuing");
+                0
+            });
+        Ok(locks + tmp)
     }
+}
+
+/// Remove every orphan `*.tmp` staging file under `base_path/<bucket>/xx/yy/`
+/// whose mtime is older than `cutoff`, returning the count removed.
+///
+/// Orphans are left only by a hard crash mid-write (the streaming guard's
+/// [`Drop`] unlinks the tmp on any clean abort). An in-flight write's tmp has a
+/// fresh mtime, so a sane `cutoff` never races an active PUT. Shared by the
+/// filesystem and uring backends, which use the identical on-disk layout.
+pub(crate) async fn clear_orphan_tmp_files(
+    base_path: &Path,
+    cutoff: SystemTime,
+) -> std::io::Result<u64> {
+    let mut removed = 0u64;
+    let mut buckets = tokio::fs::read_dir(base_path).await?;
+    while let Some(b) = buckets.next_entry().await? {
+        if !b.file_type().await?.is_dir() {
+            continue;
+        }
+        let mut l1 = tokio::fs::read_dir(b.path()).await?;
+        while let Some(e1) = l1.next_entry().await? {
+            if !e1.file_type().await?.is_dir() {
+                continue;
+            }
+            let mut l2 = tokio::fs::read_dir(e1.path()).await?;
+            while let Some(e2) = l2.next_entry().await? {
+                if !e2.file_type().await?.is_dir() {
+                    continue;
+                }
+                let mut files = tokio::fs::read_dir(e2.path()).await?;
+                while let Some(f) = files.next_entry().await? {
+                    let p = f.path();
+                    if p.extension().is_none_or(|x| x != "tmp") {
+                        continue;
+                    }
+                    let stale = matches!(
+                        f.metadata().await.and_then(|m| m.modified()),
+                        Ok(mtime) if mtime < cutoff
+                    );
+                    if stale && tokio::fs::remove_file(&p).await.is_ok() {
+                        removed += 1;
+                    }
+                }
+            }
+        }
+    }
+    Ok(removed)
 }
 
 /// Walk every `.obj` file under `base_path/<bucket>/xx/yy/`, read the embedded
@@ -1704,6 +1760,30 @@ mod tests {
             labels: m,
             ..Default::default()
         }
+    }
+
+    #[tokio::test]
+    async fn clear_stale_locks_sweeps_orphan_tmp() {
+        let (s, _dir) = make_storage();
+        // Write a real object so the sharded directory tree exists.
+        s.put("b", "k", make_object(b"data"), PutOptions::default())
+            .await
+            .unwrap();
+        // Plant an orphan `.tmp` next to the committed `.obj`.
+        let obj = s.key_path("b", "k").unwrap();
+        let tmp = obj.with_extension("tmp");
+        tokio::fs::write(&tmp, b"orphan").await.unwrap();
+        assert!(tmp.exists());
+
+        // A cutoff in the past leaves the just-created orphan in place.
+        let past = SystemTime::now() - std::time::Duration::from_secs(3600);
+        assert_eq!(s.clear_stale_locks(past).await.unwrap(), 0);
+        assert!(tmp.exists(), "fresh tmp must survive an old cutoff");
+
+        // A cutoff in the future treats it as stale and removes it.
+        let future = SystemTime::now() + std::time::Duration::from_secs(3600);
+        assert_eq!(s.clear_stale_locks(future).await.unwrap(), 1);
+        assert!(!tmp.exists(), "stale orphan tmp must be swept");
     }
 
     #[tokio::test]
