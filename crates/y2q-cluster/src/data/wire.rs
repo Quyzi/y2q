@@ -27,6 +27,11 @@ pub struct PrepareMeta {
     /// Epoch the write is fenced under; a node rejects a PREPARE older than its
     /// committed epoch.
     pub epoch: u64,
+    /// CRAQ object version assigned by the HEAD. Every replica persists this
+    /// exact value in [`Metadata::version`](y2q_core::Metadata::version) so all
+    /// copies of a version agree; the TAIL's committed value is what a version
+    /// query returns.
+    pub version: u64,
     /// The v2 header `plaintext_len` (padded length) the HEAD patched locally.
     /// The Tee does not forward the patch, so the receiver backfills it from
     /// here to keep its envelope byte-identical to the HEAD's.
@@ -62,11 +67,14 @@ impl PrepareMeta {
         }
     }
 
-    /// Reconstruct the [`PutOptions`] a replica uses when committing.
+    /// Reconstruct the [`PutOptions`] a replica uses when committing. Carries the
+    /// HEAD-assigned version so the replica stamps the identical
+    /// [`Metadata::version`](y2q_core::Metadata::version).
     pub fn put_options(&self) -> PutOptions {
         PutOptions {
             labels: self.labels.iter().cloned().collect(),
             sync: self.sync_level(),
+            version: Some(self.version),
             ..Default::default()
         }
     }
@@ -145,6 +153,16 @@ impl LabelMode {
     }
 }
 
+/// Response to a version query (`GET /internal/v1/version`): the committed CRAQ
+/// version the answering node holds for `(bucket, key)`. `None` means the node
+/// has no committed copy, or holds a legacy/single-node object without a version.
+/// The chain TAIL is the authoritative answerer (the CRAQ commit point).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VersionResp {
+    /// The committed object version, or `None` if absent/unversioned.
+    pub version: Option<u64>,
+}
+
 /// A non-PUT mutation routed down the chain (no bulk body): DELETE, or a label
 /// edit. For labels the HEAD resolves the edit against its committed copy into a
 /// final set ([`MutateOp::SetLabels`]) and relays that set verbatim, so every
@@ -205,6 +223,7 @@ mod tests {
             key: "k".into(),
             chain_id: 42,
             epoch: 7,
+            version: 3,
             plaintext_len: 4096,
             plaintext_size: 4000,
             checksum_gxhash_b64: "Y2hrc3VtAAA=".into(),
@@ -295,6 +314,7 @@ mod tests {
         assert_eq!(m.sync_level(), SyncLevel::Durable);
         let opts = m.put_options();
         assert_eq!(opts.sync, SyncLevel::Durable);
+        assert_eq!(opts.version, Some(3));
         assert!(opts.labels.contains(&("env".into(), "prod".into())));
         assert_eq!(m.plaintext_metrics().size, 4000);
         assert_eq!(m.cipher_metadata().cipher_size, 5200);

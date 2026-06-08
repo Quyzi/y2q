@@ -230,6 +230,17 @@ impl AnyStreamingPutGuard {
             }),
         }
     }
+
+    /// Read `len` bytes at absolute file offset `start` from the staged (not yet
+    /// committed) tmp file. Used by the cluster HEAD to stream the envelope
+    /// down-chain before committing locally (CRAQ tail-first ordering).
+    pub async fn read_staged_range(&self, start: u64, len: u64) -> Result<Bytes, Error> {
+        match self {
+            Self::Filesystem(g) => g.read_staged_range(start, len).await,
+            #[cfg(target_os = "linux")]
+            Self::Uring(g) => g.read_staged_range(start, len).await,
+        }
+    }
 }
 
 impl AnyStorage {

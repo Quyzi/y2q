@@ -655,6 +655,8 @@ impl StreamingPutGuard {
             kem_alg: Some(cipher_metadata.kem_alg),
             aead_alg: Some(cipher_metadata.aead_alg),
             envelope_version: Some(cipher_metadata.envelope_version),
+            version: options.version,
+            committed_at: options.version.map(|_| now),
         };
 
         let meta_json = serde_json::to_vec(&metadata).map_err(|e| Error::InternalError {
@@ -779,6 +781,42 @@ impl StreamingPutGuard {
 
         Ok(self.is_overwrite)
     }
+
+    /// Read `len` bytes at absolute file offset `start` from the staged (not yet
+    /// committed) tmp file. The cluster HEAD uses this to stream the envelope
+    /// down-chain before committing locally (CRAQ tail-first ordering), when the
+    /// committed `.obj` does not yet exist.
+    pub async fn read_staged_range(&self, start: u64, len: u64) -> Result<Bytes, Error> {
+        read_staged_range_from(&self.tmp_path, &self.bucket, &self.key, start, len).await
+    }
+}
+
+/// Read `len` bytes at `start` from `path` (a staging tmp file). Shared by the
+/// streaming guards' `read_staged_range`.
+pub(crate) async fn read_staged_range_from(
+    path: &Path,
+    bucket: &str,
+    key: &str,
+    start: u64,
+    len: u64,
+) -> Result<Bytes, Error> {
+    let internal = |message: String| Error::InternalError {
+        bucket: bucket.to_owned(),
+        key: key.to_owned(),
+        operation: "read_staged".to_owned(),
+        message,
+    };
+    let mut f = tokio::fs::File::open(path)
+        .await
+        .map_err(|e| internal(format!("open tmp: {e}")))?;
+    f.seek(std::io::SeekFrom::Start(start))
+        .await
+        .map_err(|e| internal(format!("seek tmp: {e}")))?;
+    let mut buf = vec![0u8; len as usize];
+    f.read_exact(&mut buf)
+        .await
+        .map_err(|e| internal(format!("read tmp: {e}")))?;
+    Ok(Bytes::from(buf))
 }
 
 impl Drop for StreamingPutGuard {
@@ -1099,6 +1137,10 @@ impl Storage for FilesystemStorage {
                 kem_alg,
                 aead_alg,
                 envelope_version,
+                // Buffered put is not a cluster write path; CRAQ versions are
+                // assigned only on the streaming commit path.
+                version: None,
+                committed_at: None,
             };
 
             let meta_json = serde_json::to_vec(&metadata).map_err(|e| Error::InternalError {

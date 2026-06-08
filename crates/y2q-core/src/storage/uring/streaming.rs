@@ -125,6 +125,8 @@ impl UringStreamingPutGuard {
             kem_alg: Some(cipher_metadata.kem_alg),
             aead_alg: Some(cipher_metadata.aead_alg),
             envelope_version: Some(cipher_metadata.envelope_version),
+            version: options.version,
+            committed_at: options.version.map(|_| now),
         };
 
         let meta_json = serde_json::to_vec(&metadata).map_err(|e| Error::InternalError {
@@ -208,6 +210,20 @@ impl UringStreamingPutGuard {
         }
 
         Ok(self.is_overwrite)
+    }
+
+    /// Read `len` bytes at absolute file offset `start` from the staged (not yet
+    /// committed) tmp file. The cluster HEAD uses this to stream the envelope
+    /// down-chain before committing locally (CRAQ tail-first ordering).
+    pub async fn read_staged_range(&self, start: u64, len: u64) -> Result<Bytes, Error> {
+        crate::storage::filesystem::read_staged_range_from(
+            &self.tmp_path,
+            &self.bucket,
+            &self.key,
+            start,
+            len,
+        )
+        .await
     }
 }
 

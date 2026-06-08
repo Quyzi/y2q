@@ -157,6 +157,58 @@ impl InternalClient {
         self.decode(url, resp).await
     }
 
+    /// GET `url` with URL-encoded query `params` and decode the JSON response.
+    /// `reqwest` percent-encodes each pair, so values may contain `/`, `&`, etc.
+    pub async fn get_json_query<Resp: DeserializeOwned>(
+        &self,
+        url: &str,
+        params: &[(&str, &str)],
+    ) -> Result<Resp, TransportError> {
+        let rb = self.auth(self.http.get(url).query(params));
+        let resp = rb.send().await.map_err(|e| TransportError::Request {
+            url: url.to_string(),
+            error: e.to_string(),
+        })?;
+        self.decode(url, resp).await
+    }
+
+    /// GET `url` with query `params` and return the raw response body plus the
+    /// plaintext object size advertised in the `X-Y2Q-Size` header. Used by the
+    /// apportioned read path to fetch a committed ciphertext envelope from a
+    /// peer (the chain TAIL) for local decryption. A `404` is surfaced as
+    /// [`TransportError::Status`] with status `404` so the caller can map it to
+    /// not-found.
+    pub async fn fetch_object(
+        &self,
+        url: &str,
+        params: &[(&str, &str)],
+    ) -> Result<(bytes::Bytes, u64), TransportError> {
+        let rb = self.auth(self.http.get(url).query(params));
+        let resp = rb.send().await.map_err(|e| TransportError::Request {
+            url: url.to_string(),
+            error: e.to_string(),
+        })?;
+        let status = resp.status();
+        if !status.is_success() {
+            let message = resp.text().await.unwrap_or_default();
+            return Err(TransportError::Status {
+                status: status.as_u16(),
+                message,
+            });
+        }
+        let size = resp
+            .headers()
+            .get("x-y2q-size")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        let bytes = resp.bytes().await.map_err(|e| TransportError::Decode {
+            url: url.to_string(),
+            error: e.to_string(),
+        })?;
+        Ok((bytes, size))
+    }
+
     async fn decode<Resp: DeserializeOwned>(
         &self,
         url: &str,

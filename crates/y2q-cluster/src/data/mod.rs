@@ -39,6 +39,7 @@ pub use pending::{Pending, PendingGuard, PendingWrites};
 pub use route::{ChainRoute, resolve_route};
 pub use wire::{
     LabelMode, MutateMeta, MutateOp, MutateResp, PREPARE_META_HEADER, PrepareMeta, PrepareResp,
+    VersionResp,
 };
 
 /// Bounded depth of the per-hop forward channel. A few in-flight chunks gives
@@ -89,6 +90,89 @@ pub enum DataError {
         bucket: String,
         /// Key component.
         key: String,
+    },
+}
+
+/// Read consistency requested for an apportioned read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadConsistency {
+    /// Linearizable: a dirty chain member version-queries the TAIL (the commit
+    /// point) and fetches the committed version if its local copy is behind.
+    Strong,
+    /// Serve the local committed copy if this node is a chain member, even if a
+    /// newer write is in flight. Cheapest; may return a slightly stale version.
+    Eventual,
+    /// Serve the local committed copy if it is clean, or if it last committed
+    /// within `bound_ms`; otherwise fall back to the strong version-query path.
+    EventualBounded {
+        /// Freshness window in milliseconds.
+        bound_ms: u64,
+    },
+}
+
+/// Outcome of the pure read decision before any I/O: serve the local copy,
+/// fetch from the TAIL, or run a version query to decide between the two.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServeDecision {
+    /// Serve this node's local committed copy.
+    Local,
+    /// Fetch the committed envelope from the TAIL.
+    Remote,
+    /// Dirty key under a linearizable mode: compare local vs TAIL version.
+    VersionQuery,
+}
+
+/// Decide, from already-resolved inputs, how a node should serve a read.
+///
+/// `is_member` is whether this node is in the object's chain; `pending` whether a
+/// write is in flight locally; `fresh` whether the local copy is within the
+/// `eventual-bounded` window (only meaningful when `pending`).
+fn serve_decision(
+    consistency: ReadConsistency,
+    is_member: bool,
+    pending: bool,
+    fresh: bool,
+) -> ServeDecision {
+    if !is_member {
+        // A non-member holds no copy; it must fetch the committed envelope.
+        return ServeDecision::Remote;
+    }
+    match consistency {
+        // Always serve the local copy, even if a newer write is in flight.
+        ReadConsistency::Eventual => ServeDecision::Local,
+        // Clean copies serve locally; dirty copies serve locally only while fresh,
+        // else fall back to the linearizable version query.
+        ReadConsistency::EventualBounded { .. } => {
+            if !pending || fresh {
+                ServeDecision::Local
+            } else {
+                ServeDecision::VersionQuery
+            }
+        }
+        // Clean copies are the latest committed (fast path); dirty copies require a
+        // version query against the TAIL (the commit point).
+        ReadConsistency::Strong => {
+            if pending {
+                ServeDecision::VersionQuery
+            } else {
+                ServeDecision::Local
+            }
+        }
+    }
+}
+
+/// Where an apportioned read should source its bytes.
+pub enum ReadPlan {
+    /// Serve from this node's local committed copy (the GET handler's normal
+    /// local path, range-capable).
+    Local,
+    /// Serve the committed ciphertext envelope fetched from the chain TAIL,
+    /// along with the true plaintext size for padding trim.
+    Remote {
+        /// The committed envelope bytes (ciphertext), to be decrypted locally.
+        envelope: Bytes,
+        /// True plaintext size, for trimming Padmé padding after decryption.
+        size: u64,
     },
 }
 
@@ -162,6 +246,158 @@ impl DistributedStorage {
     pub async fn peer_url(&self, id: NodeId) -> Option<String> {
         let state = self.controller.control_state().await;
         self.peer_base_url(&state, id)
+    }
+
+    /// This node's locally-committed CRAQ version for `(bucket, key)`, or `None`
+    /// when absent or unversioned (legacy/single-node object).
+    pub async fn local_committed_version(&self, bucket: &str, key: &str) -> Option<u64> {
+        self.local
+            .describe(bucket, key)
+            .await
+            .ok()
+            .and_then(|m| m.version)
+    }
+
+    /// The committed version of `(bucket, key)` as known to the chain TAIL — the
+    /// CRAQ commit point, so its answer is the authoritative committed version.
+    /// Answered locally when this node is the TAIL, otherwise via a version query
+    /// to the TAIL's `/internal/v1/version`.
+    pub async fn tail_committed_version(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<Option<u64>, DataError> {
+        let state = self.controller.control_state().await;
+        let route = resolve_route(
+            &state,
+            bucket,
+            key,
+            self.replication_factor,
+            self.virtual_nodes_per_node,
+        );
+        match route.tail() {
+            Some(tail) if tail == self.node_id => {
+                Ok(self.local_committed_version(bucket, key).await)
+            }
+            Some(tail) => {
+                let url = self
+                    .peer_base_url(&state, tail)
+                    .ok_or_else(|| DataError::NoChain {
+                        bucket: bucket.to_owned(),
+                        key: key.to_owned(),
+                    })?;
+                let resp: VersionResp = self
+                    .client
+                    .get_json_query(
+                        &format!("{url}/internal/v1/version"),
+                        &[("bucket", bucket), ("key", key)],
+                    )
+                    .await?;
+                Ok(resp.version)
+            }
+            None => Err(DataError::NoChain {
+                bucket: bucket.to_owned(),
+                key: key.to_owned(),
+            }),
+        }
+    }
+
+    /// Decide how to serve a read of `(bucket, key)` under `consistency`
+    /// (CRAQ apportioned read). Returns [`ReadPlan::Local`] when this node may
+    /// serve its own committed copy, or [`ReadPlan::Remote`] carrying the
+    /// committed envelope fetched from the chain TAIL when the local copy is
+    /// absent or behind.
+    pub async fn plan_read(
+        &self,
+        bucket: &str,
+        key: &str,
+        consistency: ReadConsistency,
+    ) -> Result<ReadPlan, DataError> {
+        let state = self.controller.control_state().await;
+        let route = resolve_route(
+            &state,
+            bucket,
+            key,
+            self.replication_factor,
+            self.virtual_nodes_per_node,
+        );
+
+        // No chain yet (empty cluster / unrouted): best-effort local copy.
+        if route.members.is_empty() {
+            return Ok(ReadPlan::Local);
+        }
+
+        let is_member = route.contains(self.node_id);
+        let pending = self.pending.is_pending(bucket, key);
+        let fresh = match consistency {
+            // Only `eventual-bounded` consults committed_at, and only when dirty.
+            ReadConsistency::EventualBounded { bound_ms } if pending => {
+                self.local_fresh_within(bucket, key, bound_ms).await
+            }
+            _ => false,
+        };
+
+        let serve_local = match serve_decision(consistency, is_member, pending, fresh) {
+            ServeDecision::Local => true,
+            ServeDecision::Remote => false,
+            // Dirty under strong/bounded: the local committed copy is current only
+            // if it matches the TAIL's committed version.
+            ServeDecision::VersionQuery => {
+                let local_v = self.local_committed_version(bucket, key).await;
+                let tail_v = self.tail_committed_version(bucket, key).await?;
+                local_v == tail_v
+            }
+        };
+
+        if serve_local {
+            return Ok(ReadPlan::Local);
+        }
+
+        // The authoritative committed copy lives at the TAIL. If this node *is*
+        // the TAIL, its local copy is authoritative — serve it.
+        match route.tail() {
+            Some(tail) if tail == self.node_id => Ok(ReadPlan::Local),
+            Some(tail) => {
+                let url = self
+                    .peer_base_url(&state, tail)
+                    .ok_or_else(|| DataError::NoChain {
+                        bucket: bucket.to_owned(),
+                        key: key.to_owned(),
+                    })?;
+                let (envelope, size) = self
+                    .client
+                    .fetch_object(
+                        &format!("{url}/internal/v1/read"),
+                        &[("bucket", bucket), ("key", key)],
+                    )
+                    .await
+                    .map_err(map_fetch_err)?;
+                Ok(ReadPlan::Remote { envelope, size })
+            }
+            None => Err(DataError::NoChain {
+                bucket: bucket.to_owned(),
+                key: key.to_owned(),
+            }),
+        }
+    }
+
+    /// Whether this node's local committed copy of `(bucket, key)` was committed
+    /// within `bound_ms` of now (used by `eventual-bounded`).
+    async fn local_fresh_within(&self, bucket: &str, key: &str, bound_ms: u64) -> bool {
+        let Some(committed_at) = self
+            .local
+            .describe(bucket, key)
+            .await
+            .ok()
+            .and_then(|m| m.committed_at)
+        else {
+            return false;
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        now.saturating_sub(committed_at) <= bound_ms.saturating_mul(1_000_000)
     }
 
     /// Apply a non-PUT mutation (DELETE / label edit) locally and relay it to the
@@ -376,6 +612,21 @@ impl DistributedStorage {
     }
 }
 
+/// Map a peer object-fetch transport error: a `404` from the TAIL becomes a
+/// typed not-found (so the read surfaces as 404, not 500); other errors pass
+/// through as transport failures.
+fn map_fetch_err(e: TransportError) -> DataError {
+    match e {
+        TransportError::Status { status: 404, .. } => {
+            DataError::Storage(y2q_core::Error::NotFound {
+                bucket: String::new(),
+                key: String::new(),
+            })
+        }
+        other => DataError::Transport(other),
+    }
+}
+
 /// Stream the envelope `body` into a fresh local `.tmp`, optionally relaying each
 /// chunk to `forward`, and backfill the v2 `plaintext_len` patch. Returns the
 /// uncommitted guard and its sink so the caller can commit after the downstream
@@ -490,6 +741,42 @@ mod tests {
         rx
     }
 
+    /// The pure read decision covers every consistency mode against the
+    /// member/pending/fresh inputs.
+    #[test]
+    fn serve_decision_matrix() {
+        use ReadConsistency::*;
+        // Non-members always fetch from the TAIL, regardless of mode.
+        for c in [Strong, Eventual, EventualBounded { bound_ms: 100 }] {
+            assert_eq!(
+                serve_decision(c, false, false, false),
+                ServeDecision::Remote
+            );
+        }
+        // Strong: clean member serves local; dirty member version-queries.
+        assert_eq!(
+            serve_decision(Strong, true, false, false),
+            ServeDecision::Local
+        );
+        assert_eq!(
+            serve_decision(Strong, true, true, false),
+            ServeDecision::VersionQuery
+        );
+        // Eventual: members always serve local, even when dirty.
+        assert_eq!(
+            serve_decision(Eventual, true, true, false),
+            ServeDecision::Local
+        );
+        // Eventual-bounded: dirty + fresh serves local; dirty + stale falls back.
+        let b = EventualBounded { bound_ms: 100 };
+        assert_eq!(serve_decision(b, true, false, false), ServeDecision::Local);
+        assert_eq!(serve_decision(b, true, true, true), ServeDecision::Local);
+        assert_eq!(
+            serve_decision(b, true, true, false),
+            ServeDecision::VersionQuery
+        );
+    }
+
     /// The TAIL/Solo path writes the envelope verbatim and applies the
     /// plaintext_len patch, so a read-back returns byte-identical data.
     #[tokio::test]
@@ -509,6 +796,7 @@ mod tests {
             key: "obj".into(),
             chain_id: 1,
             epoch: 0,
+            version: 1,
             plaintext_len,
             plaintext_size: 50,
             checksum_gxhash_b64: "AAAAAAAAAAA=".into(),
@@ -552,6 +840,7 @@ mod tests {
             key: "obj".into(),
             chain_id: 1,
             epoch: 0,
+            version: 1,
             plaintext_len: 16,
             plaintext_size: 16,
             checksum_gxhash_b64: "AAAAAAAAAAA=".into(),
