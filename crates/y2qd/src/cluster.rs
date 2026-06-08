@@ -37,7 +37,10 @@ use y2q_cluster::{
     ReadConsistency, ReadPlan, Role, VersionResp, chain_id, resolve_node_id,
 };
 use y2q_core::crypto::{envelope, kdf};
-use y2q_core::{AnyStorage, AnyStreamingPutGuard, LabelSet, PutOptions, Storage, SyncLevel};
+use y2q_core::{
+    AnyStorage, AnyStreamingPutGuard, LabelSet, ListOptions, Listing, MAX_LIST_LIMIT, PutOptions,
+    Storage, SyncLevel,
+};
 
 use crate::auth::{AdminAuthenticated, AuthState};
 use crate::cipher;
@@ -928,6 +931,24 @@ pub async fn plan_read(rt: &ClusterRuntime, bucket: &str, key: &str) -> Result<R
         .map_err(|e| map_data_err(bucket, key, e))
 }
 
+/// Scatter-gather a list (`query = None`) or label search across every Active
+/// node, returning the merged, deduped page. `bucket` is `Some` for a
+/// single-bucket list/search and `None` for a cross-bucket search.
+pub async fn scatter_list(
+    rt: &ClusterRuntime,
+    bucket: Option<&str>,
+    query: Option<&str>,
+    opts: &y2q_core::ListOptions,
+) -> Result<y2q_core::ListPage, AppError> {
+    rt.distributed
+        .scatter_list(bucket, query, opts)
+        .await
+        .map_err(|e| match e {
+            y2q_cluster::DataError::Storage(core) => AppError(core),
+            other => internal_err(bucket.unwrap_or(""), "", other),
+        })
+}
+
 /// Route a label edit through the chain. The HEAD resolves `mode`/`incoming`
 /// against its committed copy and applies the resolved set verbatim at every
 /// member; the resolved set is returned for the HTTP response.
@@ -965,6 +986,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
     cfg.service(web::resource("/internal/v1/mutate").route(web::post().to(mutate)));
     cfg.service(web::resource("/internal/v1/version").route(web::get().to(version)));
     cfg.service(web::resource("/internal/v1/read").route(web::get().to(internal_read)));
+    cfg.service(web::resource("/internal/v1/list").route(web::get().to(internal_list)));
     cfg.service(
         web::resource("/internal/v1/backfill/manifest").route(web::get().to(backfill_manifest)),
     );
@@ -1173,6 +1195,52 @@ async fn internal_read(
         .insert_header(("X-Y2Q-Size", size.to_string()))
         .content_type("application/octet-stream")
         .body(object.into_inner()))
+}
+
+/// Query params for the internal scatter-gather list/search endpoint.
+#[derive(Debug, Deserialize)]
+struct InternalListParams {
+    /// Bucket to list/search; omit for a cross-bucket search.
+    bucket: Option<String>,
+    /// Raw label-query expression; omit for a plain prefix list.
+    #[serde(rename = "q")]
+    query: Option<String>,
+    /// Key prefix filter.
+    prefix: Option<String>,
+    /// Continuation cursor (key, or `bucket\0key` composite cross-bucket).
+    after: Option<String>,
+    /// Page size cap.
+    limit: Option<usize>,
+}
+
+/// Serve this node's *local* list/search page for a scatter-gather. The contact
+/// node merges these per-node pages, dedups by `(bucket, key)`, and enforces user
+/// authorization; this endpoint trusts the peer and returns raw local metadata.
+async fn internal_list(
+    rt: web::Data<ClusterRuntime>,
+    _peer: ClusterPeer,
+    q: web::Query<InternalListParams>,
+) -> Result<HttpResponse, actix_web::Error> {
+    let q = q.into_inner();
+    let opts = ListOptions {
+        prefix: q.prefix,
+        after: q.after,
+        limit: q.limit.map(|n| n.min(MAX_LIST_LIMIT)),
+    };
+    let local = rt.distributed.local();
+    let page = match (q.bucket.as_deref(), q.query.as_deref()) {
+        (Some(b), None) => local.list_objects(b, opts).await,
+        (b, Some(qstr)) => {
+            let parsed =
+                y2q_core::LabelQuery::parse(qstr).map_err(|e| ErrorBadRequest(e.to_string()))?;
+            local.search_objects(&parsed, b, opts).await
+        }
+        (None, None) => {
+            return Err(ErrorBadRequest("list requires a bucket or a label query"));
+        }
+    }
+    .map_err(|e| ErrorBadGateway(e.to_string()))?;
+    Ok(HttpResponse::Ok().json(page))
 }
 
 /// Serve this node's backfill manifest (every object it holds) to a recovering

@@ -26,7 +26,10 @@ use tokio::sync::mpsc;
 
 use y2q_core::crypto::envelope;
 use y2q_core::storage::streaming_sink::StreamingSink;
-use y2q_core::{AnyStorage, AnyStreamingPutGuard, ListOptions, Listing, MAX_LIST_LIMIT, Storage};
+use y2q_core::{
+    AnyStorage, AnyStreamingPutGuard, DEFAULT_LIST_LIMIT, LabelQuery, ListOptions, ListPage,
+    Listing, MAX_LIST_LIMIT, Metadata, Storage,
+};
 
 use crate::control::Controller;
 use crate::control::types::{ControlState, NodeStatus};
@@ -437,6 +440,105 @@ impl DistributedStorage {
         Ok(BackfillManifest { entries })
     }
 
+    /// Fan a list (or label search) across every Active node, k-way merge the
+    /// per-node pages, dedup by `(bucket, key)` keeping the highest committed
+    /// `version`, and return one merged page honoring `limit`.
+    ///
+    /// `bucket` is `Some` for a single-bucket list/search and `None` for a
+    /// cross-bucket search; `query` is the raw label-query string for a search
+    /// (`None` for a plain list). Each node returns up to `limit` of its lowest
+    /// keys `> after`; the global first `limit` distinct keys are a subset of the
+    /// union of those per-node pages, so merging the lowest `limit` distinct is
+    /// complete. Unreachable peers are skipped (their objects still surface from a
+    /// live replica) — CRAQ's "reads continue elsewhere" availability.
+    pub async fn scatter_list(
+        &self,
+        bucket: Option<&str>,
+        query: Option<&str>,
+        opts: &ListOptions,
+    ) -> Result<ListPage, DataError> {
+        let limit = opts
+            .limit
+            .filter(|n| *n > 0)
+            .map(|n| n.min(MAX_LIST_LIMIT))
+            .unwrap_or(DEFAULT_LIST_LIMIT);
+        let state = self.controller.control_state().await;
+
+        let mut pages: Vec<ListPage> = Vec::new();
+        pages.push(self.local_list_page(bucket, query, opts).await?);
+
+        for (id, meta) in state.nodes.iter() {
+            if *id == self.node_id || meta.status != NodeStatus::Active {
+                continue;
+            }
+            match self
+                .fetch_remote_list(&meta.addr, bucket, query, opts)
+                .await
+            {
+                Ok(page) => pages.push(page),
+                Err(e) => tracing::warn!(
+                    peer = %meta.addr,
+                    error = %e,
+                    "scatter list: peer unreachable, skipping"
+                ),
+            }
+        }
+
+        Ok(merge_list_pages(pages, bucket.is_some(), limit))
+    }
+
+    /// Compute this node's own list/search page for a scatter-gather.
+    async fn local_list_page(
+        &self,
+        bucket: Option<&str>,
+        query: Option<&str>,
+        opts: &ListOptions,
+    ) -> Result<ListPage, DataError> {
+        match (bucket, query) {
+            (Some(b), None) => Ok(self.local.list_objects(b, opts.clone()).await?),
+            (b, Some(q)) => {
+                let parsed = LabelQuery::parse(q)
+                    .map_err(|e| DataError::Io(format!("bad label query: {e}")))?;
+                Ok(self.local.search_objects(&parsed, b, opts.clone()).await?)
+            }
+            (None, None) => Err(DataError::Io(
+                "scatter list requires a bucket or a label query".into(),
+            )),
+        }
+    }
+
+    /// Fetch one peer's local list/search page from its `/internal/v1/list`.
+    async fn fetch_remote_list(
+        &self,
+        peer_url: &str,
+        bucket: Option<&str>,
+        query: Option<&str>,
+        opts: &ListOptions,
+    ) -> Result<ListPage, DataError> {
+        let mut params: Vec<(&str, &str)> = Vec::new();
+        if let Some(b) = bucket {
+            params.push(("bucket", b));
+        }
+        if let Some(q) = query {
+            params.push(("q", q));
+        }
+        if let Some(p) = opts.prefix.as_deref() {
+            params.push(("prefix", p));
+        }
+        if let Some(a) = opts.after.as_deref() {
+            params.push(("after", a));
+        }
+        let limit_s = opts.limit.map(|n| n.to_string());
+        if let Some(l) = limit_s.as_deref() {
+            params.push(("limit", l));
+        }
+        let url = format!("{peer_url}/internal/v1/list");
+        self.client
+            .get_json_query(&url, &params)
+            .await
+            .map_err(DataError::from)
+    }
+
     /// Whether this node *would* hold `(bucket, key)` once Active, computed from
     /// the ring over the active membership **plus this node** (so a Recovering
     /// node — excluded from the active ring — still discovers what to pull).
@@ -771,6 +873,52 @@ fn need_backfill(
     false // local is ahead
 }
 
+/// K-way merge per-node list pages: dedup by `(bucket, key)` keeping the highest
+/// committed `version` (legacy `None` treated as v0), sort ascending by
+/// `(bucket, key)`, and cap at `limit`. `single_bucket` selects the cursor
+/// format: a bare `key` for a single-bucket list/search, or the `bucket\0key`
+/// composite the core index uses for cross-bucket pagination.
+///
+/// `next` is `Some(last cursor)` whenever more may remain — either the merge
+/// overflowed `limit`, or some node still had a continuation — and `None` only
+/// when every node's page was exhausted and the merge fit within `limit`.
+fn merge_list_pages(pages: Vec<ListPage>, single_bucket: bool, limit: usize) -> ListPage {
+    use std::collections::HashMap;
+
+    let any_more = pages.iter().any(|p| p.next.is_some());
+    let mut best: HashMap<(String, String), Metadata> = HashMap::new();
+    for page in pages {
+        for md in page.items {
+            let id = (md.bucket.clone(), md.key.clone());
+            match best.get(&id) {
+                Some(existing) if existing.version.unwrap_or(0) >= md.version.unwrap_or(0) => {}
+                _ => {
+                    best.insert(id, md);
+                }
+            }
+        }
+    }
+
+    let mut items: Vec<Metadata> = best.into_values().collect();
+    items.sort_by(|a, b| a.bucket.cmp(&b.bucket).then_with(|| a.key.cmp(&b.key)));
+    let overflow = items.len() > limit;
+    items.truncate(limit);
+
+    let next = if overflow || any_more {
+        items.last().map(|m| {
+            if single_bucket {
+                m.key.clone()
+            } else {
+                format!("{}\u{0}{}", m.bucket, m.key)
+            }
+        })
+    } else {
+        None
+    };
+
+    ListPage { items, next }
+}
+
 /// Map a peer object-fetch transport error: a `404` from the TAIL becomes a
 /// typed not-found (so the read surfaces as 404, not 500); other errors pass
 /// through as transport failures.
@@ -1064,5 +1212,95 @@ mod tests {
         ));
         // Nothing was committed.
         assert!(local.get("bkt", "obj").await.is_err());
+    }
+
+    /// Build a minimal `Metadata` for merge tests.
+    fn md(bucket: &str, key: &str, version: Option<u64>) -> Metadata {
+        Metadata {
+            created: 0,
+            modified: 0,
+            size: 0,
+            checksum_gxhash: String::new(),
+            bucket: bucket.into(),
+            key: key.into(),
+            disk_path: std::path::PathBuf::new(),
+            url_path: format!("{bucket}/{key}"),
+            labels: Default::default(),
+            cipher_size: None,
+            cipher_sha256: None,
+            kem_alg: None,
+            aead_alg: None,
+            envelope_version: None,
+            version,
+            committed_at: None,
+        }
+    }
+
+    fn page(items: Vec<Metadata>, next: Option<&str>) -> ListPage {
+        ListPage {
+            items,
+            next: next.map(|s| s.to_string()),
+        }
+    }
+
+    /// Replicas of the same key collapse to one entry (highest version wins),
+    /// results sort by key, and the cursor is a bare key for a single bucket.
+    #[test]
+    fn merge_dedups_by_highest_version_single_bucket() {
+        let pages = vec![
+            page(vec![md("b", "a", Some(2)), md("b", "c", Some(1))], None),
+            page(vec![md("b", "a", Some(3)), md("b", "b", Some(1))], None),
+        ];
+        let merged = merge_list_pages(pages, true, 10);
+        let keys: Vec<_> = merged.items.iter().map(|m| m.key.as_str()).collect();
+        assert_eq!(keys, ["a", "b", "c"]);
+        // The surviving "a" is the higher-version replica.
+        assert_eq!(merged.items[0].version, Some(3));
+        // Exhausted within limit -> no cursor.
+        assert_eq!(merged.next, None);
+    }
+
+    /// Overflowing `limit` truncates and emits the last key as the cursor.
+    #[test]
+    fn merge_truncates_and_emits_cursor() {
+        let pages = vec![
+            page(vec![md("b", "a", None), md("b", "c", None)], None),
+            page(vec![md("b", "b", None), md("b", "d", None)], None),
+        ];
+        let merged = merge_list_pages(pages, true, 2);
+        let keys: Vec<_> = merged.items.iter().map(|m| m.key.as_str()).collect();
+        assert_eq!(keys, ["a", "b"]);
+        assert_eq!(merged.next.as_deref(), Some("b"));
+    }
+
+    /// A continuation from any node propagates even when the merge fits `limit`.
+    #[test]
+    fn merge_propagates_peer_continuation() {
+        let pages = vec![
+            page(vec![md("b", "a", None)], Some("a")),
+            page(vec![md("b", "b", None)], None),
+        ];
+        let merged = merge_list_pages(pages, true, 10);
+        assert_eq!(merged.items.len(), 2);
+        // A peer still had more, so a cursor is emitted at the last key.
+        assert_eq!(merged.next.as_deref(), Some("b"));
+    }
+
+    /// Cross-bucket merges sort by `(bucket, key)` and emit the `bucket\0key`
+    /// composite cursor the core index uses.
+    #[test]
+    fn merge_cross_bucket_composite_cursor() {
+        let pages = vec![
+            page(vec![md("z", "k", None), md("a", "k", None)], None),
+            page(vec![md("a", "j", None)], None),
+        ];
+        let merged = merge_list_pages(pages, false, 2);
+        let ids: Vec<_> = merged
+            .items
+            .iter()
+            .map(|m| (m.bucket.as_str(), m.key.as_str()))
+            .collect();
+        assert_eq!(ids, [("a", "j"), ("a", "k")]);
+        assert_eq!(merged.next.as_deref(), Some("a\u{0}k"));
     }
 }
