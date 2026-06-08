@@ -32,8 +32,8 @@ use y2q_cluster::transport::internal_client::CLUSTER_AUTH_HEADER;
 use y2q_cluster::{
     ChainRoute, ControlCmd, Controller, ControllerConfig, DistributedStorage,
     HttpRaftNetworkFactory, InternalClient, InternalTlsOptions, LabelMode, MutateMeta, MutateOp,
-    MutateResp, PREPARE_META_HEADER, PrepareMeta, ReadConsistency, ReadPlan, Role, VersionResp,
-    chain_id, resolve_node_id,
+    MutateResp, NodeStatus, PREPARE_META_HEADER, PrepareMeta, ReadConsistency, ReadPlan, Role,
+    VersionResp, chain_id, resolve_node_id,
 };
 use y2q_core::crypto::{envelope, kdf};
 use y2q_core::{AnyStorage, AnyStreamingPutGuard, LabelSet, PutOptions, Storage, SyncLevel};
@@ -202,6 +202,81 @@ fn read_consistency(cfg: &Config) -> ReadConsistency {
             bound_ms: cfg.cluster.eventual_bound_ms,
         },
     }
+}
+
+/// Spawn the leader-driven cluster maintenance loop: on every tick the leader
+/// re-splices pinned chains (pinning membership changes and bumping the epoch,
+/// which the data-plane epoch fence then enforces) and probes each Active peer's
+/// `/internal/v1/health`. A peer that fails `fail_threshold` consecutive probes
+/// is marked [`NodeStatus::Down`] and the chains re-spliced to route around it.
+///
+/// Only the leader acts (it is the single controller authority); followers idle.
+/// A node is never auto-promoted back to `Active` here — that waits for the
+/// back-fill protocol (Phase E continuation), since serving reads from a stale
+/// recovered replica would violate strong consistency.
+pub fn spawn_maintenance(rt: web::Data<ClusterRuntime>, interval_ms: u64, fail_threshold: u32) {
+    let interval = Duration::from_millis(interval_ms.max(100));
+    let threshold = fail_threshold.max(1);
+    tokio::spawn(async move {
+        let mut failures: BTreeMap<u64, u32> = BTreeMap::new();
+        loop {
+            tokio::time::sleep(interval).await;
+
+            // Only the leader mutates control state; followers track nothing.
+            if !rt.controller.is_leader().await {
+                failures.clear();
+                continue;
+            }
+
+            // Pin chains + bump epoch for any membership delta (no-op in steady
+            // state, so this does not churn the epoch).
+            if let Err(e) = rt.controller.resplice_now().await {
+                tracing::warn!(error = %e, "cluster maintenance: resplice tick failed");
+            }
+
+            let state = rt.controller.control_state().await;
+            for (id, meta) in state.nodes.iter() {
+                if *id == rt.node_id || meta.status != NodeStatus::Active {
+                    continue;
+                }
+                let url = format!("{}/internal/v1/health", meta.addr);
+                match rt.client.get_json::<HealthResp>(&url).await {
+                    Ok(_) => {
+                        failures.remove(id);
+                    }
+                    Err(_) => {
+                        let n = failures.entry(*id).or_insert(0);
+                        *n += 1;
+                        if *n >= threshold {
+                            tracing::warn!(
+                                peer = *id,
+                                url = %meta.addr,
+                                "cluster maintenance: peer unreachable; marking Down and re-splicing"
+                            );
+                            match rt
+                                .controller
+                                .propose(ControlCmd::SetNodeStatus {
+                                    node_id: *id,
+                                    status: NodeStatus::Down,
+                                })
+                                .await
+                            {
+                                Ok(_) => {
+                                    failures.remove(id);
+                                    if let Err(e) = rt.controller.resplice_now().await {
+                                        tracing::warn!(error = %e, "cluster maintenance: resplice after mark-down failed");
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(error = %e, peer = *id, "cluster maintenance: SetNodeStatus(Down) failed")
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    });
 }
 
 /// Unwrap the deployment SK from the configured `unlock_user`'s record using the
@@ -856,6 +931,28 @@ async fn raft_snapshot(
     HttpResponse::Ok().json(res)
 }
 
+/// Whether a message stamped with `msg_epoch` is stale relative to the
+/// receiver's `committed` epoch. Strictly-older messages were routed under a
+/// superseded topology and must be rejected; equal or newer are accepted (a
+/// newer epoch means this node is merely lagging the raft log).
+fn epoch_is_stale(msg_epoch: u64, committed: u64) -> bool {
+    msg_epoch < committed
+}
+
+/// Reject a peer write whose epoch predates this node's committed epoch (the
+/// stale-topology fence). Returns `409 STALE_EPOCH` and bumps the rejection
+/// metric; the sender should re-resolve the route and retry.
+async fn fence_epoch(rt: &ClusterRuntime, msg_epoch: u64) -> Result<(), actix_web::Error> {
+    let committed = rt.controller.control_state().await.epoch;
+    if epoch_is_stale(msg_epoch, committed) {
+        metrics::counter!(crate::observability::CLUSTER_STALE_EPOCH_REJECTIONS).increment(1);
+        return Err(actix_web::error::ErrorConflict(format!(
+            "STALE_EPOCH: message epoch {msg_epoch} < committed {committed}"
+        )));
+    }
+    Ok(())
+}
+
 /// Receive a CRAQ PREPARE: stream the ciphertext envelope from the request body
 /// into the data plane, which writes it locally, relays it down-chain, and
 /// commits once the downstream sub-chain commits. The `X-Y2Q-Prepare` header
@@ -873,6 +970,10 @@ async fn prepare(
         .ok_or_else(|| ErrorBadRequest("missing X-Y2Q-Prepare header"))?;
     let meta: PrepareMeta = serde_json::from_str(meta_raw)
         .map_err(|e| ErrorBadRequest(format!("bad prepare meta: {e}")))?;
+
+    // Epoch fence: reject a PREPARE routed under a superseded topology before
+    // staging anything locally.
+    fence_epoch(&rt, meta.epoch).await?;
 
     // Drain the request body into a bounded channel the data plane consumes, so
     // the envelope streams through without being buffered whole.
@@ -937,9 +1038,12 @@ async fn mutate(
     _peer: ClusterPeer,
     body: web::Json<MutateMeta>,
 ) -> Result<HttpResponse, actix_web::Error> {
+    let meta = body.into_inner();
+    // Epoch fence: reject a mutation routed under a superseded topology.
+    fence_epoch(&rt, meta.epoch).await?;
     let resp = rt
         .distributed
-        .accept_mutate(body.into_inner())
+        .accept_mutate(meta)
         .await
         .map_err(|e| ErrorBadGateway(format!("mutate: {e}")))?;
     Ok(HttpResponse::Ok().json(resp))
@@ -1152,6 +1256,15 @@ mod tests {
         assert_eq!(back.fingerprint, "deadbeef");
         assert_eq!(back.node_id, 5);
         assert!(back.is_leader);
+    }
+
+    /// Epoch fencing rejects strictly-older messages; equal or newer pass.
+    #[test]
+    fn epoch_fence_rejects_only_older() {
+        assert!(epoch_is_stale(4, 5)); // stale: routed under an old topology
+        assert!(!epoch_is_stale(5, 5)); // current
+        assert!(!epoch_is_stale(6, 5)); // newer: this node is merely lagging
+        assert!(!epoch_is_stale(0, 0));
     }
 
     /// A fingerprint mismatch renders an unambiguous, non-transient error so the

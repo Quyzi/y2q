@@ -42,6 +42,9 @@ pub const STORAGE_OPS_TOTAL: &str = "y2qd_storage_ops_total";
 pub const STORAGE_OP_DURATION: &str = "y2qd_storage_op_duration_milliseconds";
 pub const AUTH_LOGINS_TOTAL: &str = "y2qd_auth_logins_total";
 pub const SESSIONS_ACTIVE: &str = "y2qd_sessions_active";
+/// Count of internal cluster requests rejected because their epoch predated the
+/// receiver's committed epoch (stale-topology fence).
+pub const CLUSTER_STALE_EPOCH_REJECTIONS: &str = "y2qd_cluster_stale_epoch_rejections_total";
 
 /// Bucket boundaries for both payload-size histograms, in bytes.
 /// Spans small JSON bodies (~256 B) through the default 256 MiB upload cap.
@@ -119,6 +122,10 @@ pub fn describe_metrics() {
     metrics::describe_gauge!(
         SESSIONS_ACTIVE,
         "Number of active (non-expired) sessions currently held in memory"
+    );
+    describe_counter!(
+        CLUSTER_STALE_EPOCH_REJECTIONS,
+        "Internal cluster requests rejected because their epoch predated the receiver's committed epoch"
     );
 }
 

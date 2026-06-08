@@ -373,7 +373,14 @@ async fn main() -> std::io::Result<()> {
         )
         .await
         .map_err(|e| std::io::Error::other(format!("cluster startup: {e}")))?;
-        Some(web::Data::new(rt))
+        let rt = web::Data::new(rt);
+        // Leader-driven failure detection + re-splice loop.
+        cluster::spawn_maintenance(
+            rt.clone(),
+            cfg.cluster.health_probe_interval_ms,
+            cfg.cluster.health_fail_threshold,
+        );
+        Some(rt)
     } else {
         None
     };
