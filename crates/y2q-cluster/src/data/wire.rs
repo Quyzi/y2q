@@ -98,6 +98,43 @@ pub struct PrepareResp {
     pub overwrite: bool,
 }
 
+/// A non-PUT mutation routed down the chain (no bulk body): DELETE, or a label
+/// set. The final state is computed once (at the contact node for labels) and
+/// applied verbatim at every member so replicas stay identical.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MutateOp {
+    /// Delete the object at every chain member.
+    Delete,
+    /// Replace the object's label set at every member with these pairs.
+    SetLabels {
+        /// The full label set to apply.
+        labels: Vec<(String, String)>,
+    },
+}
+
+/// Addressing + fencing for a [`MutateOp`] relayed through the chain.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MutateMeta {
+    /// Target bucket.
+    pub bucket: String,
+    /// Target key.
+    pub key: String,
+    /// Consistent-hash chain id (diagnostics).
+    pub chain_id: u64,
+    /// Epoch the mutation is fenced under.
+    pub epoch: u64,
+    /// The mutation to apply at each member.
+    pub op: MutateOp,
+}
+
+/// Response from a chain mutation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MutateResp {
+    /// Whether the object existed at the node that originated the chain apply
+    /// (the HEAD). For DELETE this distinguishes 204 from 404.
+    pub existed: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -127,6 +164,33 @@ mod tests {
         let bytes = serde_json::to_vec(&m).unwrap();
         let back: PrepareMeta = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(m, back);
+    }
+
+    #[test]
+    fn mutate_meta_round_trips() {
+        for op in [
+            MutateOp::Delete,
+            MutateOp::SetLabels {
+                labels: vec![
+                    ("env".into(), "prod".into()),
+                    ("team".into(), "core".into()),
+                ],
+            },
+        ] {
+            let m = MutateMeta {
+                bucket: "b".into(),
+                key: "k".into(),
+                chain_id: 11,
+                epoch: 3,
+                op,
+            };
+            let bytes = serde_json::to_vec(&m).unwrap();
+            let back: MutateMeta = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(m, back);
+        }
+        let r = MutateResp { existed: true };
+        let back: MutateResp = serde_json::from_slice(&serde_json::to_vec(&r).unwrap()).unwrap();
+        assert_eq!(r, back);
     }
 
     #[test]
