@@ -31,8 +31,8 @@ use y2q_cluster::control::raft_impl::TypeConfig;
 use y2q_cluster::transport::internal_client::CLUSTER_AUTH_HEADER;
 use y2q_cluster::{
     ChainRoute, ControlCmd, Controller, ControllerConfig, DistributedStorage,
-    HttpRaftNetworkFactory, InternalClient, InternalTlsOptions, MutateMeta, MutateOp, MutateResp,
-    PREPARE_META_HEADER, PrepareMeta, Role, chain_id, resolve_node_id,
+    HttpRaftNetworkFactory, InternalClient, InternalTlsOptions, LabelMode, MutateMeta, MutateOp,
+    MutateResp, PREPARE_META_HEADER, PrepareMeta, Role, chain_id, resolve_node_id,
 };
 use y2q_core::crypto::kdf;
 use y2q_core::{AnyStorage, LabelSet, PutOptions, Storage, SyncLevel};
@@ -757,26 +757,26 @@ pub async fn chain_delete(rt: &ClusterRuntime, bucket: &str, key: &str) -> Resul
     Ok(dispatch_mutate(rt, &route, meta).await?.existed)
 }
 
-/// Route a label-set replacement through the chain; `final_labels` is applied
-/// verbatim at every member.
-pub async fn chain_set_labels(
+/// Route a label edit through the chain. The HEAD resolves `mode`/`incoming`
+/// against its committed copy and applies the resolved set verbatim at every
+/// member; the resolved set is returned for the HTTP response.
+pub async fn chain_edit_labels(
     rt: &ClusterRuntime,
     bucket: &str,
     key: &str,
-    final_labels: &LabelSet,
-) -> Result<(), AppError> {
+    mode: LabelMode,
+    incoming: Vec<(String, String)>,
+) -> Result<LabelSet, AppError> {
     let route = rt.distributed.route(bucket, key).await;
     let meta = MutateMeta {
         bucket: bucket.to_owned(),
         key: key.to_owned(),
         chain_id: chain_id(bucket, key),
         epoch: route.epoch,
-        op: MutateOp::SetLabels {
-            labels: final_labels.iter().cloned().collect(),
-        },
+        op: MutateOp::EditLabels { mode, incoming },
     };
-    dispatch_mutate(rt, &route, meta).await?;
-    Ok(())
+    let resp = dispatch_mutate(rt, &route, meta).await?;
+    Ok(resp.labels.into_iter().collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -1001,13 +1001,10 @@ async fn join(
     })?;
 
     if req.voter {
-        let mut voters: BTreeSet<u64> = rt
-            .controller
-            .control_state()
-            .await
-            .active_nodes()
-            .into_iter()
-            .collect();
+        // Extend the *current* voting quorum with the joiner rather than
+        // promoting every active node, so the voter set stays bounded (the
+        // voter/learner split). The leader is already a voter.
+        let mut voters = rt.controller.current_voters();
         voters.insert(rt.node_id);
         voters.insert(req.id);
         rt.controller
