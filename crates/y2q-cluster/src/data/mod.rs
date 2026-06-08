@@ -37,7 +37,9 @@ use crate::transport::TransportError;
 
 pub use pending::{Pending, PendingGuard, PendingWrites};
 pub use route::{ChainRoute, resolve_route};
-pub use wire::{MutateMeta, MutateOp, MutateResp, PREPARE_META_HEADER, PrepareMeta, PrepareResp};
+pub use wire::{
+    LabelMode, MutateMeta, MutateOp, MutateResp, PREPARE_META_HEADER, PrepareMeta, PrepareResp,
+};
 
 /// Bounded depth of the per-hop forward channel. A few in-flight chunks gives
 /// pipelining without letting a slow downstream make an upstream node buffer the
@@ -56,6 +58,19 @@ pub enum DataError {
     /// The downstream forward channel closed before the write finished.
     #[error("downstream replication failed (forward channel closed)")]
     ForwardClosed,
+    /// The streamed envelope was shorter than the HEAD-committed size (a
+    /// truncated or aborted relay). The replica is not committed.
+    #[error("short envelope for {bucket}/{key}: got {got} bytes, expected {expected}")]
+    ShortEnvelope {
+        /// Bucket component.
+        bucket: String,
+        /// Key component.
+        key: String,
+        /// Envelope size the HEAD committed and advertised in the PREPARE.
+        expected: u64,
+        /// Bytes actually received before the body channel closed.
+        got: u64,
+    },
     /// A peer RPC failed.
     #[error("transport: {0}")]
     Transport(#[from] TransportError),
@@ -149,10 +164,14 @@ impl DistributedStorage {
         self.peer_base_url(&state, id)
     }
 
-    /// Apply a non-PUT mutation (DELETE / set-labels) locally and relay it to the
-    /// next chain member. Called on each member as the mutation walks the chain;
-    /// the HEAD's `existed` verdict is returned. Marks the key dirty for the
-    /// duration.
+    /// Apply a non-PUT mutation (DELETE / label edit) locally and relay it to the
+    /// next chain member. Called on each member as the mutation walks the chain.
+    ///
+    /// A label edit ([`MutateOp::EditLabels`]) is resolved here against this
+    /// node's committed copy into a concrete set, which is what gets applied and
+    /// relayed downstream — so every member ends up with identical labels even
+    /// though only the HEAD reads the prior set. Returns the HEAD's `existed`
+    /// verdict and the resolved label set. Marks the key dirty for the duration.
     pub async fn accept_mutate(&self, meta: MutateMeta) -> Result<MutateResp, DataError> {
         let _pending = self.pending.begin(&meta.bucket, &meta.key, meta.epoch);
         let state = self.controller.control_state().await;
@@ -170,24 +189,54 @@ impl DistributedStorage {
             });
         }
 
-        let existed = self.apply_mutate(&meta).await?;
+        // Resolve a label edit against the local copy before applying/relaying,
+        // so downstream members receive the already-resolved set.
+        let resolved = self.resolve_op(&meta).await?;
+        let labels = match &resolved.op {
+            MutateOp::SetLabels { labels } => labels.clone(),
+            _ => Vec::new(),
+        };
+
+        let existed = self.apply_mutate(&resolved).await?;
 
         if let Some(next_id) = route.next_after(self.node_id) {
             let url = self
                 .peer_base_url(&state, next_id)
                 .ok_or_else(|| DataError::NoChain {
-                    bucket: meta.bucket.clone(),
-                    key: meta.key.clone(),
+                    bucket: resolved.bucket.clone(),
+                    key: resolved.key.clone(),
                 })?;
             let _down: MutateResp = self
                 .client
-                .post_json(&format!("{url}/internal/v1/mutate"), &meta)
+                .post_json(&format!("{url}/internal/v1/mutate"), &resolved)
                 .await?;
         }
-        Ok(MutateResp { existed })
+        Ok(MutateResp { existed, labels })
     }
 
-    /// Apply a mutation to the local backend.
+    /// Resolve a label edit against this node's committed copy. Delete and an
+    /// already-resolved `SetLabels` pass through unchanged.
+    async fn resolve_op(&self, meta: &MutateMeta) -> Result<MutateMeta, DataError> {
+        match &meta.op {
+            MutateOp::EditLabels { mode, incoming } => {
+                let current: Vec<(String, String)> = self
+                    .local
+                    .describe(&meta.bucket, &meta.key)
+                    .await?
+                    .labels
+                    .into_iter()
+                    .collect();
+                let labels = mode.resolve(current, incoming.clone());
+                Ok(MutateMeta {
+                    op: MutateOp::SetLabels { labels },
+                    ..meta.clone()
+                })
+            }
+            _ => Ok(meta.clone()),
+        }
+    }
+
+    /// Apply a (resolved) mutation to the local backend.
     async fn apply_mutate(&self, meta: &MutateMeta) -> Result<bool, DataError> {
         match &meta.op {
             MutateOp::Delete => match self.local.delete(&meta.bucket, &meta.key).await {
@@ -201,6 +250,10 @@ impl DistributedStorage {
                     .await?;
                 Ok(true)
             }
+            // Resolved by `resolve_op` before reaching here; never relayed raw.
+            MutateOp::EditLabels { .. } => Err(DataError::Io(
+                "unresolved label edit reached apply_mutate".to_owned(),
+            )),
         }
     }
 
@@ -294,7 +347,16 @@ impl DistributedStorage {
                     forward_prepare(&client, &next_url, &fmeta, fwd_rx).await
                 });
 
-                let (guard, sink) = stage_envelope(&self.local, &meta, body, Some(fwd_tx)).await?;
+                // On a local staging failure, cancel the relay so the successor
+                // does not see a clean EOF and commit a partial copy.
+                let (guard, sink) =
+                    match stage_envelope(&self.local, &meta, body, Some(fwd_tx)).await {
+                        Ok(staged) => staged,
+                        Err(e) => {
+                            fwd_task.abort();
+                            return Err(e);
+                        }
+                    };
                 // fwd_tx was dropped by stage_envelope, ending the relay body.
                 let down = fwd_task
                     .await
@@ -328,13 +390,27 @@ async fn stage_envelope(
     let (guard, mut sink, write_offset) =
         local.begin_streaming_put(&meta.bucket, &meta.key).await?;
 
+    let mut received: u64 = 0;
     while let Some(chunk) = body.recv().await {
+        received += chunk.len() as u64;
         sink.write_all(&chunk)
             .await
             .map_err(|e| DataError::Io(e.to_string()))?;
         if let Some(f) = &forward {
             f.send(chunk).await.map_err(|_| DataError::ForwardClosed)?;
         }
+    }
+
+    // A closed body channel is indistinguishable from a complete one, so a cut or
+    // aborted relay would otherwise commit a short, undecryptable replica. Reject
+    // anything that does not match the exact envelope the HEAD committed.
+    if received != meta.cipher_size {
+        return Err(DataError::ShortEnvelope {
+            bucket: meta.bucket.clone(),
+            key: meta.key.clone(),
+            expected: meta.cipher_size,
+            got: received,
+        });
     }
 
     // The Tee at the HEAD does not forward the positioned plaintext_len patch, so
@@ -461,5 +537,46 @@ mod tests {
             .await
             .unwrap();
         assert!(commit_staged(g2, s2, &meta).await.unwrap());
+    }
+
+    /// A relay that delivers fewer bytes than the HEAD committed is rejected
+    /// (not committed as a truncated replica).
+    #[tokio::test]
+    async fn stage_rejects_short_envelope() {
+        let dir = tempfile::tempdir().unwrap();
+        let local = local_storage(dir.path());
+
+        let env = vec![0u8; 32];
+        let meta = PrepareMeta {
+            bucket: "bkt".into(),
+            key: "obj".into(),
+            chain_id: 1,
+            epoch: 0,
+            plaintext_len: 16,
+            plaintext_size: 16,
+            checksum_gxhash_b64: "AAAAAAAAAAA=".into(),
+            // Claim a larger envelope than the body will deliver.
+            cipher_size: 64,
+            cipher_sha256_b64: String::new(),
+            kem_alg: "ml-kem-768".into(),
+            aead_alg: "aes-256-gcm".into(),
+            envelope_version: 2,
+            sync_durable: false,
+            labels: vec![],
+        };
+
+        let Err(err) = stage_envelope(&local, &meta, body_of(&env), None).await else {
+            panic!("expected a ShortEnvelope error");
+        };
+        assert!(matches!(
+            err,
+            DataError::ShortEnvelope {
+                expected: 64,
+                got: 32,
+                ..
+            }
+        ));
+        // Nothing was committed.
+        assert!(local.get("bkt", "obj").await.is_err());
     }
 }

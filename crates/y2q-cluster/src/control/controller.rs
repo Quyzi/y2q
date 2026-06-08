@@ -156,6 +156,16 @@ impl Controller {
             .map_err(|e| ControllerError::Raft(e.to_string()))
     }
 
+    /// The current voting membership as known to this node's raft.
+    pub fn current_voters(&self) -> BTreeSet<NodeId> {
+        self.raft
+            .metrics()
+            .borrow()
+            .membership_config
+            .voter_ids()
+            .collect()
+    }
+
     /// Change the voting membership to `voters` (promoting learners as needed).
     pub async fn change_membership(&self, voters: BTreeSet<NodeId>) -> Result<(), ControllerError> {
         self.raft

@@ -16,6 +16,7 @@ use std::sync::Arc;
 use actix_web::{HttpRequest, HttpResponse, web};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
+use y2q_cluster::LabelMode;
 use y2q_core::{AnyStorage, BucketPermission, Storage};
 
 use super::labels::extract_labels;
@@ -73,31 +74,10 @@ pub async fn handle(
     authorize_bucket(&auth, &storage, &bucket, BucketPermission::Write).await?;
     let incoming = extract_labels(&req, limits.get_ref())?;
     let op = query.op.as_deref().unwrap_or("set");
-
-    let current = storage
-        .describe(&bucket, &key)
-        .await
-        .map_err(AppError::from)?
-        .labels;
-
-    let final_labels = match op {
-        "set" => {
-            let mut merged = current;
-            merged.extend(incoming);
-            merged
-        }
-        "remove" => {
-            if incoming.is_empty() {
-                BTreeSet::new()
-            } else {
-                let names: BTreeSet<&String> = incoming.iter().map(|(n, _)| n).collect();
-                current
-                    .into_iter()
-                    .filter(|(n, _)| !names.contains(n))
-                    .collect()
-            }
-        }
-        "replace" => incoming,
+    let mode = match op {
+        "set" => LabelMode::Set,
+        "remove" => LabelMode::Remove,
+        "replace" => LabelMode::Replace,
         other => {
             return Err(AppError(y2q_core::Error::InvalidLabelValue {
                 name: format!("op={other} (expected set|remove|replace)"),
@@ -105,17 +85,30 @@ pub async fn handle(
         }
     };
 
-    // Clustered: apply the final label set across the chain. Otherwise write
-    // locally. The final set is computed once here and applied verbatim at every
-    // replica so they stay identical.
-    if let Some(rt) = cluster.as_ref() {
-        cluster::chain_set_labels(rt, &bucket, &key, &final_labels).await?;
+    // Clustered: the edit is resolved at the chain HEAD against its committed
+    // copy and applied verbatim across the chain. The contact node may not hold
+    // the object, so it must not read the current set locally. Single-node:
+    // read-modify-write against the local copy.
+    let final_labels: BTreeSet<(String, String)> = if let Some(rt) = cluster.as_ref() {
+        cluster::chain_edit_labels(rt, &bucket, &key, mode, incoming.into_iter().collect()).await?
     } else {
+        let current: Vec<(String, String)> = storage
+            .describe(&bucket, &key)
+            .await
+            .map_err(AppError::from)?
+            .labels
+            .into_iter()
+            .collect();
+        let resolved: BTreeSet<(String, String)> = mode
+            .resolve(current, incoming.into_iter().collect())
+            .into_iter()
+            .collect();
         storage
-            .set_labels(&bucket, &key, final_labels.clone())
+            .set_labels(&bucket, &key, resolved.clone())
             .await
             .map_err(AppError::from)?;
-    }
+        resolved
+    };
 
     Ok(HttpResponse::Ok().json(SetTagsResponse {
         bucket,

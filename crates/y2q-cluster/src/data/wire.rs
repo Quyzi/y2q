@@ -98,14 +98,71 @@ pub struct PrepareResp {
     pub overwrite: bool,
 }
 
+/// How a label edit combines the supplied labels with an object's current set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LabelMode {
+    /// Add the supplied labels to the existing set.
+    Set,
+    /// Remove every value of each supplied label name (or clear all if empty).
+    Remove,
+    /// Replace the entire set with the supplied labels.
+    Replace,
+}
+
+impl LabelMode {
+    /// Resolve an edit against `current` into the final label set. Inputs and
+    /// output are deduplicated and ordered (collected through a `BTreeSet`) so
+    /// every chain member that applies the resolved set ends up identical.
+    pub fn resolve(
+        self,
+        current: Vec<(String, String)>,
+        incoming: Vec<(String, String)>,
+    ) -> Vec<(String, String)> {
+        use std::collections::BTreeSet;
+        match self {
+            LabelMode::Set => {
+                let mut merged: BTreeSet<(String, String)> = current.into_iter().collect();
+                merged.extend(incoming);
+                merged.into_iter().collect()
+            }
+            LabelMode::Remove => {
+                if incoming.is_empty() {
+                    return Vec::new();
+                }
+                let names: BTreeSet<&String> = incoming.iter().map(|(n, _)| n).collect();
+                let kept: BTreeSet<(String, String)> = current
+                    .into_iter()
+                    .filter(|(n, _)| !names.contains(n))
+                    .collect();
+                kept.into_iter().collect()
+            }
+            LabelMode::Replace => {
+                let set: BTreeSet<(String, String)> = incoming.into_iter().collect();
+                set.into_iter().collect()
+            }
+        }
+    }
+}
+
 /// A non-PUT mutation routed down the chain (no bulk body): DELETE, or a label
-/// set. The final state is computed once (at the contact node for labels) and
-/// applied verbatim at every member so replicas stay identical.
+/// edit. For labels the HEAD resolves the edit against its committed copy into a
+/// final set ([`MutateOp::SetLabels`]) and relays that set verbatim, so every
+/// member applies identical labels regardless of which node was contacted.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MutateOp {
     /// Delete the object at every chain member.
     Delete,
-    /// Replace the object's label set at every member with these pairs.
+    /// An unresolved label edit. Only the HEAD receives this; it resolves the
+    /// edit against its local copy and relays the resulting [`Self::SetLabels`].
+    EditLabels {
+        /// How the incoming labels combine with the current set.
+        mode: LabelMode,
+        /// The labels supplied by the client request.
+        incoming: Vec<(String, String)>,
+    },
+    /// A resolved label set, applied verbatim at every member (what downstream
+    /// members receive after the HEAD resolves an [`Self::EditLabels`]).
     SetLabels {
         /// The full label set to apply.
         labels: Vec<(String, String)>,
@@ -133,6 +190,9 @@ pub struct MutateResp {
     /// Whether the object existed at the node that originated the chain apply
     /// (the HEAD). For DELETE this distinguishes 204 from 404.
     pub existed: bool,
+    /// The resolved label set the HEAD applied (empty for DELETE). Returned so
+    /// the contact node can render it in the HTTP response without re-reading.
+    pub labels: Vec<(String, String)>,
 }
 
 #[cfg(test)]
@@ -170,6 +230,10 @@ mod tests {
     fn mutate_meta_round_trips() {
         for op in [
             MutateOp::Delete,
+            MutateOp::EditLabels {
+                mode: LabelMode::Set,
+                incoming: vec![("env".into(), "prod".into())],
+            },
             MutateOp::SetLabels {
                 labels: vec![
                     ("env".into(), "prod".into()),
@@ -188,9 +252,41 @@ mod tests {
             let back: MutateMeta = serde_json::from_slice(&bytes).unwrap();
             assert_eq!(m, back);
         }
-        let r = MutateResp { existed: true };
+        let r = MutateResp {
+            existed: true,
+            labels: vec![("env".into(), "prod".into())],
+        };
         let back: MutateResp = serde_json::from_slice(&serde_json::to_vec(&r).unwrap()).unwrap();
         assert_eq!(r, back);
+    }
+
+    #[test]
+    fn label_mode_resolves() {
+        let current = vec![("a".to_string(), "1".to_string())];
+        let incoming = vec![("b".to_string(), "2".to_string())];
+        // set merges
+        assert_eq!(
+            LabelMode::Set.resolve(current.clone(), incoming.clone()),
+            vec![
+                ("a".to_string(), "1".to_string()),
+                ("b".to_string(), "2".to_string())
+            ]
+        );
+        // replace drops current
+        assert_eq!(
+            LabelMode::Replace.resolve(current.clone(), incoming.clone()),
+            vec![("b".to_string(), "2".to_string())]
+        );
+        // remove by name; empty incoming clears all
+        let two = vec![
+            ("a".to_string(), "1".to_string()),
+            ("b".to_string(), "2".to_string()),
+        ];
+        assert_eq!(
+            LabelMode::Remove.resolve(two.clone(), vec![("a".to_string(), "x".to_string())]),
+            vec![("b".to_string(), "2".to_string())]
+        );
+        assert!(LabelMode::Remove.resolve(two, vec![]).is_empty());
     }
 
     #[test]
