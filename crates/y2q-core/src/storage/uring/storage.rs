@@ -690,7 +690,16 @@ impl StorageExt for UringStorage {
     }
 
     async fn clear_stale_locks(&self, older_than: SystemTime) -> Result<u64, Error> {
-        Ok(self.locks.clear_stale(older_than))
+        let locks = self.locks.clear_stale(older_than);
+        // Fold in orphan `.tmp` GC (hard-crash staging files); same on-disk
+        // layout as the filesystem backend, so reuse its sweeper.
+        let tmp = crate::storage::filesystem::clear_orphan_tmp_files(&self.base_path, older_than)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "orphan tmp sweep failed; continuing");
+                0
+            });
+        Ok(locks + tmp)
     }
 }
 

@@ -12,6 +12,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::future::{Ready, ready};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use actix_web::{
@@ -30,10 +31,10 @@ use zeroize::Zeroizing;
 use y2q_cluster::control::raft_impl::TypeConfig;
 use y2q_cluster::transport::internal_client::CLUSTER_AUTH_HEADER;
 use y2q_cluster::{
-    ChainRoute, ControlCmd, Controller, ControllerConfig, DistributedStorage,
-    HttpRaftNetworkFactory, InternalClient, InternalTlsOptions, LabelMode, MutateMeta, MutateOp,
-    MutateResp, NodeStatus, PREPARE_META_HEADER, PrepareMeta, ReadConsistency, ReadPlan, Role,
-    VersionResp, chain_id, resolve_node_id,
+    BACKFILL_META_HEADER, BackfillObjectMeta, ChainRoute, ControlCmd, Controller, ControllerConfig,
+    DistributedStorage, HttpRaftNetworkFactory, InternalClient, InternalTlsOptions, LabelMode,
+    MutateMeta, MutateOp, MutateResp, NodeStatus, PREPARE_META_HEADER, PrepareMeta,
+    ReadConsistency, ReadPlan, Role, VersionResp, chain_id, resolve_node_id,
 };
 use y2q_core::crypto::{envelope, kdf};
 use y2q_core::{AnyStorage, AnyStreamingPutGuard, LabelSet, PutOptions, Storage, SyncLevel};
@@ -67,6 +68,10 @@ pub struct ClusterRuntime {
     auth_mode: ClusterAuth,
     /// Read consistency applied to apportioned GETs.
     pub read_consistency: ReadConsistency,
+    /// Set true once this node has completed a clean back-fill sweep while in
+    /// `Recovering`; reported in health so the leader can promote it to `Active`.
+    /// Reset whenever the node observes itself `Down` (it has lost currency).
+    backfill_caught_up: Arc<AtomicBool>,
 }
 
 impl ClusterRuntime {
@@ -190,6 +195,7 @@ pub async fn build_runtime(
         shared_secret: shared_secret.map(Zeroizing::new),
         auth_mode: cfg.cluster.auth,
         read_consistency: read_consistency(cfg),
+        backfill_caught_up: Arc::new(AtomicBool::new(false)),
     })
 }
 
@@ -204,16 +210,18 @@ fn read_consistency(cfg: &Config) -> ReadConsistency {
     }
 }
 
-/// Spawn the leader-driven cluster maintenance loop: on every tick the leader
-/// re-splices pinned chains (pinning membership changes and bumping the epoch,
-/// which the data-plane epoch fence then enforces) and probes each Active peer's
-/// `/internal/v1/health`. A peer that fails `fail_threshold` consecutive probes
-/// is marked [`NodeStatus::Down`] and the chains re-spliced to route around it.
+/// Spawn the cluster maintenance loop. Every node runs it, but the roles differ:
 ///
-/// Only the leader acts (it is the single controller authority); followers idle.
-/// A node is never auto-promoted back to `Active` here — that waits for the
-/// back-fill protocol (Phase E continuation), since serving reads from a stale
-/// recovered replica would violate strong consistency.
+/// - **Self-recovery (any node):** when this node observes itself `Recovering`,
+///   it runs back-fill sweeps (pulling objects it should hold from Active peers)
+///   until a sweep finds nothing missing, then advertises `caught_up` in health
+///   so the leader can promote it. Observing itself `Down` resets `caught_up`.
+/// - **Leader (controller authority):** each tick it re-splices (pinning
+///   membership deltas and bumping the epoch the fence enforces) and probes every
+///   other node, driving the liveness state machine:
+///   `Active` → `Down` after `fail_threshold` failed probes; `Down` → `Recovering`
+///   once reachable again; `Recovering` → `Active` once the peer reports
+///   `caught_up`. Each transition re-splices so chains follow membership.
 pub fn spawn_maintenance(rt: web::Data<ClusterRuntime>, interval_ms: u64, fail_threshold: u32) {
     let interval = Duration::from_millis(interval_ms.max(100));
     let threshold = fail_threshold.max(1);
@@ -221,8 +229,12 @@ pub fn spawn_maintenance(rt: web::Data<ClusterRuntime>, interval_ms: u64, fail_t
         let mut failures: BTreeMap<u64, u32> = BTreeMap::new();
         loop {
             tokio::time::sleep(interval).await;
+            let state = rt.controller.control_state().await;
 
-            // Only the leader mutates control state; followers track nothing.
+            // Self-recovery runs on every node regardless of leadership.
+            run_self_recovery(&rt, &state).await;
+
+            // Only the leader drives the cluster-wide liveness state machine.
             if !rt.controller.is_leader().await {
                 failures.clear();
                 continue;
@@ -234,49 +246,107 @@ pub fn spawn_maintenance(rt: web::Data<ClusterRuntime>, interval_ms: u64, fail_t
                 tracing::warn!(error = %e, "cluster maintenance: resplice tick failed");
             }
 
-            let state = rt.controller.control_state().await;
             for (id, meta) in state.nodes.iter() {
-                if *id == rt.node_id || meta.status != NodeStatus::Active {
+                if *id == rt.node_id {
                     continue;
                 }
                 let url = format!("{}/internal/v1/health", meta.addr);
-                match rt.client.get_json::<HealthResp>(&url).await {
-                    Ok(_) => {
-                        failures.remove(id);
-                    }
-                    Err(_) => {
-                        let n = failures.entry(*id).or_insert(0);
-                        *n += 1;
-                        if *n >= threshold {
-                            tracing::warn!(
-                                peer = *id,
-                                url = %meta.addr,
-                                "cluster maintenance: peer unreachable; marking Down and re-splicing"
-                            );
-                            match rt
-                                .controller
-                                .propose(ControlCmd::SetNodeStatus {
-                                    node_id: *id,
-                                    status: NodeStatus::Down,
-                                })
-                                .await
-                            {
-                                Ok(_) => {
-                                    failures.remove(id);
-                                    if let Err(e) = rt.controller.resplice_now().await {
-                                        tracing::warn!(error = %e, "cluster maintenance: resplice after mark-down failed");
-                                    }
-                                }
-                                Err(e) => {
-                                    tracing::warn!(error = %e, peer = *id, "cluster maintenance: SetNodeStatus(Down) failed")
-                                }
-                            }
-                        }
-                    }
-                }
+                let probe = rt.client.get_json::<HealthResp>(&url).await;
+                drive_peer_liveness(&rt, *id, meta.status, probe, &mut failures, threshold).await;
             }
         }
     });
+}
+
+/// If this node sees itself `Recovering`, run a back-fill sweep and flag
+/// `caught_up` when a sweep pulls nothing (everything it should hold is present).
+/// Seeing itself `Down` clears the flag (it has lost currency since last caught up).
+///
+/// LIMITATION: a recovering node is excluded from chains until promoted, so it
+/// does not receive writes during recovery. Writes to its prospective chains in
+/// the window between `caught_up` and promotion can be missed until a later
+/// recovery. Converging under concurrent writes (the recovering node joining the
+/// write chain while catching up) is a Phase F hardening; today back-fill is
+/// correct when writes to the recovering chains quiesce during the window.
+async fn run_self_recovery(rt: &ClusterRuntime, state: &y2q_cluster::ControlState) {
+    let my_status = state.nodes.get(&rt.node_id).map(|m| m.status);
+    match my_status {
+        Some(NodeStatus::Down) => {
+            rt.backfill_caught_up.store(false, Ordering::Relaxed);
+        }
+        Some(NodeStatus::Recovering) if !rt.backfill_caught_up.load(Ordering::Relaxed) => {
+            match rt.distributed.backfill_pass().await {
+                Ok(0) => {
+                    rt.backfill_caught_up.store(true, Ordering::Relaxed);
+                    tracing::info!("cluster maintenance: back-fill caught up; awaiting promotion");
+                }
+                Ok(n) => tracing::info!(fetched = n, "cluster maintenance: back-fill sweep"),
+                Err(e) => tracing::warn!(error = %e, "cluster maintenance: back-fill sweep failed"),
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Drive one peer through the liveness state machine from a probe result. The
+/// leader proposes the transition and re-splices on success.
+async fn drive_peer_liveness(
+    rt: &ClusterRuntime,
+    id: u64,
+    status: NodeStatus,
+    probe: Result<HealthResp, y2q_cluster::TransportError>,
+    failures: &mut BTreeMap<u64, u32>,
+    threshold: u32,
+) {
+    match (status, probe) {
+        // Reachable Active peer: clear its failure count.
+        (NodeStatus::Active, Ok(_)) => {
+            failures.remove(&id);
+        }
+        // Unreachable Active/Recovering peer: count toward marking it Down.
+        (NodeStatus::Active | NodeStatus::Recovering, Err(_)) => {
+            let n = failures.entry(id).or_insert(0);
+            *n += 1;
+            if *n >= threshold && set_status_resplice(rt, id, NodeStatus::Down).await {
+                failures.remove(&id);
+            }
+        }
+        // A Down peer that answers again starts recovering.
+        (NodeStatus::Down, Ok(_)) => {
+            failures.remove(&id);
+            set_status_resplice(rt, id, NodeStatus::Recovering).await;
+        }
+        // A Recovering peer that reports it has caught up is promoted to Active.
+        (NodeStatus::Recovering, Ok(h)) if h.caught_up => {
+            set_status_resplice(rt, id, NodeStatus::Active).await;
+        }
+        _ => {}
+    }
+}
+
+/// Propose `SetNodeStatus(id, status)` and re-splice on success. Returns whether
+/// the proposal applied.
+async fn set_status_resplice(rt: &ClusterRuntime, id: u64, status: NodeStatus) -> bool {
+    tracing::info!(peer = id, ?status, "cluster maintenance: status transition");
+    match rt
+        .controller
+        .propose(ControlCmd::SetNodeStatus {
+            node_id: id,
+            status,
+        })
+        .await
+    {
+        Ok(_) => {
+            if let Err(e) = rt.controller.resplice_now().await {
+                tracing::warn!(error = %e, "cluster maintenance: resplice after status change failed");
+            }
+            true
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, peer = id, ?status, "cluster maintenance: SetNodeStatus failed");
+            false
+        }
+    }
 }
 
 /// Unwrap the deployment SK from the configured `unlock_user`'s record using the
@@ -895,6 +965,12 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
     cfg.service(web::resource("/internal/v1/mutate").route(web::post().to(mutate)));
     cfg.service(web::resource("/internal/v1/version").route(web::get().to(version)));
     cfg.service(web::resource("/internal/v1/read").route(web::get().to(internal_read)));
+    cfg.service(
+        web::resource("/internal/v1/backfill/manifest").route(web::get().to(backfill_manifest)),
+    );
+    cfg.service(
+        web::resource("/internal/v1/backfill/object").route(web::get().to(backfill_object)),
+    );
     cfg.service(web::resource("/internal/v1/health").route(web::get().to(health)));
     cfg.service(web::resource("/api/v1/cluster/status").route(web::get().to(status)));
     cfg.service(web::resource("/api/v1/cluster/join").route(web::post().to(join)));
@@ -1099,6 +1175,60 @@ async fn internal_read(
         .body(object.into_inner()))
 }
 
+/// Serve this node's backfill manifest (every object it holds) to a recovering
+/// peer, which diffs it against its own copies.
+async fn backfill_manifest(
+    rt: web::Data<ClusterRuntime>,
+    _peer: ClusterPeer,
+) -> Result<HttpResponse, actix_web::Error> {
+    let manifest = rt
+        .distributed
+        .local_manifest()
+        .await
+        .map_err(|e| ErrorBadGateway(format!("manifest: {e}")))?;
+    Ok(HttpResponse::Ok().json(manifest))
+}
+
+/// Serve a single committed envelope to a recovering peer, with the
+/// [`BackfillObjectMeta`] needed to commit a byte-identical replica carried in
+/// the `X-Y2Q-Backfill` header.
+async fn backfill_object(
+    rt: web::Data<ClusterRuntime>,
+    _peer: ClusterPeer,
+    q: web::Query<VersionParams>,
+) -> Result<HttpResponse, actix_web::Error> {
+    let local = rt.distributed.local();
+    let md = local
+        .describe(&q.bucket, &q.key)
+        .await
+        .map_err(|e| match e {
+            y2q_core::Error::NotFound { .. } => actix_web::error::ErrorNotFound(e.to_string()),
+            other => ErrorBadGateway(other.to_string()),
+        })?;
+    let object = local
+        .get(&q.bucket, &q.key)
+        .await
+        .map_err(|e| ErrorBadGateway(e.to_string()))?;
+    let meta = BackfillObjectMeta {
+        version: md.version.unwrap_or(0),
+        plaintext_len: envelope::padme_len(md.size),
+        plaintext_size: md.size,
+        checksum_gxhash_b64: md.checksum_gxhash,
+        cipher_size: md.cipher_size.unwrap_or(0),
+        cipher_sha256_b64: md.cipher_sha256.unwrap_or_default(),
+        kem_alg: md.kem_alg.unwrap_or_default(),
+        aead_alg: md.aead_alg.unwrap_or_default(),
+        envelope_version: md.envelope_version.unwrap_or(2),
+        labels: md.labels.into_iter().collect(),
+    };
+    let meta_json =
+        serde_json::to_string(&meta).map_err(|e| ErrorBadGateway(format!("encode meta: {e}")))?;
+    Ok(HttpResponse::Ok()
+        .insert_header((BACKFILL_META_HEADER, meta_json))
+        .content_type("application/octet-stream")
+        .body(object.into_inner()))
+}
+
 /// Liveness + identity returned from `/internal/v1/health`. The `fingerprint`
 /// lets the leader attest a candidate's deployment key before admitting it.
 #[derive(Debug, Serialize, Deserialize)]
@@ -1111,9 +1241,15 @@ pub struct HealthResp {
     pub is_leader: bool,
     /// This node's deployment public-key fingerprint (SHA-256 hex).
     pub fingerprint: String,
+    /// Whether this node has completed a clean back-fill sweep while
+    /// `Recovering` (so the leader may promote it to `Active`). Always `false`
+    /// for nodes that are not recovering.
+    #[serde(default)]
+    pub caught_up: bool,
 }
 
-/// Peer liveness + identity (used for admission fingerprint attestation).
+/// Peer liveness + identity (used for admission fingerprint attestation, and by
+/// the leader's maintenance loop to drive recovery promotion).
 async fn health(rt: web::Data<ClusterRuntime>, _peer: ClusterPeer) -> HttpResponse {
     let epoch = rt.controller.control_state().await.epoch;
     let is_leader = rt.controller.is_leader().await;
@@ -1122,6 +1258,7 @@ async fn health(rt: web::Data<ClusterRuntime>, _peer: ClusterPeer) -> HttpRespon
         epoch,
         is_leader,
         fingerprint: rt.fingerprint.clone(),
+        caught_up: rt.backfill_caught_up.load(Ordering::Relaxed),
     })
 }
 
@@ -1250,6 +1387,7 @@ mod tests {
             epoch: 9,
             is_leader: true,
             fingerprint: "deadbeef".to_string(),
+            caught_up: false,
         };
         let bytes = serde_json::to_vec(&h).unwrap();
         let back: HealthResp = serde_json::from_slice(&bytes).unwrap();

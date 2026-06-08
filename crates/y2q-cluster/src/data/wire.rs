@@ -153,6 +153,83 @@ impl LabelMode {
     }
 }
 
+/// Request header carrying the JSON-encoded [`BackfillObjectMeta`] on a
+/// backfill object fetch response.
+pub const BACKFILL_META_HEADER: &str = "X-Y2Q-Backfill";
+
+/// One entry in a backfill manifest: an object a peer holds, with the version
+/// and ciphertext digest a recovering node diffs against its own copy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackfillEntry {
+    /// Bucket.
+    pub bucket: String,
+    /// Key.
+    pub key: String,
+    /// Committed CRAQ version (`None` for legacy/unversioned objects).
+    pub version: Option<u64>,
+    /// Standard-base64 SHA-256 of the on-disk envelope (`None` if not recorded).
+    pub cipher_sha256: Option<String>,
+}
+
+/// A backfill manifest page: the objects a peer holds locally.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackfillManifest {
+    /// Objects held by the answering node.
+    pub entries: Vec<BackfillEntry>,
+}
+
+/// Metadata accompanying a backfill object fetch: everything a recovering node
+/// needs to commit a byte-identical replica at the same version. Mirrors the
+/// commit-relevant subset of [`PrepareMeta`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackfillObjectMeta {
+    /// CRAQ version to stamp into the replica.
+    pub version: u64,
+    /// The v2 header `plaintext_len` (padded length) at envelope offset 20.
+    pub plaintext_len: u64,
+    /// True plaintext size.
+    pub plaintext_size: u64,
+    /// gxhash64 of the plaintext, standard base64.
+    pub checksum_gxhash_b64: String,
+    /// On-disk envelope size in bytes.
+    pub cipher_size: u64,
+    /// SHA-256 of the envelope, standard base64 (empty when unknown).
+    pub cipher_sha256_b64: String,
+    /// Symbolic KEM algorithm name.
+    pub kem_alg: String,
+    /// Symbolic AEAD algorithm name.
+    pub aead_alg: String,
+    /// Envelope format version.
+    pub envelope_version: u16,
+    /// User labels to persist with the object.
+    pub labels: Vec<(String, String)>,
+}
+
+impl BackfillObjectMeta {
+    /// Build the [`PrepareMeta`] used to stage and commit this object locally
+    /// (TAIL/solo path: no forwarding). `epoch` is the recovering node's current
+    /// committed epoch; the write is durable so it survives a crash mid-backfill.
+    pub fn to_prepare(&self, bucket: &str, key: &str, chain_id: u64, epoch: u64) -> PrepareMeta {
+        PrepareMeta {
+            bucket: bucket.to_owned(),
+            key: key.to_owned(),
+            chain_id,
+            epoch,
+            version: self.version,
+            plaintext_len: self.plaintext_len,
+            plaintext_size: self.plaintext_size,
+            checksum_gxhash_b64: self.checksum_gxhash_b64.clone(),
+            cipher_size: self.cipher_size,
+            cipher_sha256_b64: self.cipher_sha256_b64.clone(),
+            kem_alg: self.kem_alg.clone(),
+            aead_alg: self.aead_alg.clone(),
+            envelope_version: self.envelope_version,
+            sync_durable: true,
+            labels: self.labels.clone(),
+        }
+    }
+}
+
 /// Response to a version query (`GET /internal/v1/version`): the committed CRAQ
 /// version the answering node holds for `(bucket, key)`. `None` means the node
 /// has no committed copy, or holds a legacy/single-node object without a version.
