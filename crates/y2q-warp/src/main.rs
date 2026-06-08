@@ -20,7 +20,7 @@ use tracing_subscriber::{EnvFilter, fmt};
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
-use auth::{build_client, build_tls_options, resolve_token, spawn_refresh_task};
+use auth::{build_client, build_tls_options, login_node, resolve_token, spawn_refresh_task};
 use cli::{Cli, Commands, WorkloadArgs};
 use config::{MixedWeights, ObjSize, RunConfig, WorkloadConfig, parse_size};
 use display::DisplayMsg;
@@ -57,6 +57,7 @@ async fn run(cli: Cli) -> Result<(), WarpError> {
         insecure: cli.insecure,
         ca_cert: cli.ca_cert.clone(),
     };
+    let extra_nodes = cli.node.clone();
     match cli.command {
         Commands::Analyze(args) => {
             let skip_ns = parse_duration_ns(&args.skip)?;
@@ -100,23 +101,23 @@ async fn run(cli: Cli) -> Result<(), WarpError> {
 
         Commands::Put(args) => {
             let alias = require_alias(&cli.alias)?;
-            bench(&alias, &tls, OpKind::Put, args, None).await
+            bench(&alias, &tls, OpKind::Put, args, None, &extra_nodes).await
         }
         Commands::Get(args) => {
             let alias = require_alias(&cli.alias)?;
-            bench(&alias, &tls, OpKind::Get, args, None).await
+            bench(&alias, &tls, OpKind::Get, args, None, &extra_nodes).await
         }
         Commands::Delete(args) => {
             let alias = require_alias(&cli.alias)?;
-            bench(&alias, &tls, OpKind::Delete, args, None).await
+            bench(&alias, &tls, OpKind::Delete, args, None, &extra_nodes).await
         }
         Commands::Stat(args) => {
             let alias = require_alias(&cli.alias)?;
-            bench(&alias, &tls, OpKind::Stat, args, None).await
+            bench(&alias, &tls, OpKind::Stat, args, None, &extra_nodes).await
         }
         Commands::List(args) => {
             let alias = require_alias(&cli.alias)?;
-            bench(&alias, &tls, OpKind::List, args, None).await
+            bench(&alias, &tls, OpKind::List, args, None, &extra_nodes).await
         }
 
         Commands::Mixed(args) => {
@@ -127,7 +128,15 @@ async fn run(cli: Cli) -> Result<(), WarpError> {
                 delete: args.delete_weight,
                 stat: args.stat_weight,
             };
-            bench(&alias, &tls, OpKind::Put, args.common, Some(weights)).await
+            bench(
+                &alias,
+                &tls,
+                OpKind::Put,
+                args.common,
+                Some(weights),
+                &extra_nodes,
+            )
+            .await
         }
     }
 }
@@ -138,9 +147,22 @@ async fn bench(
     op: OpKind,
     args: WorkloadArgs,
     mixed_weights: Option<MixedWeights>,
+    extra_nodes: &[String],
 ) -> Result<(), WarpError> {
-    let (profile, client, expires_at, initial_token) =
-        init_client(alias, tls, args.password.as_deref()).await?;
+    let nodes = init_nodes(alias, tls, args.password.as_deref(), extra_nodes).await?;
+    // Node 0 (the alias) drives the single-client phases: seeding and teardown.
+    let client = nodes[0].client.clone();
+    if nodes.len() > 1 {
+        eprintln!(
+            "fanning across {} nodes: {}",
+            nodes.len(),
+            nodes
+                .iter()
+                .map(|n| n.base_url.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
 
     let duration = parse_duration(&args.duration)?;
     let obj_size = resolve_obj_size(
@@ -198,16 +220,6 @@ async fn bench(
         return Ok(());
     }
 
-    // Token watch channel — workers read this to get the current bearer token for raw HTTP GETs.
-    let (tok_tx, tok_rx) = watch::channel::<Zeroizing<String>>(initial_token);
-    spawn_refresh_task(
-        client.clone(),
-        alias.to_owned(),
-        profile.username.clone(),
-        expires_at,
-        tok_tx,
-    );
-
     let workload = WorkloadConfig {
         op,
         objects: args.objects,
@@ -216,7 +228,7 @@ async fn bench(
     };
 
     let run_config = Arc::new(RunConfig {
-        base_url: profile.url.clone(),
+        base_url: nodes[0].base_url.clone(),
         bucket: args.bucket.clone(),
         concurrent: args.concurrent,
         duration,
@@ -233,21 +245,25 @@ async fn bench(
     let recorder = Recorder::new(rec_rx, disp_tx, &output)?;
     let recorder_handle = tokio::spawn(recorder.run());
 
-    let raw_http = client.inner_client().clone();
     let put_seq = Arc::new(AtomicU64::new(args.objects as u64));
 
+    // Round-robin workers across the nodes: worker i is pinned to node i % N,
+    // using that node's authed client, raw HTTP client, base URL, and token.
     let mut worker_handles = Vec::new();
-    for _ in 0..args.concurrent {
+    for i in 0..args.concurrent {
+        let node = &nodes[i % nodes.len()];
         let cfg = run_config.clone();
-        let wc = client.clone();
-        let rh = raw_http.clone();
-        let tr = tok_rx.clone();
+        let wc = node.client.clone();
+        let rh = node.raw_http.clone();
+        let tr = node.token_rx.clone();
         let tx = rec_tx.clone();
         let sd = shutdown_rx.clone();
         let ps = put_seq.clone();
         let pl = pool.clone();
+        let node_url = node.base_url.clone();
+        let node_label = node.label.clone();
         worker_handles.push(tokio::spawn(worker::run_worker(
-            cfg, wc, rh, tr, tx, sd, ps, pl,
+            cfg, wc, rh, tr, tx, sd, ps, pl, node_url, node_label,
         )));
     }
     drop(rec_tx);
@@ -314,6 +330,106 @@ async fn init_client(
 
     let client = build_client(&profile.url, &token, tls_opts)?;
     Ok((profile, client, expires_at, token))
+}
+
+/// One authed runtime per cluster node a multi-node run fans across.
+struct NodeRuntime {
+    /// Short label tagged onto every record (the round-robin endpoint index).
+    label: String,
+    /// This node's base URL (used for the raw GET path).
+    base_url: String,
+    /// Authed high-level client (PUT/DELETE/STAT/LIST).
+    client: y2q_client::Y2qClient,
+    /// Raw reqwest client for the TTFB-measuring GET path.
+    raw_http: reqwest::Client,
+    /// Current bearer token (refreshed in the background).
+    token_rx: watch::Receiver<Zeroizing<String>>,
+}
+
+/// Initialise one [`NodeRuntime`] per cluster node a multi-node run targets.
+///
+/// Node 0 is the `alias` (token resolved from the cache, persisted on refresh).
+/// Each `--node` URL is an extra contact node reached with the alias's
+/// credentials and TLS; because sessions are node-local, each logs in separately
+/// for its own in-memory token. Every node gets a background refresh task.
+async fn init_nodes(
+    alias: &str,
+    tls: &ClientArgs,
+    password: Option<&str>,
+    extra_urls: &[String],
+) -> Result<Vec<NodeRuntime>, WarpError> {
+    let cfg_path = match &tls.config_path {
+        Some(p) => p.clone(),
+        None => y2q_config::default_config_path()?,
+    };
+    let cfg = y2q_config::CliConfig::load(&cfg_path)?;
+    let profile = cfg.get_alias(alias)?.clone();
+    let tls_opts = build_tls_options(&profile, tls.insecure, tls.ca_cert.as_deref())?;
+    let effective_pw = password.or(profile.password.as_deref());
+
+    let mut nodes = Vec::with_capacity(1 + extra_urls.len());
+
+    // Node 0: the alias. Cached token, persisted back on refresh.
+    {
+        let base_client = y2q_client::Y2qClient::new(y2q_client::ClientConfig {
+            base_url: profile.url.clone(),
+            token: None,
+            tls: tls_opts.clone(),
+        })?;
+        let (token, expires_at) =
+            resolve_token(&base_client, alias, &profile.username, effective_pw).await?;
+        let client = build_client(&profile.url, &token, tls_opts.clone())?;
+        let raw_http = client.inner_client().clone();
+        let (tx, rx) = watch::channel(token);
+        spawn_refresh_task(
+            client.clone(),
+            Some(alias.to_owned()),
+            profile.username.clone(),
+            expires_at,
+            tx,
+        );
+        nodes.push(NodeRuntime {
+            label: "0".to_owned(),
+            base_url: profile.url.clone(),
+            client,
+            raw_http,
+            token_rx: rx,
+        });
+    }
+
+    // Extra nodes: same credentials, per-run in-memory token (not persisted).
+    for (i, url) in extra_urls.iter().enumerate() {
+        let pw = effective_pw.ok_or_else(|| {
+            WarpError::Other(
+                "multi-node runs need a password (--password or Y2QWARP_PASSWORD) to log into each extra node".to_owned(),
+            )
+        })?;
+        let login_client = y2q_client::Y2qClient::new(y2q_client::ClientConfig {
+            base_url: url.clone(),
+            token: None,
+            tls: tls_opts.clone(),
+        })?;
+        let (token, expires_at) = login_node(&login_client, &profile.username, pw).await?;
+        let client = build_client(url, &token, tls_opts.clone())?;
+        let raw_http = client.inner_client().clone();
+        let (tx, rx) = watch::channel(token);
+        spawn_refresh_task(
+            client.clone(),
+            None,
+            profile.username.clone(),
+            expires_at,
+            tx,
+        );
+        nodes.push(NodeRuntime {
+            label: (i + 1).to_string(),
+            base_url: url.clone(),
+            client,
+            raw_http,
+            token_rx: rx,
+        });
+    }
+
+    Ok(nodes)
 }
 
 fn require_alias(alias: &Option<String>) -> Result<String, WarpError> {

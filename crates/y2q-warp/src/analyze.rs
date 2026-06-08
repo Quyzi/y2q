@@ -1,5 +1,7 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
+
+use hdrhistogram::Histogram;
 
 use crate::error::WarpError;
 use crate::metrics::{Aggregate, OpHistograms, OpRecord, Segment, ns_to_ms_str};
@@ -113,6 +115,59 @@ pub fn run_analyze(
                 ns_to_ms_str(p50),
                 ns_to_ms_str(p90),
                 ns_to_ms_str(p99),
+            );
+        }
+    }
+
+    // Per-node breakdown (multi-node runs only — single-node records carry an
+    // empty node label and are skipped).
+    let node_labels: BTreeSet<&str> = records
+        .iter()
+        .map(|r| r.node.as_str())
+        .filter(|n| !n.is_empty())
+        .collect();
+    if node_labels.len() > 1 {
+        println!();
+        println!("Per-node latency (contact node):");
+        println!(
+            "{:<6} {:>10} {:>8} {:>14} {:>8} {:>8} {:>8}",
+            "Node", "Ops", "Errors", "Throughput", "P50", "P90", "P99"
+        );
+        println!("{}", "─".repeat(72));
+        for node in &node_labels {
+            let mut hist = Histogram::<u64>::new(3).expect("valid histogram");
+            let (mut n_ops, mut n_errors, mut bytes) = (0u64, 0u64, 0u64);
+            let (mut first, mut last) = (u64::MAX, 0u64);
+            for rec in records.iter().filter(|r| r.node == *node) {
+                n_ops += 1;
+                first = first.min(rec.start_ns);
+                last = last.max(rec.end_ns);
+                if rec.is_error() {
+                    n_errors += 1;
+                    continue;
+                }
+                bytes += rec.bytes;
+                let _ = hist.record(rec.latency_ns().max(1));
+            }
+            let dur_s = if last > first {
+                (last - first) as f64 / 1e9
+            } else {
+                0.0
+            };
+            let tput = if dur_s > 0.0 {
+                (bytes as f64 / (1024.0 * 1024.0)) / dur_s
+            } else {
+                0.0
+            };
+            println!(
+                "{:<6} {:>10} {:>8} {:>12.1} MiB/s {:>8} {:>8} {:>8}",
+                node,
+                n_ops,
+                n_errors,
+                tput,
+                ns_to_ms_str(hist.value_at_quantile(0.50)),
+                ns_to_ms_str(hist.value_at_quantile(0.90)),
+                ns_to_ms_str(hist.value_at_quantile(0.99)),
             );
         }
     }

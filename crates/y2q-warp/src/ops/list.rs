@@ -35,5 +35,6 @@ pub async fn list_op(client: &Y2qClient, bucket: &str, run_id: &str) -> OpRecord
         bytes,
         key: format!("{bucket}/"),
         error: result.err().map(|e| e.to_string()),
+        node: String::new(),
     }
 }

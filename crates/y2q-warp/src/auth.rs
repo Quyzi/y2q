@@ -57,11 +57,26 @@ pub async fn resolve_token(
     Ok((Zeroizing::new(resp.token), expires_at))
 }
 
+/// Log into a single node directly (bypassing the token-store cache), returning
+/// the node-local bearer token and its expiry. Used for the extra cluster nodes
+/// a multi-node run fans across; their tokens are per-run and in-memory only,
+/// because sessions are node-local and the alias's cached token is node-0's.
+pub async fn login_node(
+    client: &Y2qClient,
+    username: &str,
+    password: &str,
+) -> Result<(Zeroizing<String>, u64), WarpError> {
+    let resp = client.login(username, password, Some(86400)).await?;
+    Ok((Zeroizing::new(resp.token.clone()), resp.expires_at))
+}
+
 /// Spawn a background task that refreshes the token 5 minutes before expiry.
-/// Sends updated tokens on `tx` and writes them back to tokens.toml.
+/// Sends updated tokens on `tx`. When `alias` is `Some`, the refreshed token is
+/// also written back to tokens.toml; extra cluster nodes pass `None` so their
+/// per-run, node-local tokens stay in memory and never clobber the alias entry.
 pub fn spawn_refresh_task(
     client: Y2qClient,
-    alias: String,
+    alias: Option<String>,
     username: String,
     expires_at: u64,
     tx: watch::Sender<Zeroizing<String>>,
@@ -81,11 +96,12 @@ pub fn spawn_refresh_task(
                     let tok = Zeroizing::new(resp.token.clone());
                     let _ = tx.send(tok);
 
-                    if let Ok(tokens_path) = default_tokens_path()
+                    if let Some(alias) = alias.as_deref()
+                        && let Ok(tokens_path) = default_tokens_path()
                         && let Ok(mut store) = TokenStore::load(&tokens_path)
                     {
                         store.set(
-                            &alias,
+                            alias,
                             TokenEntry {
                                 token: resp.token,
                                 expires_at: resp.expires_at,

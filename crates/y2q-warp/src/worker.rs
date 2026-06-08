@@ -14,6 +14,9 @@ use crate::generator::ObjectPool;
 use crate::metrics::OpRecord;
 use crate::ops::{OpKind, delete, get, list, put, stat};
 
+/// One worker is pinned to one cluster node (round-robin assigned by the caller).
+/// `node_url` is that node's base URL (used for the raw GET path) and `node_label`
+/// tags each record so per-node latency can be analyzed alongside the aggregate.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_worker(
     config: Arc<RunConfig>,
@@ -24,6 +27,8 @@ pub async fn run_worker(
     shutdown: watch::Receiver<bool>,
     put_seq: Arc<AtomicU64>,
     pool: Option<Arc<ObjectPool>>,
+    node_url: String,
+    node_label: String,
 ) {
     let mut client = client;
     let shutdown = shutdown;
@@ -41,10 +46,11 @@ pub async fn run_worker(
             client.set_token(tok.as_str());
         }
 
-        let Some(record) = execute_op(
+        let Some(mut record) = execute_op(
             &config,
             &client,
             &raw_http,
+            &node_url,
             &token_rx,
             &put_seq,
             pool.as_deref(),
@@ -57,16 +63,19 @@ pub async fn run_worker(
             continue;
         };
 
+        record.node = node_label.clone();
         if tx.send(record).await.is_err() {
             break;
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_op(
     config: &RunConfig,
     client: &y2q_client::Y2qClient,
     raw_http: &reqwest::Client,
+    node_url: &str,
     token_rx: &watch::Receiver<Zeroizing<String>>,
     put_seq: &AtomicU64,
     pool: Option<&ObjectPool>,
@@ -97,15 +106,7 @@ async fn execute_op(
             let p = pool?;
             let key = p.pick_for_get().await?;
             let token = token_rx.borrow().clone();
-            let rec = get::get_op(
-                raw_http,
-                &config.base_url,
-                token.as_str(),
-                bucket,
-                &key,
-                run_id,
-            )
-            .await;
+            let rec = get::get_op(raw_http, node_url, token.as_str(), bucket, &key, run_id).await;
             p.release_read(&key).await;
             rec
         }
