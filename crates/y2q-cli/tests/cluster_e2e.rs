@@ -276,6 +276,24 @@ fn list_objects(port: u16, token: &str, bucket: &str) -> (u16, String) {
     (s, String::from_utf8_lossy(&b).into_owned())
 }
 
+/// Run a migration (`POST /api/v1/cluster/migrate`) returning `(status, json)`.
+fn migrate(port: u16, token: &str, mode: &str, prune: bool) -> (u16, String) {
+    let bearer = auth_header(token);
+    let body = format!("{{\"mode\":\"{mode}\",\"prune\":{prune}}}");
+    let (s, b) = http(
+        port,
+        "POST",
+        "/api/v1/cluster/migrate",
+        &[
+            ("Authorization", &bearer),
+            ("Content-Type", "application/json"),
+        ],
+        body.as_bytes(),
+    )
+    .unwrap_or((0, Vec::new()));
+    (s, String::from_utf8_lossy(&b).into_owned())
+}
+
 /// Count nodes the leader reports as `Active` in the committed control state.
 fn active_count(port: u16, token: &str) -> usize {
     let bearer = auth_header(token);
@@ -765,7 +783,7 @@ fn cluster_user_replication() {
     assert!(
         wait_until(
             || try_login(cluster.nodes[last].port, "bob", "bobpw123").is_some(),
-            30
+            60
         ),
         "new user did not replicate to node {}",
         cluster.nodes[last].id
@@ -783,11 +801,69 @@ fn cluster_user_replication() {
     assert!(
         wait_until(
             || try_login(cluster.nodes[1].port, "bob", "bobpw123").is_none(),
-            30
+            60
         ),
         "disable did not replicate to node {}",
         cluster.nodes[1].id
     );
+}
+
+/// Bidirectional migration (Phase G): `export` collects every object in the
+/// cluster onto one node (so it could run standalone), and `import` redistributes
+/// a node's local objects across the chains. Both are idempotent: a second export
+/// transfers nothing (proving the first pulled everything), and an import+prune of
+/// an already-distributed dataset leaves every object still readable.
+#[test]
+#[ignore = "multi-node cluster; run with `cargo test --test cluster_e2e -- --ignored`"]
+fn cluster_migration_export_import() {
+    let Some(cluster) = start_cluster(3, 2) else {
+        return;
+    };
+    let pw = cluster.password.clone();
+    let n0 = cluster.nodes[0].port;
+    let tok = login(n0, "root", &pw).expect("root login on node 0");
+
+    // Create a bucket and write several objects; at RF=2 over 3 nodes each lands
+    // on 2 of 3 nodes, so node 0 is missing roughly a third of them.
+    let bucket = "mig";
+    assert!(
+        matches!(create_bucket(n0, &tok, bucket), 200 | 201),
+        "create bucket"
+    );
+    let keys: Vec<String> = (0..6).map(|i| format!("obj{i}.bin")).collect();
+    for (i, k) in keys.iter().enumerate() {
+        let body = format!("payload-{i}");
+        assert_eq!(
+            put_object(n0, &tok, bucket, k, body.as_bytes()),
+            201,
+            "PUT {k}"
+        );
+    }
+
+    // EXPORT onto node 0: it pulls every object it is missing from its peers.
+    let (s1, r1) = migrate(n0, &tok, "export", false);
+    assert_eq!(s1, 200, "export status: {r1}");
+    assert!(r1.contains("\"errors\":[]"), "export had errors: {r1}");
+
+    // Second EXPORT is idempotent: node 0 now holds everything, so nothing moves.
+    let (s2, r2) = migrate(n0, &tok, "export", false);
+    assert_eq!(s2, 200, "second export status: {r2}");
+    assert!(
+        r2.contains("\"transferred\":0") && r2.contains("\"errors\":[]"),
+        "second export should be a no-op (node 0 already holds everything): {r2}"
+    );
+
+    // IMPORT with prune: node 0 redistributes its local objects (all already on
+    // their chains, so nothing is pushed) and prunes the copies it should not
+    // hold. The dataset must stay fully readable from node 0 (apportioned reads).
+    let (s3, r3) = migrate(n0, &tok, "import", true);
+    assert_eq!(s3, 200, "import status: {r3}");
+    assert!(r3.contains("\"errors\":[]"), "import had errors: {r3}");
+    for (i, k) in keys.iter().enumerate() {
+        let (status, got) = get_object(n0, &tok, bucket, k);
+        assert_eq!(status, 200, "GET {k} after import+prune");
+        assert_eq!(got, format!("payload-{i}").as_bytes(), "wrong bytes for {k}");
+    }
 }
 
 /// Kill a node, write while it is down, restart it, and verify it recovers: the

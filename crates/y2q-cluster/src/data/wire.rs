@@ -230,6 +230,26 @@ impl BackfillObjectMeta {
     }
 }
 
+/// Outcome of a one-shot migration pass (import/distribute or export/collect).
+/// `scanned` counts objects examined (for export this may double-count an object
+/// held on several peers); `transferred` is objects actually moved this pass;
+/// `skipped` were already present at the destination; `pruned` were removed from
+/// the seed after a successful distribute (import `--prune` only).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MigrateReport {
+    /// Objects examined.
+    pub scanned: u64,
+    /// Objects actually transferred this pass.
+    pub transferred: u64,
+    /// Objects already present at the destination (idempotent skip).
+    pub skipped: u64,
+    /// Objects pruned from the seed after distribution (`--prune`).
+    pub pruned: u64,
+    /// Per-object failures (object address + reason); a non-empty list means the
+    /// pass was partial and should be re-run (the operation is idempotent).
+    pub errors: Vec<String>,
+}
+
 /// Response to a version query (`GET /internal/v1/version`): the committed CRAQ
 /// version the answering node holds for `(bucket, key)`. `None` means the node
 /// has no committed copy, or holds a legacy/single-node object without a version.

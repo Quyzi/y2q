@@ -1352,6 +1352,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
     cfg.service(web::resource("/internal/v1/control").route(web::post().to(control)));
     cfg.service(web::resource("/api/v1/cluster/status").route(web::get().to(status)));
     cfg.service(web::resource("/api/v1/cluster/join").route(web::post().to(join)));
+    cfg.service(web::resource("/api/v1/cluster/migrate").route(web::post().to(migrate)));
 }
 
 async fn raft_append(
@@ -1743,6 +1744,46 @@ async fn status(rt: web::Data<ClusterRuntime>, _auth: AdminAuthenticated) -> Htt
         "nodes": state.nodes,
         "chains": state.chains.len(),
     }))
+}
+
+/// Direction of a one-shot migration ([`migrate`]).
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MigrateMode {
+    /// Single-node → cluster: distribute this seed's local objects across the
+    /// cluster's chains.
+    Import,
+    /// Cluster → single-node: collect every object in the cluster onto this node
+    /// so it can run standalone.
+    Export,
+}
+
+/// Request body for [`migrate`].
+#[derive(Debug, Deserialize)]
+pub struct MigrateRequest {
+    /// Migration direction.
+    pub mode: MigrateMode,
+    /// On `import`, delete objects from the seed whose chain excludes it after a
+    /// successful distribution. Ignored for `export`.
+    #[serde(default)]
+    pub prune: bool,
+}
+
+/// Run a one-shot migration on this node (admin). `import` distributes this
+/// node's local objects across the cluster chains; `export` collects every
+/// object in the cluster onto this node. Both are idempotent and resumable.
+async fn migrate(
+    rt: web::Data<ClusterRuntime>,
+    _auth: AdminAuthenticated,
+    body: web::Json<MigrateRequest>,
+) -> Result<HttpResponse, actix_web::Error> {
+    let req = body.into_inner();
+    let report = match req.mode {
+        MigrateMode::Import => rt.distributed.migrate_distribute(req.prune).await,
+        MigrateMode::Export => rt.distributed.migrate_collect().await,
+    }
+    .map_err(|e| ErrorBadGateway(format!("migrate: {e}")))?;
+    Ok(HttpResponse::Ok().json(report))
 }
 
 /// Request body for [`join`].
