@@ -380,8 +380,9 @@ async fn main() -> std::io::Result<()> {
             cfg.cluster.health_probe_interval_ms,
             cfg.cluster.health_fail_threshold,
         );
-        // Mirror the replicated bucket registry into local sidecars on every apply.
-        cluster::spawn_bucket_projector(rt.clone());
+        // Mirror the replicated bucket + user registries into local stores on
+        // every apply (a joined node inherits all bucket configs and users).
+        cluster::spawn_registry_projector(rt.clone(), auth_state.clone());
         Some(rt)
     } else {
         None

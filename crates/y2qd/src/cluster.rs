@@ -36,13 +36,13 @@ use y2q_cluster::{
     MutateMeta, MutateOp, MutateResp, NodeStatus, PREPARE_META_HEADER, PrepareMeta,
     ReadConsistency, ReadPlan, Role, VersionResp, chain_id, resolve_node_id,
 };
-use y2q_core::crypto::{envelope, kdf};
+use y2q_core::crypto::{Role as UserRole, UserRecord, envelope, kdf};
 use y2q_core::{
     AnyStorage, AnyStreamingPutGuard, BucketConfig, LabelSet, ListOptions, Listing, MAX_LIST_LIMIT,
     PutOptions, Storage, SyncLevel,
 };
 
-use crate::auth::{AdminAuthenticated, AuthState};
+use crate::auth::{AdminAuthenticated, AuthError, AuthState};
 use crate::cipher;
 use crate::config::{ClusterAuth, ClusterConsistency, Config};
 use crate::error::AppError;
@@ -104,34 +104,35 @@ impl ClusterRuntime {
     }
 
     /// Propose a control command through raft, forwarding to the current leader
-    /// when this node is not it. Bucket registry/config/ACL mutations use this so
+    /// when this node is not it. Bucket and user registry mutations use this so
     /// they can originate on any contact node (only the leader may `client_write`).
-    async fn propose_control(&self, cmd: ControlCmd) -> Result<(), AppError> {
+    /// Returns a message on failure; callers wrap it in their handler's error type.
+    async fn propose_control(&self, cmd: ControlCmd) -> Result<(), String> {
         if self.controller.is_leader().await {
             return self
                 .controller
                 .propose(cmd)
                 .await
                 .map(|_| ())
-                .map_err(|e| control_err(format!("propose: {e}")));
+                .map_err(|e| format!("propose: {e}"));
         }
         let leader = self
             .controller
             .raft()
             .current_leader()
             .await
-            .ok_or_else(|| control_err("no raft leader available"))?;
+            .ok_or_else(|| "no raft leader available".to_owned())?;
         let state = self.controller.control_state().await;
         let url = state
             .nodes
             .get(&leader)
             .map(|m| m.addr.clone())
-            .ok_or_else(|| control_err(format!("leader {leader} has no known address")))?;
+            .ok_or_else(|| format!("leader {leader} has no known address"))?;
         let _: ControlAck = self
             .client
             .post_json(&format!("{url}/internal/v1/control"), &cmd)
             .await
-            .map_err(|e| control_err(format!("forward to leader: {e}")))?;
+            .map_err(|e| format!("forward to leader: {e}"))?;
         Ok(())
     }
 }
@@ -178,7 +179,8 @@ pub async fn cluster_register_bucket(rt: &ClusterRuntime, bucket: &str) -> Resul
     rt.propose_control(ControlCmd::RegisterBucket {
         bucket: bucket.to_owned(),
     })
-    .await?;
+    .await
+    .map_err(control_err)?;
     let _ = rt.distributed.local().create_bucket(bucket).await;
     Ok(!existed)
 }
@@ -194,7 +196,8 @@ pub async fn cluster_claim_owner(
         bucket: bucket.to_owned(),
         owner: owner.to_owned(),
     })
-    .await?;
+    .await
+    .map_err(control_err)?;
     let state = rt.controller.control_state().await;
     if let Some(cfg) = state.buckets.get(bucket) {
         project_bucket(rt.distributed.local(), bucket, cfg).await;
@@ -214,28 +217,136 @@ pub async fn cluster_set_bucket_config(
         bucket: bucket.to_owned(),
         config: cfg.clone(),
     })
-    .await?;
+    .await
+    .map_err(control_err)?;
     project_bucket(rt.distributed.local(), bucket, cfg).await;
     Ok(())
 }
 
-/// Spawn the bucket projector: mirror the replicated bucket registry into this
-/// node's local sidecars on every raft apply. Diffs against the last-projected
-/// map so an unrelated control change (e.g. a node-status flip) does not rewrite
-/// every sidecar. A freshly-joined node inherits all bucket configs this way.
-pub fn spawn_bucket_projector(rt: web::Data<ClusterRuntime>) {
+// ---------------------------------------------------------------------------
+// Replicated user registry (Phase G): durable user records flow through raft and
+// project into each node's local user store, preserving node-local last_login.
+// ---------------------------------------------------------------------------
+
+/// Mirror one replicated user record into the local user store. Preserves the
+/// node-local `last_login` (an observation, not replicated state) and, when the
+/// user's role changed, revokes their local sessions so a demote/disable takes
+/// effect on every node — not only where the admin action ran.
+fn project_user(state: &AuthState, record: &UserRecord) {
+    let prev = state.user_store.get(&record.username).ok().flatten();
+    let mut rec = record.clone();
+    if let Some(p) = &prev {
+        rec.last_login = p.last_login;
+    }
+    if let Err(e) = state.user_store.upsert(&rec) {
+        tracing::warn!(user = %rec.username, error = %e, "user projector: upsert failed");
+        return;
+    }
+    if prev.as_ref().map(|p| p.role) != Some(rec.role) {
+        state.sessions.revoke_user(&rec.username);
+    }
+}
+
+/// Remove a user locally and drop their sessions (mirrors a replicated delete).
+fn project_user_delete(state: &AuthState, username: &str) {
+    if let Err(e) = state.user_store.delete(username) {
+        tracing::warn!(user = %username, error = %e, "user projector: delete failed");
+    }
+    state.sessions.revoke_user(username);
+}
+
+/// Insert or replace a user record cluster-wide through raft (create / password
+/// re-wrap) and project it locally.
+pub async fn cluster_upsert_user(
+    rt: &ClusterRuntime,
+    state: &AuthState,
+    record: &UserRecord,
+) -> Result<(), AuthError> {
+    rt.propose_control(ControlCmd::UpsertUser {
+        record: record.clone(),
+    })
+    .await
+    .map_err(AuthError::Backend)?;
+    project_user(state, record);
+    Ok(())
+}
+
+/// Delete a user cluster-wide through raft and project the removal locally.
+pub async fn cluster_delete_user(
+    rt: &ClusterRuntime,
+    state: &AuthState,
+    username: &str,
+) -> Result<(), AuthError> {
+    rt.propose_control(ControlCmd::DeleteUser {
+        username: username.to_owned(),
+    })
+    .await
+    .map_err(AuthError::Backend)?;
+    project_user_delete(state, username);
+    Ok(())
+}
+
+/// Change a user's role cluster-wide through raft and project it locally
+/// (updating the role and revoking the user's sessions).
+pub async fn cluster_set_user_role(
+    rt: &ClusterRuntime,
+    state: &AuthState,
+    username: &str,
+    role: UserRole,
+) -> Result<(), AuthError> {
+    rt.propose_control(ControlCmd::SetUserRole {
+        username: username.to_owned(),
+        role,
+    })
+    .await
+    .map_err(AuthError::Backend)?;
+    if let Some(mut rec) = state.user_store.get(username).ok().flatten() {
+        rec.role = role;
+        let _ = state.user_store.upsert(&rec);
+    }
+    state.sessions.revoke_user(username);
+    Ok(())
+}
+
+/// Spawn the registry projector: mirror the replicated bucket and user registries
+/// into this node's local stores on every raft apply. Diffs against the
+/// last-projected maps so an unrelated control change (e.g. a node-status flip)
+/// does not rewrite every sidecar/record. A freshly-joined node inherits all
+/// bucket configs and user records this way.
+pub fn spawn_registry_projector(rt: web::Data<ClusterRuntime>, auth_state: web::Data<AuthState>) {
     let mut rx = rt.controller.subscribe();
     let storage = Arc::clone(rt.distributed.local());
     tokio::spawn(async move {
-        let mut last: BTreeMap<String, BucketConfig> = BTreeMap::new();
+        let mut last_buckets: BTreeMap<String, BucketConfig> = BTreeMap::new();
+        let mut last_users: BTreeMap<String, UserRecord> = BTreeMap::new();
         loop {
-            let buckets = rx.borrow_and_update().buckets.clone();
+            // Snapshot the two registries, dropping the watch borrow before any
+            // await/blocking work below.
+            let (buckets, users) = {
+                let state = rx.borrow_and_update();
+                (state.buckets.clone(), state.users.clone())
+            };
+
             for (bucket, cfg) in buckets.iter() {
-                if last.get(bucket) != Some(cfg) {
+                if last_buckets.get(bucket) != Some(cfg) {
                     project_bucket(&storage, bucket, cfg).await;
                 }
             }
-            last = buckets;
+            for (name, rec) in users.iter() {
+                if last_users.get(name) != Some(rec) {
+                    project_user(&auth_state, rec);
+                }
+            }
+            for name in last_users.keys() {
+                if !users.contains_key(name) {
+                    project_user_delete(&auth_state, name);
+                }
+            }
+            // Bucket removals are intentionally not projected (cluster-wide bucket
+            // delete is a separate concern; see project_bucket).
+
+            last_buckets = buckets;
+            last_users = users;
             if rx.changed().await.is_err() {
                 break; // controller dropped; daemon shutting down
             }

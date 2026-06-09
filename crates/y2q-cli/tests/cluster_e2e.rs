@@ -125,6 +125,58 @@ fn login(port: u16, user: &str, pw: &str) -> Option<String> {
     }
 }
 
+/// Single-shot login: return a token on success, `None` on any failure (no
+/// retry). Used for negative assertions where a retrying login would hang.
+fn try_login(port: u16, user: &str, pw: &str) -> Option<String> {
+    let body = format!("{{\"username\":\"{user}\",\"password\":\"{pw}\"}}");
+    if let Ok((200, resp)) = http(
+        port,
+        "POST",
+        "/api/v1/auth/login",
+        &[("Content-Type", "application/json")],
+        body.as_bytes(),
+    ) {
+        return json_str_field(&String::from_utf8_lossy(&resp), "token");
+    }
+    None
+}
+
+/// Create a user (`PUT /api/v1/users/add`).
+fn add_user(port: u16, token: &str, username: &str, pw: &str, role: &str) -> u16 {
+    let bearer = auth_header(token);
+    let body = format!("{{\"username\":\"{username}\",\"password\":\"{pw}\",\"role\":\"{role}\"}}");
+    http(
+        port,
+        "PUT",
+        "/api/v1/users/add",
+        &[
+            ("Authorization", &bearer),
+            ("Content-Type", "application/json"),
+        ],
+        body.as_bytes(),
+    )
+    .map(|(s, _)| s)
+    .unwrap_or(0)
+}
+
+/// Change a user's role (`PUT /api/v1/users/{user}/role`).
+fn set_user_role(port: u16, token: &str, username: &str, role: &str) -> u16 {
+    let bearer = auth_header(token);
+    let body = format!("{{\"role\":\"{role}\"}}");
+    http(
+        port,
+        "PUT",
+        &format!("/api/v1/users/{username}/role"),
+        &[
+            ("Authorization", &bearer),
+            ("Content-Type", "application/json"),
+        ],
+        body.as_bytes(),
+    )
+    .map(|(s, _)| s)
+    .unwrap_or(0)
+}
+
 /// Extract a string field value from flat JSON: `"field":"value"`.
 fn json_str_field(json: &str, field: &str) -> Option<String> {
     let needle = format!("\"{field}\":\"");
@@ -688,6 +740,54 @@ fn cluster_replication_and_apportioned_reads() {
             node.id
         );
     }
+}
+
+/// User records replicate through raft (Phase G): a user created on the leader
+/// can log in on a node that never saw the create, and disabling the user on a
+/// follower (forwarded to the leader) stops logins cluster-wide once it projects.
+#[test]
+#[ignore = "multi-node cluster; run with `cargo test --test cluster_e2e -- --ignored`"]
+fn cluster_user_replication() {
+    let Some(cluster) = start_cluster(3, 2) else {
+        return;
+    };
+    let pw = cluster.password.clone();
+    let root0 = login(cluster.nodes[0].port, "root", &pw).expect("root login on node 0");
+    let last = cluster.nodes.len() - 1;
+
+    // Create a user on the leader; the record replicates to every node.
+    assert_eq!(
+        add_user(cluster.nodes[0].port, &root0, "bob", "bobpw123", "user"),
+        201,
+        "add user bob via leader"
+    );
+    // bob can log in on a node that never created him -> user record replicated.
+    assert!(
+        wait_until(
+            || try_login(cluster.nodes[last].port, "bob", "bobpw123").is_some(),
+            30
+        ),
+        "new user did not replicate to node {}",
+        cluster.nodes[last].id
+    );
+
+    // Disable bob via a follower (control command forwarded to the leader). Once
+    // the change projects, logins are refused cluster-wide.
+    let root_last = login(cluster.nodes[last].port, "root", &pw).expect("root login on follower");
+    assert_eq!(
+        set_user_role(cluster.nodes[last].port, &root_last, "bob", "disabled"),
+        204,
+        "disable bob via follower node {}",
+        cluster.nodes[last].id
+    );
+    assert!(
+        wait_until(
+            || try_login(cluster.nodes[1].port, "bob", "bobpw123").is_none(),
+            30
+        ),
+        "disable did not replicate to node {}",
+        cluster.nodes[1].id
+    );
 }
 
 /// Kill a node, write while it is down, restart it, and verify it recovers: the
