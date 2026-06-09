@@ -380,6 +380,8 @@ async fn main() -> std::io::Result<()> {
             cfg.cluster.health_probe_interval_ms,
             cfg.cluster.health_fail_threshold,
         );
+        // Mirror the replicated bucket registry into local sidecars on every apply.
+        cluster::spawn_bucket_projector(rt.clone());
         Some(rt)
     } else {
         None

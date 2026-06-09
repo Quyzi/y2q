@@ -289,8 +289,17 @@ DELETE and label edits route down the same chain via `/internal/v1/mutate`
 [`MutateOp`](../crates/y2q-cluster/src/data/wire.rs)). A label edit is resolved
 against the HEAD's committed copy into a concrete `SetLabels` set *before* relaying,
 so every member applies an identical set regardless of which node was contacted and
-regardless of `Set`/`Remove`/`Replace` mode. Bucket create/config remains a
-broadcast-to-all stopgap until Phase G replicates it through Raft.
+regardless of `Set`/`Remove`/`Replace` mode.
+
+Bucket registry, config (quota/CORS/owner), and ACL are **cluster-global**,
+replicated through Raft as `ControlState.buckets` (Phase G). A bucket
+create/config/ACL mutation proposes a `ControlCmd`
+(`RegisterBucket`/`SetBucketConfig`/`ClaimBucketOwner`/`UnregisterBucket`),
+forwarded to the leader when the contact node is not it (`/internal/v1/control`);
+a per-node projector subscribed to the control-state watch mirrors the committed
+registry into each node's local bucket sidecars on every apply, so the read path
+(`authz`) keeps reading the local sidecar unchanged and a freshly-joined node
+inherits every bucket config.
 
 ### LIST / SEARCH scatter-gather
 
