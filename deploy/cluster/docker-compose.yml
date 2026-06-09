@@ -1,0 +1,128 @@
+# 5-node y2q cluster (CRAQ data plane + embedded raft control plane).
+#
+#   cd deploy/cluster
+#   docker compose up --build
+#
+# node1 bootstraps the raft cluster and admits node2..node5 as voters
+# (voter_seeds = [1,2,3,4,5]); objects replicate at replication_factor = 3.
+# The `init` service generates one shared deployment keystore + a random root
+# password (the provisioned unlock secret); every node gets its own copy.
+#
+# Endpoints (host -> container :8080): node1 :8080, node2 :8081, node3 :8082,
+# node4 :8083, node5 :8084. Root password: `docker compose run --rm \
+# -v cluster_seed:/seed cgr.dev/chainguard/wolfi-base cat /seed/unlock_secret.txt`
+# or read deploy/cluster/README.md.
+
+x-node: &node
+  image: y2q-cluster:latest
+  build:
+    context: ../..
+    dockerfile: deploy/cluster/Dockerfile
+  environment: &node-env
+    ROLE: node
+    RF: "3"
+    VOTER_SEEDS: "1, 2, 3, 4, 5"
+    # Override in a .env file or your shell; identical on every node.
+    Y2QD_CLUSTER__SHARED_SECRET: "${CLUSTER_SECRET:-change-me-cluster-shared-secret}"
+  depends_on:
+    init:
+      condition: service_completed_successfully
+  restart: unless-stopped
+
+services:
+  # One-shot: generate the shared keystore + capture the root/unlock password.
+  init:
+    image: y2q-cluster:latest
+    build:
+      context: ../..
+      dockerfile: deploy/cluster/Dockerfile
+    environment:
+      ROLE: init
+    volumes:
+      - seed:/seed
+    restart: "no"
+
+  node1:
+    <<: *node
+    hostname: node1
+    environment:
+      <<: *node-env
+      NODE_ID: "1"
+      ADVERTISE_ADDR: node1:8080
+      BOOTSTRAP: "true"
+      PEERS: "2=http://node2:8080;3=http://node3:8080;4=http://node4:8080;5=http://node5:8080"
+    ports:
+      - "8080:8080"
+    volumes:
+      - seed:/seed:ro
+      - node1-keys:/var/lib/y2q/keys
+      - node1-data:/var/lib/y2q/data
+
+  node2:
+    <<: *node
+    hostname: node2
+    environment:
+      <<: *node-env
+      NODE_ID: "2"
+      ADVERTISE_ADDR: node2:8080
+    ports:
+      - "8081:8080"
+    volumes:
+      - seed:/seed:ro
+      - node2-keys:/var/lib/y2q/keys
+      - node2-data:/var/lib/y2q/data
+
+  node3:
+    <<: *node
+    hostname: node3
+    environment:
+      <<: *node-env
+      NODE_ID: "3"
+      ADVERTISE_ADDR: node3:8080
+    ports:
+      - "8082:8080"
+    volumes:
+      - seed:/seed:ro
+      - node3-keys:/var/lib/y2q/keys
+      - node3-data:/var/lib/y2q/data
+
+  node4:
+    <<: *node
+    hostname: node4
+    environment:
+      <<: *node-env
+      NODE_ID: "4"
+      ADVERTISE_ADDR: node4:8080
+    ports:
+      - "8083:8080"
+    volumes:
+      - seed:/seed:ro
+      - node4-keys:/var/lib/y2q/keys
+      - node4-data:/var/lib/y2q/data
+
+  node5:
+    <<: *node
+    hostname: node5
+    environment:
+      <<: *node-env
+      NODE_ID: "5"
+      ADVERTISE_ADDR: node5:8080
+    ports:
+      - "8084:8080"
+    volumes:
+      - seed:/seed:ro
+      - node5-keys:/var/lib/y2q/keys
+      - node5-data:/var/lib/y2q/data
+
+volumes:
+  seed:
+  node1-keys:
+  node1-data:
+  node2-keys:
+  node2-data:
+  node3-keys:
+  node3-data:
+  node4-keys:
+  node4-data:
+  node5-keys:
+  node5-data:
