@@ -209,6 +209,25 @@ fn active_count(port: u16, token: &str) -> usize {
         .count()
 }
 
+/// Poll `cond` every 250ms up to `secs`; return whether it became true in time.
+fn wait_until(mut cond: impl FnMut() -> bool, secs: u64) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    loop {
+        if cond() {
+            return true;
+        }
+        if Instant::now() > deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+/// Wait for a TCP listener on `port`; return whether it came up in time.
+fn wait_port(port: u16, secs: u64) -> bool {
+    wait_until(|| TcpStream::connect(("127.0.0.1", port)).is_ok(), secs)
+}
+
 // ---------------------------------------------------------------------------
 // Keystore generation + cluster bring-up.
 // ---------------------------------------------------------------------------
@@ -299,27 +318,73 @@ fn copy_keystore(src: &Path, dst: &Path) -> std::io::Result<()> {
 }
 
 /// A spawned cluster node. Dropped with SIGTERM so coverage flushes on exit.
+/// Holds enough to stop and respawn the process in place (for recovery tests).
 struct ClusterNode {
-    child: Child,
+    child: Option<Child>,
     port: u16,
     id: u64,
     base: PathBuf,
+    cfg: PathBuf,
+    bin: PathBuf,
+    password: String,
+}
+
+/// SIGTERM a child and reap it, returning once it has exited (or been killed).
+fn stop_child(child: &mut Child) {
+    let _ = Command::new("kill")
+        .arg("-TERM")
+        .arg(child.id().to_string())
+        .status();
+    for _ in 0..40 {
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Spawn one cluster daemon with the shared secret + provisioned unlock secret,
+/// logging stdout/stderr to `<base>/stderr.log`.
+fn spawn_child(bin: &Path, cfg: &Path, base: &Path, password: &str) -> Option<Child> {
+    let log = std::fs::File::create(base.join("stderr.log")).ok()?;
+    let log2 = log.try_clone().ok()?;
+    Command::new(bin)
+        .arg("--config")
+        .arg(cfg)
+        .env("Y2QD_CLUSTER__SHARED_SECRET", SHARED_SECRET)
+        .env("Y2QD_CLUSTER__UNLOCK_SECRET", password)
+        .env("RUST_LOG", "error")
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(log2))
+        .spawn()
+        .ok()
+}
+
+impl ClusterNode {
+    /// Stop the process but keep the data dir + config, so it can be respawned.
+    fn kill(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            stop_child(&mut child);
+        }
+    }
+
+    /// Respawn a previously-killed node from its persisted config/keystore.
+    fn respawn(&mut self) -> bool {
+        if self.child.is_some() {
+            return true;
+        }
+        self.child = spawn_child(&self.bin, &self.cfg, &self.base, &self.password);
+        self.child.is_some()
+    }
 }
 
 impl Drop for ClusterNode {
     fn drop(&mut self) {
-        let _ = Command::new("kill")
-            .arg("-TERM")
-            .arg(self.child.id().to_string())
-            .status();
-        for _ in 0..40 {
-            if matches!(self.child.try_wait(), Ok(Some(_))) {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(50));
+        if let Some(mut child) = self.child.take() {
+            stop_child(&mut child);
         }
-        let _ = self.child.kill();
-        let _ = self.child.wait();
         let _ = std::fs::remove_dir_all(&self.base);
     }
 }
@@ -419,23 +484,15 @@ fn start_cluster(n: usize, rf: usize) -> Option<Cluster> {
         let cfg = node_base.join("config.toml");
         write_node_config(&cfg, &data, &keys, ports[i], id, rf, n, &ports);
 
-        let log = std::fs::File::create(node_base.join("stderr.log")).ok()?;
-        let log2 = log.try_clone().ok()?;
-        let child = Command::new(&bin)
-            .arg("--config")
-            .arg(&cfg)
-            .env("Y2QD_CLUSTER__SHARED_SECRET", SHARED_SECRET)
-            .env("Y2QD_CLUSTER__UNLOCK_SECRET", &password)
-            .env("RUST_LOG", "error")
-            .stdout(Stdio::from(log))
-            .stderr(Stdio::from(log2))
-            .spawn()
-            .ok()?;
+        let child = spawn_child(&bin, &cfg, &node_base, &password)?;
         nodes.push(ClusterNode {
-            child,
+            child: Some(child),
             port: ports[i],
             id,
             base: node_base,
+            cfg,
+            bin: bin.clone(),
+            password: password.clone(),
         });
     }
 
@@ -568,5 +625,83 @@ fn cluster_replication_and_apportioned_reads() {
             "LIST via node {} should return the key exactly once (deduped): {json}",
             node.id
         );
+    }
+}
+
+/// Kill a node, write while it is down, restart it, and verify it recovers: the
+/// leader drives it Down -> Recovering -> Active, it back-fills the history it
+/// missed plus the write that landed while it was down, and every object is
+/// readable from the recovered node. Exercises the failure/back-fill path and the
+/// continued-reconcile-through-promotion hardening.
+#[test]
+#[ignore = "multi-node cluster; run with `cargo test --test cluster_e2e -- --ignored`"]
+fn cluster_node_recovery_backfill() {
+    let Some(mut cluster) = start_cluster(3, 2) else {
+        return;
+    };
+    let pw = cluster.password.clone();
+    let tokens: Vec<String> = cluster
+        .nodes
+        .iter()
+        .map(|node| login(node.port, "root", &pw).expect("login on each node"))
+        .collect();
+
+    let bucket = "rec";
+    for (node, token) in cluster.nodes.iter().zip(&tokens) {
+        let s = create_bucket(node.port, token, bucket);
+        assert!(s == 200 || s == 201 || s == 409, "create bucket: {s}");
+    }
+
+    let leader_port = cluster.nodes[0].port;
+    let leader_tok = tokens[0].clone();
+
+    // A write before the failure.
+    assert_eq!(
+        put_object(leader_port, &leader_tok, bucket, "before.bin", b"v-before"),
+        201,
+        "PUT before.bin"
+    );
+
+    // Kill a non-leader node and wait for the leader to mark it Down.
+    let victim = 2usize;
+    let victim_port = cluster.nodes[victim].port;
+    cluster.nodes[victim].kill();
+    assert!(
+        wait_until(|| active_count(leader_port, &leader_tok) <= 2, 60),
+        "leader did not mark the killed node Down"
+    );
+
+    // A write while the victim is down — replicates to the surviving nodes only.
+    assert_eq!(
+        put_object(leader_port, &leader_tok, bucket, "during.bin", b"v-during"),
+        201,
+        "PUT during.bin while a node is down"
+    );
+
+    // Restart the victim; it rejoins, recovers, and back-fills to Active.
+    assert!(cluster.nodes[victim].respawn(), "respawn victim");
+    assert!(wait_port(victim_port, 30), "victim did not rebind");
+    assert!(
+        wait_until(|| active_count(leader_port, &leader_tok) >= 3, 90),
+        "cluster did not reconverge to 3 active nodes after recovery"
+    );
+
+    // The recovered node serves both the pre-failure object and the one written
+    // while it was down. Retry briefly to let back-fill + reconcile settle.
+    let vtok = login(victim_port, "root", &pw).expect("login recovered node");
+    for (key, want) in [
+        ("before.bin", &b"v-before"[..]),
+        ("during.bin", &b"v-during"[..]),
+    ] {
+        let mut got = (0u16, Vec::new());
+        for _ in 0..40 {
+            got = get_object(victim_port, &vtok, bucket, key);
+            if got.0 == 200 && got.1 == want {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        assert_eq!(got.0, 200, "GET {key} from recovered node");
+        assert_eq!(got.1, want, "recovered node returned wrong bytes for {key}");
     }
 }

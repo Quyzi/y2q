@@ -75,6 +75,10 @@ pub struct ClusterRuntime {
     /// `Recovering`; reported in health so the leader can promote it to `Active`.
     /// Reset whenever the node observes itself `Down` (it has lost currency).
     backfill_caught_up: Arc<AtomicBool>,
+    /// True while this node is recovering, latched so the `Recovering -> Active`
+    /// promotion transition can trigger one final reconciliation sweep that closes
+    /// the promotion-window gap. Reset after that sweep and on `Down`.
+    was_recovering: Arc<AtomicBool>,
 }
 
 impl ClusterRuntime {
@@ -199,6 +203,7 @@ pub async fn build_runtime(
         auth_mode: cfg.cluster.auth,
         read_consistency: read_consistency(cfg),
         backfill_caught_up: Arc::new(AtomicBool::new(false)),
+        was_recovering: Arc::new(AtomicBool::new(false)),
     })
 }
 
@@ -215,10 +220,12 @@ fn read_consistency(cfg: &Config) -> ReadConsistency {
 
 /// Spawn the cluster maintenance loop. Every node runs it, but the roles differ:
 ///
-/// - **Self-recovery (any node):** when this node observes itself `Recovering`,
-///   it runs back-fill sweeps (pulling objects it should hold from Active peers)
-///   until a sweep finds nothing missing, then advertises `caught_up` in health
-///   so the leader can promote it. Observing itself `Down` resets `caught_up`.
+/// - **Self-recovery (any node):** while this node observes itself `Recovering`,
+///   it runs a back-fill sweep every tick (pulling objects it should hold from
+///   Active peers, including writes that land during recovery), advertising
+///   `caught_up` in health whenever a sweep is clean so the leader can promote it.
+///   On promotion it runs one final reconciliation sweep to close the
+///   promotion-window gap. Observing itself `Down` resets the flags.
 /// - **Leader (controller authority):** each tick it re-splices (pinning
 ///   membership deltas and bumping the epoch the fence enforces) and probes every
 ///   other node, driving the liveness state machine:
@@ -265,34 +272,74 @@ pub fn spawn_maintenance(rt: web::Data<ClusterRuntime>, interval_ms: u64, fail_t
     });
 }
 
-/// If this node sees itself `Recovering`, run a back-fill sweep and flag
-/// `caught_up` when a sweep pulls nothing (everything it should hold is present).
-/// Seeing itself `Down` clears the flag (it has lost currency since last caught up).
+/// Drive this node's own recovery each maintenance tick.
 ///
-/// LIMITATION: a recovering node is excluded from chains until promoted, so it
-/// does not receive writes during recovery. Writes to its prospective chains in
-/// the window between `caught_up` and promotion can be missed until a later
-/// recovery. Converging under concurrent writes (the recovering node joining the
-/// write chain while catching up) is a Phase F hardening; today back-fill is
-/// correct when writes to the recovering chains quiesce during the window.
+/// While `Recovering`, run a back-fill sweep on EVERY tick — not just until the
+/// first clean pass. A sweep pulls every object this node should hold whose local
+/// copy is missing or behind, so running it continuously means writes that land
+/// *during* recovery are pulled too, right up until promotion. `caught_up` tracks
+/// the current result: set on a clean sweep (telling the leader it may promote),
+/// cleared again if a later sweep finds this node has fallen behind, so the leader
+/// never promotes a node that is currently behind.
+///
+/// On the `Recovering -> Active` transition (the leader applied the promotion),
+/// run one final reconciliation sweep to pull anything committed in the narrow
+/// window between the last clean sweep and the promotion taking effect, before
+/// this node — now a chain member — can be asked to serve a read as a tail. This
+/// closes the promotion-window gap the previous design left open (a write to a
+/// recovering chain in that window could be silently missed). A residual sub-tick
+/// window remains only for a key written at the exact instant of promotion; it is
+/// reconciled on this sweep. Observing `Down` resets both flags (lost currency).
 async fn run_self_recovery(rt: &ClusterRuntime, state: &y2q_cluster::ControlState) {
     let my_status = state.nodes.get(&rt.node_id).map(|m| m.status);
     match my_status {
         Some(NodeStatus::Down) => {
             rt.backfill_caught_up.store(false, Ordering::Relaxed);
+            rt.was_recovering.store(false, Ordering::Relaxed);
         }
-        Some(NodeStatus::Recovering) if !rt.backfill_caught_up.load(Ordering::Relaxed) => {
+        Some(NodeStatus::Recovering) => {
+            rt.was_recovering.store(true, Ordering::Relaxed);
             match rt.distributed.backfill_pass().await {
                 Ok(0) => {
-                    rt.backfill_caught_up.store(true, Ordering::Relaxed);
-                    tracing::info!("cluster maintenance: back-fill caught up; awaiting promotion");
+                    // Current as of this sweep — flag it (log only on the flip).
+                    if !rt.backfill_caught_up.swap(true, Ordering::Relaxed) {
+                        tracing::info!(
+                            "cluster maintenance: back-fill caught up; awaiting promotion"
+                        );
+                    }
                 }
                 Ok(n) => {
+                    // Still filling history, or fell behind a fresh write: not
+                    // promotable until the next clean sweep.
+                    rt.backfill_caught_up.store(false, Ordering::Relaxed);
                     metrics::counter!(crate::observability::CLUSTER_BACKFILL_OBJECTS)
                         .increment(n as u64);
                     tracing::info!(fetched = n, "cluster maintenance: back-fill sweep");
                 }
-                Err(e) => tracing::warn!(error = %e, "cluster maintenance: back-fill sweep failed"),
+                Err(e) => {
+                    rt.backfill_caught_up.store(false, Ordering::Relaxed);
+                    tracing::warn!(error = %e, "cluster maintenance: back-fill sweep failed");
+                }
+            }
+        }
+        // Just promoted (Recovering -> Active): one reconciliation sweep closes the
+        // promotion-window gap before this node serves reads as a chain member.
+        Some(NodeStatus::Active) if rt.was_recovering.swap(false, Ordering::Relaxed) => {
+            rt.backfill_caught_up.store(false, Ordering::Relaxed);
+            match rt.distributed.backfill_pass().await {
+                Ok(n) => {
+                    if n > 0 {
+                        metrics::counter!(crate::observability::CLUSTER_BACKFILL_OBJECTS)
+                            .increment(n as u64);
+                    }
+                    tracing::info!(
+                        reconciled = n,
+                        "cluster maintenance: post-promotion reconcile"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "cluster maintenance: post-promotion reconcile failed")
+                }
             }
         }
         _ => {}
