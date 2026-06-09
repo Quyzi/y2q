@@ -28,7 +28,7 @@ const WRAP_AAD: &[u8] = b"y2q/v1/sk-wrap";
 /// Defaults follow OWASP's "second-tier" recommendation (m=64 MiB, t=3,
 /// p=4) — slow enough on commodity hardware that a single login takes
 /// hundreds of milliseconds, which acts as natural brute-force friction.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Argon2Params {
     /// Memory cost in KiB. Argon2's `m_cost`.
     pub m_cost_kib: u32,
@@ -42,7 +42,7 @@ pub struct Argon2Params {
 }
 
 /// AES-256-GCM ciphertext (with 16-byte tag appended) of the deployment SK.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WrappedSk {
     /// 12-byte AEAD nonce.
     #[serde(with = "nonce_b64")]

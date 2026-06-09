@@ -48,7 +48,7 @@ pub enum Role {
 
 /// One user record. The wrapped SK lets this user (and only this user) recover
 /// the deployment secret key after presenting their password.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UserRecord {
     /// Login name, case-sensitive.
     pub username: String,

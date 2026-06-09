@@ -11,6 +11,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 use y2q_core::BucketConfig;
+use y2q_core::crypto::{Role, UserRecord};
 
 use crate::hashing::chain::ChainTable;
 use crate::hashing::ring::Ring;
@@ -108,6 +109,28 @@ pub enum ControlCmd {
         /// Bucket name.
         bucket: String,
     },
+    /// Insert or replace a user's durable record cluster-wide (create, or
+    /// password change which re-wraps the SK). The wrapped SK in the record is
+    /// the same ciphertext-at-rest already stored on disk; the daemon projects
+    /// the record into each node's local user store on apply.
+    UpsertUser {
+        /// The complete user record to store (keyed by its username).
+        record: UserRecord,
+    },
+    /// Remove a user's record cluster-wide.
+    DeleteUser {
+        /// Username to remove.
+        username: String,
+    },
+    /// Change a user's global role cluster-wide (idempotent; no-op if the user
+    /// is unknown). Kept distinct from [`Self::UpsertUser`] so a role change does
+    /// not resend the wrapped SK and so it applies atomically at the leader.
+    SetUserRole {
+        /// Affected username.
+        username: String,
+        /// New global role.
+        role: Role,
+    },
 }
 
 /// Response from applying a [`ControlCmd`].
@@ -131,6 +154,12 @@ pub struct ControlState {
     /// projects this into its local bucket sidecars on apply.
     #[serde(default)]
     pub buckets: BTreeMap<String, BucketConfig>,
+    /// Cluster-wide user records (durable auth state: wrapped SK, KDF params,
+    /// role), replicated so a joined node inherits every user. Each node projects
+    /// this into its local user store on apply, preserving the node-local
+    /// `last_login`. Sessions stay node-local and are not replicated.
+    #[serde(default)]
+    pub users: BTreeMap<String, UserRecord>,
 }
 
 impl ControlState {
@@ -186,6 +215,17 @@ impl ControlState {
             }
             ControlCmd::UnregisterBucket { bucket } => {
                 self.buckets.remove(bucket);
+            }
+            ControlCmd::UpsertUser { record } => {
+                self.users.insert(record.username.clone(), record.clone());
+            }
+            ControlCmd::DeleteUser { username } => {
+                self.users.remove(username);
+            }
+            ControlCmd::SetUserRole { username, role } => {
+                if let Some(rec) = self.users.get_mut(username) {
+                    rec.role = *role;
+                }
             }
         }
         ControlResp { epoch: self.epoch }
@@ -372,6 +412,75 @@ mod tests {
         assert_eq!(s, back);
         let legacy: ControlState =
             serde_json::from_str(r#"{"nodes":{},"chains":{"chains":{}},"epoch":0}"#).unwrap();
+        assert!(legacy.buckets.is_empty());
+    }
+
+    fn user_record(name: &str, role: Role) -> UserRecord {
+        let params = y2q_core::crypto::default_argon2_params();
+        let wrapped = y2q_core::crypto::kdf::wrap_sk(b"sk-bytes", b"pw", &params).unwrap();
+        UserRecord {
+            username: name.to_owned(),
+            created_at: 1,
+            last_login: None,
+            kdf: params,
+            wrapped_sk: wrapped,
+            role,
+        }
+    }
+
+    #[test]
+    fn user_registry_apply() {
+        let mut s = ControlState::default();
+
+        s.apply(&ControlCmd::UpsertUser {
+            record: user_record("alice", Role::User),
+        });
+        assert_eq!(s.users["alice"].role, Role::User);
+
+        // SetUserRole changes only the role.
+        s.apply(&ControlCmd::SetUserRole {
+            username: "alice".into(),
+            role: Role::Admin,
+        });
+        assert_eq!(s.users["alice"].role, Role::Admin);
+        // SetUserRole on an unknown user is a no-op (no panic, no insert).
+        s.apply(&ControlCmd::SetUserRole {
+            username: "ghost".into(),
+            role: Role::Admin,
+        });
+        assert!(!s.users.contains_key("ghost"));
+
+        // Upsert replaces the whole record (e.g. password change re-wraps the SK).
+        let mut rotated = user_record("alice", Role::Admin);
+        rotated.last_login = Some(42);
+        s.apply(&ControlCmd::UpsertUser {
+            record: rotated.clone(),
+        });
+        assert_eq!(s.users["alice"].last_login, Some(42));
+
+        // Delete removes; deleting an absent user is a no-op.
+        s.apply(&ControlCmd::DeleteUser {
+            username: "alice".into(),
+        });
+        assert!(!s.users.contains_key("alice"));
+        s.apply(&ControlCmd::DeleteUser {
+            username: "alice".into(),
+        });
+    }
+
+    #[test]
+    fn user_cmd_round_trips_through_serde() {
+        let cmd = ControlCmd::UpsertUser {
+            record: user_record("bob", Role::Admin),
+        };
+        let bytes = serde_json::to_vec(&cmd).unwrap();
+        let back: ControlCmd = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(cmd, back);
+
+        // A legacy state with neither `buckets` nor `users` deserializes to empty.
+        let legacy: ControlState =
+            serde_json::from_str(r#"{"nodes":{},"chains":{"chains":{}},"epoch":0}"#).unwrap();
+        assert!(legacy.users.is_empty());
         assert!(legacy.buckets.is_empty());
     }
 
