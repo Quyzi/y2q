@@ -17,6 +17,7 @@ use super::session::{SessionInfo, compute_expiry};
 use super::state::AuthState;
 use super::users::validate as validate_username;
 use super::{AdminAuthenticated, AdminReadAuthenticated, Authenticated};
+use crate::cluster::{self, ClusterRuntime};
 
 /// Parse a role name (case-insensitive) into a [`Role`], with a clean 400 on a
 /// bad value rather than a raw JSON deserialization error.
@@ -321,9 +322,10 @@ pub async fn logout(
     ),
     tag = "auth",
 )]
-#[tracing::instrument(skip(state, auth, body), fields(username = %auth.username))]
+#[tracing::instrument(skip(state, cluster, auth, body), fields(username = %auth.username))]
 pub async fn change_password(
     state: web::Data<AuthState>,
+    cluster: Option<web::Data<ClusterRuntime>>,
     auth: Authenticated,
     body: web::Json<ChangePasswordRequest>,
 ) -> Result<HttpResponse, AuthError> {
@@ -359,10 +361,15 @@ pub async fn change_password(
         wrapped_sk: wrapped,
         role: rec.role,
     };
-    state
-        .user_store
-        .upsert(&updated)
-        .map_err(|e| AuthError::Backend(e.to_string()))?;
+    // Clustered: replicate the re-wrapped record through raft; local otherwise.
+    if let Some(rt) = cluster.as_ref() {
+        cluster::cluster_upsert_user(rt, state.get_ref(), &updated).await?;
+    } else {
+        state
+            .user_store
+            .upsert(&updated)
+            .map_err(|e| AuthError::Backend(e.to_string()))?;
+    }
     Ok(HttpResponse::NoContent().finish())
 }
 
@@ -380,9 +387,10 @@ pub async fn change_password(
     ),
     tag = "users",
 )]
-#[tracing::instrument(skip(state, auth, body), fields(actor = %auth.0.username, new_user = %body.username))]
+#[tracing::instrument(skip(state, cluster, auth, body), fields(actor = %auth.0.username, new_user = %body.username))]
 pub async fn add_user(
     state: web::Data<AuthState>,
+    cluster: Option<web::Data<ClusterRuntime>>,
     auth: AdminAuthenticated,
     body: web::Json<AddUserRequest>,
 ) -> Result<HttpResponse, AuthError> {
@@ -397,11 +405,24 @@ pub async fn add_user(
         });
     }
 
-    if state
-        .user_store
-        .get(&username)
-        .map_err(|e| AuthError::Backend(e.to_string()))?
-        .is_some()
+    // Existence check. Clustered: consult the replicated registry too, so a user
+    // created on another node is not silently clobbered (a residual race remains
+    // for two truly-simultaneous creates of the same name, last write wins).
+    let exists_clustered = match cluster.as_ref() {
+        Some(rt) => rt
+            .controller
+            .control_state()
+            .await
+            .users
+            .contains_key(&username),
+        None => false,
+    };
+    if exists_clustered
+        || state
+            .user_store
+            .get(&username)
+            .map_err(|e| AuthError::Backend(e.to_string()))?
+            .is_some()
     {
         return Err(AuthError::UserExists { username });
     }
@@ -424,10 +445,14 @@ pub async fn add_user(
         wrapped_sk: wrapped,
         role,
     };
-    state
-        .user_store
-        .upsert(&record)
-        .map_err(|e| AuthError::Backend(e.to_string()))?;
+    if let Some(rt) = cluster.as_ref() {
+        cluster::cluster_upsert_user(rt, state.get_ref(), &record).await?;
+    } else {
+        state
+            .user_store
+            .upsert(&record)
+            .map_err(|e| AuthError::Backend(e.to_string()))?;
+    }
     Ok(HttpResponse::Created().finish())
 }
 
@@ -471,18 +496,37 @@ pub async fn list_users(
     ),
     tag = "users",
 )]
-#[tracing::instrument(skip(state, auth), fields(actor = %auth.0.username, target = %path))]
+#[tracing::instrument(skip(state, cluster, auth), fields(actor = %auth.0.username, target = %path))]
 pub async fn delete_user(
     state: web::Data<AuthState>,
+    cluster: Option<web::Data<ClusterRuntime>>,
     auth: AdminAuthenticated,
     path: web::Path<String>,
 ) -> Result<HttpResponse, AuthError> {
     let _ = &auth;
     let username = path.into_inner();
-    let users = state
-        .user_store
-        .list()
-        .map_err(|e| AuthError::Backend(e.to_string()))?;
+
+    // (username, role) over the authoritative set: the replicated registry in a
+    // cluster (so a freshly-joined node enforces the guards correctly), or the
+    // local store single-node.
+    let users: Vec<(String, Role)> = match cluster.as_ref() {
+        Some(rt) => rt
+            .controller
+            .control_state()
+            .await
+            .users
+            .values()
+            .map(|u| (u.username.clone(), u.role))
+            .collect(),
+        None => state
+            .user_store
+            .list()
+            .map_err(|e| AuthError::Backend(e.to_string()))?
+            .into_iter()
+            .map(|u| (u.username, u.role))
+            .collect(),
+    };
+
     if users.len() <= 1 {
         return Err(AuthError::CannotDeleteLastUser);
     }
@@ -490,16 +534,24 @@ pub async fn delete_user(
     // of admin endpoints (user management, rebuild, locks, trace).
     let target_is_admin = users
         .iter()
-        .any(|u| u.username == username && u.role == Role::Admin);
-    if target_is_admin && users.iter().filter(|u| u.role == Role::Admin).count() <= 1 {
+        .any(|(n, r)| n == &username && *r == Role::Admin);
+    if target_is_admin && users.iter().filter(|(_, r)| *r == Role::Admin).count() <= 1 {
         return Err(AuthError::CannotDeleteLastAdmin);
     }
-    let removed = state
-        .user_store
-        .delete(&username)
-        .map_err(|e| AuthError::Backend(e.to_string()))?;
-    if !removed {
-        return Err(AuthError::UserNotFound { username });
+
+    if let Some(rt) = cluster.as_ref() {
+        if !users.iter().any(|(n, _)| n == &username) {
+            return Err(AuthError::UserNotFound { username });
+        }
+        cluster::cluster_delete_user(rt, state.get_ref(), &username).await?;
+    } else {
+        let removed = state
+            .user_store
+            .delete(&username)
+            .map_err(|e| AuthError::Backend(e.to_string()))?;
+        if !removed {
+            return Err(AuthError::UserNotFound { username });
+        }
     }
     Ok(HttpResponse::NoContent().finish())
 }
@@ -524,9 +576,10 @@ pub async fn delete_user(
     ),
     tag = "users",
 )]
-#[tracing::instrument(skip(state, auth, body), fields(actor = %auth.0.username, target = %path))]
+#[tracing::instrument(skip(state, cluster, auth, body), fields(actor = %auth.0.username, target = %path))]
 pub async fn set_role(
     state: web::Data<AuthState>,
+    cluster: Option<web::Data<ClusterRuntime>>,
     auth: AdminAuthenticated,
     path: web::Path<String>,
     body: web::Json<SetRoleRequest>,
@@ -535,35 +588,60 @@ pub async fn set_role(
     let username = path.into_inner();
     let new_role = parse_role(&body.role)?;
 
-    let mut rec = state
-        .user_store
-        .get(&username)
-        .map_err(|e| AuthError::Backend(e.to_string()))?
-        .ok_or_else(|| AuthError::UserNotFound {
-            username: username.clone(),
-        })?;
+    // Resolve the target's current role and the admin count from the
+    // authoritative set (replicated registry in a cluster, local otherwise).
+    let (current_role, admin_count) = match cluster.as_ref() {
+        Some(rt) => {
+            let users = rt.controller.control_state().await.users;
+            let cur = users.get(&username).map(|u| u.role);
+            let admins = users.values().filter(|u| u.role == Role::Admin).count();
+            (cur, admins)
+        }
+        None => {
+            let cur = state
+                .user_store
+                .get(&username)
+                .map_err(|e| AuthError::Backend(e.to_string()))?
+                .map(|u| u.role);
+            let admins = state
+                .user_store
+                .list()
+                .map_err(|e| AuthError::Backend(e.to_string()))?
+                .iter()
+                .filter(|u| u.role == Role::Admin)
+                .count();
+            (cur, admins)
+        }
+    };
+    let current_role = current_role.ok_or_else(|| AuthError::UserNotFound {
+        username: username.clone(),
+    })?;
 
     // Don't demote the only administrator.
-    if rec.role == Role::Admin && new_role != Role::Admin {
-        let admin_count = state
-            .user_store
-            .list()
-            .map_err(|e| AuthError::Backend(e.to_string()))?
-            .iter()
-            .filter(|u| u.role == Role::Admin)
-            .count();
-        if admin_count <= 1 {
-            return Err(AuthError::CannotDemoteLastAdmin);
-        }
+    if current_role == Role::Admin && new_role != Role::Admin && admin_count <= 1 {
+        return Err(AuthError::CannotDemoteLastAdmin);
     }
 
-    rec.role = new_role;
-    state
-        .user_store
-        .upsert(&rec)
-        .map_err(|e| AuthError::Backend(e.to_string()))?;
-    // Apply immediately rather than at session expiry.
-    state.sessions.revoke_user(&username);
+    if let Some(rt) = cluster.as_ref() {
+        // Replicate the role change; the helper also revokes local sessions and
+        // every node revokes on projecting the change.
+        cluster::cluster_set_user_role(rt, state.get_ref(), &username, new_role).await?;
+    } else {
+        let mut rec = state
+            .user_store
+            .get(&username)
+            .map_err(|e| AuthError::Backend(e.to_string()))?
+            .ok_or_else(|| AuthError::UserNotFound {
+                username: username.clone(),
+            })?;
+        rec.role = new_role;
+        state
+            .user_store
+            .upsert(&rec)
+            .map_err(|e| AuthError::Backend(e.to_string()))?;
+        // Apply immediately rather than at session expiry.
+        state.sessions.revoke_user(&username);
+    }
     Ok(HttpResponse::NoContent().finish())
 }
 

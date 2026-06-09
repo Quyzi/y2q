@@ -291,15 +291,23 @@ against the HEAD's committed copy into a concrete `SetLabels` set *before* relay
 so every member applies an identical set regardless of which node was contacted and
 regardless of `Set`/`Remove`/`Replace` mode.
 
-Bucket registry, config (quota/CORS/owner), and ACL are **cluster-global**,
-replicated through Raft as `ControlState.buckets` (Phase G). A bucket
-create/config/ACL mutation proposes a `ControlCmd`
-(`RegisterBucket`/`SetBucketConfig`/`ClaimBucketOwner`/`UnregisterBucket`),
-forwarded to the leader when the contact node is not it (`/internal/v1/control`);
-a per-node projector subscribed to the control-state watch mirrors the committed
-registry into each node's local bucket sidecars on every apply, so the read path
-(`authz`) keeps reading the local sidecar unchanged and a freshly-joined node
-inherits every bucket config.
+Bucket registry/config/ACL and user records are **cluster-global**, replicated
+through Raft as `ControlState.buckets` and `ControlState.users` (Phase G). A
+mutation proposes a `ControlCmd`
+(`RegisterBucket`/`SetBucketConfig`/`ClaimBucketOwner`/`UnregisterBucket` for
+buckets; `UpsertUser`/`DeleteUser`/`SetUserRole` for users), forwarded to the
+leader when the contact node is not it (`/internal/v1/control`); a per-node
+projector subscribed to the control-state watch mirrors the committed registries
+into each node's local stores on every apply. So the read path (`authz`, login)
+keeps reading the local sidecar/user store unchanged, and a freshly-joined node
+inherits every bucket config and user record.
+
+For users, the projector preserves the node-local `last_login` (an observation,
+not replicated state - login stays a node-local data-plane operation) and revokes
+the user's local sessions when their role changes, so a demote/disable takes
+effect on **every** node, not only where the admin ran it. The wrapped SK carried
+in a `UserRecord` is the same ciphertext-at-rest already stored on disk; sessions
+themselves are never replicated.
 
 ### LIST / SEARCH scatter-gather
 
