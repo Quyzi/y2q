@@ -56,6 +56,12 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates/ ./crates/
 COPY config.default.toml ./
 
+# gxhash needs AES + SSE2 intrinsics. The repo's .cargo/config.toml uses
+# `target-cpu=native`, but that is not copied into the image (and would bake in
+# the build host's CPU). Require only AES-NI + SSE2, which every x86-64 server
+# CPU has, so the image stays portable.
+ENV RUSTFLAGS="-C target-feature=+aes,+sse2"
+
 ARG PYROSCOPE
 
 RUN if [ "$PYROSCOPE" = "1" ]; then \
