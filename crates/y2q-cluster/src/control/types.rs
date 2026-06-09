@@ -10,6 +10,7 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
+use y2q_core::BucketConfig;
 
 use crate::hashing::chain::ChainTable;
 use crate::hashing::ring::Ring;
@@ -78,6 +79,35 @@ pub enum ControlCmd {
     },
     /// Monotonically increment the global epoch (the fencing token).
     BumpEpoch,
+    /// Register a bucket cluster-wide, creating a default config entry if the
+    /// bucket is not yet known. Idempotent: an existing entry is left untouched.
+    RegisterBucket {
+        /// Bucket name.
+        bucket: String,
+    },
+    /// Replace a bucket's full configuration (quota, CORS, owner, ACL). Used by
+    /// the config and ACL admin endpoints, which read-modify-write the whole
+    /// config under an admin check before proposing it.
+    SetBucketConfig {
+        /// Bucket name.
+        bucket: String,
+        /// The complete configuration to store for the bucket.
+        config: BucketConfig,
+    },
+    /// Claim a bucket's owner if it has none yet (race-safe at the apply point:
+    /// the first claim through raft wins, later claims are no-ops). Ensures the
+    /// bucket entry exists. Mirrors the single-node `claim_ownership` semantics.
+    ClaimBucketOwner {
+        /// Bucket name.
+        bucket: String,
+        /// Username to record as owner when the bucket currently has none.
+        owner: String,
+    },
+    /// Remove a bucket's cluster-wide registry/config entry.
+    UnregisterBucket {
+        /// Bucket name.
+        bucket: String,
+    },
 }
 
 /// Response from applying a [`ControlCmd`].
@@ -96,6 +126,11 @@ pub struct ControlState {
     pub chains: ChainTable,
     /// Global epoch (fencing token); bumped on every reconfiguration.
     pub epoch: u64,
+    /// Cluster-wide bucket registry and config (owner, ACL, quota, CORS),
+    /// replicated so every node shares one authoritative view. Each node
+    /// projects this into its local bucket sidecars on apply.
+    #[serde(default)]
+    pub buckets: BTreeMap<String, BucketConfig>,
 }
 
 impl ControlState {
@@ -136,6 +171,21 @@ impl ControlState {
             }
             ControlCmd::BumpEpoch => {
                 self.epoch += 1;
+            }
+            ControlCmd::RegisterBucket { bucket } => {
+                self.buckets.entry(bucket.clone()).or_default();
+            }
+            ControlCmd::SetBucketConfig { bucket, config } => {
+                self.buckets.insert(bucket.clone(), config.clone());
+            }
+            ControlCmd::ClaimBucketOwner { bucket, owner } => {
+                let cfg = self.buckets.entry(bucket.clone()).or_default();
+                if cfg.owner.is_none() {
+                    cfg.owner = Some(owner.clone());
+                }
+            }
+            ControlCmd::UnregisterBucket { bucket } => {
+                self.buckets.remove(bucket);
             }
         }
         ControlResp { epoch: self.epoch }
@@ -224,6 +274,105 @@ mod tests {
             status: NodeStatus::Active,
         });
         assert!(!s.nodes.contains_key(&99));
+    }
+
+    #[test]
+    fn bucket_registry_apply() {
+        use y2q_core::BucketPermission;
+
+        let mut s = ControlState::default();
+
+        // Register creates a default entry; re-register is a no-op.
+        s.apply(&ControlCmd::RegisterBucket {
+            bucket: "photos".into(),
+        });
+        assert!(s.buckets.contains_key("photos"));
+        assert_eq!(s.buckets["photos"], BucketConfig::default());
+        s.apply(&ControlCmd::SetBucketConfig {
+            bucket: "photos".into(),
+            config: BucketConfig {
+                owner: Some("alice".into()),
+                quota_bytes: Some(1024),
+                ..Default::default()
+            },
+        });
+        s.apply(&ControlCmd::RegisterBucket {
+            bucket: "photos".into(),
+        });
+        // Re-register did not clobber the existing config.
+        assert_eq!(s.buckets["photos"].owner.as_deref(), Some("alice"));
+        assert_eq!(s.buckets["photos"].quota_bytes, Some(1024));
+
+        // Claim is first-writer-wins and idempotent.
+        s.apply(&ControlCmd::RegisterBucket {
+            bucket: "docs".into(),
+        });
+        s.apply(&ControlCmd::ClaimBucketOwner {
+            bucket: "docs".into(),
+            owner: "bob".into(),
+        });
+        s.apply(&ControlCmd::ClaimBucketOwner {
+            bucket: "docs".into(),
+            owner: "carol".into(),
+        });
+        assert_eq!(s.buckets["docs"].owner.as_deref(), Some("bob"));
+        // Claim on an unknown bucket creates it owned.
+        s.apply(&ControlCmd::ClaimBucketOwner {
+            bucket: "fresh".into(),
+            owner: "dave".into(),
+        });
+        assert_eq!(s.buckets["fresh"].owner.as_deref(), Some("dave"));
+
+        // ACL flows through a full SetBucketConfig.
+        let mut acl = BTreeMap::new();
+        acl.insert("eve".to_string(), BucketPermission::Read);
+        s.apply(&ControlCmd::SetBucketConfig {
+            bucket: "docs".into(),
+            config: BucketConfig {
+                owner: Some("bob".into()),
+                acl,
+                ..Default::default()
+            },
+        });
+        assert_eq!(
+            s.buckets["docs"].acl.get("eve"),
+            Some(&BucketPermission::Read)
+        );
+
+        // Unregister removes the entry; unregistering an absent bucket is a no-op.
+        s.apply(&ControlCmd::UnregisterBucket {
+            bucket: "photos".into(),
+        });
+        assert!(!s.buckets.contains_key("photos"));
+        s.apply(&ControlCmd::UnregisterBucket {
+            bucket: "nope".into(),
+        });
+    }
+
+    #[test]
+    fn bucket_cmd_round_trips_through_serde() {
+        let cmd = ControlCmd::SetBucketConfig {
+            bucket: "b".into(),
+            config: BucketConfig {
+                owner: Some("alice".into()),
+                quota_bytes: Some(42),
+                ..Default::default()
+            },
+        };
+        let bytes = serde_json::to_vec(&cmd).unwrap();
+        let back: ControlCmd = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(cmd, back);
+
+        // ControlState with buckets round-trips, and a legacy state with no
+        // `buckets` field deserializes to an empty map (serde default).
+        let mut s = ControlState::default();
+        s.apply(&cmd);
+        let bytes = serde_json::to_vec(&s).unwrap();
+        let back: ControlState = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(s, back);
+        let legacy: ControlState =
+            serde_json::from_str(r#"{"nodes":{},"chains":{"chains":{}},"epoch":0}"#).unwrap();
+        assert!(legacy.buckets.is_empty());
     }
 
     #[test]
