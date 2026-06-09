@@ -178,6 +178,38 @@ fn get_object(port: u16, token: &str, bucket: &str, key: &str) -> (u16, Vec<u8>)
     .unwrap_or((0, Vec::new()))
 }
 
+/// Replace a bucket's owner+ACL (`PUT /api/v1/buckets/{bucket}/acl`).
+fn set_acl(port: u16, token: &str, bucket: &str, body: &str) -> u16 {
+    let bearer = auth_header(token);
+    http(
+        port,
+        "PUT",
+        &format!("/api/v1/buckets/{bucket}/acl"),
+        &[
+            ("Authorization", &bearer),
+            ("Content-Type", "application/json"),
+        ],
+        body.as_bytes(),
+    )
+    .map(|(s, _)| s)
+    .unwrap_or(0)
+}
+
+/// Read a bucket's owner+ACL (`GET /api/v1/buckets/{bucket}/acl`) returning
+/// `(status, json_body)`. 404 until the bucket exists locally on the node.
+fn get_acl(port: u16, token: &str, bucket: &str) -> (u16, String) {
+    let bearer = auth_header(token);
+    let (s, b) = http(
+        port,
+        "GET",
+        &format!("/api/v1/buckets/{bucket}/acl"),
+        &[("Authorization", &bearer)],
+        &[],
+    )
+    .unwrap_or((0, Vec::new()));
+    (s, String::from_utf8_lossy(&b).into_owned())
+}
+
 /// List a bucket (`GET /{bucket}/`) returning `(status, json_body)`.
 fn list_objects(port: u16, token: &str, bucket: &str) -> (u16, String) {
     let bearer = auth_header(token);
@@ -573,18 +605,48 @@ fn cluster_replication_and_apportioned_reads() {
         .map(|node| login(node.port, "root", &pw).expect("login on each node"))
         .collect();
 
-    // The bucket registry is still per-node (cluster-global bucket state is a
-    // later phase), so register the bucket on every node to satisfy the
-    // per-node read authorization check.
+    // The bucket registry is cluster-global (Phase G): create the bucket on node 0
+    // only and it replicates through raft, projecting into every node's local
+    // sidecar. No per-node create workaround needed.
     let bucket = "cl";
-    for (node, token) in cluster.nodes.iter().zip(&tokens) {
-        let s = create_bucket(node.port, token, bucket);
-        assert!(
-            s == 200 || s == 201 || s == 409,
-            "create bucket on node {}: {s}",
-            node.id
-        );
-    }
+    let s = create_bucket(cluster.nodes[0].port, &tokens[0], bucket);
+    assert!(s == 200 || s == 201, "create bucket on node 0: {s}");
+
+    // Registry replication, both directions through the leader: wait for the
+    // create to project to the last (follower) node, set owner+ACL there (which
+    // forwards the control command to the leader), then verify the change is
+    // visible on a different node — proving bucket owner/ACL flow through raft.
+    let last = cluster.nodes.len() - 1;
+    assert!(
+        wait_until(
+            || get_acl(cluster.nodes[last].port, &tokens[last], bucket).0 == 200,
+            30
+        ),
+        "bucket registry did not replicate to node {}",
+        cluster.nodes[last].id
+    );
+    assert_eq!(
+        set_acl(
+            cluster.nodes[last].port,
+            &tokens[last],
+            bucket,
+            r#"{"owner":"root","grants":{"reader":"read"}}"#,
+        ),
+        200,
+        "set acl via follower node {} (forwarded to leader)",
+        cluster.nodes[last].id
+    );
+    assert!(
+        wait_until(
+            || {
+                let (st, j) = get_acl(cluster.nodes[1].port, &tokens[1], bucket);
+                st == 200 && j.contains("\"owner\":\"root\"") && j.contains("\"reader\":\"read\"")
+            },
+            30
+        ),
+        "owner/ACL set on a follower did not replicate to node {}",
+        cluster.nodes[1].id
+    );
 
     // PUT via node 0; the object replicates down its chain. A brand-new key
     // returns 201 Created.
@@ -646,10 +708,17 @@ fn cluster_node_recovery_backfill() {
         .map(|node| login(node.port, "root", &pw).expect("login on each node"))
         .collect();
 
+    // Cluster-global registry (Phase G): create once on node 0; it replicates to
+    // every node, and the recovered node re-projects it from raft on restart.
     let bucket = "rec";
+    let s = create_bucket(cluster.nodes[0].port, &tokens[0], bucket);
+    assert!(s == 200 || s == 201, "create bucket on node 0: {s}");
     for (node, token) in cluster.nodes.iter().zip(&tokens) {
-        let s = create_bucket(node.port, token, bucket);
-        assert!(s == 200 || s == 201 || s == 409, "create bucket: {s}");
+        assert!(
+            wait_until(|| get_acl(node.port, token, bucket).0 == 200, 30),
+            "bucket did not replicate to node {}",
+            node.id
+        );
     }
 
     let leader_port = cluster.nodes[0].port;

@@ -17,6 +17,7 @@ use y2q_core::{AnyStorage, BucketPermission, Listing};
 
 use crate::auth::{AuthState, Authenticated};
 use crate::authz::authorize_bucket;
+use crate::cluster::{self, ClusterRuntime};
 use crate::error::{AppError, ErrorBody};
 
 /// Owner + grants view returned by `GET` and accepted by `PUT`.
@@ -102,6 +103,7 @@ pub async fn set_acl(
     body: web::Json<AclBody>,
     storage: web::Data<Arc<AnyStorage>>,
     state: web::Data<AuthState>,
+    cluster: Option<web::Data<ClusterRuntime>>,
     auth: Authenticated,
 ) -> Result<HttpResponse, AppError> {
     let bucket = path.into_inner();
@@ -151,10 +153,15 @@ pub async fn set_acl(
     }
     cfg.acl = body.grants;
 
-    storage
-        .set_bucket_config(&bucket, &cfg)
-        .await
-        .map_err(AppError::from)?;
+    // Clustered: replicate owner+ACL through raft so every node enforces one view.
+    if let Some(rt) = cluster.as_ref() {
+        cluster::cluster_set_bucket_config(rt, &bucket, &cfg).await?;
+    } else {
+        storage
+            .set_bucket_config(&bucket, &cfg)
+            .await
+            .map_err(AppError::from)?;
+    }
     Ok(HttpResponse::Ok().json(AclBody {
         owner: cfg.owner,
         grants: cfg.acl,

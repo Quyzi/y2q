@@ -13,6 +13,7 @@ use y2q_core::{AnyStorage, BucketConfig, BucketPermission, Listing};
 
 use crate::auth::Authenticated;
 use crate::authz::{Decision, authorize_bucket, claim_ownership};
+use crate::cluster::{self, ClusterRuntime};
 use crate::error::{AppError, ErrorBody};
 
 /// Response body for `PUT /{bucket}/`.
@@ -49,18 +50,30 @@ pub struct DeleteBucketResponse {
 pub async fn create(
     path: web::Path<String>,
     storage: web::Data<Arc<AnyStorage>>,
+    cluster: Option<web::Data<ClusterRuntime>>,
     auth: Authenticated,
 ) -> Result<HttpResponse, AppError> {
     let bucket = path.into_inner();
     let decision = authorize_bucket(&auth, &storage, &bucket, BucketPermission::Write).await?;
-    let created = storage
-        .create_bucket(&bucket)
-        .await
-        .map_err(AppError::from)?;
-    // Explicitly creating a brand-new bucket makes the caller its owner.
-    if matches!(decision, Decision::ClaimOwnership) {
-        claim_ownership(&storage, &bucket, &auth.username).await?;
-    }
+    // Clustered: register the bucket and claim ownership through raft so every
+    // node shares one authoritative registry; the projector mirrors it locally.
+    let created = if let Some(rt) = cluster.as_ref() {
+        let created = cluster::cluster_register_bucket(rt, &bucket).await?;
+        if matches!(decision, Decision::ClaimOwnership) {
+            cluster::cluster_claim_owner(rt, &bucket, &auth.username).await?;
+        }
+        created
+    } else {
+        let created = storage
+            .create_bucket(&bucket)
+            .await
+            .map_err(AppError::from)?;
+        // Explicitly creating a brand-new bucket makes the caller its owner.
+        if matches!(decision, Decision::ClaimOwnership) {
+            claim_ownership(&storage, &bucket, &auth.username).await?;
+        }
+        created
+    };
     Ok(HttpResponse::Ok().json(CreateBucketResponse { bucket, created }))
 }
 
@@ -173,6 +186,7 @@ pub async fn set_config(
     path: web::Path<String>,
     body: web::Json<BucketConfigBody>,
     storage: web::Data<Arc<AnyStorage>>,
+    cluster: Option<web::Data<ClusterRuntime>>,
     auth: Authenticated,
 ) -> Result<HttpResponse, AppError> {
     let bucket = path.into_inner();
@@ -188,9 +202,14 @@ pub async fn set_config(
     cfg.quota_bytes = body.quota_bytes;
     cfg.default_sse = body.default_sse;
     cfg.cors_allow_origin = body.cors_allow_origin;
-    storage
-        .set_bucket_config(&bucket, &cfg)
-        .await
-        .map_err(AppError::from)?;
+    // Clustered: replicate the full config through raft (deterministic replace).
+    if let Some(rt) = cluster.as_ref() {
+        cluster::cluster_set_bucket_config(rt, &bucket, &cfg).await?;
+    } else {
+        storage
+            .set_bucket_config(&bucket, &cfg)
+            .await
+            .map_err(AppError::from)?;
+    }
     Ok(HttpResponse::Ok().json(BucketConfigBody::from(cfg)))
 }

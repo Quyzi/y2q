@@ -38,8 +38,8 @@ use y2q_cluster::{
 };
 use y2q_core::crypto::{envelope, kdf};
 use y2q_core::{
-    AnyStorage, AnyStreamingPutGuard, LabelSet, ListOptions, Listing, MAX_LIST_LIMIT, PutOptions,
-    Storage, SyncLevel,
+    AnyStorage, AnyStreamingPutGuard, BucketConfig, LabelSet, ListOptions, Listing, MAX_LIST_LIMIT,
+    PutOptions, Storage, SyncLevel,
 };
 
 use crate::auth::{AdminAuthenticated, AuthState};
@@ -102,6 +102,145 @@ impl ClusterRuntime {
             }
         }
     }
+
+    /// Propose a control command through raft, forwarding to the current leader
+    /// when this node is not it. Bucket registry/config/ACL mutations use this so
+    /// they can originate on any contact node (only the leader may `client_write`).
+    async fn propose_control(&self, cmd: ControlCmd) -> Result<(), AppError> {
+        if self.controller.is_leader().await {
+            return self
+                .controller
+                .propose(cmd)
+                .await
+                .map(|_| ())
+                .map_err(|e| control_err(format!("propose: {e}")));
+        }
+        let leader = self
+            .controller
+            .raft()
+            .current_leader()
+            .await
+            .ok_or_else(|| control_err("no raft leader available"))?;
+        let state = self.controller.control_state().await;
+        let url = state
+            .nodes
+            .get(&leader)
+            .map(|m| m.addr.clone())
+            .ok_or_else(|| control_err(format!("leader {leader} has no known address")))?;
+        let _: ControlAck = self
+            .client
+            .post_json(&format!("{url}/internal/v1/control"), &cmd)
+            .await
+            .map_err(|e| control_err(format!("forward to leader: {e}")))?;
+        Ok(())
+    }
+}
+
+/// Build a generic 500 `AppError` for a cluster control-plane failure (no
+/// bucket/key context — these are topology/registry operations).
+fn control_err(msg: impl std::fmt::Display) -> AppError {
+    AppError(y2q_core::Error::InternalError {
+        bucket: String::new(),
+        key: String::new(),
+        operation: "cluster control".to_owned(),
+        message: msg.to_string(),
+    })
+}
+
+/// Ack body for `/internal/v1/control` (the leader applied the proposed command).
+#[derive(Debug, Serialize, Deserialize)]
+struct ControlAck {}
+
+// ---------------------------------------------------------------------------
+// Replicated bucket registry (Phase G): owner/ACL/config flow through raft and
+// project into each node's local bucket sidecars so every node shares one view.
+// ---------------------------------------------------------------------------
+
+/// Mirror one bucket's desired config into local storage (idempotent): ensure the
+/// bucket exists, then write its config sidecar. Shared by the projector task and
+/// the post-propose fast path so a read on the contact node is consistent.
+async fn project_bucket(storage: &AnyStorage, bucket: &str, cfg: &BucketConfig) {
+    let _ = storage.create_bucket(bucket).await;
+    if let Err(e) = storage.set_bucket_config(bucket, cfg).await {
+        tracing::warn!(bucket, error = %e, "bucket projector: set_bucket_config failed");
+    }
+}
+
+/// Register a bucket cluster-wide through raft and ensure it exists locally.
+/// Returns whether it was newly registered (for the create endpoint's `created`).
+pub async fn cluster_register_bucket(rt: &ClusterRuntime, bucket: &str) -> Result<bool, AppError> {
+    let existed = rt
+        .controller
+        .control_state()
+        .await
+        .buckets
+        .contains_key(bucket);
+    rt.propose_control(ControlCmd::RegisterBucket {
+        bucket: bucket.to_owned(),
+    })
+    .await?;
+    let _ = rt.distributed.local().create_bucket(bucket).await;
+    Ok(!existed)
+}
+
+/// Claim a bucket's owner cluster-wide (first-writer-wins at the raft apply) and
+/// project the committed config locally.
+pub async fn cluster_claim_owner(
+    rt: &ClusterRuntime,
+    bucket: &str,
+    owner: &str,
+) -> Result<(), AppError> {
+    rt.propose_control(ControlCmd::ClaimBucketOwner {
+        bucket: bucket.to_owned(),
+        owner: owner.to_owned(),
+    })
+    .await?;
+    let state = rt.controller.control_state().await;
+    if let Some(cfg) = state.buckets.get(bucket) {
+        project_bucket(rt.distributed.local(), bucket, cfg).await;
+    }
+    Ok(())
+}
+
+/// Replace a bucket's full config (quota/CORS/owner/ACL) cluster-wide through raft
+/// and project it locally. The caller computed `cfg` via read-modify-write under
+/// an admin check; `SetBucketConfig` is a deterministic full replace.
+pub async fn cluster_set_bucket_config(
+    rt: &ClusterRuntime,
+    bucket: &str,
+    cfg: &BucketConfig,
+) -> Result<(), AppError> {
+    rt.propose_control(ControlCmd::SetBucketConfig {
+        bucket: bucket.to_owned(),
+        config: cfg.clone(),
+    })
+    .await?;
+    project_bucket(rt.distributed.local(), bucket, cfg).await;
+    Ok(())
+}
+
+/// Spawn the bucket projector: mirror the replicated bucket registry into this
+/// node's local sidecars on every raft apply. Diffs against the last-projected
+/// map so an unrelated control change (e.g. a node-status flip) does not rewrite
+/// every sidecar. A freshly-joined node inherits all bucket configs this way.
+pub fn spawn_bucket_projector(rt: web::Data<ClusterRuntime>) {
+    let mut rx = rt.controller.subscribe();
+    let storage = Arc::clone(rt.distributed.local());
+    tokio::spawn(async move {
+        let mut last: BTreeMap<String, BucketConfig> = BTreeMap::new();
+        loop {
+            let buckets = rx.borrow_and_update().buckets.clone();
+            for (bucket, cfg) in buckets.iter() {
+                if last.get(bucket) != Some(cfg) {
+                    project_bucket(&storage, bucket, cfg).await;
+                }
+            }
+            last = buckets;
+            if rx.changed().await.is_err() {
+                break; // controller dropped; daemon shutting down
+            }
+        }
+    });
 }
 
 /// Extractor that admits only authenticated cluster peers. Used to gate the
@@ -1099,6 +1238,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         web::resource("/internal/v1/backfill/object").route(web::get().to(backfill_object)),
     );
     cfg.service(web::resource("/internal/v1/health").route(web::get().to(health)));
+    cfg.service(web::resource("/internal/v1/control").route(web::post().to(control)));
     cfg.service(web::resource("/api/v1/cluster/status").route(web::get().to(status)));
     cfg.service(web::resource("/api/v1/cluster/join").route(web::post().to(join)));
 }
@@ -1463,6 +1603,22 @@ async fn health(rt: web::Data<ClusterRuntime>, _peer: ClusterPeer) -> HttpRespon
         fingerprint: rt.fingerprint.clone(),
         caught_up: rt.backfill_caught_up.load(Ordering::Relaxed),
     })
+}
+
+/// Apply a peer-forwarded control command. Used when a bucket registry/config/ACL
+/// mutation originated on a non-leader node: that node forwards the command here,
+/// to the leader, which proposes it through raft. Fails with 502 if this node is
+/// not (or no longer) the leader.
+async fn control(
+    rt: web::Data<ClusterRuntime>,
+    _peer: ClusterPeer,
+    body: web::Json<ControlCmd>,
+) -> Result<HttpResponse, actix_web::Error> {
+    rt.controller
+        .propose(body.into_inner())
+        .await
+        .map_err(|e| ErrorBadGateway(format!("control propose: {e}")))?;
+    Ok(HttpResponse::Ok().json(ControlAck {}))
 }
 
 /// Operator-facing cluster status (admin).

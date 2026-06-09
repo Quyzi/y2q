@@ -145,7 +145,7 @@ pub async fn handle(
         };
 
         if matches!(decision, Decision::ClaimOwnership) {
-            claim_ownership(&storage, &bucket, &auth.username).await?;
+            cluster::cluster_claim_owner(rt, &bucket, &auth.username).await?;
         }
         return Ok(if was_overwrite {
             HttpResponse::Ok().finish()
