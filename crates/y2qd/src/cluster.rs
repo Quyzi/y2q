@@ -880,13 +880,25 @@ pub async fn proxy_put_to_head(
     let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(8);
     let feeder = async {
         use futures::StreamExt as _;
+        let mut result = Ok::<(), AppError>(());
         while let Some(chunk) = payload.next().await {
-            let chunk = chunk.map_err(|e| internal_err(bucket, key, e))?;
-            if tx.send(chunk).await.is_err() {
-                break;
+            match chunk {
+                Ok(chunk) => {
+                    if tx.send(chunk).await.is_err() {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    result = Err(internal_err(bucket, key, e));
+                    break;
+                }
             }
         }
-        Ok::<(), AppError>(())
+        // See the matching note in `prepare`: drop the sender so the relayed body
+        // reaches EOF; `tokio::join!` otherwise keeps `tx` alive until the joined
+        // send future finishes, which deadlocks against the HEAD awaiting the body.
+        drop(tx);
+        result
     };
     let url = format!("{head_url}/internal/v1/put");
     let headers = [(CLUSTER_PUT_HEADER, meta_json)];
@@ -1125,13 +1137,28 @@ async fn prepare(
     let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(8);
     let feeder = async {
         use futures::StreamExt as _;
+        let mut result = Ok::<(), actix_web::Error>(());
         while let Some(chunk) = payload.next().await {
-            let chunk = chunk.map_err(|e| ErrorBadRequest(format!("read body: {e}")))?;
-            if tx.send(chunk).await.is_err() {
-                break; // receiver gone (accept_prepare returned early with an error)
+            match chunk {
+                Ok(chunk) => {
+                    if tx.send(chunk).await.is_err() {
+                        break; // receiver gone (accept_prepare returned early)
+                    }
+                }
+                Err(e) => {
+                    result = Err(ErrorBadRequest(format!("read body: {e}")));
+                    break;
+                }
             }
         }
-        Ok::<(), actix_web::Error>(())
+        // Drop the sender so the data plane's body channel reaches end-of-stream.
+        // `tokio::join!` keeps this (completed) future — and thus its captured
+        // `tx` — alive until the joined `accept` future also finishes, so without
+        // this explicit drop the receiver would block forever waiting for a close
+        // that only happens when the whole handler returns. That is a deadlock:
+        // `accept` cannot finish because it is still awaiting the body.
+        drop(tx);
+        result
     };
     let accept = rt.distributed.accept_prepare(meta, rx);
 
