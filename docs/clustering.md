@@ -367,7 +367,8 @@ greedy `/{bucket}/{key}` route ([`cluster.rs`](../crates/y2qd/src/cluster.rs)):
 | GET | `/internal/v1/backfill/object` | one object's ciphertext envelope, verbatim |
 | GET | `/internal/v1/health` | liveness, status, epoch, raft last-applied |
 
-Admin (under `/api/v1/cluster/`, admin-authed): `POST /join`, `GET /status`.
+Admin (under `/api/v1/cluster/`, admin-authed): `POST /join`, `GET /status`,
+`POST /migrate` (see [Migration](#migration)).
 
 **Peer auth:** v1 uses a constant-time shared-secret header (`cluster.auth =
 "shared-secret"`, `Y2QD_CLUSTER__SHARED_SECRET`). Production posture is
@@ -375,6 +376,37 @@ Admin (under `/api/v1/cluster/`, admin-authed): `POST /join`, `GET /status`.
 are never reused for peer traffic (they idle-drop).
 
 ---
+
+## Migration
+
+`POST /api/v1/cluster/migrate` (admin) moves objects **either direction** between a
+single-node dataset and the cluster, built on the same verbatim-ciphertext
+primitives as back-fill (so no re-encryption ever happens). Body:
+`{ "mode": "import" | "export", "prune": bool }`; the response is a report
+(`scanned`, `transferred`, `skipped`, `pruned`, `errors`). Both directions are
+**idempotent and resumable** - re-run after an interruption and already-present
+objects are skipped (digest match).
+
+- **`import` (single-node → cluster):** run on the seed node holding a pre-cluster
+  dataset. For each local object it resolves the object's chain and, unless every
+  chain member already holds a byte-identical copy, pushes the verbatim envelope
+  to the chain HEAD (which replicates it down the chain). With `"prune": true`, an
+  object whose chain excludes the seed is deleted locally **after** it is safely
+  replicated (never before, never on a transfer error) - so a seed can shed the
+  data it no longer owns once the cluster holds it. This is the redistribution
+  pass that turns an existing `base_path` into a properly chain-replicated dataset
+  (the hash ring routes each key to R nodes, but the bytes physically lived on one
+  node only until this runs).
+
+- **`export` (cluster → single-node):** run on the target node. It pulls the full
+  object set from every Active peer **regardless of chain ownership**, so
+  afterwards the node holds a complete copy of the cluster and can be detached to
+  run standalone (`cluster.enabled = false`). The single-node `.obj` format is
+  byte-identical, so the detached node serves the data directly.
+
+**Precondition (both directions):** every node already shares the deployment
+keystore (the shared-key invariant), so ciphertext is portable verbatim. Migration
+is a one-shot operator tool, not part of the steady-state read/write path.
 
 ## Configuration reference
 

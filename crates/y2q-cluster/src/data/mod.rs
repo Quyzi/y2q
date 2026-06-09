@@ -43,7 +43,8 @@ pub use pending::{Pending, PendingGuard, PendingWrites};
 pub use route::{ChainRoute, resolve_route};
 pub use wire::{
     BACKFILL_META_HEADER, BackfillEntry, BackfillManifest, BackfillObjectMeta, LabelMode,
-    MutateMeta, MutateOp, MutateResp, PREPARE_META_HEADER, PrepareMeta, PrepareResp, VersionResp,
+    MigrateReport, MutateMeta, MutateOp, MutateResp, PREPARE_META_HEADER, PrepareMeta, PrepareResp,
+    VersionResp,
 };
 
 /// Bounded depth of the per-hop forward channel. A few in-flight chunks gives
@@ -634,6 +635,230 @@ impl DistributedStorage {
             }
         }
         Ok(fetched)
+    }
+
+    /// Distribute this node's local objects across the cluster (single-node →
+    /// cluster import). For each local object, resolve its chain and — unless
+    /// every chain member already holds a byte-identical copy — push the verbatim
+    /// envelope to the chain HEAD, which replicates it down the chain. Idempotent
+    /// and resumable: objects already replicated are skipped. With `prune`, an
+    /// object whose chain excludes this node is deleted locally after it has been
+    /// safely replicated (never before, and never on a transfer error).
+    pub async fn migrate_distribute(&self, prune: bool) -> Result<MigrateReport, DataError> {
+        use std::collections::HashMap;
+
+        let state = self.controller.control_state().await;
+        let manifest = self.local_manifest().await?;
+        // Per-member manifest cache: member id → {(bucket,key) → cipher_sha256}.
+        let mut member_objs: HashMap<NodeId, HashMap<(String, String), Option<String>>> =
+            HashMap::new();
+        let mut report = MigrateReport::default();
+
+        for entry in manifest.entries {
+            report.scanned += 1;
+            let route = resolve_route(
+                &state,
+                &entry.bucket,
+                &entry.key,
+                self.replication_factor,
+                self.virtual_nodes_per_node,
+            );
+            if route.members.is_empty() {
+                report
+                    .errors
+                    .push(format!("{}/{}: no chain", entry.bucket, entry.key));
+                continue;
+            }
+
+            if self
+                .chain_fully_holds(&state, &route, &entry, &mut member_objs)
+                .await
+            {
+                report.skipped += 1;
+            } else {
+                match self
+                    .push_object(&state, &route, &entry.bucket, &entry.key)
+                    .await
+                {
+                    Ok(()) => report.transferred += 1,
+                    Err(e) => {
+                        report
+                            .errors
+                            .push(format!("{}/{}: {e}", entry.bucket, entry.key));
+                        continue; // do not prune an object we failed to replicate
+                    }
+                }
+            }
+
+            if prune
+                && !route.contains(self.node_id)
+                && self.local.delete(&entry.bucket, &entry.key).await.is_ok()
+            {
+                report.pruned += 1;
+            }
+        }
+        Ok(report)
+    }
+
+    /// Whether every chain member other than this node already holds a copy of
+    /// `entry` with a matching ciphertext digest (so a distribute can skip it).
+    /// Lazily fetches and caches each member's backfill manifest; an unreachable
+    /// member or an unknown digest counts as "does not hold" (forcing a push).
+    async fn chain_fully_holds(
+        &self,
+        state: &ControlState,
+        route: &ChainRoute,
+        entry: &BackfillEntry,
+        cache: &mut std::collections::HashMap<
+            NodeId,
+            std::collections::HashMap<(String, String), Option<String>>,
+        >,
+    ) -> bool {
+        use std::collections::HashMap;
+        let Some(want) = entry.cipher_sha256.clone() else {
+            return false;
+        };
+        for &m in &route.members {
+            if m == self.node_id {
+                continue;
+            }
+            // Lazily fetch and cache the member's manifest. The await happens
+            // inside the vacant arm, which is the sole borrow of `cache`.
+            if let std::collections::hash_map::Entry::Vacant(slot) = cache.entry(m) {
+                let mut map: HashMap<(String, String), Option<String>> = HashMap::new();
+                if let Some(url) = self.peer_base_url(state, m)
+                    && let Ok(man) = self
+                        .client
+                        .get_json::<BackfillManifest>(&format!(
+                            "{url}/internal/v1/backfill/manifest"
+                        ))
+                        .await
+                {
+                    for e in man.entries {
+                        map.insert((e.bucket, e.key), e.cipher_sha256);
+                    }
+                }
+                slot.insert(map);
+            }
+            let held = cache
+                .get(&m)
+                .and_then(|map| map.get(&(entry.bucket.clone(), entry.key.clone())).cloned())
+                .flatten();
+            if held.as_deref() != Some(want.as_str()) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Push one local object's verbatim envelope onto its chain. If this node is
+    /// the chain HEAD it replicates straight down the chain; otherwise it sends a
+    /// PREPARE to the remote HEAD, which writes the bytes verbatim and relays them
+    /// through the rest of the chain (including back through this node when it is a
+    /// non-head member — an idempotent verbatim overwrite).
+    async fn push_object(
+        &self,
+        state: &ControlState,
+        route: &ChainRoute,
+        bucket: &str,
+        key: &str,
+    ) -> Result<(), DataError> {
+        let md = self.local.describe(bucket, key).await?;
+        let bmeta = BackfillObjectMeta {
+            version: md.version.unwrap_or(0),
+            plaintext_len: envelope::padme_len(md.size),
+            plaintext_size: md.size,
+            checksum_gxhash_b64: md.checksum_gxhash.clone(),
+            cipher_size: md.cipher_size.unwrap_or(0),
+            cipher_sha256_b64: md.cipher_sha256.clone().unwrap_or_default(),
+            kem_alg: md.kem_alg.clone().unwrap_or_default(),
+            aead_alg: md.aead_alg.clone().unwrap_or_default(),
+            envelope_version: md.envelope_version.unwrap_or(2),
+            labels: md.labels.iter().cloned().collect(),
+        };
+        let pmeta = bmeta.to_prepare(bucket, key, chain_id(bucket, key), route.epoch);
+        let envelope = self.local.get(bucket, key).await?.into_inner();
+
+        let (tx, rx) = mpsc::channel::<Bytes>(4);
+        tokio::spawn(async move {
+            let _ = tx.send(envelope).await;
+        });
+
+        match route.head() {
+            Some(h) if h == self.node_id => {
+                self.forward_to_next(&pmeta, rx).await?;
+            }
+            Some(h) => {
+                let url = self
+                    .peer_base_url(state, h)
+                    .ok_or_else(|| DataError::NoChain {
+                        bucket: bucket.to_owned(),
+                        key: key.to_owned(),
+                    })?;
+                forward_prepare(&self.client, &url, &pmeta, rx).await?;
+            }
+            None => {
+                return Err(DataError::NoChain {
+                    bucket: bucket.to_owned(),
+                    key: key.to_owned(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Collect every object in the cluster onto this node (cluster → single-node
+    /// export). Pulls the full object set from every Active peer regardless of
+    /// chain ownership, so afterwards this node holds a complete copy and can run
+    /// standalone (`cluster.enabled = false`). Idempotent: objects already present
+    /// with a matching digest are skipped.
+    pub async fn migrate_collect(&self) -> Result<MigrateReport, DataError> {
+        let state = self.controller.control_state().await;
+        let epoch = state.epoch;
+        let peers: Vec<String> = state
+            .nodes
+            .iter()
+            .filter(|(id, meta)| **id != self.node_id && meta.status == NodeStatus::Active)
+            .map(|(_, meta)| meta.addr.clone())
+            .collect();
+
+        let mut report = MigrateReport::default();
+        for url in peers {
+            let manifest: BackfillManifest = match self
+                .client
+                .get_json(&format!("{url}/internal/v1/backfill/manifest"))
+                .await
+            {
+                Ok(m) => m,
+                Err(e) => {
+                    report.errors.push(format!("manifest {url}: {e}"));
+                    continue;
+                }
+            };
+            for entry in manifest.entries {
+                report.scanned += 1;
+                let local = self
+                    .local
+                    .describe(&entry.bucket, &entry.key)
+                    .await
+                    .ok()
+                    .map(|m| (m.version, m.cipher_sha256));
+                if !need_backfill(local, entry.version, &entry.cipher_sha256) {
+                    report.skipped += 1;
+                    continue;
+                }
+                match self
+                    .backfill_object(&url, &entry.bucket, &entry.key, epoch)
+                    .await
+                {
+                    Ok(()) => report.transferred += 1,
+                    Err(e) => report
+                        .errors
+                        .push(format!("{}/{}: {e}", entry.bucket, entry.key)),
+                }
+            }
+        }
+        Ok(report)
     }
 
     /// Apply a non-PUT mutation (DELETE / label edit) locally and relay it to the
