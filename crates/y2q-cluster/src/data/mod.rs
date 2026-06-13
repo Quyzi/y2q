@@ -181,6 +181,15 @@ pub enum ReadPlan {
     },
 }
 
+/// Where a HEAD / `describe` should source object metadata.
+pub enum DescribePlan {
+    /// Answer from this node's local index (it is a chain member, or the cluster
+    /// has no chain yet).
+    Local,
+    /// Metadata fetched from a chain member that holds the object (the TAIL).
+    Remote(Box<y2q_core::Metadata>),
+}
+
 /// The distributed storage handle: a local backend plus the cluster control and
 /// transport needed to replicate writes across a chain.
 pub struct DistributedStorage {
@@ -378,6 +387,54 @@ impl DistributedStorage {
                     .await
                     .map_err(map_fetch_err)?;
                 Ok(ReadPlan::Remote { envelope, size })
+            }
+            None => Err(DataError::NoChain {
+                bucket: bucket.to_owned(),
+                key: key.to_owned(),
+            }),
+        }
+    }
+
+    /// Decide how to answer a HEAD / `describe` for `(bucket, key)`: from this
+    /// node's local index if it is a chain member, otherwise fetch the committed
+    /// metadata from the chain TAIL. Mirrors [`Self::plan_read`] but transfers
+    /// only metadata (no object body), so a STAT/HEAD landing on a contact node
+    /// that does not hold the object resolves across the chain instead of 404ing.
+    pub async fn plan_describe(&self, bucket: &str, key: &str) -> Result<DescribePlan, DataError> {
+        let state = self.controller.control_state().await;
+        let route = resolve_route(
+            &state,
+            bucket,
+            key,
+            self.replication_factor,
+            self.virtual_nodes_per_node,
+        );
+
+        // No chain yet, or this node is a chain member: answer locally. A member
+        // keeps a committed clean copy whose metadata is authoritative for a stat
+        // even while a newer version is staged.
+        if route.members.is_empty() || route.contains(self.node_id) {
+            return Ok(DescribePlan::Local);
+        }
+
+        // Non-member contact node: fetch metadata from the TAIL (the commit point).
+        match route.tail() {
+            Some(tail) => {
+                let url = self
+                    .peer_base_url(&state, tail)
+                    .ok_or_else(|| DataError::NoChain {
+                        bucket: bucket.to_owned(),
+                        key: key.to_owned(),
+                    })?;
+                let meta: y2q_core::Metadata = self
+                    .client
+                    .get_json_query(
+                        &format!("{url}/internal/v1/describe"),
+                        &[("bucket", bucket), ("key", key)],
+                    )
+                    .await
+                    .map_err(map_fetch_err)?;
+                Ok(DescribePlan::Remote(Box::new(meta)))
             }
             None => Err(DataError::NoChain {
                 bucket: bucket.to_owned(),

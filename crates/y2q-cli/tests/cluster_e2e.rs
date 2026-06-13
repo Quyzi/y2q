@@ -230,6 +230,22 @@ fn get_object(port: u16, token: &str, bucket: &str, key: &str) -> (u16, Vec<u8>)
     .unwrap_or((0, Vec::new()))
 }
 
+/// STAT an object (`HEAD /{bucket}/{key}`) returning the status code. A HEAD to a
+/// node that is not in the object's chain must resolve across the chain (fetch
+/// metadata from the TAIL), not 404.
+fn head_object(port: u16, token: &str, bucket: &str, key: &str) -> u16 {
+    let bearer = auth_header(token);
+    http(
+        port,
+        "HEAD",
+        &format!("/{bucket}/{key}"),
+        &[("Authorization", &bearer)],
+        &[],
+    )
+    .map(|(s, _)| s)
+    .unwrap_or(0)
+}
+
 /// Replace a bucket's owner+ACL (`PUT /api/v1/buckets/{bucket}/acl`).
 fn set_acl(port: u16, token: &str, bucket: &str, body: &str) -> u16 {
     let bearer = auth_header(token);
@@ -744,6 +760,28 @@ fn cluster_replication_and_apportioned_reads() {
         assert_eq!(got, body2, "overwrite not visible from node {}", node.id);
     }
 
+    // STAT (HEAD) from EVERY node returns 200: chain members describe locally, the
+    // off-chain node fetches committed metadata from the TAIL (the apportioned
+    // describe path). Regression guard: before that path existed, a HEAD to a
+    // non-holding contact node 404'd.
+    for (node, token) in cluster.nodes.iter().zip(&tokens) {
+        assert_eq!(
+            head_object(node.port, token, bucket, key),
+            200,
+            "STAT (HEAD) via node {} should resolve across the chain",
+            node.id
+        );
+    }
+    // A STAT for a missing key still 404s from every node (not a false 200).
+    for (node, token) in cluster.nodes.iter().zip(&tokens) {
+        assert_eq!(
+            head_object(node.port, token, bucket, "no/such/key"),
+            404,
+            "STAT for a missing key via node {} should 404",
+            node.id
+        );
+    }
+
     // A scatter-gather LIST from any contact node returns the object exactly once
     // (deduped across the R replicas). Match the `"key":"…"` field specifically —
     // the key substring also appears in the `url_path` field.
@@ -862,7 +900,11 @@ fn cluster_migration_export_import() {
     for (i, k) in keys.iter().enumerate() {
         let (status, got) = get_object(n0, &tok, bucket, k);
         assert_eq!(status, 200, "GET {k} after import+prune");
-        assert_eq!(got, format!("payload-{i}").as_bytes(), "wrong bytes for {k}");
+        assert_eq!(
+            got,
+            format!("payload-{i}").as_bytes(),
+            "wrong bytes for {k}"
+        );
     }
 }
 
