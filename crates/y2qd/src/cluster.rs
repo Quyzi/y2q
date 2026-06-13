@@ -32,8 +32,8 @@ use y2q_cluster::control::raft_impl::TypeConfig;
 use y2q_cluster::transport::internal_client::CLUSTER_AUTH_HEADER;
 use y2q_cluster::{
     BACKFILL_META_HEADER, BackfillObjectMeta, ChainRoute, ControlCmd, Controller, ControllerConfig,
-    DistributedStorage, HttpRaftNetworkFactory, InternalClient, InternalTlsOptions, LabelMode,
-    MutateMeta, MutateOp, MutateResp, NodeStatus, PREPARE_META_HEADER, PrepareMeta,
+    DescribePlan, DistributedStorage, HttpRaftNetworkFactory, InternalClient, InternalTlsOptions,
+    LabelMode, MutateMeta, MutateOp, MutateResp, NodeStatus, PREPARE_META_HEADER, PrepareMeta,
     ReadConsistency, ReadPlan, Role, VersionResp, chain_id, resolve_node_id,
 };
 use y2q_core::crypto::{Role as UserRole, UserRecord, envelope, kdf};
@@ -1286,6 +1286,20 @@ pub async fn plan_read(rt: &ClusterRuntime, bucket: &str, key: &str) -> Result<R
         .map_err(|e| map_data_err(bucket, key, e))
 }
 
+/// Decide how to answer a HEAD/describe of `(bucket, key)`: serve this node's
+/// local metadata, or fetch the committed metadata from the chain TAIL
+/// ([`DescribePlan::Remote`]) when this contact node does not hold the object.
+pub async fn plan_describe(
+    rt: &ClusterRuntime,
+    bucket: &str,
+    key: &str,
+) -> Result<DescribePlan, AppError> {
+    rt.distributed
+        .plan_describe(bucket, key)
+        .await
+        .map_err(|e| map_data_err(bucket, key, e))
+}
+
 /// Scatter-gather a list (`query = None`) or label search across every Active
 /// node, returning the merged, deduped page. `bucket` is `Some` for a
 /// single-bucket list/search and `None` for a cross-bucket search.
@@ -1341,6 +1355,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
     cfg.service(web::resource("/internal/v1/mutate").route(web::post().to(mutate)));
     cfg.service(web::resource("/internal/v1/version").route(web::get().to(version)));
     cfg.service(web::resource("/internal/v1/read").route(web::get().to(internal_read)));
+    cfg.service(web::resource("/internal/v1/describe").route(web::get().to(internal_describe)));
     cfg.service(web::resource("/internal/v1/list").route(web::get().to(internal_list)));
     cfg.service(
         web::resource("/internal/v1/backfill/manifest").route(web::get().to(backfill_manifest)),
@@ -1579,6 +1594,26 @@ async fn internal_read(
         .insert_header(("X-Y2Q-Size", size.to_string()))
         .content_type("application/octet-stream")
         .body(object.into_inner()))
+}
+
+/// Serve this node's local object metadata for `(bucket, key)` to a peer (the
+/// apportioned HEAD/describe fetch). Metadata only — no object body crosses the
+/// wire. `404` when the object is absent so the contact node can surface a clean
+/// not-found.
+async fn internal_describe(
+    rt: web::Data<ClusterRuntime>,
+    _peer: ClusterPeer,
+    q: web::Query<VersionParams>,
+) -> Result<HttpResponse, actix_web::Error> {
+    let local = rt.distributed.local();
+    let meta = local
+        .describe(&q.bucket, &q.key)
+        .await
+        .map_err(|e| match e {
+            y2q_core::Error::NotFound { .. } => actix_web::error::ErrorNotFound(e.to_string()),
+            other => actix_web::error::ErrorBadGateway(other.to_string()),
+        })?;
+    Ok(HttpResponse::Ok().json(meta))
 }
 
 /// Query params for the internal scatter-gather list/search endpoint.

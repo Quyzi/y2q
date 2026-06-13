@@ -282,6 +282,12 @@ trimmed to the true plaintext size. This is the apportioned-read win: clean read
 fan out across all `R` replicas; only in-flight keys pay the version-query round
 trip.
 
+HEAD/stat follows the same routing through
+[`plan_describe`](../crates/y2q-cluster/src/data/mod.rs): a chain member answers
+from its local index, a non-member fetches the committed metadata from the TAIL
+(`/internal/v1/describe`) — metadata only, no object body. Without this a STAT to a
+contact node outside the object's chain would 404 even though the object exists.
+
 ### Non-PUT mutations (DELETE, label edits)
 
 DELETE and label edits route down the same chain via `/internal/v1/mutate`
@@ -362,6 +368,7 @@ greedy `/{bucket}/{key}` route ([`cluster.rs`](../crates/y2qd/src/cluster.rs)):
 | POST | `/internal/v1/mutate` | DELETE / label edit relayed down the chain |
 | GET | `/internal/v1/version` | TAIL returns the committed version for `(bucket, key)` |
 | GET | `/internal/v1/read` | TAIL returns the committed ciphertext envelope verbatim |
+| GET | `/internal/v1/describe` | TAIL returns committed object metadata (HEAD/stat), no body |
 | GET | `/internal/v1/list` | one node's local list/search page for scatter-gather |
 | GET | `/internal/v1/backfill/manifest` | `(key, version, cipher_sha256)` for recovery diff |
 | GET | `/internal/v1/backfill/object` | one object's ciphertext envelope, verbatim |

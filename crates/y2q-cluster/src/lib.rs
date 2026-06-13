@@ -23,8 +23,9 @@ pub use control::{
 pub use data::wire::PREPARE_META_HEADER;
 pub use data::{
     BACKFILL_META_HEADER, BackfillEntry, BackfillManifest, BackfillObjectMeta, ChainRoute,
-    DataError, DistributedStorage, LabelMode, MigrateReport, MutateMeta, MutateOp, MutateResp,
-    PendingWrites, PrepareMeta, PrepareResp, ReadConsistency, ReadPlan, VersionResp, resolve_route,
+    DataError, DescribePlan, DistributedStorage, LabelMode, MigrateReport, MutateMeta, MutateOp,
+    MutateResp, PendingWrites, PrepareMeta, PrepareResp, ReadConsistency, ReadPlan, VersionResp,
+    resolve_route,
 };
 pub use hashing::chain::{ChainEntry, ChainTable, Role};
 pub use hashing::ring::{Ring, chain_id};

@@ -3,10 +3,11 @@
 use std::sync::Arc;
 
 use actix_web::{HttpResponse, web};
-use y2q_core::{AnyStorage, BucketPermission, Storage};
+use y2q_core::{AnyStorage, BucketPermission, Metadata, Storage};
 
 use crate::auth::Authenticated;
 use crate::authz::authorize_bucket;
+use crate::cluster::{self, ClusterRuntime};
 use crate::error::{AppError, ErrorBody};
 
 /// Retrieve object metadata without transferring the body.
@@ -50,15 +51,34 @@ use crate::error::{AppError, ErrorBody};
 pub async fn handle(
     path: web::Path<(String, String)>,
     storage: web::Data<Arc<AnyStorage>>,
+    cluster: Option<web::Data<ClusterRuntime>>,
     auth: Authenticated,
 ) -> Result<HttpResponse, AppError> {
     let (bucket, key) = path.into_inner();
     authorize_bucket(&auth, &storage, &bucket, BucketPermission::Read).await?;
-    let meta = storage
-        .describe(&bucket, &key)
-        .await
-        .map_err(AppError::from)?;
 
+    // Clustered: a HEAD either describes this node's local copy or fetches the
+    // committed metadata from the chain TAIL when this contact node does not hold
+    // the object. Otherwise STAT on a non-holding node would 404 spuriously.
+    let meta = match cluster.as_ref() {
+        Some(rt) => match cluster::plan_describe(rt, &bucket, &key).await? {
+            y2q_cluster::DescribePlan::Local => storage
+                .describe(&bucket, &key)
+                .await
+                .map_err(AppError::from)?,
+            y2q_cluster::DescribePlan::Remote(meta) => *meta,
+        },
+        None => storage
+            .describe(&bucket, &key)
+            .await
+            .map_err(AppError::from)?,
+    };
+
+    Ok(build_response(&meta))
+}
+
+/// Build the `200 OK` metadata-header response for a HEAD request.
+fn build_response(meta: &Metadata) -> HttpResponse {
     let mut builder = HttpResponse::Ok();
     builder
         .insert_header(("Content-Length", meta.size.to_string()))
@@ -90,5 +110,5 @@ pub async fn handle(
         builder.append_header((format!("X-Y2Q-{}", name), value.clone()));
     }
 
-    Ok(builder.finish())
+    builder.finish()
 }
