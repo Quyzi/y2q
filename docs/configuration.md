@@ -60,7 +60,7 @@ CLI values are coerced as integer first, then `true`/`false`, then string.
 | `host` | string | *required* | Bind address - `127.0.0.1` for local-only, `0.0.0.0` for all interfaces |
 | `port` | u16 | *required* | TCP port |
 | `max_body_bytes` | usize | `268435456` (256 MiB) | Maximum PUT request body size |
-| `unauthenticated_metrics` | bool | `false` | When `true`, `/metrics/prometheus`, `/metrics/dashboard`, and `/swagger-ui/` are exposed without a Bearer token. Default keeps them auth-gated. |
+| `unauthenticated_metrics` | bool | `false` | When `true`, `/metrics/prometheus`, `/metrics/dashboard`, `/swagger-ui/`, and `/api-docs/openapi.json` are exposed without a Bearer token. When `false` (default) they are **not registered at all** - there is no auth-gated variant; the daemon logs that they are disabled. |
 
 ### `[server.actix]`
 
@@ -75,6 +75,20 @@ The entire section is optional. Omitting it leaves actix's compiled-in defaults 
 | `client_request_timeout_secs` | u64 | `5` | How long to wait for the first request bytes after accepting a connection. Silent connections are closed. |
 | `client_disconnect_timeout_secs` | u64 | `1` | How long to wait for the client to close after the final response is sent. |
 | `shutdown_timeout_secs` | u64 | `30` | Graceful shutdown window - in-flight requests have this long to complete after SIGTERM. |
+
+### `[server.tls]`
+
+Optional. When `enabled = true` the daemon binds **HTTPS** at `[server] port` using rustls and refuses plaintext HTTP entirely; `cert_path` and `key_path` become required. To run HTTP and HTTPS side by side, run two `y2qd` processes on different ports - this section flips a single listener between modes.
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `enabled` | bool | `false` | Bind HTTPS instead of HTTP. |
+| `cert_path` | string | *(none)* | PEM certificate chain (fullchain). Required when `enabled`. |
+| `key_path` | string | *(none)* | PEM private key (PKCS#8, PKCS#1, or SEC1). Required when `enabled`. |
+| `client_ca_path` | string | *(none)* | PEM CA bundle for **mutual TLS**. When set, every client must present a certificate chaining to one of these CAs or the handshake is rejected. Leave unset to accept clients without a client cert. |
+| `require_pq_kex` | bool | `true` | When `true`, offer **only** the X25519MLKEM768 post-quantum hybrid key-exchange group; clients that cannot negotiate it are refused at handshake time. Set `false` to fall back to rustls's default preference list (PQ-hybrid preferred, classic X25519/ECDH still offered). |
+
+When clustering with `cluster.auth = "mtls"`, `client_ca_path` is also what peer connections are verified against.
 
 ### `[storage]`
 
@@ -154,6 +168,37 @@ Continuous CPU profiling via pprof-rs shipped to a Pyroscope server or Grafana C
 Tags attached to every profile: `version` (daemon version), `backend` (`"filesystem"` or `"uring"`).
 
 The agent runs a background OS thread using SIGPROF; it does not interact with the tokio runtime and has negligible impact on request latency.
+
+### `[cluster]` and `[cluster.raft]`
+
+Distributed mode (**experimental** - functional and tested, but young and not yet recommended for production data). **Disabled by default** (`enabled = false`) - the whole section is optional and every key is defaulted; with it off the daemon is byte-for-byte single-node. Enabling clustering requires the **same deployment keystore on every node** (the key hierarchy is derived deterministically from it). This table is a quick reference; the full design, bootstrap/join procedure, voter/learner split, and migration live in [clustering.md](clustering.md).
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `enabled` | bool | `false` | Master switch. `false` => single node, no clustering behavior. |
+| `node_id` | string | *(derived)* | Explicit `u64` node id; empty derives and persists one. |
+| `advertise_addr` | string | *(none)* | `host:port` peers dial for the internal API. **Required when `enabled`.** |
+| `replication_factor` | usize | `3` | `R` = chain length (replicas per object); clamped to membership. |
+| `virtual_nodes_per_node` | u32 | `256` | Consistent-hash ring smoothing. |
+| `consistency` | enum | `"strong"` | `strong` \| `eventual` \| `eventual-bounded`. |
+| `eventual_bound_ms` | u64 | `2000` | Freshness window for `eventual-bounded` reads. |
+| `prepare_timeout_ms` | u64 | `30000` | Per-hop PREPARE forward timeout. |
+| `ack_timeout_ms` | u64 | `30000` | HEAD wait for full-chain commit. |
+| `auth` | enum | `"shared-secret"` | `shared-secret` \| `mtls`. `mtls` reuses `[server.tls] client_ca_path`. |
+| `shared_secret` | string | *(none)* | Peer-auth secret when `auth = "shared-secret"`; prefer `Y2QD_CLUSTER__SHARED_SECRET`. |
+| `health_probe_interval_ms` | u64 | `1000` | Inter-node health probe cadence. |
+| `health_fail_threshold` | u32 | `3` | Consecutive failed probes before a node is marked down. |
+| `unlock` | enum | `"provisioned"` | Boot unlock mode so peer writes commit unattended. |
+| `unlock_secret_file` | string | *(none)* | File holding the provisioned unlock secret; or set `Y2QD_CLUSTER__UNLOCK_SECRET`. |
+| `raft.heartbeat_interval_ms` | u64 | `250` | Raft heartbeat cadence. |
+| `raft.election_timeout_min_ms` | u64 | `1000` | Election timeout lower bound. |
+| `raft.election_timeout_max_ms` | u64 | `1500` | Election timeout upper bound. |
+| `raft.log_dir` | string | `<base_path>/_y2q_raft` | Raft log/state directory. |
+| `raft.bootstrap` | bool | `false` | Set `true` on exactly **one** node's first boot to initialize Raft. |
+| `raft.role` | enum | `"auto"` | `auto` (use `voter_seeds`) \| `voter` \| `learner`. |
+| `raft.voter_seeds` | array | `[]` | Node ids forming the voting quorum (size 3/5/7). Set identically on every node. |
+
+`Vec` fields (`cluster.peers`, `raft.voter_seeds`) cannot be set through environment variables - use a config file for those.
 
 ## Worked example
 

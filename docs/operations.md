@@ -71,18 +71,19 @@ How to run, manage, and recover a `y2qd` deployment. Read this before putting an
 
 ## Container
 
-Two image variants:
+Both storage backends are compiled into one image; pick the backend at runtime with `storage.backend` (`uring` needs Linux >= 5.6). Image variants:
 
-| Image | Backend | Requirement |
+| Image | Target | Notes |
 |---|---|---|
-| `y2q:latest` | filesystem | any kernel |
-| `y2q:latest-uring` | io_uring | Linux kernel >= 5.6 |
+| `y2q:latest` | `make image` | Distroless runtime; filesystem + io_uring both compiled in |
+| `y2q:dev` | `make image-dev` | Same, built with `--features pyroscope` for profiling |
+| `y2q-cluster:latest` | `make image-cluster` | Shell-bearing image used by the multi-node cluster demo (see [Clustering](#clustering)) |
 
 Build locally:
 
 ```sh
 make image          # y2q:latest
-make image-uring    # y2q:latest-uring
+make image-dev      # y2q:dev (Pyroscope enabled)
 ```
 
 ### First container run
@@ -190,6 +191,27 @@ There is no admin reset. Procedure:
 1. Log in as another user.
 2. `DELETE /api/v1/users/<forgotten>`
 3. `PUT /api/v1/users/add` with the same username and a new password.
+
+### Roles and access control
+
+When `auth.enforce_authorization = true` (default), each user has a global role and each bucket has an owner plus an ACL. The first-run `root` user is `admin`. Create users with a role, change roles later, and manage per-bucket grants (full model: [api.md](api.md#authorization)):
+
+```sh
+# create with an explicit role (admin|user|readonly|writeonly|auditor|disabled)
+y2q admin user add prod bob --role user
+
+# change a role; takes effect immediately (target's sessions are revoked).
+# `disabled` locks an account out without deleting it. Refuses to demote the last admin.
+y2q admin user role prod bob readonly
+
+# per-bucket ownership + grants (read|write|admin)
+y2q admin acl get prod photos
+y2q admin acl grant prod photos bob write
+y2q admin acl revoke prod photos bob
+y2q admin acl chown prod photos alice
+```
+
+Equivalent HTTP: `PUT /api/v1/users/{user}/role`, `GET`/`PUT /api/v1/buckets/{bucket}/acl`. Set `auth.enforce_authorization = false` only for single-user or migration deployments where every authenticated user should have full access.
 
 ## Backup and recovery
 
@@ -320,14 +342,14 @@ Interactive dashboard (in-browser):
 https://y2qd.example/metrics/dashboard
 ```
 
-Both are auth-gated by default. To expose them without a token (e.g. for an internal Prometheus scraper that doesn't speak Bearer):
+By default these endpoints are **not served at all** - there is no auth-gated variant. To expose them (without a Bearer token; e.g. for an internal Prometheus scraper):
 
 ```toml
 [server]
 unauthenticated_metrics = true
 ```
 
-When this is enabled, `/swagger-ui/` and `/api-docs/openapi.json` are also exposed without auth.
+When enabled, `/metrics/prometheus`, `/metrics/dashboard`, `/swagger-ui/`, and `/api-docs/openapi.json` are all reachable unauthenticated. Restrict access at the network layer (or behind your TLS/proxy) if you turn this on. With it `false` (default) the daemon logs that they are disabled at startup.
 
 ### Tracing
 
@@ -367,9 +389,26 @@ To profile a running deployment without restarting, rebuild with `--features pyr
 
 `y2qd` holds an exclusive `flock` on `<keystore_dir>/.lock` for its lifetime. Two daemons pointing at the same keystore will refuse to start. Healthy state shows the `.lock` file present and the daemon running; if a daemon crashes the OS releases the flock, so a normal restart Just Works without manual cleanup.
 
-## Putting it behind a proxy
+## TLS
 
-`y2qd` doesn't terminate TLS. Production deployments should run it behind a reverse proxy (nginx, Caddy, traefik) that:
+`y2qd` can terminate TLS natively with rustls. Enable it and point at a PEM cert/key:
+
+```toml
+[server.tls]
+enabled        = true
+cert_path      = "/etc/y2q/tls/fullchain.pem"
+key_path       = "/etc/y2q/tls/privkey.pem"
+require_pq_kex = true                          # offer ONLY X25519MLKEM768; refuse classic-only clients
+# client_ca_path = "/etc/y2q/tls/client-ca.pem"  # require mutual TLS
+```
+
+When `enabled = true` the daemon binds HTTPS at `[server] port` and refuses plaintext HTTP. The private key may be PKCS#8, PKCS#1, or SEC1. `require_pq_kex = true` (default) makes the handshake post-quantum-only; set `false` to also offer classic X25519/ECDH. Set `client_ca_path` to require every client to present a certificate chaining to that CA bundle (mutual TLS) - the same bundle backs `cluster.auth = "mtls"`. To serve HTTP and HTTPS together, run two `y2qd` processes on different ports.
+
+`y2q` and `y2q-warp` verify the server certificate by default; use `--ca-cert <pem>` to trust a private CA, `--client-cert`/`--client-key` on an alias for mutual TLS, or `--insecure` for self-signed dev endpoints.
+
+### Behind a reverse proxy
+
+Alternatively (or in addition) run `y2qd` behind a reverse proxy (nginx, Caddy, traefik) that:
 
 - Terminates TLS
 - Forwards the `Authorization` header
@@ -389,6 +428,19 @@ location / {
 
 `proxy_request_buffering off` matters for large PUTs - otherwise nginx will buffer the whole body to disk before sending it on, doubling the bandwidth and adding latency.
 
+## Clustering
+
+> **Experimental** - functional and tested, but not yet recommended for production data. The default single-node mode is the supported deployment.
+
+`y2qd` can run as a distributed store (off by default). Operational essentials; full reference in [clustering.md](clustering.md):
+
+- **Shared keystore is mandatory.** Every node must load the *same* deployment keystore (`pubkey.json` + `users.redb`) before joining - the key hierarchy is derived from it and the leader refuses to admit a node whose deployment-key fingerprint differs. Back it up exactly as in single-node mode.
+- **Boot unlock.** Cluster nodes unwrap the secret key at startup from a provisioned secret (`Y2QD_CLUSTER__UNLOCK_SECRET` or `cluster.unlock_secret_file`) so peer-forwarded writes commit unattended; idle-drop is disabled while clustered.
+- **Bring-up.** Exactly one node sets `cluster.raft.bootstrap = true` on first boot; the rest join and are admitted as voters (if in `voter_seeds`) or learners. Check `GET /api/v1/cluster/status` for membership, leader, and committed epoch.
+- **Migration.** `POST /api/v1/cluster/migrate` moves objects online in either direction (distribute into the cluster / collect back to one node); it is idempotent and resumable.
+- **Local demo.** `make cluster-up` starts a 5-node cluster via podman-compose ([deploy/cluster/](../deploy/cluster/)); `make cluster-down` tears it down and wipes volumes. The demo's `init` service generates the shared keystore and captures the root password to `/seed/unlock_secret.txt`.
+- **Keep client and server in lockstep.** After rebuilding the cluster image, run `make install-local` so the `y2q`/`y2q-warp` binaries match the daemon's object-metadata format.
+
 ## Failure modes and how to recognize them
 
 | Symptom | Likely cause | What to do |
@@ -396,14 +448,19 @@ location / {
 | Daemon refuses to start: `acquire keystore lock` | Another `y2qd` is already running against the same `keystore_dir` | Check `ps` / systemd. If stale, the flock is released by the OS - investigate why the daemon didn't exit cleanly. |
 | `503` on any object op | `KeystoreUnavailable` - SK not in memory (idle-dropped, no active sessions) | Log in (any user). The SK is reinstalled on the first successful login. |
 | `409 Conflict` on PUT | Active in-flight write lock for that key (same key PUT in two concurrent requests) | Normally self-resolves; if stuck, use `GET /api/v1/locks` to check and `DELETE /api/v1/locks` to force-release. |
-| `501 Not Implemented` on GET with `Range` | Range reads on encrypted objects aren't supported (whole-object AEAD) | Don't use `Range` for encrypted objects, or fetch the whole object client-side and slice. |
+| `501 Not Implemented` on GET with `Range` | The object is a **v1** whole-object envelope (legacy); only v2 chunked objects (the default for new writes) support ranged reads | Re-PUT the object so it is stored as v2, or fetch the whole object client-side and slice. |
 | `429 Too Many Requests` on login | Per-username lockout | Wait `lockout_seconds`, or use another user. `Retry-After` tells you exactly how long. |
 | Listing shows missing or stale objects after restore | Index drift after bulk restore | Run `POST /api/v1/rebuild` (or restart the daemon - startup auto-rebuild handles it). |
 | Data-loss `tracing::error!` messages at startup | `.obj` files referenced in index are gone | Indicates actual data loss (e.g. from a partial restore). Startup rebuild logs the affected keys. |
+| `503` cluster writes stall; reads still work | Raft quorum lost (voter-majority partition) - correct CP behavior | Restore connectivity / a voter majority. Reads keep serving; writes resume once quorum returns. See [clustering.md](clustering.md). |
+| Joined node 404s or `STALE_EPOCH` on peer ops | Wrong keystore (fingerprint mismatch) or stale topology after a re-splice | Verify every node shares the deployment keystore; check `GET /api/v1/cluster/status` for the committed epoch and member states. |
 
 ## Source
 
 - [crates/y2qd/src/main.rs](../crates/y2qd/src/main.rs) - startup, first-run, lifecycle
 - [crates/y2qd/src/handlers/locks.rs](../crates/y2qd/src/handlers/locks.rs) - stale-lock endpoints
 - [crates/y2qd/src/handlers/rebuild.rs](../crates/y2qd/src/handlers/rebuild.rs) - index rebuild endpoints
+- [crates/y2qd/src/tls.rs](../crates/y2qd/src/tls.rs) - native TLS listener
 - [crates/y2q-core/src/crypto/keystore.rs](../crates/y2q-core/src/crypto/keystore.rs) - keystore on-disk layout
+- [docs/clustering.md](clustering.md) - distributed-mode operations and design
+- [deploy/cluster/README.md](../deploy/cluster/README.md) - 5-node docker/podman compose demo

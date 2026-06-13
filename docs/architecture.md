@@ -53,11 +53,13 @@ flowchart TD
 
 ### AES-256-GCM implementation
 
-AES-256-GCM is implemented via [ring](https://github.com/briansmith/ring), which uses hardware AES-NI where available. This is 5–7× faster than the pure-Rust `aes-gcm` crate and is the performance-critical path for every PUT and GET.
+AES-256-GCM is implemented via [ring](https://github.com/briansmith/ring), which uses hardware AES-NI where available. This is 5-7× faster than the pure-Rust `aes-gcm` crate and is the performance-critical path for every PUT and GET.
 
 ### Envelope format
 
-Each object on disk is wrapped in a 28-byte fixed header followed by the ML-KEM-768 ciphertext and the AES-256-GCM ciphertext. The header doubles as additional authenticated data (AAD) for AES-GCM, so tampering with any header field invalidates the tag.
+There are two on-disk envelope formats, distinguished by their magic bytes. **v2 (chunked) is the default** for new writes; v1 (whole-object) is still readable for objects written by older builds. Both wrap one ML-KEM-768 ciphertext and AES-256-GCM ciphertext behind a fixed header that doubles as additional authenticated data (AAD), so tampering with any header field invalidates the tag.
+
+#### v1 - whole-object (legacy)
 
 ```mermaid
 %%{init: {"packet": {"showBits": false}}}%%
@@ -66,13 +68,31 @@ packet-beta
 4-5: "format_ver (2 B)"
 6-6: "kem_alg (1)"
 7-7: "aead_alg (1)"
-8-19: "nonce — 12 B random"
+8-19: "nonce - 12 B random"
 20-27: "plaintext_len (8 B, BE)"
-28-1115: "kem_ct — ML-KEM-768 ciphertext (1088 B)"
-1116-1131: "aead_ct — ciphertext || GCM tag (N+16 B)"
+28-1115: "kem_ct - ML-KEM-768 ciphertext (1088 B)"
+1116-1131: "aead_ct - ciphertext || GCM tag (N+16 B)"
 ```
 
-Fixed overhead per object is 1132 bytes (28 header + 1088 KEM + 16 tag).
+Fixed overhead is 1132 bytes (28 header + 1088 KEM + 16 tag). The whole object is one AEAD frame, so v1 cannot serve a partial decrypt - `Range` on a v1 object returns 501.
+
+#### v2 - chunked (default)
+
+```mermaid
+%%{init: {"packet": {"showBits": false}}}%%
+packet-beta
+0-3: "magic b'Y2Q2' (4 B)"
+4-5: "format_ver = 2 (2 B)"
+6-6: "kem_alg (1)"
+7-7: "aead_alg (1)"
+8-19: "nonce_base - 12 B"
+20-27: "plaintext_len (8 B, BE; patched after streaming)"
+28-31: "chunk_size (4 B, BE)"
+32-1119: "kem_ct - ML-KEM-768 ciphertext (1088 B)"
+1120-1199: "aead_ct chunks - [chunk_pt + 16 tag] × N"
+```
+
+The 32-byte fixed header plus the 1088-byte KEM ciphertext form a 1120-byte **preamble**, followed by `N` independently sealed chunks of `chunk_size` plaintext each (default 4 MiB, `crypto.envelope_chunk_size_bytes`). Chunk `i` uses `nonce_i = nonce_base XOR (i as u64 BE)`; the AAD for every chunk is the 32-byte fixed header. Because each chunk is its own frame at a deterministic offset, a `Range` GET reads and decrypts only the covering chunks (206), and a multi-GiB PUT streams chunk-by-chunk without buffering the whole object. `chunk_size` is recorded per object, so changing the config knob only affects future writes.
 
 ### Per-object key derivation
 
@@ -136,10 +156,13 @@ Each user's `UserRecord` records the parameters used at the time of password wri
   "username": "alice",
   "created_at": 1715000000000000000,
   "last_login": 1715000123000000000,
+  "role": "admin",
   "kdf": { "m_cost_kib": 65536, "t_cost": 3, "p_cost": 4, "salt": "<b64>" },
   "wrapped_sk": { "nonce": "<b64>", "ciphertext": "<b64+tag>" }
 }
 ```
+
+`role` is the user's global role (`admin` | `user` | `readonly` | `writeonly` | `auditor` | `disabled`); see [Authorization](#authorization-roles-ownership-acls). In cluster mode, user records and bucket ownership/ACLs are replicated through the Raft control plane so a joined node inherits them.
 
 ## Storage
 
@@ -151,9 +174,9 @@ Both the filesystem and uring backends use the same single-file `.obj` format. F
 %%{init: {"packet": {"showBits": false}}}%%
 packet-beta
 0-63: "header (64 B)"
-64-319: "data — N B (encrypted envelope)"
-320-447: "meta — M B (JSON metadata)"
-448-511: "trailer (64 B) — mirror of header"
+64-319: "data - N B (encrypted envelope)"
+320-447: "meta - M B (JSON metadata)"
+448-511: "trailer (64 B) - mirror of header"
 ```
 
 The header and trailer each carry a CRC32 over their 64-byte record. A torn write is detectable by mismatching CRCs, and the surviving copy can be used for repair.
@@ -169,31 +192,32 @@ packet-beta
 8-15: "data_len (8 B)"
 16-19: "meta_len (4 B)"
 20-23: "data_offset (4 B)"
-24-59: "reserved — 36 B (zeros)"
+24-59: "reserved - 36 B (zeros)"
 60-63: "crc32 (4 B)"
 ```
 
 ### Filesystem backend
 
-Each object is a single `.obj` file in a two-level hex-sharded directory:
+Each object is a single `.obj` file whose on-disk directory and filename are **keyed HMACs**, not the cleartext bucket/key:
 
 ```
-<base_path>/<bucket>/<xx>/<yy>/<uuid>.obj
+<base_path>/<bucket_dir>/<object_id>.obj
+  bucket_dir = hex(HMAC-SHA256(path_key, "y2q-bucket\0" || len(bucket) || bucket))
+  object_id  = hex(HMAC-SHA256(path_key, "y2q-object\0" || len(bucket)||bucket || len(key)||key))
 ```
 
-`<uuid>` is deterministic: `uuid::Uuid::new_v5(NAMESPACE_URL, key.as_bytes())`. The same key always maps to the same UUID across restarts and backends. `<xx><yy>` is the first four hex digits of that UUID.
+The `path_key` is derived from the login-gated MEK (deterministic from the deployment secret key), so the mapping is stable across restarts and backends but **the storage tree leaks neither bucket names nor object keys** to anyone who can read the directory - the names are irreversible without the key. This is why listing reads names from the encrypted index, not from the directory.
 
 Bucket names: ASCII alphanumeric plus `-` and `_`; case-insensitive `"api"` is reserved (collides with `/api/v1/*`). Keys: up to 1024 bytes, no null bytes.
 
-The JSON metadata blob embedded in the `.obj` trailer has this shape:
+The metadata blob embedded in each `.obj` is **encrypted at rest** under the MEK (`encrypt_meta`, AES-256-GCM; `MEK = SHA-256(sk || "y2q-metadata-encryption-key-v2")`), so labels, timestamps, checksums, and the cleartext key are not readable from the file without the deployment key. Decrypted, it has this logical shape:
 
 ```json
 {
   "created":         1715000000000000000,
   "modified":        1715000000000000000,
   "size":            12345,
-  "checksum_md5":    "<b64 16-byte digest>",
-  "checksum_sha256": "<b64 32-byte digest>",
+  "checksum_gxhash": "<b64 8-byte gxhash64, 12 chars>",
   "bucket":          "my-bucket",
   "key":             "path/to/object",
   "disk_path":       "/var/lib/y2qd/objects/my-bucket/ab/cd/<uuid>.obj",
@@ -203,11 +227,13 @@ The JSON metadata blob embedded in the `.obj` trailer has this shape:
   "cipher_sha256":   "<b64>",
   "kem_alg":         "ml-kem-768",
   "aead_alg":        "aes-256-gcm",
-  "envelope_version": 1
+  "envelope_version": 2,
+  "version":         null,
+  "committed_at":    null
 }
 ```
 
-`size` is the plaintext length. The `cipher_*` fields and algorithm names are always populated in current builds.
+`size` is the plaintext length. `checksum_gxhash` is a non-cryptographic gxhash64 digest of the plaintext (corruption detection, not tamper detection). The `cipher_*` fields and algorithm names are always populated in current builds. `version` and `committed_at` are the CRAQ object version and local commit time; they are `null` outside cluster writes (legacy/single-node objects read as clean v0). The list/HEAD API surface (`MetadataView`) exposes the same fields except `disk_path`, `version`, and `committed_at`, which stay server-internal.
 
 ### Write locks (in-memory)
 
@@ -345,6 +371,21 @@ Default `keystore_idle_drop_seconds = 0` drops the SK immediately on the first s
 
 On startup the daemon acquires a POSIX exclusive `flock` on `<keystore_dir>/.lock`. Two processes pointing at the same keystore would race on the user-store database; the flock makes the second one fail fast with a clear error.
 
+### Authorization (roles, ownership, ACLs)
+
+Authentication answers *who*; authorization answers *what they may do*, when `auth.enforce_authorization = true` (default). Two layers intersect:
+
+- **Global role** - an account-wide capability ceiling stored on the `UserRecord`: `admin` (everything), `user` (governed by bucket grants), `readonly`/`writeonly` (read-or-write only on owned/granted buckets), `auditor` (read every bucket + read-only admin), `disabled` (nothing).
+- **Per-bucket ownership + ACL** - each bucket has an owner (full control) and an optional grant map (`read`/`write`/`writeonly`/`admin`). New buckets are private to their creator. A bucket the caller has no relationship to is hidden: it is omitted from listings and any direct operation returns 404 (never 403), so existence cannot be probed; 403 appears only on a bucket you can already see but lack the verb for.
+
+The effective capability for an action is the intersection of the role ceiling and the bucket relationship. With `enforce_authorization = false`, both layers are skipped and every authenticated user has full access (single-user / migration mode). Full model and status codes: [api.md](api.md#authorization).
+
+## Distributed mode
+
+> **Experimental.** Functional and covered by multi-node integration tests, but young and not yet recommended for production data. The single-node path (`cluster.enabled = false`, default) is unaffected.
+
+`y2qd` optionally runs as a cluster. The **data plane** is CRAQ (chain replication with apportioned reads); the **control plane** is an embedded Raft controller (`y2q-cluster`) that replicates only topology plus low-volume user/bucket metadata - object data and per-object metadata never enter the Raft log. Every node loads the **same deployment keystore**, so the derived key hierarchy (and therefore the on-disk path for any `(bucket, key)`) is identical on every node and ciphertext is portable verbatim - replication and migration never re-encrypt. The integration seam is at the handler layer: the daemon routes through `DistributedStorage` (in `y2q-cluster`, wrapping a local `AnyStorage`) when `cluster.enabled = true`, and is byte-for-byte single-node when it is `false`. Full design: [clustering.md](clustering.md).
+
 ## Threat model (brief)
 
 What the design defends against:
@@ -357,7 +398,7 @@ What it doesn't defend against:
 
 - **Compromised running daemon** - once the SK is unwrapped into memory, anything that can read process memory can read objects. The `keystore_idle_drop_seconds` shortens but doesn't eliminate this window.
 - **Compromised client** - Bearer tokens are bearer credentials. A client that leaks one gives the holder full access until expiry or revocation.
-- **Traffic analysis on the wire** - `y2qd` does not currently terminate TLS. Put it behind a reverse proxy.
+- **Plaintext on the wire** - mitigated by the native TLS listener (`[server.tls]`), which can be restricted to the X25519MLKEM768 post-quantum hybrid key exchange and can enforce mutual TLS. When TLS is disabled the daemon serves plaintext HTTP and should sit behind a TLS-terminating reverse proxy.
 - **Replay of encrypted payloads under a different key** - the daemon trusts whatever public key is in `pubkey.json` at process start. Key rotation is not yet implemented.
 
 ## Observability
@@ -379,7 +420,7 @@ The `RUST_LOG` environment variable takes precedence over `log_filter`.
 
 ### Metrics
 
-Storage and auth metrics are exposed at `/metrics/prometheus` (Prometheus format) and `/metrics/dashboard` (in-browser):
+Storage and auth metrics are exposed at `/metrics/prometheus` (Prometheus format) and `/metrics/dashboard` (in-browser) - but only when `server.unauthenticated_metrics = true`; otherwise neither endpoint (nor `/swagger-ui/`) is registered. Cluster builds add `y2qd_cluster_*` series (per-hop and full-chain commit latency, dirty-read version queries, local-vs-proxied read ratio, Raft term/leader/epoch, back-fill volume, stale-epoch rejections). Core series:
 
 - `y2q_storage_ops_total{op,backend,result}` - operation counters
 - `y2q_storage_duration_seconds{op,backend}` - latency histograms
@@ -403,4 +444,7 @@ When built with `--features pyroscope` and `[observability.pyroscope] enabled = 
 - [crates/y2qd/src/auth/session.rs](../crates/y2qd/src/auth/session.rs) - session store, token hashing
 - [crates/y2qd/src/auth/keystore.rs](../crates/y2qd/src/auth/keystore.rs) - in-memory keystore slot, idle drop
 - [crates/y2qd/src/observability.rs](../crates/y2qd/src/observability.rs) - metrics setup, log format
+- [crates/y2qd/src/tls.rs](../crates/y2qd/src/tls.rs) - rustls listener, PQ-hybrid kex, mutual TLS
+- [crates/y2qd/src/authz.rs](../crates/y2qd/src/authz.rs) - bucket ownership / ACL / role enforcement
+- [crates/y2q-cluster/](../crates/y2q-cluster/) - CRAQ data plane + embedded Raft control plane (see [clustering.md](clustering.md))
 - [crates/y2qd/src/main.rs](../crates/y2qd/src/main.rs) - startup, lifecycle, route wiring

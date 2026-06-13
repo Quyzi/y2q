@@ -1,8 +1,8 @@
 # HTTP API Reference
 
-`y2qd` speaks plain HTTP. All routes use `application/json` for structured request and response bodies. Object PUT/GET payloads are raw bytes with `application/octet-stream`. Errors are JSON.
+`y2qd` speaks HTTP, or HTTPS when `[server.tls]` is enabled (rustls, optionally restricted to the X25519MLKEM768 post-quantum hybrid key exchange, with optional mutual TLS). All routes use `application/json` for structured request and response bodies. Object PUT/GET payloads are raw bytes with `application/octet-stream`. Errors are JSON.
 
-For machine-readable schemas: `/api-docs/openapi.json`. Interactive UI: `/swagger-ui/`.
+For machine-readable schemas: `/api-docs/openapi.json`. Interactive UI: `/swagger-ui/`. (Both require `server.unauthenticated_metrics = true`; see [Observability endpoints](#observability-endpoints).)
 
 ## Authentication
 
@@ -18,7 +18,7 @@ A daemon restart invalidates every token.
 
 ## Authorization
 
-Authentication answers *who* is calling; authorization answers *what they may do*. y2q enforces two layers (both active when `[auth] enforce_authorization = true`, the default). Access is modelled as a set of **verb capabilities** — read, write, admin — and the effective set for any action is the *intersection* of the caller's global-role ceiling and their per-bucket relationship.
+Authentication answers *who* is calling; authorization answers *what they may do*. y2q enforces two layers (both active when `[auth] enforce_authorization = true`, the default). Access is modelled as a set of **verb capabilities** - read, write, admin - and the effective set for any action is the *intersection* of the caller's global-role ceiling and their per-bucket relationship.
 
 ### Capabilities
 
@@ -32,7 +32,7 @@ Authentication answers *who* is calling; authorization answers *what they may do
 
 ### Global roles
 
-Every user has one global role — an account-wide ceiling applied on top of bucket grants. Change it with `PUT /api/v1/users/{user}/role` (admin only). The first-run `root` user is `admin`.
+Every user has one global role - an account-wide ceiling applied on top of bucket grants. Change it with `PUT /api/v1/users/{user}/role` (admin only). The first-run `root` user is `admin`.
 
 | Role | Bucket reach | Capabilities | Admin endpoints |
 |---|---|---|---|
@@ -41,7 +41,7 @@ Every user has one global role — an account-wide ceiling applied on top of buc
 | `readonly` | owned / granted | read only | none |
 | `writeonly` | owned / granted | write/delete only, never read | none |
 | `auditor` | **all buckets** | read only | read only (user list, rebuild status, lock list, any ACL) |
-| `disabled` | none | none — every request rejected, login refused | none |
+| `disabled` | none | none - every request rejected, login refused | none |
 
 A role *caps* what a user can do even on buckets they own: a `readonly` owner can read their own bucket but not write it; a `writeonly` owner can write but not read.
 
@@ -51,7 +51,7 @@ Each bucket has an **owner** (full control) and an optional **ACL** mapping othe
 
 **New buckets are private to their creator.** A `PUT /{bucket}/` or the first object `PUT` into a non-existent bucket makes the caller its owner (only if their role permits writing). Until they grant access, only they (and admins/auditors) can see it.
 
-**Existence is hidden.** A bucket you have *no* relationship to is indistinguishable from one that does not exist: it is omitted from `GET /` and search results, and any direct operation on it returns **404** — never 403. **403** is returned only when you can already see the bucket but lack the verb for the action (because of your grant level, your role ceiling, or both).
+**Existence is hidden.** A bucket you have *no* relationship to is indistinguishable from one that does not exist: it is omitted from `GET /` and search results, and any direct operation on it returns **404** - never 403. **403** is returned only when you can already see the bucket but lack the verb for the action (because of your grant level, your role ceiling, or both).
 
 **Legacy buckets** (created before ownership existed, so with no recorded owner) are accessible only to admins/auditors until an admin assigns an owner via `PUT /api/v1/buckets/{bucket}/acl`.
 
@@ -176,7 +176,7 @@ Create a new user. **Admin only.** The SK is wrapped under the new user's passwo
 }
 ```
 
-Username: `[A-Za-z0-9_.-]+`, max 64 bytes, case-sensitive. `role` is optional (defaults to `"user"`) and is one of `admin`, `user`, `readonly`, `writeonly`, `auditor`, `disabled` — see [Authorization](#authorization).
+Username: `[A-Za-z0-9_.-]+`, max 64 bytes, case-sensitive. `role` is optional (defaults to `"user"`) and is one of `admin`, `user`, `readonly`, `writeonly`, `auditor`, `disabled` - see [Authorization](#authorization).
 
 **Response (201):** empty.
 
@@ -236,7 +236,7 @@ Remove a user. **Admin only.** Other users keep their wrapped SK copies and cont
 
 ### `PUT /api/v1/users/{user}/role`
 
-Change a user's global role. **Admin only.** Takes effect immediately — the target's existing sessions are revoked, so a demotion or `disabled` applies without waiting for session expiry. Refuses to demote the only remaining admin.
+Change a user's global role. **Admin only.** Takes effect immediately - the target's existing sessions are revoked, so a demotion or `disabled` applies without waiting for session expiry. Refuses to demote the only remaining admin.
 
 **Request:**
 ```json
@@ -276,7 +276,7 @@ Store an object. The body is encrypted (envelope + ML-KEM-768 + AES-256-GCM) and
 | `X-Y2Q-Sync` | `durable`, `best-effort` | `durable` | `durable` fsyncs the object file and parent directory before responding (crash-safe); `best-effort` skips the fsyncs and queues the write for asynchronous flushing. |
 | `X-Y2Q-<label>` | any UTF-8 string | - | Attach a custom label. Repeatable. The `X-Y2Q-` prefix is stripped and the name is lowercased before storage. |
 
-Reserved label names (rejected case-insensitively): `Created`, `Modified`, `Checksum-MD5`, `Checksum-SHA256`. These conflict with auto-generated headers on GET/HEAD.
+Reserved label names (rejected case-insensitively): `Created`, `Modified`, `Checksum-GxHash`. These conflict with auto-generated headers on GET/HEAD.
 
 **Response:** empty body. 201 for first write, 200 for overwrite.
 
@@ -334,15 +334,15 @@ Metadata only - no body.
 |---|---|---|
 | `Content-Length` | yes | Plaintext size in bytes |
 | `Content-Type` | yes | `application/octet-stream` |
+| `X-Y2Q-Size` | yes | Plaintext size in bytes (mirrors `Content-Length`) |
 | `X-Y2Q-Created` | yes | Nanoseconds since Unix epoch when first written |
 | `X-Y2Q-Modified` | yes | Nanoseconds since Unix epoch when last overwritten |
-| `X-Y2Q-Checksum-MD5` | yes | Full 16-byte MD5 digest, standard base64 (24 chars) |
-| `X-Y2Q-Checksum-SHA256` | yes | Full 32-byte SHA-256 digest, standard base64 (44 chars) |
+| `X-Y2Q-Checksum-GxHash` | yes | 8-byte gxhash64 digest of the plaintext, standard base64 (12 chars). Non-cryptographic; for accidental-corruption detection, not tamper detection |
 | `X-Y2Q-Cipher-Size` | encrypted only | On-disk envelope size in bytes |
 | `X-Y2Q-Cipher-SHA256` | encrypted only | SHA-256 of the envelope, base64 |
 | `X-Y2Q-Kem-Alg` | encrypted only | `ml-kem-768` |
 | `X-Y2Q-Aead-Alg` | encrypted only | `aes-256-gcm` |
-| `X-Y2Q-Envelope-Version` | encrypted only | `1` |
+| `X-Y2Q-Envelope-Version` | encrypted only | `2` for chunked (default), `1` for legacy whole-object |
 | `X-Y2Q-<label>` | per-object | Each custom label attached on PUT, echoed back lowercased |
 
 | Code | Meaning |
@@ -366,6 +366,50 @@ Remove an object. Idempotent on the metadata index, but 404s if the object never
 | 401 | Token missing or invalid |
 | 404 | Not found |
 | 500 | Storage failure |
+
+## Buckets
+
+### `PUT /{bucket}/`
+
+Create a bucket explicitly. With authorization enforced, the caller becomes the bucket **owner** (only if their role permits writing). Creating an object in a non-existent bucket creates the bucket implicitly the same way (and the object `PUT` itself returns 201).
+
+**Response (200):** `{ "bucket": "archive", "created": true }` - `created` is `false` if the bucket already existed.
+
+| Code | Meaning |
+|---|---|
+| 200 | Bucket created (`created: true`) or already present (`created: false`) |
+| 400 | Invalid bucket name (or reserved name `api`) |
+| 401 | Token missing or invalid |
+| 403 | Caller's role does not permit creating buckets |
+
+### `DELETE /{bucket}/`
+
+Remove a bucket and all of its objects. Requires the `admin` capability on the bucket (owner or global admin).
+
+**Response (200):** `{ "bucket": "archive", "objects_removed": 42 }`.
+
+| Code | Meaning |
+|---|---|
+| 200 | Bucket removed (object count reported) |
+| 401 | Token missing or invalid |
+| 403 | Caller lacks admin on the bucket |
+| 404 | Bucket not found (or not visible to the caller) |
+
+### `GET /api/v1/buckets/{bucket}/config`
+
+Read a bucket's configuration (size quota, recorded default-SSE marker, owner reference). Requires `read` on the bucket.
+
+### `PUT /api/v1/buckets/{bucket}/config`
+
+Set a bucket's configuration. Requires `admin` on the bucket. Owner and ACL are **not** settable here - use the ACL endpoint, so this endpoint cannot be used to escalate privileges. The CLI wrappers are `y2q quota set|info|clear` and `y2q encrypt set|info|clear`.
+
+| Code | Meaning |
+|---|---|
+| 200 | Config read or updated |
+| 400 | Invalid config body |
+| 401 | Token missing or invalid |
+| 403 | Caller lacks the required capability |
+| 404 | Bucket not found (or not visible to the caller) |
 
 ## Listing
 
@@ -406,17 +450,16 @@ List objects in a bucket, paginated.
       "created":          1715000000000000000,
       "modified":         1715000000000000000,
       "size":             12345,
-      "checksum_md5":     "<b64 16-byte digest>",
-      "checksum_sha256":  "<b64 32-byte digest>",
+      "checksum_gxhash":  "<b64 8-byte gxhash64, 12 chars>",
       "bucket":           "photos",
       "key":              "2024/05/cat.jpg",
       "url_path":         "photos/2024/05/cat.jpg",
-      "labels":           { "owner": "alice", "album": "vacation" },
+      "labels":           [["owner", "alice"], ["album", "vacation"]],
       "cipher_size":      13477,
       "cipher_sha256":    "<b64>",
       "kem_alg":          "ml-kem-768",
       "aead_alg":         "aes-256-gcm",
-      "envelope_version": 1
+      "envelope_version": 2
     }
   ],
   "next": "2024/05/cat.jpg"
@@ -640,9 +683,29 @@ Force-release every active lock older than `older_than`. Use carefully - releasi
 | 401 | Token missing or invalid |
 | 500 | Storage failure |
 
-## Observability endpoints
+### `GET /api/v1/trace`
 
-These are usually auth-gated. Set `[server] unauthenticated_metrics = true` to expose them without a Bearer token.
+Server-sent-events stream of every request the daemon handles, in real time. **Admin or auditor.** Each event carries timestamp, method, path, status, latency, and request/response sizes. The server has no overhead when no trace client is connected. The CLI wrapper is `y2q admin trace <alias> [--errors]`.
+
+| Code | Meaning |
+|---|---|
+| 200 | SSE stream opened (`text/event-stream`) |
+| 401 | Token missing or invalid |
+| 403 | Caller is not an admin or auditor |
+
+## Cluster endpoints
+
+Present only when `[cluster] enabled = true`. Admin-authed operator endpoints:
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/api/v1/cluster/status` | Membership, leader, committed epoch, per-node status |
+| `POST` | `/api/v1/cluster/join` | Admit this contact node's caller-specified peer into the cluster |
+| `POST` | `/api/v1/cluster/migrate` | Online migration: distribute (import) or collect (export) objects between a single node and the cluster |
+
+Peer-only, shared-secret/mTLS-authed and epoch-fenced `/internal/v1/*` routes (Raft RPC, CRAQ prepare/read/describe/version, backfill, health) are documented in [clustering.md](clustering.md) and are not for client use.
+
+## Observability endpoints
 
 | Route | Purpose |
 |---|---|
@@ -650,6 +713,8 @@ These are usually auth-gated. Set `[server] unauthenticated_metrics = true` to e
 | `GET /metrics/dashboard` | Interactive in-browser metrics dashboard |
 | `GET /swagger-ui/` | Interactive API documentation |
 | `GET /api-docs/openapi.json` | Raw OpenAPI 3 document |
+
+These are served **only** when `[server] unauthenticated_metrics = true`, and then without a Bearer token. With the default `false` they are not registered at all (no auth-gated variant) - the daemon logs that they are disabled at startup.
 
 ## Status code summary
 
