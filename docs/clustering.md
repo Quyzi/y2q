@@ -1,5 +1,7 @@
 # Clustering: Raft control plane, CRAQ replication, and erasure coding
 
+> **Status: experimental.** Distributed mode is functional and covered by multi-node integration tests, but it is young and not yet recommended for production data. On-disk and wire formats may still change. The single-node path (`cluster.enabled = false`, the default) is the supported deployment and is unaffected by anything in this document.
+
 This document describes how `y2q` runs multiple `y2qd` daemons as one distributed
 storage system: the **embedded Raft control plane** that replicates topology, the
 **CRAQ data plane** that chain-replicates objects, and the **erasure-coding** end
@@ -9,7 +11,7 @@ The whole feature is gated behind `cluster.enabled` (default `false`). With it
 off, the daemon is byte-for-byte the single-node store described in
 [architecture.md](architecture.md); none of the machinery below runs. The cluster
 code lives in the `y2q-cluster` crate, which depends on `y2q-core` and is consumed
-by `y2qd` — never the reverse.
+by `y2qd` - never the reverse.
 
 ## Two planes
 
@@ -54,10 +56,10 @@ Every node loads the **same deployment keystore**. `derive_mek(sk)` and the deri
 Path Key are pure functions of the deployment secret key, so every node derives the
 *identical* MEK and Path Key. Two consequences make the whole data plane possible:
 
-1. The on-disk path for `(bucket, key)` is `HMAC(path_key, …)` — **identical on
+1. The on-disk path for `(bucket, key)` is `HMAC(path_key, …)` - **identical on
    every node**.
 2. Any node can decrypt any other node's envelope. **Ciphertext is portable
-   between nodes verbatim — re-encryption never happens.**
+   between nodes verbatim - re-encryption never happens.**
 
 The HEAD encrypts an object exactly once; every downstream replica writes the
 received bytes byte-for-byte. The Raft leader refuses to admit a node whose
@@ -98,14 +100,14 @@ the RaftNetwork rides the existing HTTP server over `/internal/v1/raft/{append,v
 
 ### Voter / learner split
 
-Raft commit needs a majority ack, so consensus latency grows with voter count —
+Raft commit needs a majority ack, so consensus latency grows with voter count -
 the practical ceiling is ~5-7 voters. To scale past that, the cluster runs a
 **small fixed voting quorum** and joins everyone else as a **learner**:
 
 - **Voters** (`raft.voter_seeds`, sized 3/5/7) form the consensus quorum and elect
   a leader. Set `voter_seeds` identically on every node so all agree on the quorum.
 - **Learners** receive the full replicated log, hold the snapshot, and serve the
-  committed `ControlState` — but never vote and never lead. A learner is still a
+  committed `ControlState` - but never vote and never lead. A learner is still a
   full *data-plane* participant (HEAD/MIDDLE/TAIL of chains, serving reads/writes).
 
 `raft.role = auto` (default) makes a node a voter iff its `node_id` is in
@@ -174,13 +176,13 @@ chain for `(bucket, key)` with no central lookup
    components) of the address → a point on a `u64` ring.
 2. Each node places `virtual_nodes_per_node` (default 256) tokens on the ring.
 3. The chain is the next `R` *distinct* nodes walking clockwise from the object's
-   point — clamped to membership, so `R` larger than the cluster yields a shorter
+   point - clamped to membership, so `R` larger than the cluster yields a shorter
    chain rather than repeating a node.
 
 A chain is either **pinned** in the committed `ChainTable` (the leader re-splices
 pinned chains on membership change) or, for a never-written key, **resolved lazily**
 from the live ring at the current epoch. Either way the result is deterministic
-across nodes. `RING_SEED` is a wire constant — changing it reshuffles every
+across nodes. `RING_SEED` is a wire constant - changing it reshuffles every
 assignment and demands a data migration.
 
 [`Role`](../crates/y2q-cluster/src/hashing/chain.rs) tells a node where it sits:
@@ -233,7 +235,7 @@ Mechanics:
   writes the ciphertext **verbatim** into its own `.tmp` while keeping its old
   `.obj` (dirty alongside clean), relays to its successor, and commits *after* the
   downstream sub-chain commits.
-- The **TAIL** has no successor → it commits (`.tmp` → `.obj`) — the **commit
+- The **TAIL** has no successor → it commits (`.tmp` → `.obj`) - the **commit
   point**. Success bubbles back HEAD ← TAIL through the synchronous PREPARE
   responses; each node promotes its `.tmp` → `.obj` as its downstream resolves.
 - The client PUT returns only after full-chain commit (`strong` default). All the
@@ -254,7 +256,7 @@ commit.
   `StreamingPutGuard` for the write window.
 - [`PendingWrites`](../crates/y2q-cluster/src/data/pending.rs): a
   `DashMap<(bucket,key), Pending>` recording in-flight writes. Presence == dirty.
-  Cleanup is RAII — a `PendingGuard` clears the entry on drop, so an aborted or
+  Cleanup is RAII - a `PendingGuard` clears the entry on drop, so an aborted or
   panicking write never wedges a key as permanently dirty.
 - `version` lives in the committed `Metadata` (optional → legacy/single-node
   objects deserialize `version = None`, treated as clean v0), so a node recovers
@@ -264,14 +266,14 @@ commit.
 ### Read path: apportioned queries
 
 Any chain member can serve a read. [`plan_read`](../crates/y2q-cluster/src/data/mod.rs)
-+ the pure [`serve_decision`] decide between three outcomes — serve the local
++ the pure [`serve_decision`] decide between three outcomes - serve the local
 committed copy, version-query the TAIL, or fetch the committed envelope from the
-TAIL — driven by the consistency mode:
+TAIL - driven by the consistency mode:
 
 | Mode (`cluster.consistency`) | Clean local copy | Dirty (write in flight) |
 |---|---|---|
 | `strong` (default) | serve local (fast path) | version-query the TAIL; serve local only if versions match, else fetch from TAIL |
-| `eventual` | serve local | serve local (may be slightly stale) — cheapest |
+| `eventual` | serve local | serve local (may be slightly stale) - cheapest |
 | `eventual-bounded` | serve local | serve local if committed within `eventual_bound_ms`, else fall back to the strong path |
 
 A non-member always fetches the committed envelope from the TAIL (it holds no
@@ -285,7 +287,7 @@ trip.
 HEAD/stat follows the same routing through
 [`plan_describe`](../crates/y2q-cluster/src/data/mod.rs): a chain member answers
 from its local index, a non-member fetches the committed metadata from the TAIL
-(`/internal/v1/describe`) — metadata only, no object body. Without this a STAT to a
+(`/internal/v1/describe`) - metadata only, no object body. Without this a STAT to a
 contact node outside the object's chain would 404 even though the object exists.
 
 ### Non-PUT mutations (DELETE, label edits)
@@ -321,9 +323,9 @@ Replication means each object appears on `R` nodes, so a naive cluster-wide list
 would show duplicates. [`scatter_list`](../crates/y2q-cluster/src/data/mod.rs) fans
 the list/search across every Active node, then [`merge_list_pages`] k-way merges:
 dedup by `(bucket, key)` keeping the highest committed `version`, sort, and cap at
-`limit`. The cursor is format-compatible with the single-node API — a bare `key`
+`limit`. The cursor is format-compatible with the single-node API - a bare `key`
 for a single-bucket list, or the `bucket\0key` composite for a cross-bucket search.
-Unreachable peers are skipped (their objects still surface from a live replica) —
+Unreachable peers are skipped (their objects still surface from a live replica) -
 CRAQ's "reads continue elsewhere" availability. Completeness holds because each
 node returns its lowest `limit` keys `> after`, so the global first `limit` distinct
 keys are a subset of the union of the per-node pages.
@@ -344,7 +346,7 @@ epoch:
 
 **Back-fill** ([`backfill_pass`](../crates/y2q-cluster/src/data/mod.rs)): the
 recovering node pulls each Active peer's manifest
-(`/internal/v1/backfill/manifest` — `(key, version, cipher_sha256)` per object),
+(`/internal/v1/backfill/manifest` - `(key, version, cipher_sha256)` per object),
 keeps only objects it *prospectively* holds (ring computed over the active
 membership **plus itself**, so a node excluded from the active ring still discovers
 what to pull), and for each it is missing/behind/digest-divergent on
@@ -455,7 +457,7 @@ voter_seeds = []                 # node_ids forming the voting quorum; sized 3/5
 
 ## Erasure coding (future)
 
-Erasure coding is **not implemented** — it is the intended end state, and the data
+Erasure coding is **not implemented** - it is the intended end state, and the data
 plane is shaped so it layers on cleanly without touching the control plane.
 
 Today PREPARE broadcasts the **full envelope** to all `R` chain members
@@ -466,7 +468,7 @@ and reconstruct from any `k` shards on read (storage cost `(k+m)/k ×`, tolerati
 `m` losses). Because shards are derived from the already-encrypted envelope, the
 shared-key/verbatim-ciphertext invariant is preserved end to end.
 
-Seams that change when EC lands (the control plane — chains, epoch, Raft — is
+Seams that change when EC lands (the control plane - chains, epoch, Raft - is
 **unaffected**):
 
 | Seam | Replication today | Erasure coding |
@@ -483,7 +485,7 @@ the write/route/recovery machinery above.
 
 ## See also
 
-- [architecture.md](architecture.md) — single-node internals (envelope, storage, index, auth)
-- [configuration.md](configuration.md) — all config keys and env overrides
-- [operations.md](operations.md) — running and operating the daemon
-- `y2q-cluster` crate — [control/](../crates/y2q-cluster/src/control/), [data/](../crates/y2q-cluster/src/data/), [hashing/](../crates/y2q-cluster/src/hashing/), [transport/](../crates/y2q-cluster/src/transport/)
+- [architecture.md](architecture.md) - single-node internals (envelope, storage, index, auth)
+- [configuration.md](configuration.md) - all config keys and env overrides
+- [operations.md](operations.md) - running and operating the daemon
+- `y2q-cluster` crate - [control/](../crates/y2q-cluster/src/control/), [data/](../crates/y2q-cluster/src/data/), [hashing/](../crates/y2q-cluster/src/hashing/), [transport/](../crates/y2q-cluster/src/transport/)
