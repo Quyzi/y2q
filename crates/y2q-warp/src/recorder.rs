@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 
-use crate::display::DisplayMsg;
+use crate::display::{DisplayMsg, RunningSnapshot};
 use crate::metrics::{OpHistograms, OpRecord, Segment};
 use crate::ops::OpKind;
 
@@ -15,6 +15,9 @@ pub struct Recorder {
     agg_tx: mpsc::Sender<DisplayMsg>,
     csv_writer: Option<csv::Writer<Box<dyn std::io::Write + Send>>>,
     histograms: HashMap<OpKind, OpHistograms>,
+    /// Per-contact-node histograms (all op kinds folded together), keyed by the
+    /// round-robin endpoint label. Drives the live per-node TUI panel.
+    node_histograms: HashMap<String, OpHistograms>,
     segment_buckets: HashMap<(OpKind, u64), (u64, u64, u64)>,
     last_display: Instant,
     display_interval: Duration,
@@ -36,6 +39,7 @@ impl Recorder {
             agg_tx,
             csv_writer: Some(csv_writer),
             histograms: HashMap::new(),
+            node_histograms: HashMap::new(),
             segment_buckets: HashMap::new(),
             last_display: Instant::now(),
             display_interval: Duration::from_millis(500),
@@ -73,6 +77,15 @@ impl Recorder {
             .or_insert_with(|| OpHistograms::new(op))
             .record(rec);
 
+        // Per-contact-node accounting (op kind irrelevant here; the histogram's
+        // `op` field is unused for the node panel).
+        if !rec.node.is_empty() {
+            self.node_histograms
+                .entry(rec.node.clone())
+                .or_insert_with(|| OpHistograms::new(op))
+                .record(rec);
+        }
+
         // Segment accounting
         let window = rec.start_ns / SEGMENT_NS;
         let entry = self.segment_buckets.entry((op, window)).or_default();
@@ -89,13 +102,21 @@ impl Recorder {
     }
 
     async fn snapshot_and_send(&mut self) {
-        let mut map = HashMap::new();
+        let mut ops = HashMap::new();
         for (op, hist) in &self.histograms {
             if let Some(agg) = hist.aggregate() {
-                map.insert(*op, agg);
+                ops.insert(*op, agg);
             }
         }
-        let _ = self.agg_tx.try_send(DisplayMsg::Running(map));
+        let mut nodes = HashMap::new();
+        for (label, hist) in &self.node_histograms {
+            if let Some(agg) = hist.aggregate() {
+                nodes.insert(label.clone(), agg);
+            }
+        }
+        let _ = self
+            .agg_tx
+            .try_send(DisplayMsg::Running(RunningSnapshot { ops, nodes }));
     }
 
     #[allow(dead_code)]
