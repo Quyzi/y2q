@@ -100,9 +100,16 @@ const HISTORY_CAP: usize = 256;
 const TICK_MS: u64 = 100;
 const SAMPLE_INTERVAL_MS: u128 = 1_000;
 
+/// One live snapshot from the recorder: per-op rollups plus per-contact-node
+/// rollups (the latter keyed by the round-robin endpoint label).
+pub struct RunningSnapshot {
+    pub ops: HashMap<OpKind, Aggregate>,
+    pub nodes: HashMap<String, Aggregate>,
+}
+
 pub enum DisplayMsg {
     Preparing { done: u32, total: u32 },
-    Running(HashMap<OpKind, Aggregate>),
+    Running(RunningSnapshot),
 }
 
 enum Phase {
@@ -113,6 +120,8 @@ enum Phase {
 struct AppState {
     phase: Phase,
     aggregates: HashMap<OpKind, Aggregate>,
+    /// Per-contact-node rollups, keyed by endpoint label ("0", "1", …).
+    node_aggregates: HashMap<String, Aggregate>,
     throughput_history: VecDeque<u64>,
     ops_history: HashMap<OpKind, VecDeque<u64>>,
     errors_4xx_per_sec: HashMap<OpKind, f64>,
@@ -136,6 +145,7 @@ impl AppState {
         Self {
             phase: Phase::Preparing { done: 0, total: 0 },
             aggregates: HashMap::new(),
+            node_aggregates: HashMap::new(),
             throughput_history: VecDeque::with_capacity(HISTORY_CAP + 1),
             ops_history: HashMap::new(),
             errors_4xx_per_sec: HashMap::new(),
@@ -155,12 +165,13 @@ impl AppState {
             DisplayMsg::Preparing { done, total } => {
                 self.phase = Phase::Preparing { done, total };
             }
-            DisplayMsg::Running(agg) => {
+            DisplayMsg::Running(snap) => {
                 if self.bench_start.is_none() {
                     self.bench_start = Some(Instant::now());
                 }
                 self.phase = Phase::Running;
-                self.aggregates = agg;
+                self.aggregates = snap.ops;
+                self.node_aggregates = snap.nodes;
                 self.record_snapshot();
             }
         }
@@ -451,11 +462,18 @@ fn render_running(
     let n_data_rows = op_kinds.len().max(1) as u16;
     let table_height = n_data_rows + 2;
 
-    let mut constraints = vec![
-        Constraint::Length(1),
-        Constraint::Length(table_height),
-        Constraint::Min(3),
-    ];
+    // Per-contact-node panel only when the run fans across more than one node.
+    let mut node_labels: Vec<String> = state.node_aggregates.keys().cloned().collect();
+    node_labels.sort();
+    let show_nodes = node_labels.len() > 1;
+    // header(1) + bottom margin(1) + rows(n) + TOP border(1).
+    let node_table_height = node_labels.len() as u16 + 3;
+
+    let mut constraints = vec![Constraint::Length(1), Constraint::Length(table_height)];
+    if show_nodes {
+        constraints.push(Constraint::Length(node_table_height));
+    }
+    constraints.push(Constraint::Min(3));
     for _ in op_kinds {
         constraints.push(Constraint::Length(3));
     }
@@ -463,6 +481,20 @@ fn render_running(
         .direction(Direction::Vertical)
         .constraints(constraints)
         .split(area);
+
+    // chunks[0] = time bar, chunks[1] = op table, then the optional node table,
+    // then the throughput sparkline, then one sparkline per op kind.
+    let mut next = 2;
+    let node_area = if show_nodes {
+        let a = chunks[next];
+        next += 1;
+        Some(a)
+    } else {
+        None
+    };
+    let tp_idx = next;
+    next += 1;
+    let spark_base = next;
 
     // ── Time progress bar ────────────────────────────────────────────────────
     let op_label = match op_kinds.len() {
@@ -570,8 +602,13 @@ fn render_running(
     .column_spacing(1);
     f.render_widget(table, chunks[1]);
 
+    // ── Per-node table (contact endpoint) ─────────────────────────────────────
+    if let Some(area) = node_area {
+        render_node_table(f, area, state, &node_labels);
+    }
+
     // ── Throughput sparkline ─────────────────────────────────────────────────
-    let tp_area = chunks[2];
+    let tp_area = chunks[tp_idx];
     let tp_hist = rjust(&state.throughput_history, tp_area.width as usize);
     let tp_peak = tp_hist.iter().copied().max().unwrap_or(0);
     let tp_cur = state.throughput_history.back().copied().unwrap_or(0);
@@ -599,7 +636,7 @@ fn render_running(
     // Cycle through neon colors for multiple ops
     let spark_colors = [NEON_YELLOW, NEON_CYAN, NEON_PURPLE, NEON_GREEN];
     for (i, &op) in op_kinds.iter().enumerate() {
-        let chunk_idx = 3 + i;
+        let chunk_idx = spark_base + i;
         if chunk_idx >= chunks.len() {
             break;
         }
@@ -636,6 +673,84 @@ fn render_running(
     }
 }
 
+/// Per-contact-node rollup table (cumulative over the run so far), mirroring the
+/// op table's columns. `labels` is the sorted set of endpoint labels.
+fn render_node_table(f: &mut Frame, area: Rect, state: &AppState, labels: &[String]) {
+    let header = Row::new(
+        [
+            "Node",
+            "Ops",
+            "5xx",
+            "Throughput",
+            "Ops/s",
+            "P50",
+            "P90",
+            "P99",
+        ]
+        .map(|h| {
+            Cell::from(h).style(
+                Style::default()
+                    .fg(NEON_YELLOW)
+                    .add_modifier(Modifier::BOLD),
+            )
+        }),
+    )
+    .height(1)
+    .bottom_margin(1);
+
+    let rows: Vec<Row> = labels
+        .iter()
+        .filter_map(|label| state.node_aggregates.get(label).map(|agg| (label, agg)))
+        .map(|(label, agg)| {
+            Row::new([
+                Cell::from(format!("node {label}")).style(Style::default().fg(NEON_PINK)),
+                Cell::from(format!("{:>8}", agg.n_ops)).style(Style::default().fg(NORMAL_TEXT)),
+                Cell::from(format!("{:>5}", agg.n_errors_5xx)).style(if agg.n_errors_5xx > 0 {
+                    Style::default().fg(ERROR_RED).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(DIM_TEXT)
+                }),
+                Cell::from(format!("{:>10.1} MiB/s", agg.throughput_mibps))
+                    .style(Style::default().fg(NEON_GREEN).add_modifier(Modifier::BOLD)),
+                Cell::from(format!("{:>6.0}", agg.ops_per_sec))
+                    .style(Style::default().fg(NEON_PURPLE)),
+                Cell::from(format!("{:>7}", ns_to_ms_str(agg.p50_ns)))
+                    .style(Style::default().fg(NORMAL_TEXT)),
+                Cell::from(format!("{:>7}", ns_to_ms_str(agg.p90_ns)))
+                    .style(Style::default().fg(NORMAL_TEXT)),
+                Cell::from(format!("{:>7}", ns_to_ms_str(agg.p99_ns)))
+                    .style(Style::default().fg(NORMAL_TEXT)),
+            ])
+        })
+        .collect();
+
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(8),
+            Constraint::Length(9),
+            Constraint::Length(5),
+            Constraint::Length(16),
+            Constraint::Length(8),
+            Constraint::Length(8),
+            Constraint::Length(8),
+            Constraint::Length(8),
+        ],
+    )
+    .header(header)
+    .block(
+        Block::default()
+            .title(Span::styled(
+                " PER-NODE (contact endpoint) ",
+                Style::default().fg(NEON_PINK).add_modifier(Modifier::BOLD),
+            ))
+            .borders(Borders::TOP)
+            .border_style(Style::default().fg(DIM_BORDER)),
+    )
+    .column_spacing(1);
+    f.render_widget(table, area);
+}
+
 fn render_statusbar(f: &mut Frame, area: Rect) {
     let bar = Paragraph::new(Line::from(vec![
         Span::styled(" // ", Style::default().fg(DIM_TEXT)),
@@ -657,7 +772,7 @@ async fn plain_fallback(mut rx: mpsc::Receiver<DisplayMsg>, op: OpKind, total_du
     let mut bench_start: Option<Instant> = None;
 
     loop {
-        let mut latest: Option<HashMap<OpKind, Aggregate>> = None;
+        let mut latest: Option<RunningSnapshot> = None;
         tokio::select! {
             _ = interval.tick() => {}
             msg = rx.recv() => {
@@ -669,24 +784,24 @@ async fn plain_fallback(mut rx: mpsc::Receiver<DisplayMsg>, op: OpKind, total_du
                         }
                         continue;
                     }
-                    Some(DisplayMsg::Running(m)) => {
+                    Some(DisplayMsg::Running(snap)) => {
                         if bench_start.is_none() {
                             bench_start = Some(Instant::now());
                         }
-                        latest = Some(m);
+                        latest = Some(snap);
                     }
                 }
             }
         }
-        while let Ok(DisplayMsg::Running(m)) = rx.try_recv() {
-            latest = Some(m);
+        while let Ok(DisplayMsg::Running(snap)) = rx.try_recv() {
+            latest = Some(snap);
         }
         let elapsed = bench_start.map_or(Duration::ZERO, |s| s.elapsed());
         if elapsed >= total_duration {
             break;
         }
-        if let Some(agg_map) = latest {
-            let agg = agg_map.get(&op);
+        if let Some(snap) = latest {
+            let agg = snap.ops.get(&op);
             eprintln!(
                 "y2q-warp  {op}  {}s/{}s | {}",
                 elapsed.as_secs(),
@@ -697,6 +812,19 @@ async fn plain_fallback(mut rx: mpsc::Receiver<DisplayMsg>, op: OpKind, total_du
                 ))
                 .unwrap_or_else(|| "--".to_owned()),
             );
+            // Per-contact-node line for multi-node fan-out runs.
+            if snap.nodes.len() > 1 {
+                let mut labels: Vec<&String> = snap.nodes.keys().collect();
+                labels.sort();
+                let parts: Vec<String> = labels
+                    .iter()
+                    .map(|l| {
+                        let a = &snap.nodes[*l];
+                        format!("n{l} {:.0}MiB/s", a.throughput_mibps)
+                    })
+                    .collect();
+                eprintln!("          per-node | {}", parts.join("  "));
+            }
         }
     }
 }

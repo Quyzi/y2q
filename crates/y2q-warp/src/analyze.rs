@@ -119,14 +119,15 @@ pub fn run_analyze(
         }
     }
 
-    // Per-node breakdown (multi-node runs only — single-node records carry an
-    // empty node label and are skipped).
+    // Per-node breakdown. Any record carrying a non-empty contact-node label is
+    // included; legacy CSVs (empty label) are skipped. Shown even for a single
+    // contact node so a one-endpoint run still reports its node row.
     let node_labels: BTreeSet<&str> = records
         .iter()
         .map(|r| r.node.as_str())
         .filter(|n| !n.is_empty())
         .collect();
-    if node_labels.len() > 1 {
+    if !node_labels.is_empty() {
         println!();
         println!("Per-node latency (contact node):");
         println!(
