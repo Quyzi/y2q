@@ -66,8 +66,6 @@ jobs:
             os: macos-latest
           - target: aarch64-apple-darwin
             os: macos-latest
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
     steps:
       - uses: actions/checkout@v4
         with:
@@ -92,23 +90,11 @@ jobs:
       - name: Build release binaries
         run: cargo build --release --target ${{ matrix.target }} -p y2qd -p y2q-cli -p y2q-warp
 
-      - name: Package (unix)
-        if: runner.os != 'Windows'
+      - name: Package
         run: |
           mkdir -p dist
           tar czf dist/y2q-${{ github.ref_name }}-${{ matrix.target }}.tar.gz \
             -C target/${{ matrix.target }}/release y2qd y2q y2q-warp
-
-      - name: Package (windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Compress-Archive -Path `
-            target/${{ matrix.target }}/release/y2qd.exe, `
-            target/${{ matrix.target }}/release/y2q.exe, `
-            target/${{ matrix.target }}/release/y2q-warp.exe `
-            -DestinationPath dist/y2q-${{ github.ref_name }}-${{ matrix.target }}.zip
 
       - uses: actions/upload-artifact@v4
         with:
@@ -126,6 +112,11 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.ref_name }}
+
+      - name: Lowercase image names
+        run: |
+          echo "IMAGE=$(echo "$IMAGE" | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_ENV"
+          echo "IMAGE_CLUSTER=$(echo "$IMAGE_CLUSTER" | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_ENV"
 
       - uses: docker/setup-buildx-action@v3
 
