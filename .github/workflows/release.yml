@@ -96,7 +96,7 @@ jobs:
           tar czf dist/y2q-${{ github.ref_name }}-${{ matrix.target }}.tar.gz \
             -C target/${{ matrix.target }}/release y2qd y2q y2q-warp
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: y2q-${{ github.ref_name }}-${{ matrix.target }}
           path: dist/*
