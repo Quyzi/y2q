@@ -52,7 +52,7 @@ pest_derive                 = "2"
 pqcrypto                    = { version = "0.18.1", features = ["serialization"] }
 pqcrypto-traits             = "0.3.5"
 rand                        = "0.8"
-ratatui                     = { version = "0.29", features = ["crossterm"] }
+ratatui                     = { version = "0.30", features = ["crossterm"] }
 redb                        = "4.1.0"
 regex                       = "1"
 reqwest                     = { version = "0.12", features = ["json", "stream", "rustls-tls-no-provider"], default-features = false }
