@@ -1,0 +1,198 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE: ghcr.io/${{ github.repository }}
+  IMAGE_CLUSTER: ghcr.io/${{ github.repository }}-cluster
+
+jobs:
+  branch:
+    name: Create release branch
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Bump workspace version to tag
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          sed -i "s/^version = \".*\"/version = \"${VERSION}\"/" Cargo.toml
+          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
+
+      - name: Refresh Cargo.lock
+        run: cargo check --workspace --quiet
+
+      - name: Commit + push release branch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock
+          git commit -m "chore(release): set version to ${VERSION}"
+          git push origin HEAD:refs/heads/${{ github.ref_name }}
+
+  build:
+    name: Build (${{ matrix.target }})
+    needs: branch
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-24.04
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04
+            cross_pkg: gcc-aarch64-linux-gnu
+            linker_env: CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER
+            linker: aarch64-linux-gnu-gcc
+            cc_env: CC_aarch64_unknown_linux_gnu
+          - target: riscv64gc-unknown-linux-gnu
+            os: ubuntu-24.04
+            cross_pkg: gcc-riscv64-linux-gnu
+            linker_env: CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_LINKER
+            linker: riscv64-linux-gnu-gcc
+            cc_env: CC_riscv64gc_unknown_linux_gnu
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install cross-compiler
+        if: matrix.cross_pkg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.cross_pkg }}
+          echo "${{ matrix.linker_env }}=${{ matrix.linker }}" >> "$GITHUB_ENV"
+          echo "${{ matrix.cc_env }}=${{ matrix.linker }}" >> "$GITHUB_ENV"
+
+      - name: Build release binaries
+        run: cargo build --release --target ${{ matrix.target }} -p y2qd -p y2q-cli -p y2q-warp
+
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p dist
+          tar czf dist/y2q-${{ github.ref_name }}-${{ matrix.target }}.tar.gz \
+            -C target/${{ matrix.target }}/release y2qd y2q y2q-warp
+
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Compress-Archive -Path `
+            target/${{ matrix.target }}/release/y2qd.exe, `
+            target/${{ matrix.target }}/release/y2q.exe, `
+            target/${{ matrix.target }}/release/y2q-warp.exe `
+            -DestinationPath dist/y2q-${{ github.ref_name }}-${{ matrix.target }}.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: y2q-${{ github.ref_name }}-${{ matrix.target }}
+          path: dist/*
+
+  docker-release:
+    name: Build + push release images
+    needs: branch
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build + push y2q image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:${{ github.ref_name }}
+            ${{ env.IMAGE }}:latest
+
+      - name: Build + push cluster image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/cluster/Dockerfile
+          push: true
+          tags: |
+            ${{ env.IMAGE_CLUSTER }}:${{ github.ref_name }}
+            ${{ env.IMAGE_CLUSTER }}:latest
+
+  release:
+    name: Create GitHub Release
+    needs: [build, branch]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: "y2q-${{ github.ref_name }}-*"
+          merge-multiple: true
+
+      - name: Generate checksums
+        working-directory: dist
+        run: sha256sum * > SHA256SUMS
+
+      - name: Generate release notes
+        run: |
+          PREV_TAG=$(git tag --sort=-version:refname | grep -v "^${{ github.ref_name }}$" | head -n1)
+          {
+            echo "## Changes"
+            if [ -n "$PREV_TAG" ]; then
+              git log "${PREV_TAG}..${{ github.ref_name }}" --oneline --no-merges
+            else
+              git log "${{ github.ref_name }}" --oneline --no-merges
+            fi
+          } > notes.md
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            dist/* \
+            --title "${{ github.ref_name }}" \
+            --notes-file notes.md

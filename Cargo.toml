@@ -11,6 +11,9 @@ members = [
 ]
 resolver = "2"
 
+[workspace.package]
+version = "0.1.0"
+
 [workspace.dependencies]
 actix-web                   = "4"
 aead                        = { version = "0.5", features = ["bytes"] }
@@ -81,3 +84,4 @@ zstd                        = "0.13"
 [profile.release]
 lto = "thin"
 codegen-units = 1
+strip = "symbols"
