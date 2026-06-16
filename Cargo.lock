@@ -233,6 +233,7 @@ version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d122413f284cf2d62fb1b7db97e02edb8cda96d769b16e443a4f6195e35662b0"
 dependencies = [
+ "bytes",
  "crypto-common 0.1.7",
  "generic-array",
 ]
@@ -1716,15 +1717,6 @@ name = "glob"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
-
-[[package]]
-name = "gxhash"
-version = "3.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f3ce1bab7aa741d4e7042b2aae415b78741f267a98a7271ea226cd5ba6c43d7d"
-dependencies = [
- "rustversion",
-]
 
 [[package]]
 name = "h2"
@@ -5696,6 +5688,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "xxhash-rust"
+version = "0.8.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fdd20c5420375476fbd4394763288da7eb0cc0b8c11deed431a91562af7335d3"
+
+[[package]]
 name = "y2q-behavior"
 version = "0.1.0"
 dependencies = [
@@ -5761,7 +5759,6 @@ dependencies = [
  "bytes",
  "dashmap",
  "futures",
- "gxhash",
  "openraft",
  "rand 0.8.6",
  "redb",
@@ -5775,6 +5772,7 @@ dependencies = [
  "tokio",
  "tracing",
  "webpki-roots 0.26.11",
+ "xxhash-rust",
  "y2q-core",
  "zeroize",
 ]
@@ -5795,6 +5793,7 @@ dependencies = [
 name = "y2q-core"
 version = "0.1.0"
 dependencies = [
+ "aead",
  "aes-gcm",
  "aligned-vec",
  "argon2",
@@ -5805,7 +5804,6 @@ dependencies = [
  "criterion",
  "flume",
  "fs2",
- "gxhash",
  "hkdf",
  "hmac",
  "libc",
@@ -5818,7 +5816,6 @@ dependencies = [
  "rand 0.8.6",
  "redb",
  "regex",
- "ring",
  "serde",
  "serde_json",
  "sha2",
@@ -5829,6 +5826,7 @@ dependencies = [
  "tokio-uring",
  "tracing",
  "uuid",
+ "xxhash-rust",
  "zeroize",
 ]
 
@@ -5873,7 +5871,6 @@ dependencies = [
  "figment",
  "flume",
  "futures",
- "gxhash",
  "metrics",
  "metrics-exporter-prometheus",
  "metrics-rs-dashboard-actix",

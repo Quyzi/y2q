@@ -11,16 +11,14 @@
 //! table it commits through raft; nodes then serve from the committed,
 //! epoch-stamped table rather than the live ring (see [`super::chain`]).
 
-use std::hash::Hasher as _;
-
-use gxhash::GxHasher;
+use xxhash_rust::xxh3::xxh3_64_with_seed;
 
 use crate::identity::NodeId;
 
 /// Seed for all ring hashing. This is a pinned wire constant: changing it
 /// reshuffles every object's chain assignment, so it must never change without a
 /// data migration.
-const RING_SEED: i64 = 0x7932_7100_0000_0001;
+const RING_SEED: u64 = 0x7932_7100_0000_0001;
 
 /// Hash an object `(bucket, key)` to its point on the ring.
 ///
@@ -44,11 +42,9 @@ fn token(node: NodeId, vnode: u32) -> u64 {
     hash(&buf)
 }
 
-/// Single-shot gxhash of a buffer with the pinned ring seed.
+/// Single-shot XXH3-64 of a buffer with the pinned ring seed.
 fn hash(bytes: &[u8]) -> u64 {
-    let mut h = GxHasher::with_seed(RING_SEED);
-    h.write(bytes);
-    h.finish()
+    xxh3_64_with_seed(bytes, RING_SEED)
 }
 
 /// A consistent-hash ring over the current active membership.
