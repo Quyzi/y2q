@@ -7,7 +7,6 @@ edition = "2024"
 bytes          = { workspace = true }
 dashmap        = { workspace = true }
 futures        = { workspace = true }
-gxhash         = { workspace = true }
 openraft       = { workspace = true }
 rand           = { workspace = true }
 redb           = { workspace = true }
@@ -20,6 +19,7 @@ thiserror      = { workspace = true }
 tokio          = { workspace = true }
 tracing        = { workspace = true }
 webpki-roots   = { workspace = true }
+xxhash-rust    = { workspace = true }
 y2q-core       = { path = "../y2q-core" }
 zeroize        = { workspace = true }
 

@@ -4,7 +4,7 @@ This document describes how `y2qd` is put together: the components, the encrypti
 
 ## Overview
 
-`y2qd` is an HTTP daemon that exposes an object store. Every object is encrypted at rest using ML-KEM-768 key encapsulation feeding AES-256-GCM (via [ring](https://github.com/briansmith/ring)). The deployment's private key is never written to disk in plaintext - it is wrapped under each authorized user's password with Argon2id, unwrapped into process memory on successful login, and dropped when no sessions remain (subject to an optional idle timeout).
+`y2qd` is an HTTP daemon that exposes an object store. Every object is encrypted at rest using ML-KEM-768 key encapsulation feeding AES-256-GCM (via the pure-Rust [aes-gcm](https://github.com/RustCrypto/AEADs) crate). The deployment's private key is never written to disk in plaintext - it is wrapped under each authorized user's password with Argon2id, unwrapped into process memory on successful login, and dropped when no sessions remain (subject to an optional idle timeout).
 
 Two storage backends ship in tree:
 
@@ -19,7 +19,7 @@ flowchart TD
     MW --> AUTH[auth extractor]
     SESSIONS[("DashMap\ntoken_hash → SessionInfo")] --> AUTH
     AUTH --> HANDLERS["handlers/*.rs"]
-    HANDLERS --> ENV["envelope.rs\nML-KEM-768 + HKDF + ring\nencrypt/decrypt via in-memory SK"]
+    HANDLERS --> ENV["envelope.rs\nML-KEM-768 + HKDF + aes-gcm\nencrypt/decrypt via in-memory SK"]
     ENV --> STORAGE[AnyStorage dispatcher]
     STORAGE --> FS[FilesystemStorage]
     STORAGE --> URING[UringStorage]
@@ -38,7 +38,7 @@ flowchart TD
     A --> L["LockRegistry.try_acquire(bucket, key)"]
     L --> K["ML-KEM-768.encapsulate(pubkey)\n→ kem_ct, ss"]
     K --> H["HKDF-SHA256(salt=kem_ct, ikm=ss)\n→ content_key"]
-    H --> E["ring AES-256-GCM.seal\n(content_key, nonce, body, aad=header)"]
+    H --> E["aes-gcm AES-256-GCM.encrypt_in_place\n(content_key, nonce, body, aad=header)"]
     E --> W["write header + ciphertext + metadata\nto tmp .obj"]
     W --> S{sync mode?}
     S -->|durable| D["fdatasync(tmp)\nrename(tmp → final)\nfsync(parent_dir)"]
@@ -53,7 +53,7 @@ flowchart TD
 
 ### AES-256-GCM implementation
 
-AES-256-GCM is implemented via [ring](https://github.com/briansmith/ring), which uses hardware AES-NI where available. This is 5-7× faster than the pure-Rust `aes-gcm` crate and is the performance-critical path for every PUT and GET.
+AES-256-GCM is implemented via the pure-Rust [aes-gcm](https://github.com/RustCrypto/AEADs) crate, which uses hardware AES-NI/NEON acceleration where the CPU and target support it, falling back to a constant-time software implementation elsewhere. This keeps the daemon buildable on any architecture Rust supports (it previously depended on `ring`, whose assembly backend only covers x86, x86_64, aarch64, and arm).
 
 ### Envelope format
 
@@ -217,7 +217,7 @@ The metadata blob embedded in each `.obj` is **encrypted at rest** under the MEK
   "created":         1715000000000000000,
   "modified":        1715000000000000000,
   "size":            12345,
-  "checksum_gxhash": "<b64 8-byte gxhash64, 12 chars>",
+  "checksum_gxhash": "<b64 8-byte XXH3-64, 12 chars>",
   "bucket":          "my-bucket",
   "key":             "path/to/object",
   "disk_path":       "/var/lib/y2qd/objects/my-bucket/ab/cd/<uuid>.obj",
@@ -233,7 +233,7 @@ The metadata blob embedded in each `.obj` is **encrypted at rest** under the MEK
 }
 ```
 
-`size` is the plaintext length. `checksum_gxhash` is a non-cryptographic gxhash64 digest of the plaintext (corruption detection, not tamper detection). The `cipher_*` fields and algorithm names are always populated in current builds. `version` and `committed_at` are the CRAQ object version and local commit time; they are `null` outside cluster writes (legacy/single-node objects read as clean v0). The list/HEAD API surface (`MetadataView`) exposes the same fields except `disk_path`, `version`, and `committed_at`, which stay server-internal.
+`size` is the plaintext length. `checksum_gxhash` is a non-cryptographic XXH3-64 digest of the plaintext (corruption detection, not tamper detection). The `cipher_*` fields and algorithm names are always populated in current builds. `version` and `committed_at` are the CRAQ object version and local commit time; they are `null` outside cluster writes (legacy/single-node objects read as clean v0). The list/HEAD API surface (`MetadataView`) exposes the same fields except `disk_path`, `version`, and `committed_at`, which stay server-internal.
 
 ### Write locks (in-memory)
 
@@ -430,6 +430,16 @@ Storage and auth metrics are exposed at `/metrics/prometheus` (Prometheus format
 ### Continuous profiling
 
 When built with `--features pyroscope` and `[observability.pyroscope] enabled = true`, the daemon starts a Pyroscope agent before the HTTP server and stops it on graceful shutdown. The agent runs a background OS thread using SIGPROF (pprof-rs) and pushes CPU profiles to the configured server on each sample interval. It is fully independent of the tokio runtime. Tags `version` and `backend` are attached to every profile so flame graphs can be filtered by deployment variant.
+
+## Platform support
+
+y2q targets any architecture the Rust toolchain supports. The two formerly arch-restrictive dependencies (`gxhash`, hardware-AES-only checksums, and `ring`, assembly-only AEAD) have been replaced with pure-Rust equivalents (`xxhash-rust` XXH3-64 and the RustCrypto `aes-gcm` crate), so the daemon, CLI, and client build on `x86_64`, `aarch64`, `riscv64gc`, `powerpc64le`, `s390x`, `loongarch64`, and other Linux targets the toolchain provides a `std` for. The daemon (`y2qd`) requires Linux; the CLI and client crates are not Linux-bound and also build on macOS.
+
+**Datasets are not cross-platform compatible, and this is intentional, not a gap to be filled.** Checksums, on-disk layout, and the encrypted envelope format are versioned and validated, but never tested or guaranteed across architectures. Concretely:
+
+- A dataset written on one CPU architecture is not guaranteed to read back correctly on another. Don't copy a `storage.base_path` directory between machines of different architectures and expect it to work.
+- Checksums (`checksum_gxhash`, field name kept for wire compatibility with existing deployments) and any future arch-sensitive storage details may differ in their underlying implementation between architectures, even though the algorithm itself is now portable.
+- The only supported way to move data between architectures is a full logical export/import through the API (or the migrate tooling in [clustering.md](clustering.md)), never a raw filesystem copy.
 
 ## Source map
 

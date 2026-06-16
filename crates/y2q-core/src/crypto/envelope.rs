@@ -43,6 +43,9 @@
 //! Chunk nonce_i = nonce_base XOR (i as u64 BE in bytes [4..12]).
 //! AAD for each chunk = the 32-byte v2 fixed header.
 
+use aes_gcm::{Aes256Gcm, KeyInit, aead::AeadInPlace};
+
+type Nonce = aes_gcm::aead::Nonce<Aes256Gcm>;
 use bytes::{Bytes, BytesMut};
 use hkdf::Hkdf;
 use pqcrypto::kem::mlkem768;
@@ -51,7 +54,6 @@ use pqcrypto_traits::kem::{
     SecretKey as KemSecretKeyTrait, SharedSecret as KemSharedSecretTrait,
 };
 use rand::RngCore;
-use ring::aead::{AES_256_GCM, Aad, LessSafeKey, Nonce, UnboundKey};
 use sha2::Sha256;
 use zeroize::Zeroize;
 
@@ -164,18 +166,14 @@ pub fn encrypt(pk_bytes: &[u8], plaintext: &[u8]) -> Result<(Vec<u8>, EnvelopeIn
     let header = build_header(&nonce_bytes, plaintext.len() as u64);
 
     let mut key_bytes = derive_content_key(ss.as_bytes(), kem_ct_bytes)?;
-    let ring_key = make_ring_key(&key_bytes)?;
+    let cipher = aes_key(&key_bytes);
     key_bytes.zeroize();
 
-    // Encrypt plaintext into a buffer; ring appends the 16-byte GCM tag in-place,
-    // eliminating the separate ciphertext allocation that the old aes-gcm path required.
+    // Encrypt plaintext into a buffer; aes-gcm appends the 16-byte GCM tag
+    // in-place, avoiding a separate ciphertext allocation.
     let mut ct_buf: Vec<u8> = plaintext.to_vec();
-    ring_key
-        .seal_in_place_append_tag(
-            ring_nonce(&nonce_bytes)?,
-            Aad::from(&header[..]),
-            &mut ct_buf,
-        )
+    cipher
+        .encrypt_in_place(&aes_nonce(&nonce_bytes), &header[..], &mut ct_buf)
         .map_err(|_| CryptoError::Aead("encrypt"))?;
 
     let mut out = Vec::with_capacity(ENVELOPE_HEADER_FIXED_LEN + kem_ct_bytes.len() + ct_buf.len());
@@ -224,21 +222,19 @@ fn decrypt_v1(sk_bytes: &[u8], envelope: &[u8]) -> Result<Vec<u8>, CryptoError> 
     let ss = mlkem768::decapsulate(&kem_ct, &sk);
 
     let mut key_bytes = derive_content_key(ss.as_bytes(), kem_ct_bytes)?;
-    let ring_key = make_ring_key(&key_bytes)?;
+    let cipher = aes_key(&key_bytes);
     key_bytes.zeroize();
 
-    // Decrypt in-place: ring verifies the tag and overwrites the buffer with
-    // plaintext, avoiding a second Vec allocation vs. the old aes-gcm path.
+    // Decrypt in-place: verifies the tag and truncates the buffer to plaintext,
+    // avoiding a second Vec allocation.
     let mut ct_buf = aead_ct.to_vec();
-    let pt_len = ring_key
-        .open_in_place(
-            ring_nonce(&header.nonce)?,
-            Aad::from(&envelope[..ENVELOPE_HEADER_FIXED_LEN]),
+    cipher
+        .decrypt_in_place(
+            &aes_nonce(&header.nonce),
+            &envelope[..ENVELOPE_HEADER_FIXED_LEN],
             &mut ct_buf,
         )
-        .map_err(|_| CryptoError::AuthFailed)?
-        .len();
-    ct_buf.truncate(pt_len);
+        .map_err(|_| CryptoError::AuthFailed)?;
 
     if ct_buf.len() as u64 != header.plaintext_len {
         return Err(CryptoError::Envelope("plaintext length mismatch"));
@@ -275,7 +271,7 @@ fn decrypt_v2(sk_bytes: &[u8], envelope: &[u8]) -> Result<Vec<u8>, CryptoError> 
     let ss = mlkem768::decapsulate(&kem_ct, &sk);
 
     let mut key_bytes = derive_content_key(ss.as_bytes(), kem_ct_bytes)?;
-    let ring_key = make_ring_key(&key_bytes)?;
+    let cipher = aes_key(&key_bytes);
     key_bytes.zeroize();
 
     let mut plaintext = if plaintext_len > 0 {
@@ -293,15 +289,10 @@ fn decrypt_v2(sk_bytes: &[u8], envelope: &[u8]) -> Result<Vec<u8>, CryptoError> 
         }
         let chunk_nonce_bytes = chunk_nonce(&nonce_base, chunk_idx);
         let mut chunk_buf = envelope[pos..ct_end].to_vec();
-        let pt_len = ring_key
-            .open_in_place(
-                ring_nonce(&chunk_nonce_bytes)?,
-                Aad::from(aad),
-                &mut chunk_buf,
-            )
-            .map_err(|_| CryptoError::AuthFailed)?
-            .len();
-        plaintext.extend_from_slice(&chunk_buf[..pt_len]);
+        cipher
+            .decrypt_in_place(&aes_nonce(&chunk_nonce_bytes), aad, &mut chunk_buf)
+            .map_err(|_| CryptoError::AuthFailed)?;
+        plaintext.extend_from_slice(&chunk_buf);
         pos = ct_end;
         chunk_idx += 1;
     }
@@ -350,21 +341,15 @@ fn decrypt_v1_owned(sk_bytes: &[u8], mut envelope: BytesMut) -> Result<Bytes, Cr
     let ss = mlkem768::decapsulate(&kem_ct, &sk);
 
     let mut key_bytes = derive_content_key(ss.as_bytes(), &kem_ct_owned)?;
-    let ring_key = make_ring_key(&key_bytes)?;
+    let cipher = aes_key(&key_bytes);
     key_bytes.zeroize();
 
     // O(1) split: `body` owns the aead_ct region of the original allocation.
     let mut body = envelope.split_off(kem_ct_end);
     drop(envelope);
-    let pt_len = ring_key
-        .open_in_place(
-            ring_nonce(&header.nonce)?,
-            Aad::from(&aad_bytes[..]),
-            &mut body,
-        )
-        .map_err(|_| CryptoError::AuthFailed)?
-        .len();
-    body.truncate(pt_len);
+    cipher
+        .decrypt_in_place(&aes_nonce(&header.nonce), &aad_bytes[..], &mut body)
+        .map_err(|_| CryptoError::AuthFailed)?;
 
     if body.len() as u64 != header.plaintext_len {
         return Err(CryptoError::Envelope("plaintext length mismatch"));
@@ -401,7 +386,7 @@ fn decrypt_v2_owned(sk_bytes: &[u8], mut envelope: BytesMut) -> Result<Bytes, Cr
     let ss = mlkem768::decapsulate(&kem_ct, &sk);
 
     let mut key_bytes = derive_content_key(ss.as_bytes(), &kem_ct_owned)?;
-    let ring_key = make_ring_key(&key_bytes)?;
+    let cipher = aes_key(&key_bytes);
     key_bytes.zeroize();
 
     // Drop the preamble; `body` retains the chunked ciphertext region.
@@ -423,15 +408,10 @@ fn decrypt_v2_owned(sk_bytes: &[u8], mut envelope: BytesMut) -> Result<Bytes, Cr
         let chunk_nonce_bytes = chunk_nonce(&nonce_base, chunk_idx);
         // O(1) split: `chunk_buf` owns this chunk's ciphertext region.
         let mut chunk_buf = body.split_to(take);
-        let pt_len = ring_key
-            .open_in_place(
-                ring_nonce(&chunk_nonce_bytes)?,
-                Aad::from(&aad[..]),
-                &mut chunk_buf,
-            )
-            .map_err(|_| CryptoError::AuthFailed)?
-            .len();
-        plaintext.extend_from_slice(&chunk_buf[..pt_len]);
+        cipher
+            .decrypt_in_place(&aes_nonce(&chunk_nonce_bytes), &aad[..], &mut chunk_buf)
+            .map_err(|_| CryptoError::AuthFailed)?;
+        plaintext.extend_from_slice(&chunk_buf);
         chunk_idx += 1;
     }
 
@@ -514,7 +494,7 @@ pub fn decrypt_v2_chunks(
     let ss = mlkem768::decapsulate(&kem_ct, &sk);
 
     let mut key_bytes = derive_content_key(ss.as_bytes(), kem_ct_bytes)?;
-    let ring_key = make_ring_key(&key_bytes)?;
+    let cipher = aes_key(&key_bytes);
     key_bytes.zeroize();
 
     let mut plaintext = Vec::with_capacity(chunks_ct.len());
@@ -527,15 +507,10 @@ pub fn decrypt_v2_chunks(
         }
         let chunk_nonce_bytes = chunk_nonce(&nonce_base, chunk_idx);
         let mut chunk_buf = chunks_ct[pos..ct_end].to_vec();
-        let pt_len = ring_key
-            .open_in_place(
-                ring_nonce(&chunk_nonce_bytes)?,
-                Aad::from(aad),
-                &mut chunk_buf,
-            )
-            .map_err(|_| CryptoError::AuthFailed)?
-            .len();
-        plaintext.extend_from_slice(&chunk_buf[..pt_len]);
+        cipher
+            .decrypt_in_place(&aes_nonce(&chunk_nonce_bytes), aad, &mut chunk_buf)
+            .map_err(|_| CryptoError::AuthFailed)?;
+        plaintext.extend_from_slice(&chunk_buf);
         pos = ct_end;
         chunk_idx += 1;
     }
@@ -564,7 +539,7 @@ const V2_AAD_LEN: usize = 20; // up to and including nonce_base
 /// the session).
 pub struct EncryptSession {
     sink: crate::storage::streaming_sink::StreamingSink,
-    key: LessSafeKey,
+    cipher: Aes256Gcm,
     nonce_base: [u8; 12],
     chunk_idx: u64,
     buf: Vec<u8>,
@@ -621,7 +596,7 @@ impl EncryptSession {
             .map_err(|_| CryptoError::Aead("write kem ct"))?;
 
         let mut key_bytes = derive_content_key(ss.as_bytes(), kem_ct_bytes)?;
-        let ring_key = make_ring_key(&key_bytes)?;
+        let cipher = aes_key(&key_bytes);
         key_bytes.zeroize();
 
         let bytes_written = (header.len() + kem_ct_bytes.len()) as u64;
@@ -631,7 +606,7 @@ impl EncryptSession {
 
         Ok(Self {
             sink,
-            key: ring_key,
+            cipher,
             nonce_base,
             chunk_idx: 0,
             buf: Vec::with_capacity(chunk_size),
@@ -719,14 +694,10 @@ impl EncryptSession {
         let chunk_nonce_bytes = chunk_nonce(&self.nonce_base, self.chunk_idx);
         let plaintext_len = self.buf.len();
 
-        // Encrypt self.buf in-place; ring appends the 16-byte tag, so self.buf
-        // becomes [ciphertext || tag] with no separate ct allocation.
-        self.key
-            .seal_in_place_append_tag(
-                ring_nonce(&chunk_nonce_bytes)?,
-                Aad::from(&self.aad[..]),
-                &mut self.buf,
-            )
+        // Encrypt self.buf in-place; aes-gcm appends the 16-byte tag, so
+        // self.buf becomes [ciphertext || tag] with no separate ct allocation.
+        self.cipher
+            .encrypt_in_place(&aes_nonce(&chunk_nonce_bytes), &self.aad[..], &mut self.buf)
             .map_err(|_| CryptoError::Aead("encrypt chunk"))?;
 
         self.plaintext_total += plaintext_len as u64;
@@ -752,16 +723,14 @@ fn chunk_nonce(base: &[u8; 12], idx: u64) -> [u8; 12] {
     n
 }
 
-/// Build a `ring` [`LessSafeKey`] from a 32-byte AES-256 key.
-fn make_ring_key(key: &[u8; 32]) -> Result<LessSafeKey, CryptoError> {
-    let unbound =
-        UnboundKey::new(&AES_256_GCM, key).map_err(|_| CryptoError::Aead("ring key init"))?;
-    Ok(LessSafeKey::new(unbound))
+/// Build an [`Aes256Gcm`] cipher from a 32-byte AES-256 key.
+fn aes_key(key: &[u8; 32]) -> Aes256Gcm {
+    Aes256Gcm::new(key.into())
 }
 
-/// Wrap a 12-byte array into a ring [`Nonce`].
-fn ring_nonce(bytes: &[u8; 12]) -> Result<Nonce, CryptoError> {
-    Nonce::try_assume_unique_for_key(bytes).map_err(|_| CryptoError::Aead("nonce length"))
+/// Wrap a 12-byte array into an AES-GCM [`Nonce`].
+fn aes_nonce(bytes: &[u8; 12]) -> Nonce {
+    Nonce::clone_from_slice(bytes)
 }
 
 /// Sniff the magic+version prefix to decide whether `bytes` is an encrypted
