@@ -16,7 +16,7 @@ version = "0.1.0"
 
 [workspace.dependencies]
 actix-web                   = "4"
-aead                        = { version = "0.5", features = ["bytes"] }
+aead                        = { version = "0.6", features = ["bytes"] }
 aes-gcm                     = "0.10"
 aligned-vec                 = "0.6"
 argon2                      = "0.5"
