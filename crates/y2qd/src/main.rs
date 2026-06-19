@@ -338,10 +338,27 @@ async fn main() -> std::io::Result<()> {
                 .with_dirty_channel(dirty_tx, flush_notify.clone(), cfg.storage.sync_flush_limit),
         ),
         #[cfg(target_os = "linux")]
-        config::StorageBackend::Uring => AnyStorage::Uring(
-            UringStorage::new(&cfg.storage.base_path, &index_path, UringConfig::default())
-                .map_err(|e| std::io::Error::other(format!("storage init: {e}")))?,
-        ),
+        config::StorageBackend::Uring => AnyStorage::Uring({
+            let ur = &cfg.storage.uring;
+            let uring_cfg = UringConfig {
+                workers: ur.workers.unwrap_or_else(|| {
+                    std::thread::available_parallelism()
+                        .map(|n| n.get())
+                        .unwrap_or(4)
+                }),
+                large_object_bytes: UringConfig::default().large_object_bytes,
+                sq_entries: ur.sq_entries,
+                cq_entries: ur.cq_entries,
+                sq_poll: ur.sq_poll,
+                sq_poll_idle_ms: ur.sq_poll_idle_ms,
+                sq_poll_cpu: ur.sq_poll_cpu,
+                io_poll: ur.io_poll,
+                single_issuer: ur.single_issuer,
+                coop_taskrun: ur.coop_taskrun,
+            };
+            UringStorage::new(&cfg.storage.base_path, &index_path, uring_cfg)
+                .map_err(|e| std::io::Error::other(format!("storage init: {e}")))?
+        }),
         #[cfg(not(target_os = "linux"))]
         config::StorageBackend::Uring => {
             return Err(std::io::Error::other(
