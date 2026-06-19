@@ -346,7 +346,7 @@ async fn main() -> std::io::Result<()> {
                         .map(|n| n.get())
                         .unwrap_or(4)
                 }),
-                large_object_bytes: UringConfig::default().large_object_bytes,
+                large_object_bytes: ur.large_object_bytes,
                 sq_entries: ur.sq_entries,
                 cq_entries: ur.cq_entries,
                 sq_poll: ur.sq_poll,
