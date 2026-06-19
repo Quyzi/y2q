@@ -426,6 +426,71 @@ pub enum StorageBackend {
     Uring,
 }
 
+/// io_uring ring builder tunables. All fields default to tokio-uring's own
+/// defaults. Only meaningful when `backend = "uring"`.
+#[derive(Debug, Deserialize)]
+pub struct UringRingConfig {
+    /// Number of dedicated tokio-uring worker threads. Defaults to the number
+    /// of logical CPUs.
+    pub workers: Option<usize>,
+    /// Submission queue (SQ) ring size. Must be a power of two. Default: 256.
+    #[serde(default = "default_uring_sq_entries")]
+    pub sq_entries: u32,
+    /// Completion queue (CQ) ring size. `None` (omit) lets the kernel pick
+    /// (typically 2x `sq_entries`). Default: omitted.
+    pub cq_entries: Option<u32>,
+    /// Enable kernel-side SQ polling thread (`IORING_SETUP_SQPOLL`). Requires
+    /// `CAP_SYS_NICE` or `CAP_SYS_ADMIN`. Default: false.
+    #[serde(default)]
+    pub sq_poll: bool,
+    /// Milliseconds of SQ poll thread idle before it sleeps. Only meaningful
+    /// when `sq_poll = true`. Default: 2000.
+    #[serde(default = "default_uring_sq_poll_idle_ms")]
+    pub sq_poll_idle_ms: u32,
+    /// Pin the SQ poll thread to this CPU index. `None` = no affinity. Only
+    /// meaningful when `sq_poll = true`. Default: omitted.
+    pub sq_poll_cpu: Option<u32>,
+    /// Busy-poll for I/O completions (`IORING_SETUP_IOPOLL`). Useful on NVMe
+    /// devices that support polled I/O. Default: false.
+    #[serde(default)]
+    pub io_poll: bool,
+    /// Declare single-thread submission (`IORING_SETUP_SINGLE_ISSUER`). Each
+    /// worker thread owns its own ring, so this is always accurate and enables
+    /// kernel-side optimisations. Default: true.
+    #[serde(default = "default_true")]
+    pub single_issuer: bool,
+    /// Enable cooperative task-run scheduling (`IORING_SETUP_COOP_TASKRUN`).
+    /// Reduces interrupt overhead. Default: false.
+    #[serde(default)]
+    pub coop_taskrun: bool,
+}
+
+fn default_uring_sq_entries() -> u32 {
+    256
+}
+fn default_uring_sq_poll_idle_ms() -> u32 {
+    2000
+}
+fn default_true() -> bool {
+    true
+}
+
+impl Default for UringRingConfig {
+    fn default() -> Self {
+        Self {
+            workers: None,
+            sq_entries: default_uring_sq_entries(),
+            cq_entries: None,
+            sq_poll: false,
+            sq_poll_idle_ms: default_uring_sq_poll_idle_ms(),
+            sq_poll_cpu: None,
+            io_poll: false,
+            single_issuer: true,
+            coop_taskrun: false,
+        }
+    }
+}
+
 /// Object storage settings.
 #[derive(Debug, Deserialize)]
 pub struct StorageConfig {
@@ -463,6 +528,9 @@ pub struct StorageConfig {
     /// `"best-effort"` — no fsync; higher throughput, not crash-safe.
     #[serde(default)]
     pub default_sync: SyncLevel,
+    /// io_uring ring builder tunables. Only used when `backend = "uring"`.
+    #[serde(default)]
+    pub uring: UringRingConfig,
 }
 
 /// Per-request limits on `X-Y2Q-<label>` headers, registered as actix

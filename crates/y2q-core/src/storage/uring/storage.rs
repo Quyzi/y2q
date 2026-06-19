@@ -62,6 +62,35 @@ pub struct UringConfig {
     /// Object size at or above which writes switch to the `O_DIRECT` path
     /// with aligned buffers. Below this, buffered uring writes are used.
     pub large_object_bytes: u64,
+    /// io_uring submission queue (SQ) ring size. Must be a power of two.
+    /// Default: 256 (tokio-uring default).
+    pub sq_entries: u32,
+    /// io_uring completion queue (CQ) ring size. `None` lets the kernel pick
+    /// (typically 2x `sq_entries`). Default: `None`.
+    pub cq_entries: Option<u32>,
+    /// Enable kernel-side SQ polling thread (`IORING_SETUP_SQPOLL`). The
+    /// kernel thread busy-polls the SQ, eliminating `io_uring_enter` syscalls
+    /// on the hot path. Requires `CAP_SYS_NICE` or `CAP_SYS_ADMIN`.
+    /// Default: false.
+    pub sq_poll: bool,
+    /// Milliseconds of SQ poll thread idle time before it sleeps. Only
+    /// meaningful when `sq_poll = true`. Default: 2000 (kernel default).
+    pub sq_poll_idle_ms: u32,
+    /// Pin the SQ poll thread to a specific CPU. `None` = no affinity.
+    /// Only meaningful when `sq_poll = true`. Default: `None`.
+    pub sq_poll_cpu: Option<u32>,
+    /// Enable busy-poll for I/O completions (`IORING_SETUP_IOPOLL`). Useful
+    /// on NVMe devices that support polled I/O. Default: false.
+    pub io_poll: bool,
+    /// Declare that the ring is submitted from a single thread
+    /// (`IORING_SETUP_SINGLE_ISSUER`). Always accurate here — each worker
+    /// thread owns its own ring. Enables kernel-side optimisations.
+    /// Default: true.
+    pub single_issuer: bool,
+    /// Enable cooperative task-run scheduling (`IORING_SETUP_COOP_TASKRUN`).
+    /// Reduces interrupt overhead at the cost of slightly higher per-task
+    /// latency. Default: false.
+    pub coop_taskrun: bool,
 }
 
 impl Default for UringConfig {
@@ -71,6 +100,14 @@ impl Default for UringConfig {
                 .map(|n| n.get())
                 .unwrap_or(4),
             large_object_bytes: 4 * 1024 * 1024,
+            sq_entries: 256,
+            cq_entries: None,
+            sq_poll: false,
+            sq_poll_idle_ms: 2000,
+            sq_poll_cpu: None,
+            io_poll: false,
+            single_issuer: true,
+            coop_taskrun: false,
         }
     }
 }
@@ -883,6 +920,7 @@ mod tests {
             UringConfig {
                 workers,
                 large_object_bytes,
+                ..UringConfig::default()
             },
         )
         .unwrap();
