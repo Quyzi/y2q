@@ -164,6 +164,11 @@ default_sync = "durable"
 # Default: false.
 # coop_taskrun = false
 
+# Object size threshold (bytes) at or above which writes switch to the O_DIRECT
+# path with aligned buffers. Below this, buffered uring writes are used.
+# Default: 4194304 (4 MiB).
+# large_object_bytes = 4194304
+
 # ---------------------------------------------------------------------------
 # [crypto] — keystore and key-derivation settings
 # ---------------------------------------------------------------------------

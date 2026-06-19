@@ -463,6 +463,11 @@ pub struct UringRingConfig {
     /// Reduces interrupt overhead. Default: false.
     #[serde(default)]
     pub coop_taskrun: bool,
+    /// Object size threshold (bytes) at or above which writes use `O_DIRECT`
+    /// with aligned buffers. Below this, buffered uring writes are used.
+    /// Default: 4 MiB.
+    #[serde(default = "default_uring_large_object_bytes")]
+    pub large_object_bytes: u64,
 }
 
 fn default_uring_sq_entries() -> u32 {
@@ -473,6 +478,9 @@ fn default_uring_sq_poll_idle_ms() -> u32 {
 }
 fn default_true() -> bool {
     true
+}
+fn default_uring_large_object_bytes() -> u64 {
+    4 * 1024 * 1024
 }
 
 impl Default for UringRingConfig {
@@ -487,6 +495,7 @@ impl Default for UringRingConfig {
             io_poll: false,
             single_issuer: true,
             coop_taskrun: false,
+            large_object_bytes: default_uring_large_object_bytes(),
         }
     }
 }
