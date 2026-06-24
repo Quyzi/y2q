@@ -50,11 +50,12 @@ impl WorkerPool {
             let (tx, rx) = async_channel::unbounded::<UringOp>();
             let (probe_tx, probe_rx) = std::sync::mpsc::channel::<Result<(), String>>();
             senders.push(tx);
+            let config_clone = config.clone();
             let handle = std::thread::Builder::new()
                 .name(format!("y2q-uring-worker-{i}"))
                 .spawn(move || {
                     let ok = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        tokio_uring::start(async {})
+                        build_ring(&config_clone).start(async {})
                     })) {
                         Ok(()) => {
                             let _ = probe_tx.send(Ok(()));
@@ -71,7 +72,7 @@ impl WorkerPool {
                         }
                     };
                     if ok {
-                        worker_main(rx);
+                        worker_main(rx, config_clone);
                     }
                 })
                 .expect("spawn uring worker thread");
@@ -132,6 +133,34 @@ impl Drop for WorkerPool {
     }
 }
 
+/// Build a `tokio_uring::Builder` from `config` ring parameters.
+fn build_ring(config: &UringConfig) -> tokio_uring::Builder {
+    let mut b = tokio_uring::builder();
+    b.entries(config.sq_entries);
+
+    let mut urb = tokio_uring::uring_builder();
+    if let Some(cq) = config.cq_entries {
+        urb.setup_cqsize(cq);
+    }
+    if config.sq_poll {
+        urb.setup_sqpoll(config.sq_poll_idle_ms);
+        if let Some(cpu) = config.sq_poll_cpu {
+            urb.setup_sqpoll_cpu(cpu);
+        }
+    }
+    if config.io_poll {
+        urb.setup_iopoll();
+    }
+    if config.single_issuer {
+        urb.setup_single_issuer();
+    }
+    if config.coop_taskrun {
+        urb.setup_coop_taskrun();
+    }
+    b.uring_builder(&urb);
+    b
+}
+
 /// Worker thread entry point.
 ///
 /// Blocks the OS thread via `recv_blocking` (futex) when idle, so the thread
@@ -145,10 +174,10 @@ impl Drop for WorkerPool {
 /// `IORING_ENTER_GETEVENTS`. When the submission ring is empty that syscall
 /// returns immediately, producing a tight spin loop even on an idle worker.
 /// Keeping the blocking wait outside the uring runtime avoids this entirely.
-fn worker_main(rx: Receiver<UringOp>) {
+fn worker_main(rx: Receiver<UringOp>, config: UringConfig) {
     while let Ok(op) = rx.recv_blocking() {
         let r = &rx;
-        tokio_uring::start(async move {
+        build_ring(&config).start(async move {
             super::ops::handle(op).await;
             // Drain ops already queued. Per-key serialization is preserved
             // because same-key ops still funnel through this one channel in

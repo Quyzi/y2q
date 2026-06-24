@@ -122,6 +122,54 @@ sync_flush_limit = 64
 default_sync = "durable"
 
 # ---------------------------------------------------------------------------
+# [storage.uring] — io_uring ring builder tunables (Linux only)
+# Only relevant when backend = "uring". All options default to tokio-uring's
+# own defaults and can be omitted entirely.
+# ---------------------------------------------------------------------------
+# [storage.uring]
+
+# Number of dedicated io_uring worker threads. Defaults to logical CPU count.
+# workers = 8
+
+# Submission queue (SQ) ring size. Must be a power of two. Default: 256.
+# sq_entries = 256
+
+# Completion queue (CQ) ring size. Omit to let the kernel choose (≥ 2x sq_entries).
+# cq_entries = 512
+
+# Enable kernel-side SQ polling thread (IORING_SETUP_SQPOLL). Eliminates
+# io_uring_enter syscalls on the submission hot path. Requires CAP_SYS_NICE
+# or CAP_SYS_ADMIN. Default: false.
+# sq_poll = false
+
+# Milliseconds before the SQ poll thread sleeps when idle. Only meaningful
+# when sq_poll = true. Default: 2000.
+# sq_poll_idle_ms = 2000
+
+# Pin the SQ poll thread to a specific CPU. Omit for no affinity. Only
+# meaningful when sq_poll = true.
+# sq_poll_cpu = 0
+
+# Busy-poll for I/O completions (IORING_SETUP_IOPOLL). Reduces latency on
+# NVMe devices that support polled I/O. Default: false.
+# io_poll = false
+
+# Declare single-thread submission (IORING_SETUP_SINGLE_ISSUER). Each worker
+# thread owns its own ring, so this is always accurate and enables kernel
+# optimisations. Default: true.
+# single_issuer = true
+
+# Cooperative task-run scheduling (IORING_SETUP_COOP_TASKRUN). Reduces
+# interrupt overhead at the cost of slightly higher per-task latency.
+# Default: false.
+# coop_taskrun = false
+
+# Object size threshold (bytes) at or above which writes switch to the O_DIRECT
+# path with aligned buffers. Below this, buffered uring writes are used.
+# Default: 4194304 (4 MiB).
+# large_object_bytes = 4194304
+
+# ---------------------------------------------------------------------------
 # [crypto] — keystore and key-derivation settings
 # ---------------------------------------------------------------------------
 [crypto]
