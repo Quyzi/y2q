@@ -1,0 +1,49 @@
+[Unit]
+Description=y2qd post-quantum secure storage daemon
+Documentation=https://github.com/Quyzi/y2q
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/y2qd --config /etc/y2q/config.toml
+Restart=on-failure
+RestartSec=5s
+
+User=y2qd
+Group=y2qd
+
+# Filesystem isolation
+UMask=0027
+StateDirectory=y2q
+StateDirectoryMode=0750
+ConfigurationDirectory=y2q
+ConfigurationDirectoryMode=0750
+
+# Capability restrictions
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=true
+
+# Namespace isolation
+PrivateTmp=true
+PrivateDevices=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/y2q
+
+# Syscall filtering
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallErrorNumber=EPERM
+
+# Misc hardening
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RemoveIPC=true
+
+[Install]
+WantedBy=multi-user.target
