@@ -53,7 +53,7 @@ use pqcrypto_traits::kem::{
     Ciphertext as KemCiphertextTrait, PublicKey as KemPublicKeyTrait,
     SecretKey as KemSecretKeyTrait, SharedSecret as KemSharedSecretTrait,
 };
-use rand::RngCore;
+use rand::Rng;
 use sha2::Sha256;
 use zeroize::Zeroize;
 
@@ -161,7 +161,7 @@ pub fn encrypt(pk_bytes: &[u8], plaintext: &[u8]) -> Result<(Vec<u8>, EnvelopeIn
     let kem_ct_bytes = kem_ct.as_bytes();
 
     let mut nonce_bytes = [0u8; 12];
-    rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
+    rand::rng().fill_bytes(&mut nonce_bytes);
 
     let header = build_header(&nonce_bytes, plaintext.len() as u64);
 
@@ -345,16 +345,17 @@ fn decrypt_v1_owned(sk_bytes: &[u8], mut envelope: BytesMut) -> Result<Bytes, Cr
     key_bytes.zeroize();
 
     // O(1) split: `body` owns the aead_ct region of the original allocation.
-    let mut body = envelope.split_off(kem_ct_end);
+    let body = envelope.split_off(kem_ct_end);
     drop(envelope);
+    let mut body_vec: Vec<u8> = body.into();
     cipher
-        .decrypt_in_place(&aes_nonce(&header.nonce), &aad_bytes[..], &mut body)
+        .decrypt_in_place(&aes_nonce(&header.nonce), &aad_bytes[..], &mut body_vec)
         .map_err(|_| CryptoError::AuthFailed)?;
 
-    if body.len() as u64 != header.plaintext_len {
+    if body_vec.len() as u64 != header.plaintext_len {
         return Err(CryptoError::Envelope("plaintext length mismatch"));
     }
-    Ok(body.freeze())
+    Ok(Bytes::from(body_vec))
 }
 
 fn decrypt_v2_owned(sk_bytes: &[u8], mut envelope: BytesMut) -> Result<Bytes, CryptoError> {
@@ -407,11 +408,12 @@ fn decrypt_v2_owned(sk_bytes: &[u8], mut envelope: BytesMut) -> Result<Bytes, Cr
         }
         let chunk_nonce_bytes = chunk_nonce(&nonce_base, chunk_idx);
         // O(1) split: `chunk_buf` owns this chunk's ciphertext region.
-        let mut chunk_buf = body.split_to(take);
+        let chunk_buf = body.split_to(take);
+        let mut chunk_vec: Vec<u8> = chunk_buf.into();
         cipher
-            .decrypt_in_place(&aes_nonce(&chunk_nonce_bytes), &aad[..], &mut chunk_buf)
+            .decrypt_in_place(&aes_nonce(&chunk_nonce_bytes), &aad[..], &mut chunk_vec)
             .map_err(|_| CryptoError::AuthFailed)?;
-        plaintext.extend_from_slice(&chunk_buf);
+        plaintext.extend_from_slice(&chunk_vec);
         chunk_idx += 1;
     }
 
@@ -576,7 +578,7 @@ impl EncryptSession {
         let kem_ct_bytes = kem_ct.as_bytes();
 
         let mut nonce_base = [0u8; 12];
-        rand::rngs::OsRng.fill_bytes(&mut nonce_base);
+        rand::rng().fill_bytes(&mut nonce_base);
 
         // Build the 32-byte v2 fixed header (plaintext_len = 0 placeholder).
         let mut header = Vec::with_capacity(ENVELOPE_V2_HEADER_FIXED_LEN);

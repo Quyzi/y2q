@@ -16,7 +16,7 @@ version = "0.1.0"
 
 [workspace.dependencies]
 actix-web                   = "4"
-aead                        = { version = "0.5", features = ["bytes"] }
+aead                        = "0.6"
 aes-gcm                     = "0.10"
 aligned-vec                 = "0.6"
 argon2                      = "0.5"
@@ -31,7 +31,7 @@ criterion                   = { version = "0.5", features = ["async_tokio"] }
 crossterm                   = { version = "0.28", features = ["event-stream"] }
 csv                         = "1.3"
 dashmap                     = "6"
-directories                 = "5"
+directories                 = "6"
 figment                     = { version = "0.10.19", features = ["toml", "env"] }
 flume                       = "0.12"
 fs2                         = "0.4"
@@ -51,8 +51,8 @@ pest                        = "2"
 pest_derive                 = "2"
 pqcrypto                    = { version = "0.18.1", features = ["serialization"] }
 pqcrypto-traits             = "0.3.5"
-rand                        = "0.8"
-ratatui                     = { version = "0.29", features = ["crossterm"] }
+rand                        = "0.10"
+ratatui                     = { version = "0.30", features = ["crossterm"] }
 redb                        = "4.1.0"
 regex                       = "1"
 reqwest                     = { version = "0.12", features = ["json", "stream", "rustls-tls-no-provider"], default-features = false }
@@ -65,7 +65,7 @@ sha2                        = "0.10"
 subtle                      = "2"
 tempfile                    = "3"
 thiserror                   = "2.0.18"
-throbber-widgets-tui        = "0.8"
+throbber-widgets-tui        = "0.11"
 tokio                       = { version = "1.52.3", features = ["full"] }
 tokio-uring                 = "0.5"
 tokio-util                  = { version = "0.7", features = ["io", "codec"] }
@@ -76,7 +76,7 @@ tracing-subscriber          = { version = "0.3", features = ["env-filter", "json
 utoipa                      = "5"
 utoipa-swagger-ui           = { version = "9", features = ["actix-web"] }
 uuid                        = { version = "1", features = ["v4", "v5"] }
-webpki-roots                = "0.26"
+webpki-roots                = "1"
 xxhash-rust                 = { version = "0.8", features = ["xxh3"] }
 zeroize                     = { version = "1", features = ["derive"] }
 zstd                        = "0.13"

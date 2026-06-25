@@ -22,7 +22,7 @@ use std::sync::RwLock;
 
 use aes_gcm::{Aes256Gcm, KeyInit, aead::Aead};
 use hmac::{Hmac, Mac};
-use rand::RngCore;
+use rand::Rng;
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
@@ -189,7 +189,7 @@ impl MekSlot {
 pub fn encrypt_meta(mek: &[u8; 32], json: &[u8]) -> Result<Vec<u8>, CryptoError> {
     let cipher = Aes256Gcm::new(mek.into());
     let mut nonce_bytes = [0u8; NONCE_LEN];
-    rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
+    rand::rng().fill_bytes(&mut nonce_bytes);
     let nonce = aes_gcm::Nonce::from_slice(&nonce_bytes);
     let ct = cipher
         .encrypt(nonce, json)
