@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use tokio::io::AsyncRead;
 use tokio::io::ReadBuf;
 use tokio::sync::Mutex;
@@ -97,7 +97,7 @@ impl ObjectPool {
         if inner.keys.is_empty() {
             return None;
         }
-        let idx = rand::thread_rng().gen_range(0..inner.keys.len());
+        let idx = rand::rng().random_range(0..inner.keys.len());
         let key = inner.keys[idx].clone();
         *inner.readers.entry(key.clone()).or_insert(0) += 1;
         Some(key)
@@ -123,7 +123,7 @@ impl ObjectPool {
         if len == 0 {
             return None;
         }
-        let start = rand::thread_rng().gen_range(0..len);
+        let start = rand::rng().random_range(0..len);
         // Probe from a random offset for the first unleased key so deletes still
         // make progress under read contention instead of bailing out.
         for offset in 0..len {

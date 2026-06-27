@@ -8,7 +8,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use rand::RngCore;
+use rand::Rng;
 
 /// Cluster node identifier.
 ///
@@ -81,7 +81,7 @@ pub fn resolve_node_id(dir: &Path, configured: Option<NodeId>) -> Result<NodeId,
 /// Generate a fresh non-zero random node id. Zero is avoided because it is an
 /// easy footgun (it reads like "unset" and some tooling treats it specially).
 fn generate_node_id() -> NodeId {
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     loop {
         let id = rng.next_u64();
         if id != 0 {

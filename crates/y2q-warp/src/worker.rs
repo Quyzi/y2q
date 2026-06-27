@@ -2,9 +2,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use rand::Rng;
-use rand::SeedableRng;
-use rand::distributions::WeightedIndex;
-use rand::prelude::Distribution;
+use rand::distr::Distribution;
+use rand::distr::weighted::WeightedIndex;
 use rand::rngs::StdRng;
 use tokio::sync::{mpsc, watch};
 use zeroize::Zeroizing;
@@ -32,7 +31,7 @@ pub async fn run_worker(
 ) {
     let mut client = client;
     let shutdown = shutdown;
-    let mut rng = StdRng::from_entropy();
+    let mut rng: StdRng = rand::make_rng();
 
     loop {
         // Check shutdown

@@ -226,9 +226,9 @@ fn write_pubkey(path: &Path, pk_bytes: &[u8], fingerprint: &str) -> Result<(), C
 
 fn generate_root_password() -> String {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-    use rand::RngCore;
+    use rand::Rng;
     let mut buf = [0u8; 24];
-    rand::rngs::OsRng.fill_bytes(&mut buf);
+    rand::rng().fill_bytes(&mut buf);
     URL_SAFE_NO_PAD.encode(buf)
 }
 

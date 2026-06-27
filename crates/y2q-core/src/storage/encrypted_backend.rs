@@ -43,7 +43,7 @@ use std::path::Path;
 use std::sync::RwLock;
 
 use aes_gcm::{Aes256Gcm, KeyInit, aead::Aead};
-use rand::RngCore;
+use rand::Rng;
 use redb::StorageBackend;
 
 /// Plaintext bytes per data block.
@@ -148,7 +148,7 @@ impl EncryptedFileBackend {
     /// Seal `BLOCK_SIZE` plaintext bytes for data block `idx` into a physical block.
     fn seal_block(&self, idx: u64, plain: &[u8; BLOCK_SIZE]) -> Result<Vec<u8>, io::Error> {
         let mut nonce = [0u8; NONCE_LEN];
-        rand::rngs::OsRng.fill_bytes(&mut nonce);
+        rand::rng().fill_bytes(&mut nonce);
         let ct = self
             .cipher
             .encrypt(
@@ -248,7 +248,7 @@ fn write_header(cipher: &Aes256Gcm, file: &mut File, logical_len: u64) -> Result
     plaintext[8..16].copy_from_slice(&logical_len.to_be_bytes());
 
     let mut nonce = [0u8; NONCE_LEN];
-    rand::rngs::OsRng.fill_bytes(&mut nonce);
+    rand::rng().fill_bytes(&mut nonce);
     let ct = cipher
         .encrypt(
             aes_gcm::Nonce::from_slice(&nonce),
@@ -387,7 +387,7 @@ impl StorageBackend for EncryptedFileBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::Rng;
+    use rand::RngExt;
 
     fn backend(dir: &std::path::Path) -> EncryptedFileBackend {
         EncryptedFileBackend::open(&dir.join("t.redb"), [7u8; 32]).unwrap()
@@ -398,11 +398,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let be = backend(dir.path());
         let mut oracle: Vec<u8> = Vec::new();
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
 
         for _ in 0..400 {
-            let len = rng.gen_range(1..9000usize);
-            let offset = rng.gen_range(0..20_000u64);
+            let len = rng.random_range(1..9000usize);
+            let offset = rng.random_range(0..20_000u64);
             let end = offset as usize + len;
             if end as u64 > be.len().unwrap() {
                 be.set_len(end as u64).unwrap();
@@ -410,7 +410,7 @@ mod tests {
             if oracle.len() < end {
                 oracle.resize(end, 0);
             }
-            let data: Vec<u8> = (0..len).map(|_| rng.r#gen()).collect();
+            let data: Vec<u8> = (0..len).map(|_| rng.random()).collect();
             be.write(offset, &data).unwrap();
             oracle[offset as usize..end].copy_from_slice(&data);
         }
@@ -425,8 +425,8 @@ mod tests {
             if oracle.is_empty() {
                 break;
             }
-            let off = rng.gen_range(0..oracle.len());
-            let n = rng.gen_range(0..(oracle.len() - off + 1));
+            let off = rng.random_range(0..oracle.len());
+            let n = rng.random_range(0..(oracle.len() - off + 1));
             let mut buf = vec![0u8; n];
             be.read(off as u64, &mut buf).unwrap();
             assert_eq!(buf, &oracle[off..off + n]);
