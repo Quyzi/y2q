@@ -25,7 +25,7 @@ use pqcrypto_traits::kem::{
     Ciphertext as KemCiphertextTrait, PublicKey as KemPublicKeyTrait,
     SecretKey as KemSecretKeyTrait,
 };
-use rand::RngCore;
+use rand::Rng;
 use sha2::Sha256;
 use std::hint::black_box;
 use y2q_core::crypto::envelope::{decrypt, encrypt};
@@ -66,8 +66,8 @@ fn bench_kem_decap(c: &mut Criterion) {
 fn bench_hkdf_derive(c: &mut Criterion) {
     let mut ss = [0u8; 32];
     let mut salt = [0u8; 1088]; // same length as ML-KEM-768 ciphertext
-    rand::rngs::OsRng.fill_bytes(&mut ss);
-    rand::rngs::OsRng.fill_bytes(&mut salt);
+    rand::rng().fill_bytes(&mut ss);
+    rand::rng().fill_bytes(&mut salt);
 
     c.bench_function("hkdf_derive", |b| {
         b.iter(|| {
@@ -82,8 +82,8 @@ fn bench_hkdf_derive(c: &mut Criterion) {
 fn bench_aes_gcm_encrypt(c: &mut Criterion) {
     let mut key_bytes = [0u8; 32];
     let mut nonce_bytes = [0u8; 12];
-    rand::rngs::OsRng.fill_bytes(&mut key_bytes);
-    rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
+    rand::rng().fill_bytes(&mut key_bytes);
+    rand::rng().fill_bytes(&mut nonce_bytes);
     let aad = b"bench-aad";
 
     let mut group = c.benchmark_group("aes_gcm_encrypt");
@@ -114,8 +114,8 @@ fn bench_aes_gcm_encrypt(c: &mut Criterion) {
 fn bench_aes_gcm_decrypt(c: &mut Criterion) {
     let mut key_bytes = [0u8; 32];
     let mut nonce_bytes = [0u8; 12];
-    rand::rngs::OsRng.fill_bytes(&mut key_bytes);
-    rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
+    rand::rng().fill_bytes(&mut key_bytes);
+    rand::rng().fill_bytes(&mut nonce_bytes);
     let aad = b"bench-aad";
 
     let mut group = c.benchmark_group("aes_gcm_decrypt");

@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use rand::Rng;
+use rand::{Rng, RngExt};
 
 use crate::ops::OpKind;
 
@@ -56,7 +56,7 @@ impl ObjSize {
     pub fn sample(&self, rng: &mut impl Rng) -> u64 {
         match self {
             Self::Fixed(n) => *n,
-            Self::Random { min, max } => rng.gen_range(*min..=*max),
+            Self::Random { min, max } => rng.random_range(*min..=*max),
         }
     }
 

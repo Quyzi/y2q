@@ -14,7 +14,7 @@ use aes_gcm::{
     aead::{Aead, Payload},
 };
 use argon2::{Algorithm, Argon2, Params, Version};
-use rand::RngCore;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroize;
 
@@ -62,7 +62,7 @@ impl Argon2Params {
     /// random salt.
     pub fn with_random_salt(m_cost_kib: u32, t_cost: u32, p_cost: u32) -> Self {
         let mut salt = [0u8; 16];
-        rand::rngs::OsRng.fill_bytes(&mut salt);
+        rand::rng().fill_bytes(&mut salt);
         Self {
             m_cost_kib,
             t_cost,
@@ -119,7 +119,7 @@ pub fn unwrap_sk(
 
 fn wrap_with_kek(sk_bytes: &[u8], kek: &[u8; 32]) -> Result<WrappedSk, CryptoError> {
     let mut nonce_bytes = [0u8; 12];
-    rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
+    rand::rng().fill_bytes(&mut nonce_bytes);
     let cipher = Aes256Gcm::new(kek.into());
     let ct = cipher
         .encrypt(

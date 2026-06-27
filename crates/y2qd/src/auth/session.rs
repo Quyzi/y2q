@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use dashmap::DashMap;
-use rand::RngCore;
+use rand::Rng;
 use sha2::{Digest, Sha256};
 use y2q_core::crypto::Role;
 
@@ -24,7 +24,7 @@ impl SessionToken {
     /// Mint a fresh random token.
     pub fn random() -> Self {
         let mut buf = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut buf);
+        rand::rng().fill_bytes(&mut buf);
         SessionToken(URL_SAFE_NO_PAD.encode(buf))
     }
 

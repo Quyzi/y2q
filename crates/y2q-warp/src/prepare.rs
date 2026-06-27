@@ -23,7 +23,7 @@ pub async fn prepare(
     let prepared = Arc::new(AtomicU32::new(0));
     let progress_tx = Arc::new(progress_tx);
     let mut tasks: JoinSet<Result<String, String>> = JoinSet::new();
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
 
     for n in 0..objects {
         let key = format!("warp/{run_id}/{n:08}");
