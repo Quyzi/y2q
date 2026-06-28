@@ -9,7 +9,7 @@ use fuser::{
     ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr, Request,
 };
 use tempfile::NamedTempFile;
-use y2q_client::{ClientError, ListOptions, Y2qClient};
+use y2q_client::{AclBody, BucketConfig, ClientError, ListOptions, Y2qClient};
 
 use crate::dir::{ChildEntry, list_children};
 use crate::error::to_errno;
@@ -220,6 +220,11 @@ impl Filesystem for Y2qFuse {
                                     modified: head.modified,
                                     checksum_gxhash: head.checksum_gxhash.clone(),
                                     labels: head.labels.clone(),
+                                    cipher_size: head.cipher_size,
+                                    cipher_sha256: head.cipher_sha256.clone(),
+                                    kem_alg: head.kem_alg.clone(),
+                                    aead_alg: head.aead_alg.clone(),
+                                    envelope_version: head.envelope_version,
                                 },
                             );
                             ino
@@ -280,6 +285,11 @@ impl Filesystem for Y2qFuse {
                                     modified: head.modified,
                                     checksum_gxhash: head.checksum_gxhash.clone(),
                                     labels: head.labels.clone(),
+                                    cipher_size: head.cipher_size,
+                                    cipher_sha256: head.cipher_sha256.clone(),
+                                    kem_alg: head.kem_alg.clone(),
+                                    aead_alg: head.aead_alg.clone(),
+                                    envelope_version: head.envelope_version,
                                 },
                             );
                             ino
@@ -351,6 +361,11 @@ impl Filesystem for Y2qFuse {
                                     modified: head.modified,
                                     checksum_gxhash: head.checksum_gxhash.clone(),
                                     labels: head.labels.clone(),
+                                    cipher_size: head.cipher_size,
+                                    cipher_sha256: head.cipher_sha256.clone(),
+                                    kem_alg: head.kem_alg.clone(),
+                                    aead_alg: head.aead_alg.clone(),
+                                    envelope_version: head.envelope_version,
                                 },
                             );
                         reply.attr(
@@ -439,6 +454,9 @@ impl Filesystem for Y2qFuse {
                     .block_on(async move { list_children(&client, &bucket, &pfx).await })
                 {
                     Ok(c) => c,
+                    // Bucket doesn't exist yet: treat as empty so the mount is
+                    // usable before any objects are written.
+                    Err(ClientError::NotFound { .. }) => vec![],
                     Err(e) => {
                         reply.error(to_errno(&e));
                         return;
@@ -515,6 +533,11 @@ impl Filesystem for Y2qFuse {
                                         modified: meta.modified,
                                         checksum_gxhash: meta.checksum_gxhash.clone(),
                                         labels: meta.labels.clone(),
+                                        cipher_size: meta.cipher_size,
+                                        cipher_sha256: meta.cipher_sha256.clone(),
+                                        kem_alg: meta.kem_alg.clone(),
+                                        aead_alg: meta.aead_alg.clone(),
+                                        envelope_version: meta.envelope_version,
                                     },
                                 );
                                 cino
@@ -998,18 +1021,23 @@ impl Filesystem for Y2qFuse {
 
         let name = name.to_string_lossy().into_owned();
 
-        // Only allow bucket creation at the root in multi mode.
         let parent_path = {
             let inodes = self.inodes.lock().unwrap_or_else(|e| e.into_inner());
             inodes.get(parent).map(|e| e.path.clone())
         };
 
+        // In single-bucket mode the root IS the bucket; remap so virtual-dir
+        // creation falls through to the Bucket arm below.
+        let parent_path =
+            if let (Some(InodePath::Root), MountMode::Single(b)) = (&parent_path, &self.mode) {
+                Some(InodePath::Bucket(b.clone()))
+            } else {
+                parent_path
+            };
+
         match parent_path {
             Some(InodePath::Root) => {
-                if matches!(self.mode, MountMode::Single(_)) {
-                    reply.error(libc::EPERM);
-                    return;
-                }
+                // Multi mode: create a real bucket on the server.
                 let bucket = name.clone();
                 let client = self.client_clone();
                 match self
@@ -1026,6 +1054,30 @@ impl Filesystem for Y2qFuse {
                     }
                     Err(e) => reply.error(to_errno(&e)),
                 }
+            }
+            Some(InodePath::Bucket(bucket)) => {
+                // Virtual dir: exists by convention (key prefix). No server call.
+                let ino = self
+                    .inodes
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get_or_assign(InodePath::VirtualDir {
+                        bucket,
+                        prefix: name,
+                    });
+                reply.entry(&ENTRY_TTL, &self.dir_attr(ino), 0);
+            }
+            Some(InodePath::VirtualDir { bucket, prefix }) => {
+                let child_prefix = format!("{prefix}/{name}");
+                let ino = self
+                    .inodes
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get_or_assign(InodePath::VirtualDir {
+                        bucket,
+                        prefix: child_prefix,
+                    });
+                reply.entry(&ENTRY_TTL, &self.dir_attr(ino), 0);
             }
             _ => reply.error(libc::EPERM),
         }
@@ -1247,6 +1299,337 @@ impl Filesystem for Y2qFuse {
         }
     }
 
+    fn setxattr(
+        &mut self,
+        _req: &Request,
+        ino: u64,
+        name: &std::ffi::OsStr,
+        value: &[u8],
+        _flags: i32,
+        _position: u32,
+        reply: ReplyEmpty,
+    ) {
+        if self.read_only {
+            reply.error(libc::EROFS);
+            return;
+        }
+
+        let xname = match name.to_str() {
+            Some(n) => n.to_owned(),
+            None => {
+                reply.error(libc::ENOTSUP);
+                return;
+            }
+        };
+
+        let inode_path = {
+            let inodes = self.inodes.lock().unwrap_or_else(|e| e.into_inner());
+            inodes.get(ino).map(|e| e.path.clone())
+        };
+
+        match inode_path {
+            Some(InodePath::Object { bucket, key }) => {
+                // Read-only object xattrs.
+                const RO: &[&str] = &[
+                    "user.y2q.checksum.gxhash",
+                    "user.y2q.size",
+                    "user.y2q.created",
+                    "user.y2q.modified",
+                    "user.y2q.cipher.size",
+                    "user.y2q.cipher.sha256",
+                    "user.y2q.kem.alg",
+                    "user.y2q.aead.alg",
+                    "user.y2q.envelope.version",
+                ];
+                if RO.contains(&xname.as_str()) {
+                    reply.error(libc::EPERM);
+                    return;
+                }
+
+                let label_name = match xname.strip_prefix("user.y2q.label.") {
+                    Some(n) if !n.is_empty() => n.to_owned(),
+                    _ => {
+                        reply.error(libc::ENOTSUP);
+                        return;
+                    }
+                };
+
+                let label_value = match std::str::from_utf8(value) {
+                    Ok(v) => v.to_owned(),
+                    Err(_) => {
+                        reply.error(libc::EINVAL);
+                        return;
+                    }
+                };
+
+                // Fetch current labels so we can do a full replace (removes
+                // any existing values for this label name, then adds the new one).
+                let (cached_meta, fresh) = {
+                    let inodes = self.inodes.lock().unwrap_or_else(|e| e.into_inner());
+                    match inodes.get(ino) {
+                        Some(e) => (e.cached_meta.clone(), e.meta_fresh()),
+                        None => (None, false),
+                    }
+                };
+                let current_labels: BTreeSet<(String, String)> = if fresh {
+                    cached_meta.map(|m| m.labels).unwrap_or_default()
+                } else {
+                    let client = self.client_clone();
+                    let b = bucket.clone();
+                    let k = key.clone();
+                    match self.rt.block_on(async move { client.head(&b, &k).await }) {
+                        Ok(head) => {
+                            let m = CachedMeta {
+                                size: head.size,
+                                created: head.created,
+                                modified: head.modified,
+                                checksum_gxhash: head.checksum_gxhash,
+                                labels: head.labels.clone(),
+                                cipher_size: head.cipher_size,
+                                cipher_sha256: head.cipher_sha256,
+                                kem_alg: head.kem_alg,
+                                aead_alg: head.aead_alg,
+                                envelope_version: head.envelope_version,
+                            };
+                            self.inodes
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .update_meta(ino, m);
+                            head.labels
+                        }
+                        Err(e) => {
+                            reply.error(to_errno(&e));
+                            return;
+                        }
+                    }
+                };
+
+                // Replace this label name's values with the single new value.
+                let mut new_labels: BTreeSet<(String, String)> = current_labels
+                    .into_iter()
+                    .filter(|(n, _)| n != &label_name)
+                    .collect();
+                new_labels.insert((label_name, label_value));
+
+                let client = self.client_clone();
+                let b = bucket.clone();
+                let k = key.clone();
+                match self.rt.block_on(async move {
+                    client.set_labels(&b, &k, "replace", &new_labels).await
+                }) {
+                    Ok(_) => {
+                        self.inodes
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .invalidate_meta(ino);
+                        reply.ok();
+                    }
+                    Err(e) => reply.error(to_errno(&e)),
+                }
+            }
+
+            Some(InodePath::Bucket(_)) | Some(InodePath::Root)
+                if matches!(&self.mode, MountMode::Single(_))
+                    || matches!(&inode_path, Some(InodePath::Bucket(_))) =>
+            {
+                let bucket = match &inode_path {
+                    Some(InodePath::Bucket(b)) => b.clone(),
+                    _ => match &self.mode {
+                        MountMode::Single(b) => b.clone(),
+                        _ => {
+                            reply.error(libc::ENOTSUP);
+                            return;
+                        }
+                    },
+                };
+
+                let str_val = match std::str::from_utf8(value) {
+                    Ok(v) => v.to_owned(),
+                    Err(_) => {
+                        reply.error(libc::EINVAL);
+                        return;
+                    }
+                };
+
+                match xname.as_str() {
+                    "user.y2q.quota.bytes" => {
+                        let quota: u64 = match str_val.trim().parse() {
+                            Ok(n) => n,
+                            Err(_) => {
+                                reply.error(libc::EINVAL);
+                                return;
+                            }
+                        };
+                        let client = self.client_clone();
+                        let b = bucket.clone();
+                        match self.rt.block_on(async move {
+                            let mut cfg = client.get_bucket_config(&b).await?;
+                            cfg.quota_bytes = Some(quota);
+                            client.set_bucket_config(&b, &cfg).await
+                        }) {
+                            Ok(_) => reply.ok(),
+                            Err(e) => reply.error(to_errno(&e)),
+                        }
+                    }
+                    "user.y2q.default.sse" => {
+                        let client = self.client_clone();
+                        let b = bucket.clone();
+                        match self.rt.block_on(async move {
+                            let mut cfg = client.get_bucket_config(&b).await?;
+                            cfg.default_sse = if str_val.is_empty() {
+                                None
+                            } else {
+                                Some(str_val)
+                            };
+                            client.set_bucket_config(&b, &cfg).await
+                        }) {
+                            Ok(_) => reply.ok(),
+                            Err(e) => reply.error(to_errno(&e)),
+                        }
+                    }
+                    _ => reply.error(libc::ENOTSUP),
+                }
+            }
+
+            _ => reply.error(libc::ENOTSUP),
+        }
+    }
+
+    fn removexattr(&mut self, _req: &Request, ino: u64, name: &std::ffi::OsStr, reply: ReplyEmpty) {
+        if self.read_only {
+            reply.error(libc::EROFS);
+            return;
+        }
+
+        let xname = match name.to_str() {
+            Some(n) => n.to_owned(),
+            None => {
+                reply.error(libc::ENOTSUP);
+                return;
+            }
+        };
+
+        let (bucket, key, cached_meta, fresh) = {
+            let inodes = self.inodes.lock().unwrap_or_else(|e| e.into_inner());
+            match inodes.get(ino).map(|e| &e.path) {
+                Some(InodePath::Object { bucket, key }) => {
+                    let entry = inodes.get(ino).unwrap();
+                    (
+                        bucket.clone(),
+                        key.clone(),
+                        entry.cached_meta.clone(),
+                        entry.meta_fresh(),
+                    )
+                }
+                Some(InodePath::Bucket(b)) => {
+                    // Bucket config xattrs: removing sets the field to None.
+                    let bucket = b.clone();
+                    drop(inodes);
+                    match xname.as_str() {
+                        "user.y2q.quota.bytes" => {
+                            let client = self.client_clone();
+                            let bk = bucket.clone();
+                            match self.rt.block_on(async move {
+                                let mut cfg = client.get_bucket_config(&bk).await?;
+                                cfg.quota_bytes = None;
+                                client.set_bucket_config(&bk, &cfg).await
+                            }) {
+                                Ok(_) => reply.ok(),
+                                Err(e) => reply.error(to_errno(&e)),
+                            }
+                        }
+                        "user.y2q.default.sse" => {
+                            let client = self.client_clone();
+                            let bk = bucket.clone();
+                            match self.rt.block_on(async move {
+                                let mut cfg = client.get_bucket_config(&bk).await?;
+                                cfg.default_sse = None;
+                                client.set_bucket_config(&bk, &cfg).await
+                            }) {
+                                Ok(_) => reply.ok(),
+                                Err(e) => reply.error(to_errno(&e)),
+                            }
+                        }
+                        _ => reply.error(libc::ENODATA),
+                    }
+                    return;
+                }
+                _ => {
+                    reply.error(libc::ENOTSUP);
+                    return;
+                }
+            }
+        };
+
+        let label_name = match xname.strip_prefix("user.y2q.label.") {
+            Some(n) if !n.is_empty() => n.to_owned(),
+            _ => {
+                reply.error(libc::ENOTSUP);
+                return;
+            }
+        };
+
+        let current_labels: BTreeSet<(String, String)> = if fresh {
+            cached_meta.map(|m| m.labels).unwrap_or_default()
+        } else {
+            let client = self.client_clone();
+            let b = bucket.clone();
+            let k = key.clone();
+            match self.rt.block_on(async move { client.head(&b, &k).await }) {
+                Ok(head) => {
+                    let m = CachedMeta {
+                        size: head.size,
+                        created: head.created,
+                        modified: head.modified,
+                        checksum_gxhash: head.checksum_gxhash,
+                        labels: head.labels.clone(),
+                        cipher_size: head.cipher_size,
+                        cipher_sha256: head.cipher_sha256,
+                        kem_alg: head.kem_alg,
+                        aead_alg: head.aead_alg,
+                        envelope_version: head.envelope_version,
+                    };
+                    self.inodes
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .update_meta(ino, m);
+                    head.labels
+                }
+                Err(e) => {
+                    reply.error(to_errno(&e));
+                    return;
+                }
+            }
+        };
+
+        let to_remove: BTreeSet<(String, String)> = current_labels
+            .into_iter()
+            .filter(|(n, _)| n == &label_name)
+            .collect();
+
+        if to_remove.is_empty() {
+            reply.error(libc::ENODATA);
+            return;
+        }
+
+        let client = self.client_clone();
+        let b = bucket.clone();
+        let k = key.clone();
+        match self
+            .rt
+            .block_on(async move { client.set_labels(&b, &k, "remove", &to_remove).await })
+        {
+            Ok(_) => {
+                self.inodes
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .invalidate_meta(ino);
+                reply.ok();
+            }
+            Err(e) => reply.error(to_errno(&e)),
+        }
+    }
+
     fn getxattr(
         &mut self,
         _req: &Request,
@@ -1263,19 +1646,12 @@ impl Filesystem for Y2qFuse {
             }
         };
 
-        let (bucket, key, cached) = {
+        let (path, cached) = {
             let inodes = self.inodes.lock().unwrap_or_else(|e| e.into_inner());
             let entry = match inodes.get(ino) {
                 Some(e) => e,
                 None => {
                     reply.error(libc::ENOENT);
-                    return;
-                }
-            };
-            let (bucket, key) = match &entry.path {
-                InodePath::Object { bucket, key } => (bucket.clone(), key.clone()),
-                _ => {
-                    reply.error(libc::ENODATA);
                     return;
                 }
             };
@@ -1284,130 +1660,240 @@ impl Filesystem for Y2qFuse {
             } else {
                 None
             };
-            (bucket, key, cached)
+            (entry.path.clone(), cached)
         };
 
-        let meta = match cached {
-            Some(m) => m,
-            None => {
-                let client = self.client_clone();
-                let b = bucket.clone();
-                let k = key.clone();
-                match self.rt.block_on(async move { client.head(&b, &k).await }) {
-                    Ok(head) => {
-                        let m = CachedMeta {
-                            size: head.size,
-                            created: head.created,
-                            modified: head.modified,
-                            checksum_gxhash: head.checksum_gxhash,
-                            labels: head.labels,
-                        };
-                        self.inodes
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .update_meta(ino, m.clone());
-                        m
+        match path {
+            InodePath::Object { bucket, key } => {
+                let meta = match cached {
+                    Some(m) => m,
+                    None => {
+                        let client = self.client_clone();
+                        let b = bucket.clone();
+                        let k = key.clone();
+                        match self.rt.block_on(async move { client.head(&b, &k).await }) {
+                            Ok(head) => {
+                                let m = CachedMeta {
+                                    size: head.size,
+                                    created: head.created,
+                                    modified: head.modified,
+                                    checksum_gxhash: head.checksum_gxhash,
+                                    labels: head.labels,
+                                    cipher_size: head.cipher_size,
+                                    cipher_sha256: head.cipher_sha256,
+                                    kem_alg: head.kem_alg,
+                                    aead_alg: head.aead_alg,
+                                    envelope_version: head.envelope_version,
+                                };
+                                self.inodes
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .update_meta(ino, m.clone());
+                                m
+                            }
+                            Err(e) => {
+                                reply.error(to_errno(&e));
+                                return;
+                            }
+                        }
                     }
-                    Err(e) => {
-                        reply.error(to_errno(&e));
+                };
+                let value = match xattr_get(&meta, &xname) {
+                    Some(v) => v,
+                    None => {
+                        reply.error(libc::ENODATA);
                         return;
                     }
+                };
+                xattr_reply(reply, size, &value);
+            }
+            InodePath::Bucket(b) => {
+                self.reply_bucket_xattr(ino, &b, &xname, size, reply);
+            }
+            InodePath::Root => {
+                if let MountMode::Single(b) = self.mode.clone() {
+                    self.reply_bucket_xattr(ino, &b, &xname, size, reply);
+                } else {
+                    reply.error(libc::ENODATA);
                 }
             }
-        };
-
-        let value = match xattr_get(&meta.checksum_gxhash, &meta.labels, &xname) {
-            Some(v) => v,
-            None => {
-                reply.error(libc::ENODATA);
-                return;
-            }
-        };
-
-        if size == 0 {
-            reply.size(value.len() as u32);
-        } else if value.len() > size as usize {
-            reply.error(libc::ERANGE);
-        } else {
-            reply.data(&value);
+            _ => reply.error(libc::ENODATA),
         }
     }
 
     fn listxattr(&mut self, _req: &Request, ino: u64, size: u32, reply: ReplyXattr) {
-        let (bucket, key, cached) = {
+        let path = {
             let inodes = self.inodes.lock().unwrap_or_else(|e| e.into_inner());
-            let entry = match inodes.get(ino) {
-                Some(e) => e,
+            match inodes.get(ino) {
+                Some(e) => e.path.clone(),
                 None => {
                     reply.error(libc::ENOENT);
                     return;
                 }
-            };
-            let (bucket, key) = match &entry.path {
-                InodePath::Object { bucket, key } => (bucket.clone(), key.clone()),
-                _ => {
-                    // Dirs have no xattrs.
+            }
+        };
+
+        match path {
+            InodePath::Object { bucket, key } => {
+                let cached = {
+                    let inodes = self.inodes.lock().unwrap_or_else(|e| e.into_inner());
+                    inodes
+                        .get(ino)
+                        .filter(|e| e.meta_fresh())
+                        .and_then(|e| e.cached_meta.clone())
+                };
+                let meta = match cached {
+                    Some(m) => m,
+                    None => {
+                        let client = self.client_clone();
+                        let b = bucket.clone();
+                        let k = key.clone();
+                        match self.rt.block_on(async move { client.head(&b, &k).await }) {
+                            Ok(head) => {
+                                let m = CachedMeta {
+                                    size: head.size,
+                                    created: head.created,
+                                    modified: head.modified,
+                                    checksum_gxhash: head.checksum_gxhash,
+                                    labels: head.labels,
+                                    cipher_size: head.cipher_size,
+                                    cipher_sha256: head.cipher_sha256,
+                                    kem_alg: head.kem_alg,
+                                    aead_alg: head.aead_alg,
+                                    envelope_version: head.envelope_version,
+                                };
+                                self.inodes
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .update_meta(ino, m.clone());
+                                m
+                            }
+                            Err(e) => {
+                                reply.error(to_errno(&e));
+                                return;
+                            }
+                        }
+                    }
+                };
+                let buf = xattr_list(&meta);
+                if size == 0 {
+                    reply.size(buf.len() as u32);
+                } else if buf.len() > size as usize {
+                    reply.error(libc::ERANGE);
+                } else {
+                    reply.data(&buf);
+                }
+            }
+            InodePath::Bucket(b) => {
+                self.reply_bucket_xattr_list(&b, size, reply);
+            }
+            InodePath::Root => {
+                if let MountMode::Single(b) = self.mode.clone() {
+                    self.reply_bucket_xattr_list(&b, size, reply);
+                } else {
                     if size == 0 {
                         reply.size(0);
                     } else {
                         reply.data(&[]);
                     }
-                    return;
-                }
-            };
-            let cached = if entry.meta_fresh() {
-                entry.cached_meta.clone()
-            } else {
-                None
-            };
-            (bucket, key, cached)
-        };
-
-        let meta = match cached {
-            Some(m) => m,
-            None => {
-                let client = self.client_clone();
-                let b = bucket.clone();
-                let k = key.clone();
-                match self.rt.block_on(async move { client.head(&b, &k).await }) {
-                    Ok(head) => {
-                        let m = CachedMeta {
-                            size: head.size,
-                            created: head.created,
-                            modified: head.modified,
-                            checksum_gxhash: head.checksum_gxhash,
-                            labels: head.labels,
-                        };
-                        self.inodes
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .update_meta(ino, m.clone());
-                        m
-                    }
-                    Err(e) => {
-                        reply.error(to_errno(&e));
-                        return;
-                    }
                 }
             }
-        };
-
-        let buf = xattr_list(&meta.labels);
-        if size == 0 {
-            reply.size(buf.len() as u32);
-        } else if buf.len() > size as usize {
-            reply.error(libc::ERANGE);
-        } else {
-            reply.data(&buf);
+            _ => {
+                if size == 0 {
+                    reply.size(0);
+                } else {
+                    reply.data(&[]);
+                }
+            }
         }
     }
 }
 
+impl Y2qFuse {
+    fn reply_bucket_xattr(
+        &mut self,
+        _ino: u64,
+        bucket: &str,
+        xname: &str,
+        size: u32,
+        reply: ReplyXattr,
+    ) {
+        let client = self.client_clone();
+        let b = bucket.to_owned();
+        match self.rt.block_on(async move {
+            let cfg = client.get_bucket_config(&b).await?;
+            let acl = client.get_bucket_acl(&b).await?;
+            Ok::<_, ClientError>((cfg, acl))
+        }) {
+            Ok((cfg, acl)) => match bucket_xattr_get(&cfg, &acl, xname) {
+                Some(v) => xattr_reply(reply, size, &v),
+                None => reply.error(libc::ENODATA),
+            },
+            Err(e) => reply.error(to_errno(&e)),
+        }
+    }
+
+    fn reply_bucket_xattr_list(&mut self, bucket: &str, size: u32, reply: ReplyXattr) {
+        let client = self.client_clone();
+        let b = bucket.to_owned();
+        match self.rt.block_on(async move {
+            let cfg = client.get_bucket_config(&b).await?;
+            let acl = client.get_bucket_acl(&b).await?;
+            Ok::<_, ClientError>((cfg, acl))
+        }) {
+            Ok((cfg, acl)) => {
+                let buf = bucket_xattr_list(&cfg, &acl);
+                if size == 0 {
+                    reply.size(buf.len() as u32);
+                } else if buf.len() > size as usize {
+                    reply.error(libc::ERANGE);
+                } else {
+                    reply.data(&buf);
+                }
+            }
+            Err(e) => reply.error(to_errno(&e)),
+        }
+    }
+}
+
+fn xattr_reply(reply: ReplyXattr, size: u32, value: &[u8]) {
+    if size == 0 {
+        reply.size(value.len() as u32);
+    } else if value.len() > size as usize {
+        reply.error(libc::ERANGE);
+    } else {
+        reply.data(value);
+    }
+}
+
 /// Build the null-terminated xattr name list for an object.
-fn xattr_list(labels: &BTreeSet<(String, String)>) -> Vec<u8> {
-    let mut buf: Vec<u8> = b"user.y2q.checksum.gxhash\0".to_vec();
+fn xattr_list(meta: &CachedMeta) -> Vec<u8> {
+    let mut buf: Vec<u8> = Vec::new();
+    for name in &[
+        "user.y2q.checksum.gxhash\0",
+        "user.y2q.size\0",
+        "user.y2q.created\0",
+        "user.y2q.modified\0",
+    ] {
+        buf.extend_from_slice(name.as_bytes());
+    }
+    if meta.cipher_size.is_some() {
+        buf.extend_from_slice(b"user.y2q.cipher.size\0");
+    }
+    if meta.cipher_sha256.is_some() {
+        buf.extend_from_slice(b"user.y2q.cipher.sha256\0");
+    }
+    if meta.kem_alg.is_some() {
+        buf.extend_from_slice(b"user.y2q.kem.alg\0");
+    }
+    if meta.aead_alg.is_some() {
+        buf.extend_from_slice(b"user.y2q.aead.alg\0");
+    }
+    if meta.envelope_version.is_some() {
+        buf.extend_from_slice(b"user.y2q.envelope.version\0");
+    }
     let mut seen = BTreeSet::<&str>::new();
-    for (name, _) in labels {
+    for (name, _) in &meta.labels {
         if seen.insert(name.as_str()) {
             buf.extend_from_slice(format!("user.y2q.label.{name}\0").as_bytes());
         }
@@ -1415,24 +1901,71 @@ fn xattr_list(labels: &BTreeSet<(String, String)>) -> Vec<u8> {
     buf
 }
 
-/// Return the byte value for xattr `name`, or `None` if not found.
-fn xattr_get(
-    checksum_gxhash: &str,
-    labels: &BTreeSet<(String, String)>,
-    name: &str,
-) -> Option<Vec<u8>> {
-    if name == "user.y2q.checksum.gxhash" {
-        return Some(checksum_gxhash.as_bytes().to_vec());
-    }
-    if let Some(label_name) = name.strip_prefix("user.y2q.label.") {
-        let vals: Vec<&str> = labels
-            .iter()
-            .filter(|(n, _)| n == label_name)
-            .map(|(_, v)| v.as_str())
-            .collect();
-        if !vals.is_empty() {
-            return Some(vals.join(",").into_bytes());
+/// Return the byte value for object xattr `name`, or `None` if not found.
+fn xattr_get(meta: &CachedMeta, name: &str) -> Option<Vec<u8>> {
+    match name {
+        "user.y2q.checksum.gxhash" => Some(meta.checksum_gxhash.as_bytes().to_vec()),
+        "user.y2q.size" => Some(meta.size.to_string().into_bytes()),
+        "user.y2q.created" => Some(meta.created.to_string().into_bytes()),
+        "user.y2q.modified" => Some(meta.modified.to_string().into_bytes()),
+        "user.y2q.cipher.size" => meta.cipher_size.map(|v| v.to_string().into_bytes()),
+        "user.y2q.cipher.sha256" => meta.cipher_sha256.as_deref().map(|v| v.as_bytes().to_vec()),
+        "user.y2q.kem.alg" => meta.kem_alg.as_deref().map(|v| v.as_bytes().to_vec()),
+        "user.y2q.aead.alg" => meta.aead_alg.as_deref().map(|v| v.as_bytes().to_vec()),
+        "user.y2q.envelope.version" => meta.envelope_version.map(|v| v.to_string().into_bytes()),
+        _ => {
+            if let Some(label_name) = name.strip_prefix("user.y2q.label.") {
+                let vals: Vec<&str> = meta
+                    .labels
+                    .iter()
+                    .filter(|(n, _)| n == label_name)
+                    .map(|(_, v)| v.as_str())
+                    .collect();
+                if !vals.is_empty() {
+                    return Some(vals.join(",").into_bytes());
+                }
+            }
+            None
         }
     }
-    None
+}
+
+/// Build the null-terminated xattr name list for a bucket.
+fn bucket_xattr_list(cfg: &BucketConfig, acl: &AclBody) -> Vec<u8> {
+    let mut buf: Vec<u8> = Vec::new();
+    if cfg.quota_bytes.is_some() {
+        buf.extend_from_slice(b"user.y2q.quota.bytes\0");
+    }
+    if cfg.default_sse.is_some() {
+        buf.extend_from_slice(b"user.y2q.default.sse\0");
+    }
+    if cfg.cors_allow_origin.is_some() {
+        buf.extend_from_slice(b"user.y2q.cors.allow_origin\0");
+    }
+    if acl.owner.is_some() {
+        buf.extend_from_slice(b"user.y2q.acl.owner\0");
+    }
+    for username in acl.grants.keys() {
+        buf.extend_from_slice(format!("user.y2q.acl.grant.{username}\0").as_bytes());
+    }
+    buf
+}
+
+/// Return the byte value for bucket xattr `name`, or `None` if not found.
+fn bucket_xattr_get(cfg: &BucketConfig, acl: &AclBody, name: &str) -> Option<Vec<u8>> {
+    match name {
+        "user.y2q.quota.bytes" => cfg.quota_bytes.map(|v| v.to_string().into_bytes()),
+        "user.y2q.default.sse" => cfg.default_sse.as_deref().map(|v| v.as_bytes().to_vec()),
+        "user.y2q.cors.allow_origin" => cfg
+            .cors_allow_origin
+            .as_deref()
+            .map(|v| v.as_bytes().to_vec()),
+        "user.y2q.acl.owner" => acl.owner.as_deref().map(|v| v.as_bytes().to_vec()),
+        _ => {
+            if let Some(username) = name.strip_prefix("user.y2q.acl.grant.") {
+                return acl.grants.get(username).map(|v| v.as_bytes().to_vec());
+            }
+            None
+        }
+    }
 }

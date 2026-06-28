@@ -21,6 +21,11 @@ pub struct CachedMeta {
     pub modified: u64,
     pub checksum_gxhash: String,
     pub labels: BTreeSet<(String, String)>,
+    pub cipher_size: Option<u64>,
+    pub cipher_sha256: Option<String>,
+    pub kem_alg: Option<String>,
+    pub aead_alg: Option<String>,
+    pub envelope_version: Option<u16>,
 }
 
 #[derive(Debug)]
@@ -85,6 +90,12 @@ impl InodeTable {
         if let Some(e) = self.by_ino.get_mut(&ino) {
             e.cached_meta = Some(meta);
             e.cached_at = Some(Instant::now());
+        }
+    }
+
+    pub fn invalidate_meta(&mut self, ino: u64) {
+        if let Some(e) = self.by_ino.get_mut(&ino) {
+            e.cached_at = None;
         }
     }
 
