@@ -113,6 +113,7 @@ install-local: ## Build release binaries and install to ~/.cargo/bin
 	$(CARGO) install --force --path crates/y2q-cli
 	$(CARGO) install --force --path crates/y2qd
 	$(CARGO) install --force --path crates/y2q-warp
+	$(CARGO) install --force --path crates/y2q-fuse
 
 # ---------------------------------------------------------------------------
 # Housekeeping
