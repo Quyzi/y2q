@@ -38,9 +38,54 @@
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::sync::RwLock;
+
+#[cfg(unix)]
+fn file_read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    file.read_exact_at(buf, offset)
+}
+
+#[cfg(windows)]
+fn file_read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    let mut total = 0;
+    while total < buf.len() {
+        let n = file.seek_read(&mut buf[total..], offset + total as u64)?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "unexpected EOF during positioned read",
+            ));
+        }
+        total += n;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn file_write_all_at(file: &File, buf: &[u8], offset: u64) -> io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    file.write_all_at(buf, offset)
+}
+
+#[cfg(windows)]
+fn file_write_all_at(file: &File, buf: &[u8], offset: u64) -> io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    let mut total = 0;
+    while total < buf.len() {
+        let n = file.seek_write(&buf[total..], offset + total as u64)?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "zero-byte positioned write",
+            ));
+        }
+        total += n;
+    }
+    Ok(())
+}
 
 use aes_gcm::{Aes256Gcm, KeyInit, aead::Aead};
 use rand::Rng;
@@ -175,7 +220,7 @@ impl EncryptedFileBackend {
             return Ok([0u8; BLOCK_SIZE]);
         }
         let mut buf = vec![0u8; PHYS_BLOCK];
-        inner.file.read_exact_at(&mut buf, phys)?;
+        file_read_exact_at(&inner.file, &mut buf, phys)?;
         let nonce = &buf[..NONCE_LEN];
         let ct = &buf[NONCE_LEN..];
         let plain = self
@@ -218,12 +263,10 @@ impl EncryptedFileBackend {
             for gap in next_missing..idx {
                 batch.extend_from_slice(&self.seal_block(gap, &zero)?);
             }
-            inner
-                .file
-                .write_all_at(&batch, block_phys_offset(next_missing))?;
+            file_write_all_at(&inner.file, &batch, block_phys_offset(next_missing))?;
         }
         let block = self.seal_block(idx, plain)?;
-        inner.file.write_all_at(&block, block_phys_offset(idx))?;
+        file_write_all_at(&inner.file, &block, block_phys_offset(idx))?;
         let end_phys = block_phys_offset(idx) + PHYS_BLOCK as u64;
         if end_phys > inner.phys_len {
             inner.phys_len = end_phys;
