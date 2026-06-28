@@ -6,6 +6,7 @@ members = [
     "crates/y2q-cluster",
     "crates/y2q-config",
     "crates/y2q-core",
+    "crates/y2q-fuse",
     "crates/y2q-warp",
     "crates/y2qd",
 ]
