@@ -38,7 +38,7 @@ flume                       = "0.12"
 fs2                         = "0.4"
 futures                     = "0.3"
 hdrhistogram                = "7"
-hkdf                        = "0.12"
+hkdf                        = "0.13"
 hmac                        = "0.12"
 humantime                   = "2"
 indexmap                    = { version = "2", features = ["serde"] }
