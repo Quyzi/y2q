@@ -39,7 +39,7 @@ fs2                         = "0.4"
 futures                     = "0.3"
 hdrhistogram                = "7"
 hkdf                        = "0.12"
-hmac                        = "0.12"
+hmac                        = "0.13"
 humantime                   = "2"
 indexmap                    = { version = "2", features = ["serde"] }
 libc                        = "0.2"
