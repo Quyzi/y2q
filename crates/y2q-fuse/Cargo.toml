@@ -18,4 +18,4 @@ tracing-subscriber = { workspace = true }
 zeroize     = { workspace = true }
 y2q-client  = { path = "../y2q-client" }
 y2q-config  = { path = "../y2q-config" }
-fuser       = "0.15"
+fuser       = "0.17"
