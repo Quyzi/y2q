@@ -276,6 +276,12 @@ log_format = "json"    # structured output for log aggregators
 
 Per-request spans flow through `tracing-actix-web`. Each HTTP request gets a span with method, path, status, elapsed time, and a UUID `X-Request-ID`. Override verbosity with `RUST_LOG=tracing_actix_web=warn` if it's too noisy.
 
+The other binaries have no `[observability]` config section - they log to stderr and are controlled by `RUST_LOG` alone:
+
+- **`y2q`** - defaults to `warn`; `--verbose`/`-v` (repeatable) raises it to `info`/`debug`/`trace`, `--debug` forces `trace`, `--quiet` forces `error`. `RUST_LOG`, if set, always wins over these flags.
+- **`y2q-warp`** - defaults to `error` (`EnvFilter::from_default_env()`'s built-in default) when `RUST_LOG` is unset; there is no `-v` flag.
+- **`y2q-fuse`** - defaults to `warn` when `RUST_LOG` is unset.
+
 ## Source
 
 - [crates/y2qd/src/config.rs](../crates/y2qd/src/config.rs) - schema, defaults, and Figment wiring (includes `ActixConfig`, `ObservabilityConfig`, `SyncLevel`)
