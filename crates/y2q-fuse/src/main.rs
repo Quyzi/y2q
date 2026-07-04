@@ -7,7 +7,7 @@ mod inode;
 use std::path::PathBuf;
 
 use clap::Parser;
-use fuser::MountOption;
+use fuser::{Config, MountOption, SessionACL};
 
 use crate::error::FuseError;
 use crate::fs::{MountMode, Y2qFuse};
@@ -78,24 +78,28 @@ fn main() -> Result<(), FuseError> {
 
     let fs = Y2qFuse::new(client, handle.clone(), args.read_only, mode, uid, gid);
 
-    let mut opts = vec![
+    let mut mount_options = vec![
         MountOption::FSName("y2q".into()),
         MountOption::Subtype("y2q".into()),
         MountOption::DefaultPermissions,
         MountOption::NoExec,
         MountOption::NoDev,
     ];
-    if args.allow_other {
-        opts.push(MountOption::AllowOther);
-    }
     if args.read_only {
-        opts.push(MountOption::RO);
+        mount_options.push(MountOption::RO);
     }
+    let mut config = Config::default();
+    config.mount_options = mount_options;
+    config.acl = if args.allow_other {
+        SessionACL::All
+    } else {
+        SessionACL::Owner
+    };
 
     let mountpoint = args.mountpoint.clone();
     tracing::info!(mountpoint = %mountpoint.display(), "mounting y2q");
 
-    let session = fuser::Session::new(fs, &mountpoint, &opts).map_err(FuseError::Io)?;
+    let session = fuser::Session::new(fs, &mountpoint, &config).map_err(FuseError::Io)?;
     let bg = session.spawn().map_err(FuseError::Io)?;
 
     // Block until SIGINT or SIGTERM, then unmount and exit cleanly.
@@ -124,7 +128,9 @@ fn main() -> Result<(), FuseError> {
                 .status()
         })
         .ok();
-    bg.join();
+    if let Err(e) = bg.join() {
+        tracing::warn!("session join: {e}");
+    }
 
     Ok(())
 }
