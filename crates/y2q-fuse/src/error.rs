@@ -18,13 +18,15 @@ pub enum FuseError {
     Other(String),
 }
 
-pub fn to_errno(e: &y2q_client::ClientError) -> libc::c_int {
+pub fn to_errno(e: &y2q_client::ClientError) -> fuser::Errno {
     use y2q_client::ClientError;
     match e {
-        ClientError::NotFound { .. } => libc::ENOENT,
-        ClientError::Unauthenticated => libc::EACCES,
-        ClientError::Conflict { .. } => libc::EEXIST,
-        ClientError::BadRequest { .. } => libc::EINVAL,
-        ClientError::ServerError { .. } | ClientError::Io(_) | ClientError::Http(_) => libc::EIO,
+        ClientError::NotFound { .. } => fuser::Errno::ENOENT,
+        ClientError::Unauthenticated => fuser::Errno::EACCES,
+        ClientError::Conflict { .. } => fuser::Errno::EEXIST,
+        ClientError::BadRequest { .. } => fuser::Errno::EINVAL,
+        ClientError::ServerError { .. } | ClientError::Io(_) | ClientError::Http(_) => {
+            fuser::Errno::EIO
+        }
     }
 }
