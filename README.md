@@ -12,6 +12,7 @@ Post-quantum secure object storage. `y2qd` is a REST daemon that encrypts every 
 - [Getting Started](#getting-started)
 - [CLI (`y2q`)](#cli-y2q)
 - [Load Benchmarking (`y2q-warp`)](#load-benchmarking-y2q-warp)
+- [FUSE Mount (`y2q-fuse`)](#fuse-mount-y2q-fuse)
 - [Configuration](#configuration)
 - [API Reference](#api-reference)
 - [Clustering](#clustering)
@@ -51,11 +52,13 @@ Post-quantum secure object storage. `y2qd` is a REST daemon that encrypts every 
 |---|---|---|
 | `y2qd` | `y2qd` | HTTP REST daemon |
 | `y2q-core` | - | Crypto, storage backends, metadata index |
+| `y2q-behavior` | - | Trait-only behavioral contract mirroring `y2q-core` (I/O, crypto, storage, index), no implementations |
 | `y2q-cli` | `y2q` | Client CLI and TUI |
 | `y2q-client` | - | HTTP client library |
 | `y2q-cluster` | - | CRAQ data plane + embedded Raft control plane |
 | `y2q-config` | - | Shared config types |
 | `y2q-warp` | `y2q-warp` | Load benchmarking tool |
+| `y2q-fuse` | `y2q-fuse` | FUSE filesystem driver (mount a store as a directory tree) |
 
 ## Getting Started
 
@@ -322,6 +325,8 @@ Supported shells: `bash`, `zsh`, `fish`, `powershell`, `elvish`.
 | `--ca-cert <path>` | - | - | Trust this PEM CA bundle for this invocation |
 | `--config <path>` | - | - | Override config file location |
 
+`RUST_LOG`, if set, overrides `--verbose`/`--quiet`/`--debug` entirely (see [docs/configuration.md#logging](docs/configuration.md#logging)).
+
 ## Load Benchmarking (`y2q-warp`)
 
 `y2q-warp` runs timed workloads against a live `y2qd` server, records per-operation latencies to a compressed CSV, and shows a live ratatui dashboard. The first positional argument is the **alias** (server profile), followed by the workload subcommand.
@@ -373,6 +378,42 @@ y2q-warp analyze warp-put-*.csv.zst --op PUT --skip 5s
 ```
 
 Outputs a per-operation summary table (throughput in MiB/s and ops/s, p50/p90/p99 latency, total ops, error count) plus a per-node breakdown when the run fanned across more than one endpoint.
+
+`y2q-warp` logs to stderr via `RUST_LOG` (no config file, no `-v` flag); unset, only `error`-level events print. See [docs/configuration.md#logging](docs/configuration.md#logging).
+
+## FUSE Mount (`y2q-fuse`)
+
+Mounts a y2q store at a local directory using [FUSE](https://github.com/cberner/fuser), so any program can read and write objects as ordinary files. Linux only; requires `libfuse3` (or `libfuse2` - it falls back to `fusermount` if `fusermount3` isn't found).
+
+```sh
+cargo build --release -p y2q-fuse
+# or: make install-local  (installs y2q, y2qd, y2q-warp, y2q-fuse to ~/.cargo/bin)
+```
+
+Log in first, then mount - the alias must already have a valid cached token (`y2q login <alias>`):
+
+```sh
+y2q login prod
+y2q-fuse --alias prod /mnt/y2q
+```
+
+By default every bucket appears as a top-level directory. Restrict the mount to one bucket (bucket becomes the root) with `--bucket`:
+
+```sh
+y2q-fuse --alias prod --bucket photos /mnt/photos
+```
+
+Unmount with Ctrl+C, SIGTERM, or `fusermount3 -u /mnt/y2q`. The session token is refreshed in the background ~60 seconds before expiry for as long as the mount is alive.
+
+| Flag | Effect |
+|---|---|
+| `--alias <NAME>` | Server alias to use (required) |
+| `--config <PATH>` | Config file path (default: platform config dir) |
+| `--bucket <BUCKET>` | Mount a single bucket as the filesystem root; default is all buckets |
+| `--read-only` | Disable all write operations |
+| `--allow-other` | Allow other users to access the mount; requires `user_allow_other` in `/etc/fuse.conf` |
+
+`y2q-fuse` logs to stderr via `RUST_LOG`, defaulting to `warn` when unset. See [docs/configuration.md#logging](docs/configuration.md#logging).
 
 ## Configuration
 

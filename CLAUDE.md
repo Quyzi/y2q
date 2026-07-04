@@ -23,10 +23,13 @@ binaries. Do not use it to read, search, or mutate source.
 |---|---|---|
 | `y2qd` | `y2qd` | HTTP REST daemon |
 | `y2q-core` | - | Crypto, storage backends, metadata index |
+| `y2q-behavior` | - | Trait-only behavioral contract (I/O, crypto, storage, index) mirroring `y2q-core`, no implementations |
 | `y2q-cli` | `y2q` | Client CLI and TUI |
 | `y2q-client` | - | HTTP client library |
+| `y2q-cluster` | - | CRAQ data plane + embedded Raft control plane (distributed mode) |
 | `y2q-config` | - | Shared config types |
 | `y2q-warp` | `y2q-warp` | Load benchmarking tool |
+| `y2q-fuse` | `y2q-fuse` | FUSE filesystem driver (mount a bucket/store as a directory tree) |
 
 ## Commands
 

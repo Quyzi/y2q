@@ -128,7 +128,7 @@ The image ships a default config at `/etc/y2q/config.toml` with `base_path = "/v
 
 ### Running other binaries
 
-All three binaries (`y2qd`, `y2q`, `y2q-warp`) are present in the image. The default entrypoint is `y2qd`. Override to run others:
+All three binaries (`y2qd`, `y2q`, `y2q-warp`) are present in the image. The default entrypoint is `y2qd`. Override to run others (`y2q-fuse` is not built into the image - it needs a FUSE mount namespace and `libfuse3` on the host):
 
 ```sh
 # client CLI
