@@ -3,7 +3,7 @@
 config.toml
 !.cargo/config.toml
 *.csv.zst
-
+.codegraph
 # Coverage artifacts (cargo llvm-cov)
 *.profraw
 /lcov.info
