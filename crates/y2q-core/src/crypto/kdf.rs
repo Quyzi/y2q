@@ -123,7 +123,7 @@ fn wrap_with_kek(sk_bytes: &[u8], kek: &[u8; 32]) -> Result<WrappedSk, CryptoErr
     let cipher = Aes256Gcm::new(kek.into());
     let ct = cipher
         .encrypt(
-            aes_gcm::Nonce::from_slice(&nonce_bytes),
+            &aes_gcm::Nonce::from(nonce_bytes),
             Payload {
                 msg: sk_bytes,
                 aad: WRAP_AAD,
@@ -140,7 +140,7 @@ fn unwrap_with_kek(wrapped: &WrappedSk, kek: &[u8; 32]) -> Result<Vec<u8>, Crypt
     let cipher = Aes256Gcm::new(kek.into());
     cipher
         .decrypt(
-            aes_gcm::Nonce::from_slice(&wrapped.nonce),
+            &aes_gcm::Nonce::from(wrapped.nonce),
             Payload {
                 msg: &wrapped.ciphertext,
                 aad: WRAP_AAD,

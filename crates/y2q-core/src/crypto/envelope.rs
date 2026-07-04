@@ -43,7 +43,7 @@
 //! Chunk nonce_i = nonce_base XOR (i as u64 BE in bytes [4..12]).
 //! AAD for each chunk = the 32-byte v2 fixed header.
 
-use aes_gcm::{Aes256Gcm, KeyInit, aead::AeadInPlace};
+use aes_gcm::{Aes256Gcm, KeyInit, aead::AeadInOut};
 
 type Nonce = aes_gcm::aead::Nonce<Aes256Gcm>;
 use bytes::{Bytes, BytesMut};
@@ -732,7 +732,7 @@ fn aes_key(key: &[u8; 32]) -> Aes256Gcm {
 
 /// Wrap a 12-byte array into an AES-GCM [`Nonce`].
 fn aes_nonce(bytes: &[u8; 12]) -> Nonce {
-    Nonce::clone_from_slice(bytes)
+    Nonce::from(*bytes)
 }
 
 /// Sniff the magic+version prefix to decide whether `bytes` is an encrypted

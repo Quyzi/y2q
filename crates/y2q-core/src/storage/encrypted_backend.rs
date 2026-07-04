@@ -197,7 +197,7 @@ impl EncryptedFileBackend {
         let ct = self
             .cipher
             .encrypt(
-                aes_gcm::Nonce::from_slice(&nonce),
+                &aes_gcm::Nonce::from(nonce),
                 aes_gcm::aead::Payload {
                     msg: plain.as_slice(),
                     aad: &idx.to_be_bytes(),
@@ -226,7 +226,7 @@ impl EncryptedFileBackend {
         let plain = self
             .cipher
             .decrypt(
-                aes_gcm::Nonce::from_slice(nonce),
+                &aes_gcm::Nonce::try_from(nonce).expect("nonce slice is NONCE_LEN bytes"),
                 aes_gcm::aead::Payload {
                     msg: ct,
                     aad: &idx.to_be_bytes(),
@@ -294,7 +294,7 @@ fn write_header(cipher: &Aes256Gcm, file: &mut File, logical_len: u64) -> Result
     rand::rng().fill_bytes(&mut nonce);
     let ct = cipher
         .encrypt(
-            aes_gcm::Nonce::from_slice(&nonce),
+            &aes_gcm::Nonce::from(nonce),
             aes_gcm::aead::Payload {
                 msg: &plaintext,
                 aad: MAGIC,
@@ -320,7 +320,7 @@ fn read_header(cipher: &Aes256Gcm, file: &mut File) -> Result<u64, io::Error> {
     let ct = &buf[8 + NONCE_LEN..];
     let plain = cipher
         .decrypt(
-            aes_gcm::Nonce::from_slice(nonce),
+            &aes_gcm::Nonce::try_from(nonce).expect("nonce slice is NONCE_LEN bytes"),
             aes_gcm::aead::Payload {
                 msg: ct,
                 aad: MAGIC,
