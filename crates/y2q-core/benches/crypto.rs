@@ -93,7 +93,7 @@ fn bench_aes_gcm_encrypt(c: &mut Criterion) {
 
         group.bench_with_input(BenchmarkId::from_parameter(size), &size, |b, _| {
             let cipher = Aes256Gcm::new((&key_bytes).into());
-            let nonce = aes_gcm::Nonce::from_slice(&nonce_bytes);
+            let nonce = &aes_gcm::Nonce::from(nonce_bytes);
             b.iter(|| {
                 let ct = cipher
                     .encrypt(
@@ -124,7 +124,7 @@ fn bench_aes_gcm_decrypt(c: &mut Criterion) {
         let plaintext = vec![0u8; size];
 
         let cipher = Aes256Gcm::new((&key_bytes).into());
-        let nonce = aes_gcm::Nonce::from_slice(&nonce_bytes);
+        let nonce = &aes_gcm::Nonce::from(nonce_bytes);
         let ciphertext = cipher
             .encrypt(
                 nonce,
@@ -137,7 +137,7 @@ fn bench_aes_gcm_decrypt(c: &mut Criterion) {
 
         group.bench_with_input(BenchmarkId::from_parameter(size), &size, |b, _| {
             let cipher = Aes256Gcm::new((&key_bytes).into());
-            let nonce = aes_gcm::Nonce::from_slice(&nonce_bytes);
+            let nonce = &aes_gcm::Nonce::from(nonce_bytes);
             b.iter(|| {
                 let pt = cipher
                     .decrypt(
