@@ -5,8 +5,10 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fuser::{
-    FileAttr, FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
-    ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr, Request,
+    AccessFlags, BsdFileFlags, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags,
+    Generation, INodeNo, LockOwner, OpenFlags, RenameFlags, ReplyAttr, ReplyCreate, ReplyData,
+    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr,
+    Request, WriteFlags,
 };
 use tempfile::NamedTempFile;
 use y2q_client::{AclBody, BucketConfig, ClientError, ListOptions, Y2qClient};
@@ -85,7 +87,7 @@ impl Y2qFuse {
         let created = UNIX_EPOCH + Duration::from_nanos(created_ns);
         let modified = UNIX_EPOCH + Duration::from_nanos(modified_ns);
         FileAttr {
-            ino,
+            ino: INodeNo(ino),
             size,
             blocks: size.div_ceil(512),
             atime: modified,
@@ -106,7 +108,7 @@ impl Y2qFuse {
     fn dir_attr(&self, ino: u64) -> FileAttr {
         let now = SystemTime::now();
         FileAttr {
-            ino,
+            ino: INodeNo(ino),
             size: 0,
             blocks: 0,
             atime: now,
@@ -146,7 +148,8 @@ impl Y2qFuse {
 }
 
 impl Filesystem for Y2qFuse {
-    fn lookup(&mut self, _req: &Request, parent: u64, name: &std::ffi::OsStr, reply: ReplyEntry) {
+    fn lookup(&self, _req: &Request, parent: INodeNo, name: &std::ffi::OsStr, reply: ReplyEntry) {
+        let parent = parent.0;
         let name = name.to_string_lossy().into_owned();
 
         let parent_path = {
@@ -179,9 +182,9 @@ impl Filesystem for Y2qFuse {
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
                             .get_or_assign(InodePath::Bucket(name));
-                        reply.entry(&ENTRY_TTL, &self.dir_attr(ino), 0);
+                        reply.entry(&ENTRY_TTL, &self.dir_attr(ino), Generation(0));
                     }
-                    Ok(false) => reply.error(libc::ENOENT),
+                    Ok(false) => reply.error(Errno::ENOENT),
                     Err(e) => reply.error(to_errno(&e)),
                 }
             }
@@ -232,7 +235,7 @@ impl Filesystem for Y2qFuse {
                         reply.entry(
                             &ENTRY_TTL,
                             &self.file_attr(ino, head.size, head.created, head.modified),
-                            0,
+                            Generation(0),
                         );
                     }
                     Ok((Err(ClientError::NotFound { .. }), Ok(page))) if !page.items.is_empty() => {
@@ -244,10 +247,10 @@ impl Filesystem for Y2qFuse {
                                 bucket,
                                 prefix: key,
                             });
-                        reply.entry(&ENTRY_TTL, &self.dir_attr(ino), 0);
+                        reply.entry(&ENTRY_TTL, &self.dir_attr(ino), Generation(0));
                     }
                     Ok((Err(e), _)) => reply.error(to_errno(&e)),
-                    _ => reply.error(libc::ENOENT),
+                    _ => reply.error(Errno::ENOENT),
                 }
             }
 
@@ -297,7 +300,7 @@ impl Filesystem for Y2qFuse {
                         reply.entry(
                             &ENTRY_TTL,
                             &self.file_attr(ino, head.size, head.created, head.modified),
-                            0,
+                            Generation(0),
                         );
                     }
                     Ok((Err(ClientError::NotFound { .. }), Ok(page))) if !page.items.is_empty() => {
@@ -309,24 +312,25 @@ impl Filesystem for Y2qFuse {
                                 bucket,
                                 prefix: key,
                             });
-                        reply.entry(&ENTRY_TTL, &self.dir_attr(ino), 0);
+                        reply.entry(&ENTRY_TTL, &self.dir_attr(ino), Generation(0));
                     }
                     Ok((Err(e), _)) => reply.error(to_errno(&e)),
-                    _ => reply.error(libc::ENOENT),
+                    _ => reply.error(Errno::ENOENT),
                 }
             }
 
-            _ => reply.error(libc::ENOENT),
+            _ => reply.error(Errno::ENOENT),
         }
     }
 
-    fn getattr(&mut self, _req: &Request, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
+    fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
+        let ino = ino.0;
         let path = {
             let inodes = self.inodes.lock().unwrap_or_else(|e| e.into_inner());
             let e = match inodes.get(ino) {
                 Some(e) => e,
                 None => {
-                    reply.error(libc::ENOENT);
+                    reply.error(Errno::ENOENT);
                     return;
                 }
             };
@@ -380,19 +384,20 @@ impl Filesystem for Y2qFuse {
     }
 
     fn readdir(
-        &mut self,
+        &self,
         _req: &Request,
-        ino: u64,
-        _fh: u64,
-        offset: i64,
+        ino: INodeNo,
+        _fh: FileHandle,
+        offset: u64,
         mut reply: ReplyDirectory,
     ) {
+        let ino = ino.0;
         let path = {
             let inodes = self.inodes.lock().unwrap_or_else(|e| e.into_inner());
             match inodes.get(ino) {
                 Some(e) => e.path.clone(),
                 None => {
-                    reply.error(libc::ENOENT);
+                    reply.error(Errno::ENOENT);
                     return;
                 }
             }
@@ -430,10 +435,9 @@ impl Filesystem for Y2qFuse {
                     entries.push((bino, FileType::Directory, bucket));
                 }
 
-                for (i, (ino, kind, name)) in
-                    entries.into_iter().enumerate().skip(offset.max(0) as usize)
+                for (i, (ino, kind, name)) in entries.into_iter().enumerate().skip(offset as usize)
                 {
-                    if reply.add(ino, (i + 1) as i64, kind, &name) {
+                    if reply.add(INodeNo(ino), (i + 1) as u64, kind, &name) {
                         break;
                     }
                 }
@@ -548,10 +552,9 @@ impl Filesystem for Y2qFuse {
                     }
                 }
 
-                for (i, (ino, kind, name)) in
-                    entries.into_iter().enumerate().skip(offset.max(0) as usize)
+                for (i, (ino, kind, name)) in entries.into_iter().enumerate().skip(offset as usize)
                 {
-                    if reply.add(ino, (i + 1) as i64, kind, &name) {
+                    if reply.add(INodeNo(ino), (i + 1) as u64, kind, &name) {
                         break;
                     }
                 }
@@ -559,18 +562,20 @@ impl Filesystem for Y2qFuse {
             }
 
             InodePath::Object { .. } => {
-                reply.error(libc::ENOTDIR);
+                reply.error(Errno::ENOTDIR);
             }
         }
     }
 
-    fn open(&mut self, _req: &Request, ino: u64, flags: i32, reply: ReplyOpen) {
+    fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
+        let ino = ino.0;
+        let flags = flags.0;
         let path = {
             let inodes = self.inodes.lock().unwrap_or_else(|e| e.into_inner());
             match inodes.get(ino) {
                 Some(e) => e.path.clone(),
                 None => {
-                    reply.error(libc::ENOENT);
+                    reply.error(Errno::ENOENT);
                     return;
                 }
             }
@@ -579,14 +584,14 @@ impl Filesystem for Y2qFuse {
         let (bucket, key) = match path {
             InodePath::Object { bucket, key } => (bucket, key),
             _ => {
-                reply.error(libc::EISDIR);
+                reply.error(Errno::EISDIR);
                 return;
             }
         };
 
         let write_requested = flags & libc::O_WRONLY != 0 || flags & libc::O_RDWR != 0;
         if write_requested && self.read_only {
-            reply.error(libc::EROFS);
+            reply.error(Errno::EROFS);
             return;
         }
 
@@ -596,7 +601,7 @@ impl Filesystem for Y2qFuse {
                 Ok(f) => f,
                 Err(e) => {
                     tracing::error!("tempfile: {e}");
-                    reply.error(libc::EIO);
+                    reply.error(Errno::EIO);
                     return;
                 }
             };
@@ -607,7 +612,7 @@ impl Filesystem for Y2qFuse {
                     Ok(f) => f,
                     Err(e) => {
                         tracing::error!("tempfile reopen: {e}");
-                        reply.error(libc::EIO);
+                        reply.error(Errno::EIO);
                         return;
                     }
                 };
@@ -627,7 +632,7 @@ impl Filesystem for Y2qFuse {
                 }
                 if let Err(e) = tmp.seek(SeekFrom::Start(0)) {
                     tracing::error!("tempfile seek: {e}");
-                    reply.error(libc::EIO);
+                    reply.error(Errno::EIO);
                     return;
                 }
                 (Some(tmp), false)
@@ -652,20 +657,22 @@ impl Filesystem for Y2qFuse {
                     flushed: false,
                 },
             );
-        reply.opened(fh, 0);
+        reply.opened(FileHandle(fh), FopenFlags::empty());
     }
 
     fn read(
-        &mut self,
+        &self,
         _req: &Request,
-        ino: u64,
-        fh: u64,
-        offset: i64,
+        ino: INodeNo,
+        fh: FileHandle,
+        offset: u64,
         size: u32,
-        _flags: i32,
-        _lock_owner: Option<u64>,
+        _flags: OpenFlags,
+        _lock_owner: Option<LockOwner>,
         reply: ReplyData,
     ) {
+        let ino = ino.0;
+        let fh = fh.0;
         let (bucket, key) = {
             let guard = self.open_files.lock().unwrap_or_else(|e| e.into_inner());
             match guard.get(&fh) {
@@ -676,7 +683,7 @@ impl Filesystem for Y2qFuse {
                     match inodes.get(ino).map(|e| &e.path) {
                         Some(InodePath::Object { bucket, key }) => (bucket.clone(), key.clone()),
                         _ => {
-                            reply.error(libc::EBADF);
+                            reply.error(Errno::EBADF);
                             return;
                         }
                     }
@@ -695,7 +702,7 @@ impl Filesystem for Y2qFuse {
             .and_then(|e| e.cached_meta.as_ref())
             .map(|m| m.size);
 
-        let start = offset as u64;
+        let start = offset;
         if let Some(file_size) = cached_size
             && start >= file_size
         {
@@ -727,17 +734,18 @@ impl Filesystem for Y2qFuse {
     }
 
     fn create(
-        &mut self,
+        &self,
         _req: &Request,
-        parent: u64,
+        parent: INodeNo,
         name: &std::ffi::OsStr,
         _mode: u32,
         _umask: u32,
         _flags: i32,
         reply: ReplyCreate,
     ) {
+        let parent = parent.0;
         if self.read_only {
-            reply.error(libc::EROFS);
+            reply.error(Errno::EROFS);
             return;
         }
 
@@ -747,7 +755,7 @@ impl Filesystem for Y2qFuse {
             Some(bp) => bp,
             None => {
                 // Parent is root in multi mode — creating files at root is not valid.
-                reply.error(libc::EPERM);
+                reply.error(Errno::EPERM);
                 return;
             }
         };
@@ -757,7 +765,7 @@ impl Filesystem for Y2qFuse {
             Ok(f) => f,
             Err(e) => {
                 tracing::error!("tempfile: {e}");
-                reply.error(libc::EIO);
+                reply.error(Errno::EIO);
                 return;
             }
         };
@@ -786,23 +794,30 @@ impl Filesystem for Y2qFuse {
             );
 
         let attr = self.file_attr(ino, 0, 0, 0);
-        reply.created(&ENTRY_TTL, &attr, 0, fh, 0);
+        reply.created(
+            &ENTRY_TTL,
+            &attr,
+            Generation(0),
+            FileHandle(fh),
+            FopenFlags::empty(),
+        );
     }
 
     fn write(
-        &mut self,
+        &self,
         _req: &Request,
-        _ino: u64,
-        fh: u64,
-        offset: i64,
+        _ino: INodeNo,
+        fh: FileHandle,
+        offset: u64,
         data: &[u8],
-        _write_flags: u32,
-        _flags: i32,
-        _lock_owner: Option<u64>,
+        _write_flags: WriteFlags,
+        _flags: OpenFlags,
+        _lock_owner: Option<LockOwner>,
         reply: ReplyWrite,
     ) {
+        let fh = fh.0;
         if self.read_only {
-            reply.error(libc::EROFS);
+            reply.error(Errno::EROFS);
             return;
         }
 
@@ -810,21 +825,21 @@ impl Filesystem for Y2qFuse {
         let of = match guard.get_mut(&fh) {
             Some(of) => of,
             None => {
-                reply.error(libc::EBADF);
+                reply.error(Errno::EBADF);
                 return;
             }
         };
         let buf = match of.write_buf.as_mut() {
             Some(b) => b,
             None => {
-                reply.error(libc::EBADF);
+                reply.error(Errno::EBADF);
                 return;
             }
         };
 
-        if let Err(e) = buf.seek(SeekFrom::Start(offset as u64)) {
+        if let Err(e) = buf.seek(SeekFrom::Start(offset)) {
             tracing::error!("seek: {e}");
-            reply.error(libc::EIO);
+            reply.error(Errno::EIO);
             return;
         }
         match buf.write_all(data) {
@@ -835,21 +850,22 @@ impl Filesystem for Y2qFuse {
             }
             Err(e) => {
                 tracing::error!("write: {e}");
-                reply.error(libc::EIO);
+                reply.error(Errno::EIO);
             }
         }
     }
 
     fn release(
-        &mut self,
+        &self,
         _req: &Request,
-        _ino: u64,
-        fh: u64,
-        _flags: i32,
-        _lock_owner: Option<u64>,
+        _ino: INodeNo,
+        fh: FileHandle,
+        _flags: OpenFlags,
+        _lock_owner: Option<LockOwner>,
         _flush: bool,
         reply: ReplyEmpty,
     ) {
+        let fh = fh.0;
         // flush() already did the PUT and reported the result to close().
         // If for any reason flush() was skipped (flushed=false), do a
         // best-effort PUT here — errors are logged but can't reach the caller.
@@ -909,9 +925,9 @@ impl Filesystem for Y2qFuse {
     }
 
     fn setattr(
-        &mut self,
+        &self,
         _req: &Request,
-        ino: u64,
+        ino: INodeNo,
         _mode: Option<u32>,
         _uid: Option<u32>,
         _gid: Option<u32>,
@@ -919,16 +935,18 @@ impl Filesystem for Y2qFuse {
         _atime: Option<fuser::TimeOrNow>,
         _mtime: Option<fuser::TimeOrNow>,
         _ctime: Option<std::time::SystemTime>,
-        fh: Option<u64>,
+        fh: Option<FileHandle>,
         _crtime: Option<std::time::SystemTime>,
         _chgtime: Option<std::time::SystemTime>,
         _bkuptime: Option<std::time::SystemTime>,
-        _flags: Option<u32>,
+        _flags: Option<BsdFileFlags>,
         reply: ReplyAttr,
     ) {
+        let ino = ino.0;
         if let Some(0) = size {
             // O_TRUNC: replace write buffer with a fresh empty file.
             if let Some(fh) = fh {
+                let fh = fh.0;
                 let mut guard = self.open_files.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(of) = guard.get_mut(&fh) {
                     match NamedTempFile::new() {
@@ -939,7 +957,7 @@ impl Filesystem for Y2qFuse {
                         }
                         Err(e) => {
                             tracing::error!("tempfile truncate: {e}");
-                            reply.error(libc::EIO);
+                            reply.error(Errno::EIO);
                             return;
                         }
                     }
@@ -961,7 +979,7 @@ impl Filesystem for Y2qFuse {
                     _ => self.dir_attr(ino),
                 },
                 None => {
-                    reply.error(libc::ENOENT);
+                    reply.error(Errno::ENOENT);
                     return;
                 }
             }
@@ -969,9 +987,10 @@ impl Filesystem for Y2qFuse {
         reply.attr(&ATTR_TTL, &attr);
     }
 
-    fn unlink(&mut self, _req: &Request, parent: u64, name: &std::ffi::OsStr, reply: ReplyEmpty) {
+    fn unlink(&self, _req: &Request, parent: INodeNo, name: &std::ffi::OsStr, reply: ReplyEmpty) {
+        let parent = parent.0;
         if self.read_only {
-            reply.error(libc::EROFS);
+            reply.error(Errno::EROFS);
             return;
         }
 
@@ -979,7 +998,7 @@ impl Filesystem for Y2qFuse {
         let (bucket, prefix) = match self.inode_to_bucket_prefix(parent) {
             Some(bp) => bp,
             None => {
-                reply.error(libc::EPERM);
+                reply.error(Errno::EPERM);
                 return;
             }
         };
@@ -1006,16 +1025,17 @@ impl Filesystem for Y2qFuse {
     }
 
     fn mkdir(
-        &mut self,
+        &self,
         _req: &Request,
-        parent: u64,
+        parent: INodeNo,
         name: &std::ffi::OsStr,
         _mode: u32,
         _umask: u32,
         reply: ReplyEntry,
     ) {
+        let parent = parent.0;
         if self.read_only {
-            reply.error(libc::EROFS);
+            reply.error(Errno::EROFS);
             return;
         }
 
@@ -1050,7 +1070,7 @@ impl Filesystem for Y2qFuse {
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
                             .get_or_assign(InodePath::Bucket(name));
-                        reply.entry(&ENTRY_TTL, &self.dir_attr(ino), 0);
+                        reply.entry(&ENTRY_TTL, &self.dir_attr(ino), Generation(0));
                     }
                     Err(e) => reply.error(to_errno(&e)),
                 }
@@ -1065,7 +1085,7 @@ impl Filesystem for Y2qFuse {
                         bucket,
                         prefix: name,
                     });
-                reply.entry(&ENTRY_TTL, &self.dir_attr(ino), 0);
+                reply.entry(&ENTRY_TTL, &self.dir_attr(ino), Generation(0));
             }
             Some(InodePath::VirtualDir { bucket, prefix }) => {
                 let child_prefix = format!("{prefix}/{name}");
@@ -1077,15 +1097,16 @@ impl Filesystem for Y2qFuse {
                         bucket,
                         prefix: child_prefix,
                     });
-                reply.entry(&ENTRY_TTL, &self.dir_attr(ino), 0);
+                reply.entry(&ENTRY_TTL, &self.dir_attr(ino), Generation(0));
             }
-            _ => reply.error(libc::EPERM),
+            _ => reply.error(Errno::EPERM),
         }
     }
 
-    fn rmdir(&mut self, _req: &Request, parent: u64, name: &std::ffi::OsStr, reply: ReplyEmpty) {
+    fn rmdir(&self, _req: &Request, parent: INodeNo, name: &std::ffi::OsStr, reply: ReplyEmpty) {
+        let parent = parent.0;
         if self.read_only {
-            reply.error(libc::EROFS);
+            reply.error(Errno::EROFS);
             return;
         }
 
@@ -1099,7 +1120,7 @@ impl Filesystem for Y2qFuse {
         match parent_path {
             Some(InodePath::Root) => {
                 if matches!(self.mode, MountMode::Single(_)) {
-                    reply.error(libc::EPERM);
+                    reply.error(Errno::EPERM);
                     return;
                 }
                 let bucket = name.clone();
@@ -1117,22 +1138,24 @@ impl Filesystem for Y2qFuse {
                     Err(e) => reply.error(to_errno(&e)),
                 }
             }
-            _ => reply.error(libc::EPERM),
+            _ => reply.error(Errno::EPERM),
         }
     }
 
     fn rename(
-        &mut self,
+        &self,
         _req: &Request,
-        parent: u64,
+        parent: INodeNo,
         name: &std::ffi::OsStr,
-        newparent: u64,
+        newparent: INodeNo,
         newname: &std::ffi::OsStr,
-        _flags: u32,
+        _flags: RenameFlags,
         reply: ReplyEmpty,
     ) {
+        let parent = parent.0;
+        let newparent = newparent.0;
         if self.read_only {
-            reply.error(libc::EROFS);
+            reply.error(Errno::EROFS);
             return;
         }
 
@@ -1142,14 +1165,14 @@ impl Filesystem for Y2qFuse {
         let src_bkt_pfx = match self.inode_to_bucket_prefix(parent) {
             Some(bp) => bp,
             None => {
-                reply.error(libc::EPERM);
+                reply.error(Errno::EPERM);
                 return;
             }
         };
         let dst_bkt_pfx = match self.inode_to_bucket_prefix(newparent) {
             Some(bp) => bp,
             None => {
-                reply.error(libc::EPERM);
+                reply.error(Errno::EPERM);
                 return;
             }
         };
@@ -1161,7 +1184,7 @@ impl Filesystem for Y2qFuse {
 
         if src_bucket != dst_bucket {
             // Cross-bucket rename is technically possible but complex; reject.
-            reply.error(libc::EXDEV);
+            reply.error(Errno::EXDEV);
             return;
         }
 
@@ -1174,7 +1197,7 @@ impl Filesystem for Y2qFuse {
             Ok(f) => f,
             Err(e) => {
                 tracing::error!("rename tempfile: {e}");
-                reply.error(libc::EIO);
+                reply.error(Errno::EIO);
                 return;
             }
         };
@@ -1182,7 +1205,7 @@ impl Filesystem for Y2qFuse {
             Ok(f) => f,
             Err(e) => {
                 tracing::error!("rename tempfile reopen: {e}");
-                reply.error(libc::EIO);
+                reply.error(Errno::EIO);
                 return;
             }
         };
@@ -1217,7 +1240,7 @@ impl Filesystem for Y2qFuse {
         }
     }
 
-    fn statfs(&mut self, _req: &Request, _ino: u64, reply: ReplyStatfs) {
+    fn statfs(&self, _req: &Request, _ino: INodeNo, reply: ReplyStatfs) {
         // Object store capacity is unknown; report 1 PiB total/free so tools
         // that check available space before writing don't refuse prematurely.
         const BSIZE: u32 = 4096;
@@ -1234,11 +1257,19 @@ impl Filesystem for Y2qFuse {
         );
     }
 
-    fn access(&mut self, _req: &Request, _ino: u64, _mask: i32, reply: ReplyEmpty) {
+    fn access(&self, _req: &Request, _ino: INodeNo, _mask: AccessFlags, reply: ReplyEmpty) {
         reply.ok();
     }
 
-    fn flush(&mut self, _req: &Request, _ino: u64, fh: u64, _lock_owner: u64, reply: ReplyEmpty) {
+    fn flush(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        fh: FileHandle,
+        _lock_owner: LockOwner,
+        reply: ReplyEmpty,
+    ) {
+        let fh = fh.0;
         // Extract PUT parameters while holding the lock, then release before
         // blocking on the async PUT so the lock is not held across await points.
         let work = {
@@ -1262,7 +1293,7 @@ impl Filesystem for Y2qFuse {
                 Ok(m) => m.len(),
                 Err(e) => {
                     tracing::error!("flush stat: {e}");
-                    reply.error(libc::EIO);
+                    reply.error(Errno::EIO);
                     return;
                 }
             };
@@ -1270,7 +1301,7 @@ impl Filesystem for Y2qFuse {
                 Ok(f) => f,
                 Err(e) => {
                     tracing::error!("flush reopen: {e}");
-                    reply.error(libc::EIO);
+                    reply.error(Errno::EIO);
                     return;
                 }
             };
@@ -1300,24 +1331,25 @@ impl Filesystem for Y2qFuse {
     }
 
     fn setxattr(
-        &mut self,
+        &self,
         _req: &Request,
-        ino: u64,
+        ino: INodeNo,
         name: &std::ffi::OsStr,
         value: &[u8],
         _flags: i32,
         _position: u32,
         reply: ReplyEmpty,
     ) {
+        let ino = ino.0;
         if self.read_only {
-            reply.error(libc::EROFS);
+            reply.error(Errno::EROFS);
             return;
         }
 
         let xname = match name.to_str() {
             Some(n) => n.to_owned(),
             None => {
-                reply.error(libc::ENOTSUP);
+                reply.error(Errno::ENOTSUP);
                 return;
             }
         };
@@ -1342,14 +1374,14 @@ impl Filesystem for Y2qFuse {
                     "user.y2q.envelope.version",
                 ];
                 if RO.contains(&xname.as_str()) {
-                    reply.error(libc::EPERM);
+                    reply.error(Errno::EPERM);
                     return;
                 }
 
                 let label_name = match xname.strip_prefix("user.y2q.label.") {
                     Some(n) if !n.is_empty() => n.to_owned(),
                     _ => {
-                        reply.error(libc::ENOTSUP);
+                        reply.error(Errno::ENOTSUP);
                         return;
                     }
                 };
@@ -1357,7 +1389,7 @@ impl Filesystem for Y2qFuse {
                 let label_value = match std::str::from_utf8(value) {
                     Ok(v) => v.to_owned(),
                     Err(_) => {
-                        reply.error(libc::EINVAL);
+                        reply.error(Errno::EINVAL);
                         return;
                     }
                 };
@@ -1437,7 +1469,7 @@ impl Filesystem for Y2qFuse {
                     _ => match &self.mode {
                         MountMode::Single(b) => b.clone(),
                         _ => {
-                            reply.error(libc::ENOTSUP);
+                            reply.error(Errno::ENOTSUP);
                             return;
                         }
                     },
@@ -1446,7 +1478,7 @@ impl Filesystem for Y2qFuse {
                 let str_val = match std::str::from_utf8(value) {
                     Ok(v) => v.to_owned(),
                     Err(_) => {
-                        reply.error(libc::EINVAL);
+                        reply.error(Errno::EINVAL);
                         return;
                     }
                 };
@@ -1456,7 +1488,7 @@ impl Filesystem for Y2qFuse {
                         let quota: u64 = match str_val.trim().parse() {
                             Ok(n) => n,
                             Err(_) => {
-                                reply.error(libc::EINVAL);
+                                reply.error(Errno::EINVAL);
                                 return;
                             }
                         };
@@ -1487,24 +1519,25 @@ impl Filesystem for Y2qFuse {
                             Err(e) => reply.error(to_errno(&e)),
                         }
                     }
-                    _ => reply.error(libc::ENOTSUP),
+                    _ => reply.error(Errno::ENOTSUP),
                 }
             }
 
-            _ => reply.error(libc::ENOTSUP),
+            _ => reply.error(Errno::ENOTSUP),
         }
     }
 
-    fn removexattr(&mut self, _req: &Request, ino: u64, name: &std::ffi::OsStr, reply: ReplyEmpty) {
+    fn removexattr(&self, _req: &Request, ino: INodeNo, name: &std::ffi::OsStr, reply: ReplyEmpty) {
+        let ino = ino.0;
         if self.read_only {
-            reply.error(libc::EROFS);
+            reply.error(Errno::EROFS);
             return;
         }
 
         let xname = match name.to_str() {
             Some(n) => n.to_owned(),
             None => {
-                reply.error(libc::ENOTSUP);
+                reply.error(Errno::ENOTSUP);
                 return;
             }
         };
@@ -1550,12 +1583,12 @@ impl Filesystem for Y2qFuse {
                                 Err(e) => reply.error(to_errno(&e)),
                             }
                         }
-                        _ => reply.error(libc::ENODATA),
+                        _ => reply.error(Errno::NO_XATTR),
                     }
                     return;
                 }
                 _ => {
-                    reply.error(libc::ENOTSUP);
+                    reply.error(Errno::ENOTSUP);
                     return;
                 }
             }
@@ -1564,7 +1597,7 @@ impl Filesystem for Y2qFuse {
         let label_name = match xname.strip_prefix("user.y2q.label.") {
             Some(n) if !n.is_empty() => n.to_owned(),
             _ => {
-                reply.error(libc::ENOTSUP);
+                reply.error(Errno::ENOTSUP);
                 return;
             }
         };
@@ -1608,7 +1641,7 @@ impl Filesystem for Y2qFuse {
             .collect();
 
         if to_remove.is_empty() {
-            reply.error(libc::ENODATA);
+            reply.error(Errno::NO_XATTR);
             return;
         }
 
@@ -1631,17 +1664,18 @@ impl Filesystem for Y2qFuse {
     }
 
     fn getxattr(
-        &mut self,
+        &self,
         _req: &Request,
-        ino: u64,
+        ino: INodeNo,
         name: &std::ffi::OsStr,
         size: u32,
         reply: ReplyXattr,
     ) {
+        let ino = ino.0;
         let xname = match name.to_str() {
             Some(n) => n.to_owned(),
             None => {
-                reply.error(libc::ENODATA);
+                reply.error(Errno::NO_XATTR);
                 return;
             }
         };
@@ -1651,7 +1685,7 @@ impl Filesystem for Y2qFuse {
             let entry = match inodes.get(ino) {
                 Some(e) => e,
                 None => {
-                    reply.error(libc::ENOENT);
+                    reply.error(Errno::ENOENT);
                     return;
                 }
             };
@@ -1701,7 +1735,7 @@ impl Filesystem for Y2qFuse {
                 let value = match xattr_get(&meta, &xname) {
                     Some(v) => v,
                     None => {
-                        reply.error(libc::ENODATA);
+                        reply.error(Errno::NO_XATTR);
                         return;
                     }
                 };
@@ -1714,20 +1748,21 @@ impl Filesystem for Y2qFuse {
                 if let MountMode::Single(b) = self.mode.clone() {
                     self.reply_bucket_xattr(ino, &b, &xname, size, reply);
                 } else {
-                    reply.error(libc::ENODATA);
+                    reply.error(Errno::NO_XATTR);
                 }
             }
-            _ => reply.error(libc::ENODATA),
+            _ => reply.error(Errno::NO_XATTR),
         }
     }
 
-    fn listxattr(&mut self, _req: &Request, ino: u64, size: u32, reply: ReplyXattr) {
+    fn listxattr(&self, _req: &Request, ino: INodeNo, size: u32, reply: ReplyXattr) {
+        let ino = ino.0;
         let path = {
             let inodes = self.inodes.lock().unwrap_or_else(|e| e.into_inner());
             match inodes.get(ino) {
                 Some(e) => e.path.clone(),
                 None => {
-                    reply.error(libc::ENOENT);
+                    reply.error(Errno::ENOENT);
                     return;
                 }
             }
@@ -1779,7 +1814,7 @@ impl Filesystem for Y2qFuse {
                 if size == 0 {
                     reply.size(buf.len() as u32);
                 } else if buf.len() > size as usize {
-                    reply.error(libc::ERANGE);
+                    reply.error(Errno::ERANGE);
                 } else {
                     reply.data(&buf);
                 }
@@ -1811,7 +1846,7 @@ impl Filesystem for Y2qFuse {
 
 impl Y2qFuse {
     fn reply_bucket_xattr(
-        &mut self,
+        &self,
         _ino: u64,
         bucket: &str,
         xname: &str,
@@ -1827,13 +1862,13 @@ impl Y2qFuse {
         }) {
             Ok((cfg, acl)) => match bucket_xattr_get(&cfg, &acl, xname) {
                 Some(v) => xattr_reply(reply, size, &v),
-                None => reply.error(libc::ENODATA),
+                None => reply.error(Errno::NO_XATTR),
             },
             Err(e) => reply.error(to_errno(&e)),
         }
     }
 
-    fn reply_bucket_xattr_list(&mut self, bucket: &str, size: u32, reply: ReplyXattr) {
+    fn reply_bucket_xattr_list(&self, bucket: &str, size: u32, reply: ReplyXattr) {
         let client = self.client_clone();
         let b = bucket.to_owned();
         match self.rt.block_on(async move {
@@ -1846,7 +1881,7 @@ impl Y2qFuse {
                 if size == 0 {
                     reply.size(buf.len() as u32);
                 } else if buf.len() > size as usize {
-                    reply.error(libc::ERANGE);
+                    reply.error(Errno::ERANGE);
                 } else {
                     reply.data(&buf);
                 }
@@ -1860,7 +1895,7 @@ fn xattr_reply(reply: ReplyXattr, size: u32, value: &[u8]) {
     if size == 0 {
         reply.size(value.len() as u32);
     } else if value.len() > size as usize {
-        reply.error(libc::ERANGE);
+        reply.error(Errno::ERANGE);
     } else {
         reply.data(value);
     }
