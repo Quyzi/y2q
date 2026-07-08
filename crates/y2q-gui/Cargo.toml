@@ -32,11 +32,12 @@ y2q-fuse = { path = "../y2q-fuse" }
 [target.'cfg(windows)'.dependencies]
 y2q-mount-windows = { path = "../y2q-mount-windows" }
 
-# tray-icon needs a GTK main loop of our own on Linux/BSD (see src/tray.rs) —
-# `gtk` is only a dev-dependency of the tray-icon crate itself, not something
-# consumers get transitively.
+# tray-icon needs GTK/GLib event pumping of our own on Linux/BSD (see
+# src/tray.rs) — `gtk` is only a dev-dependency of the tray-icon crate
+# itself, not something consumers get transitively.
 [target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))'.dependencies]
 gtk = "0.18"
+glib = "0.18"
 
 [target.'cfg(windows)'.build-dependencies]
 winfsp_wrs_build = "0.4"

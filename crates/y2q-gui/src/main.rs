@@ -11,22 +11,25 @@ fn main() -> eframe::Result<()> {
         )
         .init();
 
-    #[cfg(any(
-        target_os = "linux",
-        target_os = "dragonfly",
-        target_os = "freebsd",
-        target_os = "netbsd",
-        target_os = "openbsd"
-    ))]
-    tray::spawn();
-
     let rt = tokio::runtime::Runtime::new().expect("start tokio runtime");
     let handle = rt.handle().clone();
 
+    // The root viewport is a persistent controller, not the user-facing
+    // window — the actual alias-manager UI is a child viewport GuiApp
+    // creates/destroys on demand (see app.rs's `show_window`), since
+    // hiding/minimizing an existing window turned out not to be reliable on
+    // every platform. Made as unobtrusive as the ViewportBuilder API allows;
+    // on some Wayland compositors it may still show as a barely-visible
+    // sliver since programmatic hide isn't fully honored there.
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([480.0, 560.0])
-            .with_min_inner_size([360.0, 260.0]),
+            .with_visible(false)
+            .with_inner_size([1.0, 1.0])
+            .with_decorations(false)
+            .with_transparent(true)
+            .with_taskbar(false)
+            .with_mouse_passthrough(true)
+            .with_active(false),
         ..Default::default()
     };
 

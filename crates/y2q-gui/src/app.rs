@@ -103,10 +103,15 @@ pub struct GuiApp {
     login_prompt: Option<LoginPrompt>,
     error_banner: Option<String>,
     should_quit: bool,
-    // Kept alive for the app's lifetime on Windows/macOS. On Linux the tray
-    // icon lives on its own GTK thread instead (see tray::spawn) and this
-    // stays None.
-    _tray: Option<tray_icon::TrayIcon>,
+    /// The alias-manager window is a destroy/recreate immediate viewport
+    /// rather than something we hide in place — on this Wayland/KDE stack
+    /// (and plausibly others) `ViewportCommand::Visible`/`Minimized` don't
+    /// reliably hide a window or, worse, `Minimized` stops the event loop
+    /// from ticking at all, so a tray click could never restore it. Closing
+    /// the child viewport (by not calling `show_viewport_immediate` for it)
+    /// and recreating it later is the one thing verified to work.
+    show_window: bool,
+    tray: tray::TrayManager,
 }
 
 impl GuiApp {
@@ -132,22 +137,7 @@ impl GuiApp {
             );
         }
 
-        #[cfg(not(any(
-            target_os = "linux",
-            target_os = "dragonfly",
-            target_os = "freebsd",
-            target_os = "netbsd",
-            target_os = "openbsd"
-        )))]
-        let tray = Some(tray::build());
-        #[cfg(any(
-            target_os = "linux",
-            target_os = "dragonfly",
-            target_os = "freebsd",
-            target_os = "netbsd",
-            target_os = "openbsd"
-        ))]
-        let tray = None;
+        let tray = tray::TrayManager::new(&rows.keys().cloned().collect::<Vec<_>>());
         let _ = &cc.egui_ctx;
 
         Self {
@@ -163,7 +153,8 @@ impl GuiApp {
             login_prompt: None,
             error_banner: None,
             should_quit: false,
-            _tray: tray,
+            show_window: true,
+            tray,
         }
     }
 
@@ -357,6 +348,43 @@ impl GuiApp {
             tracing::error!("save config: {e}");
         }
     }
+
+    fn rebuild_tray_menu(&self) {
+        let names: Vec<String> = self.rows.keys().cloned().collect();
+        self.tray.rebuild_menu(&names);
+    }
+
+    /// Shared by the row's Mount button and the tray's Quick Connect submenu.
+    fn trigger_mount(&mut self, ctx: egui::Context, name: String) {
+        let Some(row) = self.rows.get_mut(&name) else {
+            return;
+        };
+        if !matches!(row.status, MountStatus::Unmounted | MountStatus::Error(_)) {
+            return;
+        }
+        row.status = MountStatus::Mounting;
+        let mountpoint = row.mountpoint.clone();
+        let bucket = row.bucket.clone();
+        self.spawn_mount(ctx, name, mountpoint, bucket);
+    }
+
+    /// Clears every alias's cached session token, forcing a fresh login on
+    /// the next mount. Does not touch anything currently mounted.
+    fn clear_all_logins(&mut self) {
+        let mut store = match TokenStore::load(&self.tokens_path) {
+            Ok(s) => s,
+            Err(e) => {
+                self.error_banner = Some(format!("clear logins: {e}"));
+                return;
+            }
+        };
+        for name in self.rows.keys() {
+            store.clear(name);
+        }
+        if let Err(e) = store.save(&self.tokens_path) {
+            self.error_banner = Some(format!("clear logins: {e}"));
+        }
+    }
 }
 
 async fn do_mount(
@@ -392,24 +420,30 @@ async fn do_mount(
 
 impl eframe::App for GuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Keep ticking at ~4Hz even when the window is hidden (minimized to
+        // Keep ticking at ~4Hz even when the window is closed (minimized to
         // tray) or otherwise idle — tray icon clicks arrive on a channel
         // outside egui/winit's own event stream, so without a periodic
         // repaint this loop (and the tray-menu poll below) would just stop
         // running once nothing else requests a frame, making the tray menu
         // (and a subsequent Quit) appear to do nothing.
         ctx.request_repaint_after(std::time::Duration::from_millis(250));
+        self.tray.pump();
 
         while let Ok(ev) = self.rx.try_recv() {
             self.apply_event(ev);
         }
 
         while let Ok(event) = tray_icon::menu::MenuEvent::receiver().try_recv() {
-            if event.id == tray::OPEN_ID {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-            } else if event.id == tray::QUIT_ID {
+            let id = event.id.0.as_str();
+            if id == tray::OPEN_ID {
+                self.show_window = true;
+            } else if id == tray::QUIT_ID {
                 self.should_quit = true;
+            } else if id == tray::CLEAR_LOGINS_ID {
+                self.clear_all_logins();
+            } else if let Some(name) = id.strip_prefix(tray::CONNECT_PREFIX) {
+                self.show_window = true;
+                self.trigger_mount(ctx.clone(), name.to_owned());
             }
         }
         // Left-click isn't emitted on Linux (libappindicator forces a
@@ -420,11 +454,35 @@ impl eframe::App for GuiApp {
         if self.should_quit {
             self.unmount_all_blocking();
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-        } else if ctx.input(|i| i.viewport().close_requested()) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            return;
         }
 
+        // The alias-manager window is its own immediate viewport, created
+        // fresh each time `show_window` flips true and torn down the moment
+        // we stop calling `show_viewport_immediate` for it — see the
+        // `show_window` field doc for why (destroy/recreate is the one
+        // hide/restore mechanism verified to actually work here).
+        if self.show_window {
+            let close_requested = ctx.show_viewport_immediate(
+                egui::ViewportId::from_hash_of("y2q-main"),
+                egui::ViewportBuilder::default()
+                    .with_title("y2q")
+                    .with_inner_size([480.0, 560.0])
+                    .with_min_inner_size([360.0, 260.0]),
+                |ctx, _class| {
+                    self.draw_window(ctx);
+                    ctx.input(|i| i.viewport().close_requested())
+                },
+            );
+            if close_requested {
+                self.show_window = false;
+            }
+        }
+    }
+}
+
+impl GuiApp {
+    fn draw_window(&mut self, ctx: &egui::Context) {
         if let Some(msg) = self.error_banner.clone() {
             egui::TopBottomPanel::top("error_banner").show(ctx, |ui| {
                 ui.horizontal(|ui| {
@@ -440,14 +498,20 @@ impl eframe::App for GuiApp {
             ui.heading("y2q — Alias Manager");
             ui.add_space(4.0);
 
-            if ui.button("+ Add alias").clicked() {
-                self.add_draft.get_or_insert_with(AliasDraft::empty);
-            }
+            ui.horizontal(|ui| {
+                if ui.button("+ Add alias").clicked() {
+                    self.add_draft.get_or_insert_with(AliasDraft::empty);
+                }
+                if ui.button("Log out all").clicked() {
+                    self.clear_all_logins();
+                }
+            });
 
             if let Some(draft) = &mut self.add_draft {
                 let mut save = false;
                 let mut cancel = false;
                 egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.set_width(ui.available_width());
                     ui.strong(if draft.editing.is_some() {
                         "Edit alias"
                     } else {
@@ -542,6 +606,7 @@ impl eframe::App for GuiApp {
                                         status: MountStatus::Unmounted,
                                     },
                                 );
+                                self.rebuild_tray_menu();
                             }
                         }
                         self.add_draft = None;
@@ -558,74 +623,72 @@ impl eframe::App for GuiApp {
             let mut to_unmount: Option<String> = None;
             let mut to_open: Option<String> = None;
 
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                for (name, row) in &mut self.rows {
-                    egui::Frame::group(ui.style()).show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.strong(name);
-                            ui.label(format!("({})", row.alias.url));
-                            if ui.small_button("Edit").clicked() {
-                                to_edit = Some(name.clone());
-                            }
-                            if ui.small_button("Remove").clicked() {
-                                self.pending_remove = Some(name.clone());
-                            }
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label("Bucket (blank = all):");
-                            ui.text_edit_singleline(&mut row.bucket);
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label("Mount at:");
-                            ui.text_edit_singleline(&mut row.mountpoint);
-                            if ui.button("Browse…").clicked()
-                                && let Some(p) = rfd::FileDialog::new().pick_folder()
-                            {
-                                row.mountpoint = p.display().to_string();
-                            }
-                        });
-                        ui.horizontal(|ui| match &row.status {
-                            MountStatus::Unmounted => {
-                                if ui.button("Mount").clicked() {
-                                    to_mount = Some(name.clone());
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    for (name, row) in &mut self.rows {
+                        egui::Frame::group(ui.style()).show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.horizontal(|ui| {
+                                ui.strong(name);
+                                ui.label(format!("({})", row.alias.url));
+                                if ui.small_button("Edit").clicked() {
+                                    to_edit = Some(name.clone());
                                 }
-                                ui.label("not mounted");
-                            }
-                            MountStatus::Mounting => {
-                                ui.add_enabled(false, egui::Button::new("Mount"));
-                                ui.label("mounting…");
-                            }
-                            MountStatus::Mounted { mountpoint, .. } => {
-                                if ui.button("Unmount").clicked() {
-                                    to_unmount = Some(name.clone());
+                                if ui.small_button("Remove").clicked() {
+                                    self.pending_remove = Some(name.clone());
                                 }
-                                ui.label(format!("mounted at {mountpoint}"));
-                                if ui.button("Open").clicked() {
-                                    to_open = Some(mountpoint.clone());
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Bucket (blank = all):");
+                                ui.text_edit_singleline(&mut row.bucket);
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Mount at:");
+                                ui.text_edit_singleline(&mut row.mountpoint);
+                                if ui.button("Browse…").clicked()
+                                    && let Some(p) = rfd::FileDialog::new().pick_folder()
+                                {
+                                    row.mountpoint = p.display().to_string();
                                 }
-                            }
-                            MountStatus::Unmounting => {
-                                ui.add_enabled(false, egui::Button::new("Unmount"));
-                                ui.label("unmounting…");
-                            }
-                            MountStatus::Error(msg) => {
-                                if ui.button("Mount").clicked() {
-                                    to_mount = Some(name.clone());
+                            });
+                            ui.horizontal(|ui| match &row.status {
+                                MountStatus::Unmounted => {
+                                    if ui.button("Mount").clicked() {
+                                        to_mount = Some(name.clone());
+                                    }
+                                    ui.label("not mounted");
                                 }
-                                ui.colored_label(egui::Color32::LIGHT_RED, msg);
-                            }
+                                MountStatus::Mounting => {
+                                    ui.add_enabled(false, egui::Button::new("Mount"));
+                                    ui.label("mounting…");
+                                }
+                                MountStatus::Mounted { mountpoint, .. } => {
+                                    if ui.button("Unmount").clicked() {
+                                        to_unmount = Some(name.clone());
+                                    }
+                                    ui.label(format!("mounted at {mountpoint}"));
+                                    if ui.button("Open").clicked() {
+                                        to_open = Some(mountpoint.clone());
+                                    }
+                                }
+                                MountStatus::Unmounting => {
+                                    ui.add_enabled(false, egui::Button::new("Unmount"));
+                                    ui.label("unmounting…");
+                                }
+                                MountStatus::Error(msg) => {
+                                    if ui.button("Mount").clicked() {
+                                        to_mount = Some(name.clone());
+                                    }
+                                    ui.colored_label(egui::Color32::LIGHT_RED, msg);
+                                }
+                            });
                         });
-                    });
-                }
-            });
+                    }
+                });
 
-            if let Some(name) = to_mount
-                && let Some(row) = self.rows.get_mut(&name)
-            {
-                row.status = MountStatus::Mounting;
-                let mountpoint = row.mountpoint.clone();
-                let bucket = row.bucket.clone();
-                self.spawn_mount(ctx.clone(), name, mountpoint, bucket);
+            if let Some(name) = to_mount {
+                self.trigger_mount(ctx.clone(), name);
             }
             if let Some(name) = to_unmount
                 && let Some(row) = self.rows.get_mut(&name)
@@ -670,6 +733,7 @@ impl eframe::App for GuiApp {
                 self.rows.shift_remove(&name);
                 self.config.remove_alias(&name);
                 self.save_config();
+                self.rebuild_tray_menu();
                 self.pending_remove = None;
             } else if cancelled {
                 self.pending_remove = None;

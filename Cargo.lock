@@ -9265,6 +9265,7 @@ dependencies = [
  "directories",
  "eframe",
  "egui",
+ "glib",
  "gtk",
  "indexmap",
  "opener",
