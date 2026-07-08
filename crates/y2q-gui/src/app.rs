@@ -30,6 +30,9 @@ struct AliasRow {
 }
 
 struct AliasDraft {
+    /// `Some(original_name)` when editing an existing alias (name field is
+    /// then locked); `None` when adding a new one.
+    editing: Option<String>,
     name: String,
     url: String,
     username: String,
@@ -42,6 +45,7 @@ struct AliasDraft {
 impl AliasDraft {
     fn empty() -> Self {
         Self {
+            editing: None,
             name: String::new(),
             url: String::new(),
             username: String::new(),
@@ -49,6 +53,19 @@ impl AliasDraft {
             ca_cert_path: String::new(),
             client_cert_path: String::new(),
             client_key_path: String::new(),
+        }
+    }
+
+    fn from_existing(name: &str, alias: &Alias) -> Self {
+        Self {
+            editing: Some(name.to_owned()),
+            name: name.to_owned(),
+            url: alias.url.clone(),
+            username: alias.username.clone(),
+            insecure: alias.insecure,
+            ca_cert_path: alias.ca_cert_path.clone().unwrap_or_default(),
+            client_cert_path: alias.client_cert_path.clone().unwrap_or_default(),
+            client_key_path: alias.client_key_path.clone().unwrap_or_default(),
         }
     }
 }
@@ -60,6 +77,9 @@ struct LoginPrompt {
     error: Option<String>,
     mountpoint: String,
     bucket: String,
+    /// Set once the username field has claimed initial keyboard focus, so we
+    /// don't keep stealing focus back from the password field every frame.
+    focused: bool,
 }
 
 fn default_mountpoint(alias_name: &str) -> String {
@@ -79,6 +99,7 @@ pub struct GuiApp {
     config: CliConfig,
     rows: IndexMap<String, AliasRow>,
     add_draft: Option<AliasDraft>,
+    pending_remove: Option<String>,
     login_prompt: Option<LoginPrompt>,
     error_banner: Option<String>,
     should_quit: bool,
@@ -138,6 +159,7 @@ impl GuiApp {
             config,
             rows,
             add_draft: None,
+            pending_remove: None,
             login_prompt: None,
             error_banner: None,
             should_quit: false,
@@ -182,6 +204,7 @@ impl GuiApp {
                             error: None,
                             mountpoint: row.mountpoint.clone(),
                             bucket: row.bucket.clone(),
+                            focused: false,
                         });
                     }
                     if let Some(row) = self.rows.get_mut(&alias) {
@@ -369,6 +392,14 @@ async fn do_mount(
 
 impl eframe::App for GuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Keep ticking at ~4Hz even when the window is hidden (minimized to
+        // tray) or otherwise idle — tray icon clicks arrive on a channel
+        // outside egui/winit's own event stream, so without a periodic
+        // repaint this loop (and the tray-menu poll below) would just stop
+        // running once nothing else requests a frame, making the tray menu
+        // (and a subsequent Quit) appear to do nothing.
+        ctx.request_repaint_after(std::time::Duration::from_millis(250));
+
         while let Ok(ev) = self.rx.try_recv() {
             self.apply_event(ev);
         }
@@ -417,11 +448,19 @@ impl eframe::App for GuiApp {
                 let mut save = false;
                 let mut cancel = false;
                 egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.strong(if draft.editing.is_some() {
+                        "Edit alias"
+                    } else {
+                        "Add alias"
+                    });
                     egui::Grid::new("add_alias_grid")
                         .num_columns(2)
                         .show(ui, |ui| {
                             ui.label("Name");
-                            ui.text_edit_singleline(&mut draft.name);
+                            ui.add_enabled(
+                                draft.editing.is_none(),
+                                egui::TextEdit::singleline(&mut draft.name),
+                            );
                             ui.end_row();
                             ui.label("Server URL");
                             ui.text_edit_singleline(&mut draft.url);
@@ -474,10 +513,12 @@ impl eframe::App for GuiApp {
                 });
 
                 if save {
-                    if draft.name.trim().is_empty() || draft.url.trim().is_empty() {
+                    let name = draft.name.trim().to_owned();
+                    if name.is_empty() || draft.url.trim().is_empty() {
                         self.error_banner = Some("Alias name and server URL are required".into());
+                    } else if draft.editing.is_none() && self.rows.contains_key(&name) {
+                        self.error_banner = Some(format!("Alias `{name}` already exists"));
                     } else {
-                        let name = draft.name.trim().to_owned();
                         let alias = Alias {
                             url: draft.url.trim().to_owned(),
                             username: draft.username.trim().to_owned(),
@@ -489,15 +530,20 @@ impl eframe::App for GuiApp {
                         };
                         self.config.add_alias(name.clone(), alias.clone());
                         self.save_config();
-                        self.rows.insert(
-                            name.clone(),
-                            AliasRow {
-                                alias,
-                                bucket: String::new(),
-                                mountpoint: default_mountpoint(&name),
-                                status: MountStatus::Unmounted,
-                            },
-                        );
+                        match self.rows.get_mut(&name) {
+                            Some(row) => row.alias = alias,
+                            None => {
+                                self.rows.insert(
+                                    name.clone(),
+                                    AliasRow {
+                                        alias,
+                                        bucket: String::new(),
+                                        mountpoint: default_mountpoint(&name),
+                                        status: MountStatus::Unmounted,
+                                    },
+                                );
+                            }
+                        }
                         self.add_draft = None;
                     }
                 } else if cancel {
@@ -507,7 +553,7 @@ impl eframe::App for GuiApp {
 
             ui.separator();
 
-            let mut to_remove: Option<String> = None;
+            let mut to_edit: Option<String> = None;
             let mut to_mount: Option<String> = None;
             let mut to_unmount: Option<String> = None;
             let mut to_open: Option<String> = None;
@@ -518,6 +564,12 @@ impl eframe::App for GuiApp {
                         ui.horizontal(|ui| {
                             ui.strong(name);
                             ui.label(format!("({})", row.alias.url));
+                            if ui.small_button("Edit").clicked() {
+                                to_edit = Some(name.clone());
+                            }
+                            if ui.small_button("Remove").clicked() {
+                                self.pending_remove = Some(name.clone());
+                            }
                         });
                         ui.horizontal(|ui| {
                             ui.label("Bucket (blank = all):");
@@ -532,40 +584,35 @@ impl eframe::App for GuiApp {
                                 row.mountpoint = p.display().to_string();
                             }
                         });
-                        ui.horizontal(|ui| {
-                            match &row.status {
-                                MountStatus::Unmounted => {
-                                    if ui.button("Mount").clicked() {
-                                        to_mount = Some(name.clone());
-                                    }
-                                    ui.label("not mounted");
+                        ui.horizontal(|ui| match &row.status {
+                            MountStatus::Unmounted => {
+                                if ui.button("Mount").clicked() {
+                                    to_mount = Some(name.clone());
                                 }
-                                MountStatus::Mounting => {
-                                    ui.add_enabled(false, egui::Button::new("Mount"));
-                                    ui.label("mounting…");
+                                ui.label("not mounted");
+                            }
+                            MountStatus::Mounting => {
+                                ui.add_enabled(false, egui::Button::new("Mount"));
+                                ui.label("mounting…");
+                            }
+                            MountStatus::Mounted { mountpoint, .. } => {
+                                if ui.button("Unmount").clicked() {
+                                    to_unmount = Some(name.clone());
                                 }
-                                MountStatus::Mounted { mountpoint, .. } => {
-                                    if ui.button("Unmount").clicked() {
-                                        to_unmount = Some(name.clone());
-                                    }
-                                    ui.label(format!("mounted at {mountpoint}"));
-                                    if ui.button("Open").clicked() {
-                                        to_open = Some(mountpoint.clone());
-                                    }
-                                }
-                                MountStatus::Unmounting => {
-                                    ui.add_enabled(false, egui::Button::new("Unmount"));
-                                    ui.label("unmounting…");
-                                }
-                                MountStatus::Error(msg) => {
-                                    if ui.button("Mount").clicked() {
-                                        to_mount = Some(name.clone());
-                                    }
-                                    ui.colored_label(egui::Color32::LIGHT_RED, msg);
+                                ui.label(format!("mounted at {mountpoint}"));
+                                if ui.button("Open").clicked() {
+                                    to_open = Some(mountpoint.clone());
                                 }
                             }
-                            if ui.button("Remove").clicked() {
-                                to_remove = Some(name.clone());
+                            MountStatus::Unmounting => {
+                                ui.add_enabled(false, egui::Button::new("Unmount"));
+                                ui.label("unmounting…");
+                            }
+                            MountStatus::Error(msg) => {
+                                if ui.button("Mount").clicked() {
+                                    to_mount = Some(name.clone());
+                                }
+                                ui.colored_label(egui::Color32::LIGHT_RED, msg);
                             }
                         });
                     });
@@ -593,12 +640,41 @@ impl eframe::App for GuiApp {
             {
                 self.error_banner = Some(format!("open {mountpoint}: {e}"));
             }
-            if let Some(name) = to_remove {
+            if let Some(name) = to_edit
+                && let Some(row) = self.rows.get(&name)
+            {
+                self.add_draft = Some(AliasDraft::from_existing(&name, &row.alias));
+            }
+        });
+
+        if let Some(name) = self.pending_remove.clone() {
+            let mut confirmed = false;
+            let mut cancelled = false;
+            egui::Window::new("Remove alias?")
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    ui.label(format!(
+                        "Remove `{name}`? This deletes it from your config; it does not affect the server."
+                    ));
+                    ui.horizontal(|ui| {
+                        if ui.button("Remove").clicked() {
+                            confirmed = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            cancelled = true;
+                        }
+                    });
+                });
+            if confirmed {
                 self.rows.shift_remove(&name);
                 self.config.remove_alias(&name);
                 self.save_config();
+                self.pending_remove = None;
+            } else if cancelled {
+                self.pending_remove = None;
             }
-        });
+        }
 
         let mut close_prompt = false;
         let mut submit_login: Option<(String, String, String, String, String)> = None;
@@ -607,19 +683,29 @@ impl eframe::App for GuiApp {
                 .collapsible(false)
                 .resizable(false)
                 .show(ctx, |ui| {
+                    let mut enter_pressed = false;
                     egui::Grid::new("login_grid").num_columns(2).show(ui, |ui| {
                         ui.label("Username");
-                        ui.text_edit_singleline(&mut lp.username);
+                        let username_resp = ui.text_edit_singleline(&mut lp.username);
+                        if !lp.focused {
+                            username_resp.request_focus();
+                            lp.focused = true;
+                        }
+                        enter_pressed |= username_resp.lost_focus()
+                            && ui.input(|i| i.key_pressed(egui::Key::Enter));
                         ui.end_row();
                         ui.label("Password");
-                        ui.add(egui::TextEdit::singleline(&mut lp.password).password(true));
+                        let password_resp =
+                            ui.add(egui::TextEdit::singleline(&mut lp.password).password(true));
+                        enter_pressed |= password_resp.lost_focus()
+                            && ui.input(|i| i.key_pressed(egui::Key::Enter));
                         ui.end_row();
                     });
                     if let Some(err) = &lp.error {
                         ui.colored_label(egui::Color32::LIGHT_RED, err);
                     }
                     ui.horizontal(|ui| {
-                        if ui.button("Log in & Mount").clicked() {
+                        if ui.button("Log in & Mount").clicked() || enter_pressed {
                             submit_login = Some((
                                 lp.alias.clone(),
                                 lp.username.clone(),

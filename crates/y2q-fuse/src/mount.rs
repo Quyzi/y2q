@@ -11,15 +11,20 @@ use crate::fs::Y2qFuse;
 /// A live FUSE mount. Dropping this without calling [`unmount`](MountHandle::unmount)
 /// leaves the mount attached — always unmount explicitly before exiting.
 pub struct MountHandle {
-    unmounter: fuser::SessionUnmounter,
     background: Option<fuser::BackgroundSession>,
 }
 
 impl MountHandle {
     pub fn unmount(&mut self) -> Result<(), FuseError> {
-        self.unmounter.unmount().map_err(FuseError::Io)?;
         if let Some(bg) = self.background.take() {
-            bg.join().map_err(FuseError::Io)?;
+            // `BackgroundSession::umount_and_join` owns the real `Mount` (moved
+            // in by `Session::spawn`), so this is the one that actually
+            // unmounts. A separately-held `SessionUnmounter` obtained *before*
+            // `spawn()` is a dud — `spawn()` steals the `Mount` out from under
+            // it via `mem::take`, so calling it later silently no-ops and the
+            // subsequent join then blocks forever waiting for a FUSE session
+            // that was never actually unmounted.
+            bg.umount_and_join().map_err(FuseError::Io)?;
         }
         Ok(())
     }
@@ -66,12 +71,10 @@ pub fn mount(
 
     tracing::info!(mountpoint = %mountpoint.display(), "mounting y2q");
 
-    let mut session = fuser::Session::new(fs, mountpoint, &config).map_err(FuseError::Io)?;
-    let unmounter = session.unmount_callable();
+    let session = fuser::Session::new(fs, mountpoint, &config).map_err(FuseError::Io)?;
     let background = session.spawn().map_err(FuseError::Io)?;
 
     Ok(MountHandle {
-        unmounter,
         background: Some(background),
     })
 }
