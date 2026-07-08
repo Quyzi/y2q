@@ -1,4 +1,5 @@
 mod app;
+mod assets;
 mod events;
 mod mount_backend;
 mod tray;
@@ -23,6 +24,8 @@ fn main() -> eframe::Result<()> {
     // sliver since programmatic hide isn't fully honored there.
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
+            .with_icon(assets::window_icon())
+            .with_app_id("y2q")
             .with_visible(false)
             .with_inner_size([1.0, 1.0])
             .with_decorations(false)

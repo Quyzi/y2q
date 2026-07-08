@@ -467,6 +467,8 @@ impl eframe::App for GuiApp {
                 egui::ViewportId::from_hash_of("y2q-main"),
                 egui::ViewportBuilder::default()
                     .with_title("y2q")
+                    .with_icon(crate::assets::window_icon())
+                    .with_app_id("y2q")
                     .with_inner_size([480.0, 560.0])
                     .with_min_inner_size([360.0, 260.0]),
                 |ctx, _class| {

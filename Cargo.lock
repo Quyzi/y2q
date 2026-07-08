@@ -3625,6 +3625,8 @@ dependencies = [
  "num-traits",
  "png",
  "tiff",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]
@@ -9267,6 +9269,7 @@ dependencies = [
  "egui",
  "glib",
  "gtk",
+ "image",
  "indexmap",
  "opener",
  "rfd",

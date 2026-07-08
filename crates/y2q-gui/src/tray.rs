@@ -14,16 +14,6 @@ pub const QUIT_ID: &str = "quit";
 pub const CLEAR_LOGINS_ID: &str = "clear_logins";
 pub const CONNECT_PREFIX: &str = "connect:";
 
-fn build_icon() -> tray_icon::Icon {
-    // Small solid-color placeholder icon — no bundled image asset yet.
-    const SIZE: u32 = 32;
-    let mut rgba = Vec::with_capacity((SIZE * SIZE * 4) as usize);
-    for _ in 0..(SIZE * SIZE) {
-        rgba.extend_from_slice(&[92, 74, 214, 255]);
-    }
-    tray_icon::Icon::from_rgba(rgba, SIZE, SIZE).expect("fixed-size icon buffer is always valid")
-}
-
 fn build_menu(aliases: &[String]) -> Menu {
     let menu = Menu::new();
     let _ = menu.append(&MenuItem::with_id(OPEN_ID, "Open y2q", true, None));
@@ -64,7 +54,7 @@ impl TrayManager {
 
         let tray = TrayIconBuilder::new()
             .with_menu(Box::new(build_menu(aliases)))
-            .with_icon(build_icon())
+            .with_icon(crate::assets::tray_icon())
             .with_tooltip("y2q")
             .build()
             .expect("build tray icon");

@@ -16,6 +16,7 @@ egui        = "0.31"
 tray-icon   = { version = "0.24", default-features = false, features = ["gtk"] }
 rfd         = "0.15"
 opener      = "0.7"
+image       = { version = "0.25", default-features = false, features = ["jpeg"] }
 directories = { workspace = true }
 indexmap    = { workspace = true }
 thiserror   = { workspace = true }
