@@ -1,0 +1,30 @@
+[package]
+name = "y2q-mount-windows"
+version.workspace = true
+edition = "2024"
+
+[[bin]]
+name = "y2q-mount-windows"
+path = "src/main.rs"
+
+[dependencies]
+clap        = { workspace = true }
+tempfile    = { workspace = true }
+thiserror   = { workspace = true }
+tokio       = { workspace = true }
+tracing     = { workspace = true }
+tracing-subscriber = { workspace = true }
+y2q-client      = { path = "../y2q-client" }
+y2q-mount-core  = { path = "../y2q-mount-core" }
+
+# winfsp_wrs (Scille, MIT) wraps the WinFsp user-mode filesystem API; it has
+# no meaning outside Windows. Deliberately not `winfsp`/winfsp-rs (GPL-3.0
+# for the crate itself, see CLAUDE.md Architecture Notes).
+[target.'cfg(windows)'.dependencies]
+winfsp_wrs = "0.4"
+
+# winfsp_wrs_sys's build script locates the WinFsp install via the registry
+# and needs its `lib/` dir (import lib) present at *build* time, not just
+# runtime — WinFsp must be installed on any machine building this crate.
+[target.'cfg(windows)'.build-dependencies]
+winfsp_wrs_build = "0.4"

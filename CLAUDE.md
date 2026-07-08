@@ -29,7 +29,10 @@ binaries. Do not use it to read, search, or mutate source.
 | `y2q-cluster` | - | CRAQ data plane + embedded Raft control plane (distributed mode) |
 | `y2q-config` | - | Shared config types |
 | `y2q-warp` | `y2q-warp` | Load benchmarking tool |
-| `y2q-fuse` | `y2q-fuse` | FUSE filesystem driver (mount a bucket/store as a directory tree) |
+| `y2q-fuse` | `y2q-fuse` | FUSE filesystem driver (Linux/macOS; mount a bucket/store as a directory tree) |
+| `y2q-mount-core` | - | Mount-backend helpers shared by `y2q-fuse` and `y2q-mount-windows` (client/token resolution, remote directory listing, path types) |
+| `y2q-mount-windows` | `y2q-mount-windows` | WinFsp filesystem driver (Windows; mount a bucket/store as a drive) |
+| `y2q-gui` | `y2q-gui` | Cross-platform tray app + alias manager (egui/eframe), wraps the above two mount backends |
 
 ## Commands
 
@@ -80,3 +83,4 @@ Rules:
 - Errors: `thiserror` typed enums — no `anyhow` or `Box<dyn Error>`
 - Observability: `tracing` spans/events, Prometheus via `metrics` crate, optional Pyroscope profiling
 - Full docs: `docs/` (architecture.md, configuration.md, operations.md, api.md)
+- Windows mount backend (`y2q-mount-windows`) uses `winfsp_wrs` (Scille, MIT) — deliberately **not** `winfsp`/winfsp-rs (SnowflakePowered), which is GPL-3.0 for the crate itself even though WinFsp's own FLOSS exception only covers linking its DLL, not this binding. Do not swap it for the GPL crate without re-checking the licensing implications for any binary that would statically link it (this repo ships built binaries via GitHub Releases).

@@ -1,16 +1,6 @@
-mod auth;
-mod dir;
-mod error;
-mod fs;
-mod inode;
-
 use std::path::PathBuf;
 
 use clap::Parser;
-use fuser::{Config, MountOption, SessionACL};
-
-use crate::error::FuseError;
-use crate::fs::{MountMode, Y2qFuse};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -48,7 +38,10 @@ struct Args {
     mountpoint: PathBuf,
 }
 
-fn main() -> Result<(), FuseError> {
+#[cfg(unix)]
+fn main() -> Result<(), y2q_fuse::FuseError> {
+    use y2q_fuse::MountMode;
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -62,74 +55,50 @@ fn main() -> Result<(), FuseError> {
     // The FUSE event loop runs in a background thread (via Session::spawn) and
     // uses Handle::block_on inside each callback — valid here because those
     // callbacks run on non-tokio threads.
-    let rt = tokio::runtime::Runtime::new().map_err(FuseError::Io)?;
+    let rt = tokio::runtime::Runtime::new().map_err(y2q_fuse::FuseError::Io)?;
     let handle = rt.handle().clone();
 
-    let (client, expires_at) = auth::resolve_client(args.config.as_deref(), &args.alias)?;
-    auth::spawn_token_refresh(handle.clone(), client.clone(), expires_at);
+    let (client, expires_at) =
+        y2q_mount_core::client::resolve_client(args.config.as_deref(), &args.alias)?;
+    y2q_mount_core::client::spawn_token_refresh(handle.clone(), client.clone(), expires_at);
 
     let mode = match args.bucket {
         Some(ref b) => MountMode::Single(b.clone()),
         None => MountMode::Multi,
     };
 
-    let uid = unsafe { libc::getuid() };
-    let gid = unsafe { libc::getgid() };
-
-    let fs = Y2qFuse::new(client, handle.clone(), args.read_only, mode, uid, gid);
-
-    let mut mount_options = vec![
-        MountOption::FSName("y2q".into()),
-        MountOption::DefaultPermissions,
-    ];
-    // macFUSE's mount helper doesn't guarantee support for these; a rejected
-    // option fails the whole mount, so keep them Linux-only.
-    #[cfg(target_os = "linux")]
-    mount_options.extend([
-        MountOption::Subtype("y2q".into()),
-        MountOption::NoExec,
-        MountOption::NoDev,
-    ]);
-    if args.read_only {
-        mount_options.push(MountOption::RO);
-    }
-    let mut config = Config::default();
-    config.mount_options = mount_options;
-    config.acl = if args.allow_other {
-        SessionACL::All
-    } else {
-        SessionACL::Owner
-    };
-
-    let mountpoint = args.mountpoint.clone();
-    tracing::info!(mountpoint = %mountpoint.display(), "mounting y2q");
-
-    let mut session = fuser::Session::new(fs, &mountpoint, &config).map_err(FuseError::Io)?;
-    let mut unmounter = session.unmount_callable();
-    let bg = session.spawn().map_err(FuseError::Io)?;
+    let mut mount_handle = y2q_fuse::mount(
+        client,
+        handle.clone(),
+        &args.mountpoint,
+        args.read_only,
+        mode,
+        args.allow_other,
+    )?;
 
     // Block until SIGINT or SIGTERM, then unmount and exit cleanly.
     handle.block_on(async {
-        #[cfg(unix)]
-        {
-            use tokio::signal::unix::{SignalKind, signal};
-            let mut sigterm = signal(SignalKind::terminate()).expect("SIGTERM handler");
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {}
-                _ = sigterm.recv() => {}
-            }
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut sigterm = signal(SignalKind::terminate()).expect("SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = sigterm.recv() => {}
         }
-        #[cfg(not(unix))]
-        tokio::signal::ctrl_c().await.ok();
     });
 
-    tracing::info!(mountpoint = %mountpoint.display(), "unmounting y2q");
-    if let Err(e) = unmounter.unmount() {
+    tracing::info!(mountpoint = %args.mountpoint.display(), "unmounting y2q");
+    if let Err(e) = mount_handle.unmount() {
         tracing::warn!("unmount: {e}");
-    }
-    if let Err(e) = bg.join() {
-        tracing::warn!("session join: {e}");
     }
 
     Ok(())
+}
+
+#[cfg(not(unix))]
+fn main() {
+    eprintln!(
+        "y2q-fuse has no Windows backend (fuser wraps libfuse/macFUSE only). \
+         Use y2q-mount-windows instead."
+    );
+    std::process::exit(1);
 }

@@ -1,32 +1,10 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
+
+use y2q_mount_core::path::{CachedMeta, InodePath};
 
 pub const ROOT_INO: u64 = 1;
 pub const ATTR_TTL: Duration = Duration::from_secs(5);
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum InodePath {
-    Root,
-    Bucket(String),
-    VirtualDir { bucket: String, prefix: String },
-    Object { bucket: String, key: String },
-}
-
-#[derive(Debug, Clone)]
-pub struct CachedMeta {
-    pub size: u64,
-    /// Nanoseconds since UNIX epoch (from y2q Metadata).
-    pub created: u64,
-    /// Nanoseconds since UNIX epoch (from y2q Metadata).
-    pub modified: u64,
-    pub checksum_gxhash: String,
-    pub labels: BTreeSet<(String, String)>,
-    pub cipher_size: Option<u64>,
-    pub cipher_sha256: Option<String>,
-    pub kem_alg: Option<String>,
-    pub aead_alg: Option<String>,
-    pub envelope_version: Option<u16>,
-}
 
 #[derive(Debug)]
 pub struct InodeEntry {
@@ -45,6 +23,12 @@ pub struct InodeTable {
     next_ino: u64,
     by_ino: HashMap<u64, InodeEntry>,
     by_path: HashMap<InodePath, u64>,
+}
+
+impl Default for InodeTable {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl InodeTable {

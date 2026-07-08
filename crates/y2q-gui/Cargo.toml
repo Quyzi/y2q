@@ -1,0 +1,42 @@
+[package]
+name = "y2q-gui"
+version.workspace = true
+edition = "2024"
+
+[[bin]]
+name = "y2q-gui"
+path = "src/main.rs"
+
+[dependencies]
+eframe      = "0.31"
+egui        = "0.31"
+# libxdo (X11 hotkey lib) is only needed for menu-item keyboard accelerators,
+# which this app doesn't use; dropping it removes a Linux system-lib
+# dependency (libxdo.so / libxdo-dev) we'd otherwise need at link time.
+tray-icon   = { version = "0.24", default-features = false, features = ["gtk"] }
+rfd         = "0.15"
+opener      = "0.7"
+directories = { workspace = true }
+indexmap    = { workspace = true }
+thiserror   = { workspace = true }
+tokio     = { workspace = true }
+tracing   = { workspace = true }
+tracing-subscriber = { workspace = true }
+y2q-client      = { path = "../y2q-client" }
+y2q-config      = { path = "../y2q-config" }
+y2q-mount-core  = { path = "../y2q-mount-core" }
+
+[target.'cfg(unix)'.dependencies]
+y2q-fuse = { path = "../y2q-fuse" }
+
+[target.'cfg(windows)'.dependencies]
+y2q-mount-windows = { path = "../y2q-mount-windows" }
+
+# tray-icon needs a GTK main loop of our own on Linux/BSD (see src/tray.rs) —
+# `gtk` is only a dev-dependency of the tray-icon crate itself, not something
+# consumers get transitively.
+[target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))'.dependencies]
+gtk = "0.18"
+
+[target.'cfg(windows)'.build-dependencies]
+winfsp_wrs_build = "0.4"
