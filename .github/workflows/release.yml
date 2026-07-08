@@ -92,11 +92,17 @@ jobs:
           echo "${{ matrix.linker_env }}=${{ matrix.linker }}" >> "$GITHUB_ENV"
           echo "${{ matrix.cc_env }}=${{ matrix.linker }}" >> "$GITHUB_ENV"
 
+      - name: Install macFUSE
+        if: runner.os == 'macOS'
+        run: |
+          brew install --cask macfuse
+          echo "PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:$PKG_CONFIG_PATH" >> "$GITHUB_ENV"
+
       - name: Build release binaries
         run: cargo build --release --target ${{ matrix.target }} -p y2qd -p y2q-cli -p y2q-warp
 
       - name: Build FUSE binary
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' || runner.os == 'macOS'
         run: cargo build --release --target ${{ matrix.target }} -p y2q-fuse
 
       - name: Package (Linux)
@@ -111,7 +117,7 @@ jobs:
         run: |
           mkdir -p dist
           tar czf dist/y2q-${{ github.ref_name }}-${{ matrix.target }}.tar.gz \
-            -C target/${{ matrix.target }}/release y2qd y2q y2q-warp
+            -C target/${{ matrix.target }}/release y2qd y2q y2q-warp y2q-fuse
 
       - name: Package (Windows)
         if: runner.os == 'Windows'

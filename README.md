@@ -383,7 +383,7 @@ Outputs a per-operation summary table (throughput in MiB/s and ops/s, p50/p90/p9
 
 ## FUSE Mount (`y2q-fuse`)
 
-Mounts a y2q store at a local directory using [FUSE](https://github.com/cberner/fuser), so any program can read and write objects as ordinary files. Linux only; requires `libfuse3` (or `libfuse2` - it falls back to `fusermount` if `fusermount3` isn't found).
+Mounts a y2q store at a local directory using [FUSE](https://github.com/cberner/fuser), so any program can read and write objects as ordinary files. Linux and macOS. Linux requires `libfuse3` (or `libfuse2` - it falls back to `fusermount` if `fusermount3` isn't found). macOS requires [macFUSE](https://macfuse.github.io/) (`brew install --cask macfuse`); on Apple Silicon you may need to enable the third-party kernel extension in System Settings (or use the kext-free FSKit backend on macOS 26+).
 
 ```sh
 cargo build --release -p y2q-fuse
@@ -403,7 +403,7 @@ By default every bucket appears as a top-level directory. Restrict the mount to 
 y2q-fuse --alias prod --bucket photos /mnt/photos
 ```
 
-Unmount with Ctrl+C, SIGTERM, or `fusermount3 -u /mnt/y2q`. The session token is refreshed in the background ~60 seconds before expiry for as long as the mount is alive.
+Unmount with Ctrl+C, SIGTERM, or manually: `fusermount3 -u /mnt/y2q` on Linux, `umount /mnt/y2q` (or `diskutil unmount /mnt/y2q`) on macOS. The session token is refreshed in the background ~60 seconds before expiry for as long as the mount is alive.
 
 | Flag | Effect |
 |---|---|

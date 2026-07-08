@@ -80,11 +80,16 @@ fn main() -> Result<(), FuseError> {
 
     let mut mount_options = vec![
         MountOption::FSName("y2q".into()),
-        MountOption::Subtype("y2q".into()),
         MountOption::DefaultPermissions,
+    ];
+    // macFUSE's mount helper doesn't guarantee support for these; a rejected
+    // option fails the whole mount, so keep them Linux-only.
+    #[cfg(target_os = "linux")]
+    mount_options.extend([
+        MountOption::Subtype("y2q".into()),
         MountOption::NoExec,
         MountOption::NoDev,
-    ];
+    ]);
     if args.read_only {
         mount_options.push(MountOption::RO);
     }
@@ -99,7 +104,8 @@ fn main() -> Result<(), FuseError> {
     let mountpoint = args.mountpoint.clone();
     tracing::info!(mountpoint = %mountpoint.display(), "mounting y2q");
 
-    let session = fuser::Session::new(fs, &mountpoint, &config).map_err(FuseError::Io)?;
+    let mut session = fuser::Session::new(fs, &mountpoint, &config).map_err(FuseError::Io)?;
+    let mut unmounter = session.unmount_callable();
     let bg = session.spawn().map_err(FuseError::Io)?;
 
     // Block until SIGINT or SIGTERM, then unmount and exit cleanly.
@@ -118,16 +124,9 @@ fn main() -> Result<(), FuseError> {
     });
 
     tracing::info!(mountpoint = %mountpoint.display(), "unmounting y2q");
-    std::process::Command::new("fusermount3")
-        .args(["-u", mountpoint.to_str().unwrap_or("")])
-        .status()
-        .or_else(|_| {
-            // Fall back to fusermount (FUSE 2) if fusermount3 isn't present.
-            std::process::Command::new("fusermount")
-                .args(["-u", mountpoint.to_str().unwrap_or("")])
-                .status()
-        })
-        .ok();
+    if let Err(e) = unmounter.unmount() {
+        tracing::warn!("unmount: {e}");
+    }
     if let Err(e) = bg.join() {
         tracing::warn!("session join: {e}");
     }
