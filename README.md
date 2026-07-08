@@ -13,6 +13,7 @@ Post-quantum secure object storage. `y2qd` is a REST daemon that encrypts every 
 - [CLI (`y2q`)](#cli-y2q)
 - [Load Benchmarking (`y2q-warp`)](#load-benchmarking-y2q-warp)
 - [FUSE Mount (`y2q-fuse`)](#fuse-mount-y2q-fuse)
+- [Desktop GUI (`y2q-gui`)](#desktop-gui-y2q-gui)
 - [Configuration](#configuration)
 - [API Reference](#api-reference)
 - [Clustering](#clustering)
@@ -58,7 +59,10 @@ Post-quantum secure object storage. `y2qd` is a REST daemon that encrypts every 
 | `y2q-cluster` | - | CRAQ data plane + embedded Raft control plane |
 | `y2q-config` | - | Shared config types |
 | `y2q-warp` | `y2q-warp` | Load benchmarking tool |
-| `y2q-fuse` | `y2q-fuse` | FUSE filesystem driver (mount a store as a directory tree) |
+| `y2q-fuse` | `y2q-fuse` | FUSE filesystem driver (Linux/macOS; mount a store as a directory tree) |
+| `y2q-mount-core` | - | Mount-backend helpers shared by `y2q-fuse` and `y2q-mount-windows` (client/token resolution, remote directory listing, path types) |
+| `y2q-mount-windows` | `y2q-mount-windows` | WinFsp filesystem driver (Windows; mount a store as a drive) |
+| `y2q-gui` | `y2q-gui` | Cross-platform tray app + alias manager (mount/unmount without a terminal) |
 
 ## Getting Started
 
@@ -167,7 +171,7 @@ y2q alias set prod https://y2qd.example --user alice
 y2q login prod
 ```
 
-Aliases live in `~/.config/y2q/config.toml`; cached session tokens in `~/.local/share/y2q/tokens.toml`. `y2q alias export`/`import` move alias sets between machines as TOML. Paths use `alias/bucket/key` syntax.
+Aliases live in `~/.config/y2q/config.toml`; cached session tokens in `~/.local/share/y2q/tokens.toml`. `y2q alias export`/`import` move alias sets between machines as TOML. Paths use `alias/bucket/key` syntax. The [desktop GUI](#desktop-gui-y2q-gui) reads and writes this same file - aliases are shared, not duplicated.
 
 For a self-signed dev endpoint, add `--insecure` (per alias or per command), or trust a CA bundle with `--ca-cert <pem>`. For mutual TLS, add `--client-cert`/`--client-key` to the alias.
 
@@ -414,6 +418,25 @@ Unmount with Ctrl+C, SIGTERM, or manually: `fusermount3 -u /mnt/y2q` on Linux, `
 | `--allow-other` | Allow other users to access the mount; requires `user_allow_other` in `/etc/fuse.conf` |
 
 `y2q-fuse` logs to stderr via `RUST_LOG`, defaulting to `warn` when unset. See [docs/configuration.md#logging](docs/configuration.md#logging).
+
+## Desktop GUI (`y2q-gui`)
+
+A cross-platform (Linux/macOS/Windows) tray app for people who don't want to touch a terminal. It reads and writes the *same* `config.toml`/`tokens.toml` the CLI and `y2q-fuse`/`y2q-mount-windows` use, so aliases created in the GUI show up in `y2q alias list` and vice versa - there's no separate GUI-only config.
+
+```sh
+cargo build --release -p y2q-gui
+```
+
+Click the tray icon's menu to open the alias manager window. Each alias has:
+
+- **Bucket** - leave blank to mount all buckets as top-level directories, or name one to mount it as the root (same `--bucket` semantics as `y2q-fuse`)
+- **Mount at** - a directory (Linux/macOS) or a drive letter/directory (Windows); browsable via the picker button
+- **Mount / Unmount** - if there's no valid cached session, a login prompt appears first; the resulting token is saved the same way `y2q login` saves one
+- **Open** - once mounted, opens the mount point in the OS file manager
+
+Closing the window hides it to the tray rather than quitting; use the tray menu's **Quit** to actually exit, which cleanly unmounts everything first.
+
+Mounting still depends on the same platform driver as the CLI tools: `libfuse3`/macFUSE on Linux/macOS (see [FUSE Mount](#fuse-mount-y2q-fuse) above), or [WinFsp](https://winfsp.dev/rel/) on Windows - install it once, like macFUSE on macOS.
 
 ## Configuration
 

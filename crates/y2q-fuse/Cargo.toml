@@ -9,13 +9,15 @@ path = "src/main.rs"
 
 [dependencies]
 clap        = { workspace = true }
-libc        = { workspace = true }
 tempfile    = { workspace = true }
 thiserror   = { workspace = true }
 tokio       = { workspace = true }
 tracing     = { workspace = true }
 tracing-subscriber = { workspace = true }
-zeroize     = { workspace = true }
-y2q-client  = { path = "../y2q-client" }
-y2q-config  = { path = "../y2q-config" }
-fuser       = "0.17"
+y2q-client      = { path = "../y2q-client" }
+y2q-mount-core  = { path = "../y2q-mount-core" }
+
+# fuser wraps libfuse (Linux) / macFUSE (macOS); it has no Windows backend.
+[target.'cfg(unix)'.dependencies]
+fuser = "0.17"
+libc  = { workspace = true }

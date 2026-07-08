@@ -19,7 +19,7 @@ IMAGE_CLUSTER ?= y2q-cluster:latest
         check \
         image image-dev image-cluster \
         cluster-up cluster-down \
-		install-local \
+		install-local install-desktop-linux \
         clean help
 
 # Default
@@ -114,6 +114,24 @@ install-local: ## Build release binaries and install to ~/.cargo/bin
 	$(CARGO) install --force --path crates/y2qd
 	$(CARGO) install --force --path crates/y2q-warp
 	$(CARGO) install --force --path crates/y2q-fuse
+	$(CARGO) install --force --path crates/y2q-gui
+
+install-desktop-linux: ## Install y2q-gui's XDG .desktop entry + icon (Linux; run after install-local)
+	mkdir -p $(HOME)/.local/share/applications $(HOME)/.local/share/y2q
+	cp assets/y2q.png $(HOME)/.local/share/y2q/y2q.png
+	printf '%s\n' \
+		'[Desktop Entry]' \
+		'Type=Application' \
+		'Name=y2q' \
+		'Comment=Post-quantum secure storage - tray app and alias manager' \
+		'Exec=y2q-gui' \
+		'Icon=$(HOME)/.local/share/y2q/y2q.png' \
+		'Terminal=false' \
+		'Categories=Utility;Network;' \
+		'StartupWMClass=y2q' \
+		> $(HOME)/.local/share/applications/y2q-gui.desktop
+	command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database $(HOME)/.local/share/applications || true
+	@echo "Installed. Taskbar/launcher icon needs an installed .desktop entry on Wayland (winit can't set it at runtime there) - may need a launcher/session restart to show up."
 
 # ---------------------------------------------------------------------------
 # Housekeeping

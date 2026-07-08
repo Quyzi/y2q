@@ -24,7 +24,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Install system dependencies
-        run: sudo apt-get install -y libfuse3-dev
+        run: sudo apt-get install -y libfuse3-dev libgtk-3-dev libappindicator3-dev
 
       - name: Bump workspace version to tag
         run: |
@@ -98,26 +98,44 @@ jobs:
           brew install --cask macfuse
           echo "PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:$PKG_CONFIG_PATH" >> "$GITHUB_ENV"
 
+      - name: Install Linux GUI dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libgtk-3-dev libappindicator3-dev
+
+      - name: Install WinFsp
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # winfsp_wrs_sys's build script reads the WinFsp registry key and
+          # links against its import lib at *build* time (not just runtime),
+          # so this must run before any step that builds y2q-mount-windows or
+          # y2q-gui.
+          choco install winfsp -y --no-progress
+
       - name: Build release binaries
-        run: cargo build --release --target ${{ matrix.target }} -p y2qd -p y2q-cli -p y2q-warp
+        run: cargo build --release --target ${{ matrix.target }} -p y2qd -p y2q-cli -p y2q-warp -p y2q-gui
 
       - name: Build FUSE binary
         if: runner.os == 'Linux' || runner.os == 'macOS'
         run: cargo build --release --target ${{ matrix.target }} -p y2q-fuse
+
+      - name: Build Windows mount binary
+        if: runner.os == 'Windows'
+        run: cargo build --release --target ${{ matrix.target }} -p y2q-mount-windows
 
       - name: Package (Linux)
         if: runner.os == 'Linux'
         run: |
           mkdir -p dist
           tar czf dist/y2q-${{ github.ref_name }}-${{ matrix.target }}.tar.gz \
-            -C target/${{ matrix.target }}/release y2qd y2q y2q-warp y2q-fuse
+            -C target/${{ matrix.target }}/release y2qd y2q y2q-warp y2q-fuse y2q-gui
 
       - name: Package (macOS)
         if: runner.os == 'macOS'
         run: |
           mkdir -p dist
           tar czf dist/y2q-${{ github.ref_name }}-${{ matrix.target }}.tar.gz \
-            -C target/${{ matrix.target }}/release y2qd y2q y2q-warp y2q-fuse
+            -C target/${{ matrix.target }}/release y2qd y2q y2q-warp y2q-fuse y2q-gui
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
@@ -127,7 +145,9 @@ jobs:
           Compress-Archive -Path @(
             "target\${{ matrix.target }}\release\y2qd.exe",
             "target\${{ matrix.target }}\release\y2q.exe",
-            "target\${{ matrix.target }}\release\y2q-warp.exe"
+            "target\${{ matrix.target }}\release\y2q-warp.exe",
+            "target\${{ matrix.target }}\release\y2q-gui.exe",
+            "target\${{ matrix.target }}\release\y2q-mount-windows.exe"
           ) -DestinationPath "dist\y2q-${{ github.ref_name }}-${{ matrix.target }}.zip"
 
       - uses: actions/upload-artifact@v7

@@ -6,14 +6,14 @@ use y2q_client::{ClientConfig, TlsOptions, Y2qClient};
 use y2q_config::{Alias, CliConfig, TokenStore, default_config_path, default_tokens_path};
 use zeroize::Zeroizing;
 
-use crate::error::FuseError;
+use crate::error::MountCoreError;
 
 /// Load config + token store, build a ready client and return it alongside
 /// the token's expiry timestamp (unix seconds).
 pub fn resolve_client(
     config_override: Option<&Path>,
     alias_name: &str,
-) -> Result<(Arc<RwLock<Y2qClient>>, u64), FuseError> {
+) -> Result<(Arc<RwLock<Y2qClient>>, u64), MountCoreError> {
     let config_path: PathBuf = match config_override {
         Some(p) => p.to_owned(),
         None => default_config_path()?,
@@ -25,7 +25,7 @@ pub fn resolve_client(
     let store = TokenStore::load(&tokens_path)?;
     let entry = store
         .get_valid(alias_name)
-        .ok_or_else(|| FuseError::NotLoggedIn(alias_name.to_owned()))?;
+        .ok_or_else(|| MountCoreError::NotLoggedIn(alias_name.to_owned()))?;
 
     let expires_at = entry.expires_at;
     let token = Zeroizing::new(entry.token.clone());
@@ -37,7 +37,7 @@ pub fn resolve_client(
 pub fn build_client(
     alias: &Alias,
     token: Option<Zeroizing<String>>,
-) -> Result<Y2qClient, FuseError> {
+) -> Result<Y2qClient, MountCoreError> {
     let mut tls = TlsOptions {
         insecure: alias.insecure,
         ..TlsOptions::default()
@@ -54,7 +54,7 @@ pub fn build_client(
         }
         (None, None) => {}
         _ => {
-            return Err(FuseError::Other(
+            return Err(MountCoreError::Other(
                 "client_cert_path and client_key_path must both be set or both unset".into(),
             ));
         }
@@ -64,12 +64,12 @@ pub fn build_client(
         token,
         tls,
     })
-    .map_err(FuseError::from)
+    .map_err(MountCoreError::from)
 }
 
-fn read_pem(path: &str, label: &str) -> Result<Vec<u8>, FuseError> {
+fn read_pem(path: &str, label: &str) -> Result<Vec<u8>, MountCoreError> {
     fs::read(Path::new(path))
-        .map_err(|e| FuseError::Other(format!("read {label} from {path}: {e}")))
+        .map_err(|e| MountCoreError::Other(format!("read {label} from {path}: {e}")))
 }
 
 /// Spawn a background task that refreshes the token ~60 seconds before expiry.

@@ -12,21 +12,14 @@ use fuser::{
 };
 use tempfile::NamedTempFile;
 use y2q_client::{AclBody, BucketConfig, ClientError, ListOptions, Y2qClient};
+use y2q_mount_core::dir::{ChildEntry, list_children};
+use y2q_mount_core::path::{CachedMeta, InodePath, MountMode};
 
-use crate::dir::{ChildEntry, list_children};
 use crate::error::to_errno;
-use crate::inode::{CachedMeta, InodePath, InodeTable, ROOT_INO};
+use crate::inode::{InodeTable, ROOT_INO};
 
 const ATTR_TTL: Duration = Duration::from_secs(5);
 const ENTRY_TTL: Duration = Duration::from_secs(5);
-
-#[derive(Debug, Clone)]
-pub enum MountMode {
-    /// All buckets appear as top-level directories.
-    Multi,
-    /// A single bucket is the filesystem root.
-    Single(String),
-}
 
 struct OpenFile {
     bucket: String,
