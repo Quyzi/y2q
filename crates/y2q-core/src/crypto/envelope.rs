@@ -160,7 +160,7 @@ fn decrypt_v2(sk_bytes: &[u8], envelope: &[u8]) -> Result<Vec<u8>, CryptoError> 
     }
 
     let kem_ct_bytes = &envelope[ENVELOPE_V2_HEADER_FIXED_LEN..preamble_len];
-    let aad = &envelope[..V2_AAD_LEN];
+    let aad = build_v2_aad(&envelope[..ENVELOPE_V2_HEADER_FIXED_LEN]);
 
     let sk = mlkem768::SecretKey::from_bytes(sk_bytes)
         .map_err(|_| CryptoError::KemDecode("secret key"))?;
@@ -172,11 +172,12 @@ fn decrypt_v2(sk_bytes: &[u8], envelope: &[u8]) -> Result<Vec<u8>, CryptoError> 
     let cipher = aes_key(&key_bytes);
     key_bytes.zeroize();
 
-    let mut plaintext = if plaintext_len > 0 {
-        Vec::with_capacity(plaintext_len as usize)
-    } else {
-        Vec::new()
-    };
+    // `plaintext_len` is read from the header before any AEAD chunk has been
+    // verified, so it isn't trustworthy yet — cap the pre-allocation at the
+    // received envelope's length (a real upper bound on achievable plaintext
+    // regardless of what the header claims) instead of trusting it outright.
+    let cap = plaintext_len.min(envelope.len() as u64) as usize;
+    let mut plaintext = Vec::with_capacity(cap);
 
     let mut pos = preamble_len;
     let mut chunk_idx: u64 = 0;
@@ -188,14 +189,14 @@ fn decrypt_v2(sk_bytes: &[u8], envelope: &[u8]) -> Result<Vec<u8>, CryptoError> 
         let chunk_nonce_bytes = chunk_nonce(&nonce_base, chunk_idx);
         let mut chunk_buf = envelope[pos..ct_end].to_vec();
         cipher
-            .decrypt_in_place(&aes_nonce(&chunk_nonce_bytes), aad, &mut chunk_buf)
+            .decrypt_in_place(&aes_nonce(&chunk_nonce_bytes), &aad, &mut chunk_buf)
             .map_err(|_| CryptoError::AuthFailed)?;
         plaintext.extend_from_slice(&chunk_buf);
         pos = ct_end;
         chunk_idx += 1;
     }
 
-    if plaintext_len > 0 && plaintext.len() as u64 != plaintext_len {
+    if plaintext.len() as u64 != plaintext_len {
         return Err(CryptoError::Envelope("plaintext length mismatch"));
     }
     Ok(plaintext)
@@ -239,8 +240,7 @@ fn decrypt_v2_owned(sk_bytes: &[u8], mut envelope: BytesMut) -> Result<Bytes, Cr
     if chunk_size == 0 {
         return Err(CryptoError::Envelope("zero chunk_size"));
     }
-    let mut aad = [0u8; V2_AAD_LEN];
-    aad.copy_from_slice(&envelope[..V2_AAD_LEN]);
+    let aad = build_v2_aad(&envelope[..ENVELOPE_V2_HEADER_FIXED_LEN]);
     let kem_ct_owned: Vec<u8> = envelope[ENVELOPE_V2_HEADER_FIXED_LEN..preamble_len].to_vec();
 
     let sk = mlkem768::SecretKey::from_bytes(sk_bytes)
@@ -257,11 +257,11 @@ fn decrypt_v2_owned(sk_bytes: &[u8], mut envelope: BytesMut) -> Result<Bytes, Cr
     let mut body = envelope.split_off(preamble_len);
     drop(envelope);
 
-    let mut plaintext = if plaintext_len > 0 {
-        BytesMut::with_capacity(plaintext_len as usize)
-    } else {
-        BytesMut::new()
-    };
+    // See the matching comment in `decrypt_v2` — `plaintext_len` isn't
+    // trustworthy until the chunks are verified, so the pre-allocation is
+    // capped by the received body length instead of the raw header value.
+    let cap = plaintext_len.min(body.len() as u64) as usize;
+    let mut plaintext = BytesMut::with_capacity(cap);
 
     let mut chunk_idx: u64 = 0;
     while !body.is_empty() {
@@ -280,7 +280,7 @@ fn decrypt_v2_owned(sk_bytes: &[u8], mut envelope: BytesMut) -> Result<Bytes, Cr
         chunk_idx += 1;
     }
 
-    if plaintext_len > 0 && plaintext.len() as u64 != plaintext_len {
+    if plaintext.len() as u64 != plaintext_len {
         return Err(CryptoError::Envelope("plaintext length mismatch"));
     }
     Ok(plaintext.freeze())
@@ -348,7 +348,7 @@ pub fn decrypt_v2_chunks(
 
     let mut nonce_base = [0u8; 12];
     nonce_base.copy_from_slice(&preamble[8..20]);
-    let aad = &preamble[..V2_AAD_LEN];
+    let aad = build_v2_aad(&preamble[..ENVELOPE_V2_HEADER_FIXED_LEN]);
 
     let kem_ct_bytes = &preamble[ENVELOPE_V2_HEADER_FIXED_LEN..preamble_len];
 
@@ -373,7 +373,7 @@ pub fn decrypt_v2_chunks(
         let chunk_nonce_bytes = chunk_nonce(&nonce_base, chunk_idx);
         let mut chunk_buf = chunks_ct[pos..ct_end].to_vec();
         cipher
-            .decrypt_in_place(&aes_nonce(&chunk_nonce_bytes), aad, &mut chunk_buf)
+            .decrypt_in_place(&aes_nonce(&chunk_nonce_bytes), &aad, &mut chunk_buf)
             .map_err(|_| CryptoError::AuthFailed)?;
         plaintext.extend_from_slice(&chunk_buf);
         pos = ct_end;
@@ -382,14 +382,28 @@ pub fn decrypt_v2_chunks(
     Ok(plaintext)
 }
 
-/// Length of the stable prefix used as per-chunk AAD in v2.
-///
-/// This is the first 20 bytes of the v2 fixed header: magic + format_ver +
-/// kem_alg + aead_alg + nonce_base. The subsequent `plaintext_len` (bytes
-/// 20-27) and `chunk_size` (bytes 28-31) are excluded because `plaintext_len`
-/// is only known after all chunks are written (it's patched via seek), and
-/// including a zero placeholder would cause an AAD mismatch at decrypt time.
-const V2_AAD_LEN: usize = 20; // up to and including nonce_base
+/// Length of the header prefix (magic + format_ver + kem_alg + aead_alg +
+/// nonce_base) that forms the first part of the v2 per-chunk AAD.
+const V2_AAD_PREFIX_LEN: usize = 20; // up to and including nonce_base
+
+/// Total length of the v2 per-chunk AAD: the header prefix plus `chunk_size`
+/// (bytes 28-31). `plaintext_len` (bytes 20-27) is the only fixed-header
+/// field excluded — it's only known after all chunks are written (patched in
+/// via a seek in [`EncryptSession::finish`]), so a placeholder value bound at
+/// encrypt time would never match what's read back at decrypt time.
+/// `chunk_size` has no such excuse: it's fixed before the first byte is
+/// written, so it's authenticated like every other header field.
+const V2_AAD_LEN: usize = V2_AAD_PREFIX_LEN + 4;
+
+/// Build the v2 per-chunk AAD from a (at least) 32-byte fixed header: the
+/// magic/version/alg/nonce_base prefix concatenated with `chunk_size`,
+/// skipping the not-yet-known `plaintext_len` bytes in between.
+fn build_v2_aad(header: &[u8]) -> [u8; V2_AAD_LEN] {
+    let mut aad = [0u8; V2_AAD_LEN];
+    aad[..V2_AAD_PREFIX_LEN].copy_from_slice(&header[..V2_AAD_PREFIX_LEN]);
+    aad[V2_AAD_PREFIX_LEN..].copy_from_slice(&header[28..32]);
+    aad
+}
 
 /// Streaming AES-256-GCM v2 encryptor that writes directly to a file.
 ///
@@ -409,7 +423,8 @@ pub struct EncryptSession {
     chunk_idx: u64,
     buf: Vec<u8>,
     plaintext_total: u64,
-    /// First 20 bytes of the fixed header (magic … nonce_base), used as AAD.
+    /// This session's AAD: the header prefix concatenated with `chunk_size`
+    /// (see [`build_v2_aad`]).
     aad: [u8; V2_AAD_LEN],
     bytes_written: u64,
     /// Byte offset within the file at which the v2 envelope begins.
@@ -466,8 +481,7 @@ impl EncryptSession {
 
         let bytes_written = (header.len() + kem_ct_bytes.len()) as u64;
 
-        let mut aad = [0u8; V2_AAD_LEN];
-        aad.copy_from_slice(&header[..V2_AAD_LEN]);
+        let aad = build_v2_aad(&header);
 
         Ok(Self {
             sink,
@@ -863,6 +877,64 @@ mod tests {
         let last = env.len() - 1;
         env[last] ^= 1;
         assert!(decrypt(sk.as_bytes(), &env).is_err());
+    }
+
+    #[tokio::test]
+    async fn v2_chunk_size_tampering_is_authenticated() {
+        // Before chunk_size was included in the AAD, substituting a different
+        // (still-oversized-relative-to-the-ciphertext) chunk_size value went
+        // completely undetected on a single-chunk object: any value large
+        // enough to clamp the decrypt window to the same bytes produced the
+        // exact same ciphertext window and AAD, so the tag check couldn't
+        // tell the difference. It's now part of the AAD, so this must fail.
+        let (pk, sk) = mlkem768::keypair();
+        let file = tempfile_v2().await;
+        let mut session = EncryptSession::new(file, pk.as_bytes(), 0, DEFAULT_CHUNK_SIZE_BYTES)
+            .await
+            .unwrap();
+        session.feed(b"some payload").await.unwrap();
+        let (file, _) = session.finish().await.unwrap();
+        let mut env = read_file(file).await;
+
+        // chunk_size lives at header bytes [28..32].
+        let tampered = (DEFAULT_CHUNK_SIZE_BYTES as u32) / 2;
+        env[28..32].copy_from_slice(&tampered.to_be_bytes());
+
+        assert!(matches!(
+            decrypt(sk.as_bytes(), &env),
+            Err(CryptoError::AuthFailed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn v2_lying_plaintext_len_does_not_drive_unbounded_allocation() {
+        // plaintext_len isn't authenticated (it's patched in after all chunks
+        // are written, so it can't be bound at encrypt time). Before the fix
+        // its raw value was trusted directly as a Vec/BytesMut pre-allocation
+        // size. A tiny, otherwise-legitimate envelope claiming a multi-exabyte
+        // plaintext_len must not attempt that allocation — the real chunks
+        // still decrypt fine, and the lie is caught by the trailing
+        // length-consistency check instead of an AEAD failure.
+        let (pk, sk) = mlkem768::keypair();
+        let file = tempfile_v2().await;
+        let mut session = EncryptSession::new(file, pk.as_bytes(), 0, DEFAULT_CHUNK_SIZE_BYTES)
+            .await
+            .unwrap();
+        session.feed(b"tiny").await.unwrap();
+        let (file, _) = session.finish().await.unwrap();
+        let mut env = read_file(file).await;
+
+        // plaintext_len lives at header bytes [20..28].
+        env[20..28].copy_from_slice(&u64::MAX.to_be_bytes());
+
+        assert!(matches!(
+            decrypt(sk.as_bytes(), &env),
+            Err(CryptoError::Envelope("plaintext length mismatch"))
+        ));
+        assert!(matches!(
+            decrypt_owned(sk.as_bytes(), BytesMut::from(env.as_slice())),
+            Err(CryptoError::Envelope("plaintext length mismatch"))
+        ));
     }
 
     async fn tempfile_v2() -> crate::storage::streaming_sink::StreamingSink {
