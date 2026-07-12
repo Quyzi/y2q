@@ -197,7 +197,7 @@ The `path_key` is derived from the login-gated MEK (deterministic from the deplo
 
 Bucket names: ASCII alphanumeric plus `-` and `_`; case-insensitive `"api"` is reserved (collides with `/api/v1/*`). Keys: up to 1024 bytes, no null bytes.
 
-The metadata blob embedded in each `.obj` is **encrypted at rest** under the MEK (`encrypt_meta`, AES-256-GCM; `MEK = SHA-256(sk || "y2q-metadata-encryption-key-v2")`), so labels, timestamps, checksums, and the cleartext key are not readable from the file without the deployment key. Decrypted, it has this logical shape:
+The metadata blob embedded in each `.obj` is **encrypted at rest** under the MEK (`encrypt_meta`, AES-256-GCM; `MEK = SHA-256(sk || "y2q-metadata-encryption-key-v2")`), so labels, timestamps, checksums, and the cleartext key are not readable from the file without the deployment key. Unlike the content key, the MEK is one fixed key for the whole deployment rather than per-object, so `encrypt_meta`/`decrypt_meta` bind the AEAD to the object's opaque on-disk id (the `.obj` filename stem, itself a keyed HMAC of `bucket`/`key`) via AAD - the same identity-binding principle as the envelope above, closing the same copy-attack: a metadata blob relocated to a different object's storage location fails the tag check instead of decrypting into a spoofed size/labels/checksums for the target object. Decrypted, it has this logical shape:
 
 ```json
 {

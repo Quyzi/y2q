@@ -165,12 +165,27 @@ pub trait MetadataCipher {
     /// label values into fixed-size, lookup-stable index entries.
     fn prf(&self, key: &[u8; 32], data: &[u8]) -> [u8; 32];
 
-    /// Seal a metadata JSON blob under `mek` for storage in the index.
-    fn encrypt_meta(&self, mek: &[u8; 32], json: &[u8]) -> Result<Vec<u8>, Self::Error>;
+    /// Seal a metadata JSON blob under `mek` for storage in the index, bound
+    /// to the object's opaque on-disk `object_id` via AAD so the blob cannot
+    /// be relocated to a different object's storage location and still
+    /// decrypt.
+    fn encrypt_meta(
+        &self,
+        mek: &[u8; 32],
+        json: &[u8],
+        object_id: &str,
+    ) -> Result<Vec<u8>, Self::Error>;
 
-    /// Open a metadata blob under `mek`. A blob without the recognized version
-    /// byte is rejected rather than treated as legacy plaintext.
-    fn decrypt_meta(&self, mek: &[u8; 32], blob: &[u8]) -> Result<Vec<u8>, Self::Error>;
+    /// Open a metadata blob under `mek`, requiring it to have been sealed for
+    /// the same `object_id`. A blob without the recognized version byte is
+    /// rejected rather than treated as legacy plaintext; a blob sealed for a
+    /// different object fails the same way as a tampered blob.
+    fn decrypt_meta(
+        &self,
+        mek: &[u8; 32],
+        blob: &[u8],
+        object_id: &str,
+    ) -> Result<Vec<u8>, Self::Error>;
 }
 
 /// Shared, in-memory holder for the active metadata encryption key and its
