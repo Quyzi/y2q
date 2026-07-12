@@ -486,7 +486,7 @@ impl DistributedStorage {
                         bucket: md.bucket.clone(),
                         key: md.key.clone(),
                         version: md.version,
-                        cipher_sha256: md.cipher_sha256.clone(),
+                        cipher_checksum: md.cipher_checksum.clone(),
                     });
                 }
                 match page.next {
@@ -678,8 +678,8 @@ impl DistributedStorage {
                     .describe(&entry.bucket, &entry.key)
                     .await
                     .ok()
-                    .map(|m| (m.version, m.cipher_sha256));
-                if !need_backfill(local, entry.version, &entry.cipher_sha256) {
+                    .map(|m| (m.version, m.cipher_checksum));
+                if !need_backfill(local, entry.version, &entry.cipher_checksum) {
                     continue;
                 }
                 if self
@@ -706,7 +706,7 @@ impl DistributedStorage {
 
         let state = self.controller.control_state().await;
         let manifest = self.local_manifest().await?;
-        // Per-member manifest cache: member id → {(bucket,key) → cipher_sha256}.
+        // Per-member manifest cache: member id → {(bucket,key) → cipher_checksum}.
         let mut member_objs: HashMap<NodeId, HashMap<(String, String), Option<String>>> =
             HashMap::new();
         let mut report = MigrateReport::default();
@@ -772,7 +772,7 @@ impl DistributedStorage {
         >,
     ) -> bool {
         use std::collections::HashMap;
-        let Some(want) = entry.cipher_sha256.clone() else {
+        let Some(want) = entry.cipher_checksum.clone() else {
             return false;
         };
         for &m in &route.members {
@@ -792,7 +792,7 @@ impl DistributedStorage {
                         .await
                 {
                     for e in man.entries {
-                        map.insert((e.bucket, e.key), e.cipher_sha256);
+                        map.insert((e.bucket, e.key), e.cipher_checksum);
                     }
                 }
                 slot.insert(map);
@@ -827,7 +827,7 @@ impl DistributedStorage {
             plaintext_size: md.size,
             checksum_gxhash_b64: md.checksum_gxhash.clone(),
             cipher_size: md.cipher_size.unwrap_or(0),
-            cipher_sha256_b64: md.cipher_sha256.clone().unwrap_or_default(),
+            cipher_checksum_b64: md.cipher_checksum.clone().unwrap_or_default(),
             kem_alg: md.kem_alg.clone().unwrap_or_default(),
             aead_alg: md.aead_alg.clone().unwrap_or_default(),
             envelope_version: md.envelope_version.unwrap_or(2),
@@ -899,8 +899,8 @@ impl DistributedStorage {
                     .describe(&entry.bucket, &entry.key)
                     .await
                     .ok()
-                    .map(|m| (m.version, m.cipher_sha256));
-                if !need_backfill(local, entry.version, &entry.cipher_sha256) {
+                    .map(|m| (m.version, m.cipher_checksum));
+                if !need_backfill(local, entry.version, &entry.cipher_checksum) {
                     report.skipped += 1;
                     continue;
                 }
@@ -1429,7 +1429,7 @@ mod tests {
             plaintext_size: 50,
             checksum_gxhash_b64: "AAAAAAAAAAA=".into(),
             cipher_size: env.len() as u64,
-            cipher_sha256_b64: String::new(),
+            cipher_checksum_b64: String::new(),
             kem_alg: "ml-kem-768".into(),
             aead_alg: "aes-256-gcm".into(),
             envelope_version: 2,
@@ -1474,7 +1474,7 @@ mod tests {
             checksum_gxhash_b64: "AAAAAAAAAAA=".into(),
             // Claim a larger envelope than the body will deliver.
             cipher_size: 64,
-            cipher_sha256_b64: String::new(),
+            cipher_checksum_b64: String::new(),
             kem_alg: "ml-kem-768".into(),
             aead_alg: "aes-256-gcm".into(),
             envelope_version: 2,
@@ -1510,7 +1510,7 @@ mod tests {
             url_path: format!("{bucket}/{key}"),
             labels: Default::default(),
             cipher_size: None,
-            cipher_sha256: None,
+            cipher_checksum: None,
             kem_alg: None,
             aead_alg: None,
             envelope_version: None,

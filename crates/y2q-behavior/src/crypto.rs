@@ -14,7 +14,12 @@ use bytes::{Bytes, BytesMut};
 /// The v2 chunked format splits the payload into independently sealed,
 /// per-chunk-nonced segments so large objects can be decrypted in ranges.
 /// There is no unauthenticated passthrough: an envelope with an unrecognized
-/// magic is rejected outright rather than treated as legacy plaintext.
+/// magic is rejected outright rather than treated as legacy plaintext. The
+/// content key is bound to the object's `(bucket, key)` address (folded into
+/// the HKDF derivation), so a ciphertext valid for one object fails to
+/// decrypt if presented under a different address — copying one object's
+/// on-disk envelope onto another object's storage location does not grant
+/// access to it.
 pub trait ObjectCipher {
     /// Per-envelope metadata recorded alongside the ciphertext: envelope version,
     /// KEM and AEAD algorithm identifiers, and ciphertext size.
@@ -23,22 +28,40 @@ pub trait ObjectCipher {
     type Error: std::error::Error + Send + Sync + 'static;
 
     /// Encapsulate a shared secret to the recipient public key `pk_bytes`, derive
-    /// the content key, and seal `plaintext`. Returns the complete envelope bytes
-    /// and the [`EnvelopeInfo`](Self::EnvelopeInfo) describing what was produced.
+    /// the content key (bound to `bucket`/`key`), and seal `plaintext`. Returns
+    /// the complete envelope bytes and the [`EnvelopeInfo`](Self::EnvelopeInfo)
+    /// describing what was produced.
     fn encrypt(
         &self,
         pk_bytes: &[u8],
         plaintext: &[u8],
+        bucket: &str,
+        key: &str,
     ) -> Result<(Vec<u8>, Self::EnvelopeInfo), Self::Error>;
 
-    /// Decapsulate with `sk_bytes` and open an envelope, copying the recovered
-    /// plaintext into a fresh buffer.
-    fn decrypt(&self, sk_bytes: &[u8], envelope: &[u8]) -> Result<Vec<u8>, Self::Error>;
+    /// Decapsulate with `sk_bytes` and open an envelope addressed to
+    /// `bucket`/`key`, copying the recovered plaintext into a fresh buffer.
+    /// Fails if `bucket`/`key` don't match the address the envelope was
+    /// originally encrypted for.
+    fn decrypt(
+        &self,
+        sk_bytes: &[u8],
+        envelope: &[u8],
+        bucket: &str,
+        key: &str,
+    ) -> Result<Vec<u8>, Self::Error>;
 
     /// Open an envelope in place, decrypting into the owned input buffer and
     /// returning a view of the plaintext so no copy is made. Suited to large
-    /// objects already held in memory.
-    fn decrypt_owned(&self, sk_bytes: &[u8], envelope: BytesMut) -> Result<Bytes, Self::Error>;
+    /// objects already held in memory. Same `bucket`/`key` binding as
+    /// [`decrypt`](Self::decrypt).
+    fn decrypt_owned(
+        &self,
+        sk_bytes: &[u8],
+        envelope: BytesMut,
+        bucket: &str,
+        key: &str,
+    ) -> Result<Bytes, Self::Error>;
 
     /// Open a contiguous run of chunks.
     ///
@@ -46,13 +69,15 @@ pub trait ObjectCipher {
     /// `chunks_ct` is the concatenation of the chunk ciphertexts to open; and
     /// `first_chunk_idx` is the index of the first supplied chunk, which seeds the
     /// per-chunk nonce derivation. Lets a range read decrypt only the chunks it
-    /// touches.
+    /// touches. Same `bucket`/`key` binding as [`decrypt`](Self::decrypt).
     fn decrypt_v2_chunks(
         &self,
         sk_bytes: &[u8],
         preamble: &[u8],
         chunks_ct: &[u8],
         first_chunk_idx: u64,
+        bucket: &str,
+        key: &str,
     ) -> Result<Vec<u8>, Self::Error>;
 
     /// Parse a header, returning `(chunk_size, plaintext_len)`. Callers use the

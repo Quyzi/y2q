@@ -27,7 +27,7 @@ pub fn decrypt_after_get(
     key: &str,
     bytes: BytesMut,
 ) -> Result<Bytes, AppError> {
-    match envelope::decrypt_owned(&keystore.secret_key, bytes) {
+    match envelope::decrypt_owned(&keystore.secret_key, bytes, bucket, key) {
         Ok(pt) => Ok(pt),
         Err(y2q_core::crypto::CryptoError::UnsupportedVersion(v)) => {
             Err(AppError(y2q_core::Error::UnsupportedEnvelopeVersion {
@@ -63,24 +63,30 @@ pub fn decrypt_v2_chunks(
     chunks_ct: &[u8],
     first_chunk_idx: u64,
 ) -> Result<Vec<u8>, AppError> {
-    envelope::decrypt_v2_chunks(&keystore.secret_key, preamble, chunks_ct, first_chunk_idx).map_err(
-        |e| match e {
-            y2q_core::crypto::CryptoError::UnsupportedVersion(v) => {
-                AppError(y2q_core::Error::UnsupportedEnvelopeVersion { version: v })
-            }
-            y2q_core::crypto::CryptoError::Envelope(reason) => {
-                AppError(y2q_core::Error::EnvelopeMalformed {
-                    bucket: bucket.to_owned(),
-                    key: key.to_owned(),
-                    reason: reason.to_owned(),
-                })
-            }
-            _ => AppError(y2q_core::Error::DecryptionFailed {
+    envelope::decrypt_v2_chunks(
+        &keystore.secret_key,
+        preamble,
+        chunks_ct,
+        first_chunk_idx,
+        bucket,
+        key,
+    )
+    .map_err(|e| match e {
+        y2q_core::crypto::CryptoError::UnsupportedVersion(v) => {
+            AppError(y2q_core::Error::UnsupportedEnvelopeVersion { version: v })
+        }
+        y2q_core::crypto::CryptoError::Envelope(reason) => {
+            AppError(y2q_core::Error::EnvelopeMalformed {
                 bucket: bucket.to_owned(),
                 key: key.to_owned(),
-            }),
-        },
-    )
+                reason: reason.to_owned(),
+            })
+        }
+        _ => AppError(y2q_core::Error::DecryptionFailed {
+            bucket: bucket.to_owned(),
+            key: key.to_owned(),
+        }),
+    })
 }
 
 /// Stream-encrypt a PUT payload directly to `file` using the v2 chunked
@@ -119,14 +125,15 @@ pub async fn stream_encrypt_for_put(
 ) -> Result<(StreamingSink, PlaintextMetrics, CipherMetadata), AppError> {
     use futures::StreamExt;
 
-    let mut session = envelope::EncryptSession::new(sink, public_key, write_offset, chunk_size)
-        .await
-        .map_err(|_| {
-            AppError(y2q_core::Error::EncryptionFailed {
-                bucket: bucket.to_owned(),
-                key: key.to_owned(),
-            })
-        })?;
+    let mut session =
+        envelope::EncryptSession::new(sink, public_key, bucket, key, write_offset, chunk_size)
+            .await
+            .map_err(|_| {
+                AppError(y2q_core::Error::EncryptionFailed {
+                    bucket: bucket.to_owned(),
+                    key: key.to_owned(),
+                })
+            })?;
 
     let mut hasher = StreamChecksum::new();
     let mut plaintext_size: u64 = 0;
@@ -167,16 +174,18 @@ pub async fn stream_encrypt_for_put(
     })?;
 
     let cipher_size = info.cipher_size;
-    // SHA-256 of the on-disk envelope would require a read-back; omit
-    // cipher_sha256 here (set to empty string). The plaintext checksum
-    // is a non-cryptographic gxhash64 for fast corruption detection.
+    // Both checksums are non-cryptographic XXH3-64, for corruption/divergence
+    // detection only — tamper resistance is the per-chunk AEAD tag's job, not
+    // either checksum's. The plaintext one is computed here from the stream;
+    // the ciphertext one was computed incrementally inside `EncryptSession`
+    // as each chunk was written, so no read-back was needed for either.
     let plaintext_metrics = PlaintextMetrics {
         size: plaintext_size,
         checksum_gxhash_b64: hasher.finish_b64(),
     };
     let cipher_metadata = CipherMetadata {
         cipher_size,
-        cipher_sha256_b64: String::new(),
+        cipher_checksum_b64: info.cipher_checksum_b64,
         kem_alg: info.kem_alg.to_owned(),
         aead_alg: info.aead_alg.to_owned(),
         envelope_version: info.envelope_version,

@@ -165,7 +165,7 @@ impl Y2qClient {
                         | "modified"
                         | "checksum-gxhash"
                         | "cipher-size"
-                        | "cipher-sha256"
+                        | "cipher-checksum"
                         | "kem-alg"
                         | "aead-alg"
                         | "envelope-version"
@@ -185,7 +185,7 @@ impl Y2qClient {
             checksum_gxhash: hdr(headers, "x-y2q-checksum-gxhash").unwrap_or_default(),
             labels,
             cipher_size: hdr_u64(headers, "x-y2q-cipher-size"),
-            cipher_sha256: hdr(headers, "x-y2q-cipher-sha256"),
+            cipher_checksum: hdr(headers, "x-y2q-cipher-checksum"),
             kem_alg: hdr(headers, "x-y2q-kem-alg"),
             aead_alg: hdr(headers, "x-y2q-aead-alg"),
             envelope_version: hdr_u16(headers, "x-y2q-envelope-version"),

@@ -121,7 +121,7 @@ impl UringStreamingPutGuard {
             url_path: format!("{bucket}/{key}"),
             labels: options.labels,
             cipher_size: Some(cipher_size),
-            cipher_sha256: Some(cipher_metadata.cipher_sha256_b64),
+            cipher_checksum: Some(cipher_metadata.cipher_checksum_b64),
             kem_alg: Some(cipher_metadata.kem_alg),
             aead_alg: Some(cipher_metadata.aead_alg),
             envelope_version: Some(cipher_metadata.envelope_version),

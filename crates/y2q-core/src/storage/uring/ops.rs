@@ -551,10 +551,11 @@ async fn do_put(
             crate::checksum::checksum_b64(&payload),
         ),
     };
-    let (cipher_size, cipher_sha256, kem_alg, aead_alg, envelope_version) = match cipher_metadata {
+    let (cipher_size, cipher_checksum, kem_alg, aead_alg, envelope_version) = match cipher_metadata
+    {
         Some(c) => (
             Some(c.cipher_size),
-            Some(c.cipher_sha256_b64),
+            Some(c.cipher_checksum_b64),
             Some(c.kem_alg),
             Some(c.aead_alg),
             Some(c.envelope_version),
@@ -575,7 +576,7 @@ async fn do_put(
         url_path,
         labels,
         cipher_size,
-        cipher_sha256,
+        cipher_checksum,
         kem_alg,
         aead_alg,
         envelope_version,

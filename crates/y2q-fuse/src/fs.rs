@@ -286,7 +286,7 @@ impl Filesystem for Y2qFuse {
                                     checksum_gxhash: head.checksum_gxhash.clone(),
                                     labels: head.labels.clone(),
                                     cipher_size: head.cipher_size,
-                                    cipher_sha256: head.cipher_sha256.clone(),
+                                    cipher_checksum: head.cipher_checksum.clone(),
                                     kem_alg: head.kem_alg.clone(),
                                     aead_alg: head.aead_alg.clone(),
                                     envelope_version: head.envelope_version,
@@ -351,7 +351,7 @@ impl Filesystem for Y2qFuse {
                                     checksum_gxhash: head.checksum_gxhash.clone(),
                                     labels: head.labels.clone(),
                                     cipher_size: head.cipher_size,
-                                    cipher_sha256: head.cipher_sha256.clone(),
+                                    cipher_checksum: head.cipher_checksum.clone(),
                                     kem_alg: head.kem_alg.clone(),
                                     aead_alg: head.aead_alg.clone(),
                                     envelope_version: head.envelope_version,
@@ -428,7 +428,7 @@ impl Filesystem for Y2qFuse {
                                     checksum_gxhash: head.checksum_gxhash.clone(),
                                     labels: head.labels.clone(),
                                     cipher_size: head.cipher_size,
-                                    cipher_sha256: head.cipher_sha256.clone(),
+                                    cipher_checksum: head.cipher_checksum.clone(),
                                     kem_alg: head.kem_alg.clone(),
                                     aead_alg: head.aead_alg.clone(),
                                     envelope_version: head.envelope_version,
@@ -600,7 +600,7 @@ impl Filesystem for Y2qFuse {
                                         checksum_gxhash: meta.checksum_gxhash.clone(),
                                         labels: meta.labels.clone(),
                                         cipher_size: meta.cipher_size,
-                                        cipher_sha256: meta.cipher_sha256.clone(),
+                                        cipher_checksum: meta.cipher_checksum.clone(),
                                         kem_alg: meta.kem_alg.clone(),
                                         aead_alg: meta.aead_alg.clone(),
                                         envelope_version: meta.envelope_version,
@@ -1442,7 +1442,7 @@ impl Filesystem for Y2qFuse {
                     "user.y2q.created",
                     "user.y2q.modified",
                     "user.y2q.cipher.size",
-                    "user.y2q.cipher.sha256",
+                    "user.y2q.cipher.checksum",
                     "user.y2q.kem.alg",
                     "user.y2q.aead.alg",
                     "user.y2q.envelope.version",
@@ -1492,7 +1492,7 @@ impl Filesystem for Y2qFuse {
                                 checksum_gxhash: head.checksum_gxhash,
                                 labels: head.labels.clone(),
                                 cipher_size: head.cipher_size,
-                                cipher_sha256: head.cipher_sha256,
+                                cipher_checksum: head.cipher_checksum,
                                 kem_alg: head.kem_alg,
                                 aead_alg: head.aead_alg,
                                 envelope_version: head.envelope_version,
@@ -1691,7 +1691,7 @@ impl Filesystem for Y2qFuse {
                         checksum_gxhash: head.checksum_gxhash,
                         labels: head.labels.clone(),
                         cipher_size: head.cipher_size,
-                        cipher_sha256: head.cipher_sha256,
+                        cipher_checksum: head.cipher_checksum,
                         kem_alg: head.kem_alg,
                         aead_alg: head.aead_alg,
                         envelope_version: head.envelope_version,
@@ -1788,7 +1788,7 @@ impl Filesystem for Y2qFuse {
                                     checksum_gxhash: head.checksum_gxhash,
                                     labels: head.labels,
                                     cipher_size: head.cipher_size,
-                                    cipher_sha256: head.cipher_sha256,
+                                    cipher_checksum: head.cipher_checksum,
                                     kem_alg: head.kem_alg,
                                     aead_alg: head.aead_alg,
                                     envelope_version: head.envelope_version,
@@ -1866,7 +1866,7 @@ impl Filesystem for Y2qFuse {
                                     checksum_gxhash: head.checksum_gxhash,
                                     labels: head.labels,
                                     cipher_size: head.cipher_size,
-                                    cipher_sha256: head.cipher_sha256,
+                                    cipher_checksum: head.cipher_checksum,
                                     kem_alg: head.kem_alg,
                                     aead_alg: head.aead_alg,
                                     envelope_version: head.envelope_version,
@@ -2002,8 +2002,8 @@ fn xattr_list(meta: &CachedMeta) -> Vec<u8> {
     if meta.cipher_size.is_some() {
         buf.extend_from_slice(b"user.y2q.cipher.size\0");
     }
-    if meta.cipher_sha256.is_some() {
-        buf.extend_from_slice(b"user.y2q.cipher.sha256\0");
+    if meta.cipher_checksum.is_some() {
+        buf.extend_from_slice(b"user.y2q.cipher.checksum\0");
     }
     if meta.kem_alg.is_some() {
         buf.extend_from_slice(b"user.y2q.kem.alg\0");
@@ -2031,7 +2031,10 @@ fn xattr_get(meta: &CachedMeta, name: &str) -> Option<Vec<u8>> {
         "user.y2q.created" => Some(meta.created.to_string().into_bytes()),
         "user.y2q.modified" => Some(meta.modified.to_string().into_bytes()),
         "user.y2q.cipher.size" => meta.cipher_size.map(|v| v.to_string().into_bytes()),
-        "user.y2q.cipher.sha256" => meta.cipher_sha256.as_deref().map(|v| v.as_bytes().to_vec()),
+        "user.y2q.cipher.checksum" => meta
+            .cipher_checksum
+            .as_deref()
+            .map(|v| v.as_bytes().to_vec()),
         "user.y2q.kem.alg" => meta.kem_alg.as_deref().map(|v| v.as_bytes().to_vec()),
         "user.y2q.aead.alg" => meta.aead_alg.as_deref().map(|v| v.as_bytes().to_vec()),
         "user.y2q.envelope.version" => meta.envelope_version.map(|v| v.to_string().into_bytes()),

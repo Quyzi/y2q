@@ -110,7 +110,7 @@ pub async fn stat(path: String, mode: OutputMode) -> Result<(), CliError> {
             "checksum_gxhash": head.checksum_gxhash,
             "labels": head.labels,
             "cipher_size": head.cipher_size,
-            "cipher_sha256": head.cipher_sha256,
+            "cipher_checksum": head.cipher_checksum,
             "kem_alg": head.kem_alg,
             "aead_alg": head.aead_alg,
             "envelope_version": head.envelope_version,

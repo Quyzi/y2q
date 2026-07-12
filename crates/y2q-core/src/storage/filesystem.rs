@@ -651,7 +651,7 @@ impl StreamingPutGuard {
             url_path: format!("{bucket}/{key}"),
             labels: options.labels,
             cipher_size: Some(cipher_size),
-            cipher_sha256: Some(cipher_metadata.cipher_sha256_b64),
+            cipher_checksum: Some(cipher_metadata.cipher_checksum_b64),
             kem_alg: Some(cipher_metadata.kem_alg),
             aead_alg: Some(cipher_metadata.aead_alg),
             envelope_version: Some(cipher_metadata.envelope_version),
@@ -1110,11 +1110,11 @@ impl Storage for FilesystemStorage {
                 Some(p) => (p.size, p.checksum_gxhash_b64.clone()),
                 None => (data.len() as u64, compute_checksum(data)),
             };
-            let (cipher_size, cipher_sha256, kem_alg, aead_alg, envelope_version) =
+            let (cipher_size, cipher_checksum, kem_alg, aead_alg, envelope_version) =
                 match &options.cipher_metadata {
                     Some(c) => (
                         Some(c.cipher_size),
-                        Some(c.cipher_sha256_b64.clone()),
+                        Some(c.cipher_checksum_b64.clone()),
                         Some(c.kem_alg.clone()),
                         Some(c.aead_alg.clone()),
                         Some(c.envelope_version),
@@ -1133,7 +1133,7 @@ impl Storage for FilesystemStorage {
                 url_path: format!("{bucket}/{key}"),
                 labels: options.labels,
                 cipher_size,
-                cipher_sha256,
+                cipher_checksum,
                 kem_alg,
                 aead_alg,
                 envelope_version,
@@ -2586,7 +2586,7 @@ mod tests {
     fn cipher_metadata(cipher_size: u64) -> crate::CipherMetadata {
         crate::CipherMetadata {
             cipher_size,
-            cipher_sha256_b64: "x".to_owned(),
+            cipher_checksum_b64: "x".to_owned(),
             kem_alg: "ml-kem-768".to_owned(),
             aead_alg: "aes-256-gcm".to_owned(),
             envelope_version: 1,

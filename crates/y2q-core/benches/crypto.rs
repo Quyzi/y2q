@@ -205,10 +205,16 @@ fn bench_envelope_v2_encrypt(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::from_parameter(size), &size, |b, _| {
             b.to_async(&rt).iter(|| async {
                 let (path, sink) = tempfile_sink().await;
-                let mut session =
-                    EncryptSession::new(sink, black_box(&pk_bytes), 0, DEFAULT_CHUNK_SIZE_BYTES)
-                        .await
-                        .unwrap();
+                let mut session = EncryptSession::new(
+                    sink,
+                    black_box(&pk_bytes),
+                    "bucket",
+                    "key",
+                    0,
+                    DEFAULT_CHUNK_SIZE_BYTES,
+                )
+                .await
+                .unwrap();
                 session.feed(black_box(&plaintext)).await.unwrap();
                 let (sink, info) = session.finish().await.unwrap();
                 drop(sink);
@@ -235,9 +241,16 @@ fn bench_envelope_v2_decrypt(c: &mut Criterion) {
         let plaintext = vec![0xABu8; size];
         let envelope = rt.block_on(async {
             let (path, sink) = tempfile_sink().await;
-            let mut session = EncryptSession::new(sink, &pk_bytes, 0, DEFAULT_CHUNK_SIZE_BYTES)
-                .await
-                .unwrap();
+            let mut session = EncryptSession::new(
+                sink,
+                &pk_bytes,
+                "bucket",
+                "key",
+                0,
+                DEFAULT_CHUNK_SIZE_BYTES,
+            )
+            .await
+            .unwrap();
             session.feed(&plaintext).await.unwrap();
             let (sink, _) = session.finish().await.unwrap();
             read_and_remove(&path, sink).await
@@ -245,7 +258,8 @@ fn bench_envelope_v2_decrypt(c: &mut Criterion) {
 
         group.bench_with_input(BenchmarkId::from_parameter(size), &size, |b, _| {
             b.iter(|| {
-                let pt = decrypt(black_box(&sk_bytes), black_box(&envelope)).unwrap();
+                let pt =
+                    decrypt(black_box(&sk_bytes), black_box(&envelope), "bucket", "key").unwrap();
                 black_box(pt);
             });
         });

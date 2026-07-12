@@ -122,26 +122,24 @@ pub struct Metadata {
     /// different values.
     #[serde(default, deserialize_with = "de_label_set")]
     pub labels: LabelSet,
-    /// Total bytes on disk for the encrypted envelope, when encryption is
-    /// enabled. `None` for legacy plaintext objects written before the
-    /// crypto layer was wired in.
+    /// Total bytes on disk for the encrypted envelope.
     #[serde(default)]
     pub cipher_size: Option<u64>,
-    /// Standard-base64 SHA-256 of the on-disk envelope bytes (cheap to
-    /// recompute without the secret key — useful for `rebuild_cache`
-    /// integrity scans). `None` for legacy plaintext objects.
+    /// Standard-base64 XXH3-64 checksum of the on-disk envelope bytes,
+    /// computed incrementally as it's written (no read-back needed).
+    /// Non-cryptographic — for corruption/replica-divergence detection
+    /// (`rebuild_cache` integrity scans, CRAQ backfill comparisons), not
+    /// tamper detection; the per-chunk AEAD tag is what authenticates the
+    /// envelope.
     #[serde(default)]
-    pub cipher_sha256: Option<String>,
-    /// Symbolic KEM algorithm name (e.g. `"ml-kem-768"`) when the object is
-    /// encrypted; `None` for legacy plaintext objects.
+    pub cipher_checksum: Option<String>,
+    /// Symbolic KEM algorithm name (e.g. `"ml-kem-768"`).
     #[serde(default)]
     pub kem_alg: Option<String>,
-    /// Symbolic AEAD algorithm name (e.g. `"aes-256-gcm"`) when the object is
-    /// encrypted; `None` for legacy plaintext objects.
+    /// Symbolic AEAD algorithm name (e.g. `"aes-256-gcm"`).
     #[serde(default)]
     pub aead_alg: Option<String>,
-    /// Envelope format version when the object is encrypted; `None` for
-    /// legacy plaintext objects.
+    /// Envelope format version.
     #[serde(default)]
     pub envelope_version: Option<u16>,
     /// CRAQ object version: a per-object monotonic counter assigned by the
@@ -200,7 +198,7 @@ pub struct PutOptions {
     pub plaintext_metrics: Option<PlaintextMetrics>,
     /// When the daemon performs encryption ahead of the backend, the
     /// ciphertext-side fields the backend should attach to the metadata
-    /// sidecar (cipher_size, kem/aead alg, envelope_version, cipher_sha256).
+    /// sidecar (cipher_size, kem/aead alg, envelope_version, cipher_checksum).
     pub cipher_metadata: Option<CipherMetadata>,
     /// CRAQ object version to stamp into [`Metadata::version`]. Set by the chain
     /// HEAD (and carried verbatim to replicas) so every copy of a version agrees.
@@ -230,8 +228,9 @@ pub struct PlaintextMetrics {
 pub struct CipherMetadata {
     /// Total on-disk envelope size in bytes.
     pub cipher_size: u64,
-    /// SHA-256 of the on-disk envelope, standard base64 (44 chars).
-    pub cipher_sha256_b64: String,
+    /// XXH3-64 checksum of the on-disk envelope, standard base64 (12 chars).
+    /// Non-cryptographic — see [`crate::crypto::envelope::EnvelopeInfo::cipher_checksum_b64`].
+    pub cipher_checksum_b64: String,
     /// Symbolic KEM algorithm name, e.g. `"ml-kem-768"`.
     pub kem_alg: String,
     /// Symbolic AEAD algorithm name, e.g. `"aes-256-gcm"`.

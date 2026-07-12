@@ -339,7 +339,7 @@ Metadata only - no body.
 | `X-Y2Q-Modified` | yes | Nanoseconds since Unix epoch when last overwritten |
 | `X-Y2Q-Checksum-GxHash` | yes | 8-byte gxhash64 digest of the plaintext, standard base64 (12 chars). Non-cryptographic; for accidental-corruption detection, not tamper detection |
 | `X-Y2Q-Cipher-Size` | yes | On-disk envelope size in bytes |
-| `X-Y2Q-Cipher-SHA256` | yes | SHA-256 of the envelope, base64 |
+| `X-Y2Q-Cipher-Checksum` | yes | 8-byte XXH3-64 checksum of the on-disk envelope, base64 (12 chars). Non-cryptographic, same as `X-Y2Q-Checksum-GxHash` above - for corruption/replica-divergence detection, not tamper detection (the per-chunk AEAD tag is what authenticates the envelope) |
 | `X-Y2Q-Kem-Alg` | yes | `ml-kem-768` |
 | `X-Y2Q-Aead-Alg` | yes | `aes-256-gcm` |
 | `X-Y2Q-Envelope-Version` | yes | `2` (chunked; the only supported format) |
@@ -456,7 +456,7 @@ List objects in a bucket, paginated.
       "url_path":         "photos/2024/05/cat.jpg",
       "labels":           [["owner", "alice"], ["album", "vacation"]],
       "cipher_size":      13477,
-      "cipher_sha256":    "<b64>",
+      "cipher_checksum":  "<b64>",
       "kem_alg":          "ml-kem-768",
       "aead_alg":         "aes-256-gcm",
       "envelope_version": 2
