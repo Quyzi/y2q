@@ -57,26 +57,9 @@ AES-256-GCM is implemented via the pure-Rust [aes-gcm](https://github.com/RustCr
 
 ### Envelope format
 
-There are two on-disk envelope formats, distinguished by their magic bytes. **v2 (chunked) is the default** for new writes; v1 (whole-object) is still readable for objects written by older builds. Both wrap one ML-KEM-768 ciphertext and AES-256-GCM ciphertext behind a fixed header that doubles as additional authenticated data (AAD), so tampering with any header field invalidates the tag.
+There is a single on-disk envelope format (v2, chunked), identified by its magic bytes. It wraps one ML-KEM-768 ciphertext and a sequence of AES-256-GCM-sealed chunks behind a fixed header that doubles as additional authenticated data (AAD), so tampering with any header field invalidates the tag. An envelope with an unrecognized magic - including the retired v1 whole-object format used by builds before chunked streaming existed - is rejected outright; there is no unauthenticated passthrough for unrecognized or legacy data.
 
-#### v1 - whole-object (legacy)
-
-```mermaid
-%%{init: {"packet": {"showBits": false}}}%%
-packet-beta
-0-3: "magic b'Y2Q1' (4 B)"
-4-5: "format_ver (2 B)"
-6-6: "kem_alg (1)"
-7-7: "aead_alg (1)"
-8-19: "nonce - 12 B random"
-20-27: "plaintext_len (8 B, BE)"
-28-1115: "kem_ct - ML-KEM-768 ciphertext (1088 B)"
-1116-1131: "aead_ct - ciphertext || GCM tag (N+16 B)"
-```
-
-Fixed overhead is 1132 bytes (28 header + 1088 KEM + 16 tag). The whole object is one AEAD frame, so v1 cannot serve a partial decrypt - `Range` on a v1 object returns 501.
-
-#### v2 - chunked (default)
+#### v2 - chunked
 
 ```mermaid
 %%{init: {"packet": {"showBits": false}}}%%

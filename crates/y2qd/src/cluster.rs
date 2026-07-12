@@ -1028,6 +1028,8 @@ async fn head_write_inner(
         .begin_streaming_put(bucket, key)
         .await
         .map_err(AppError::from)?;
+    // Cluster-mode max-body/quota enforcement is not yet wired up (single-node
+    // covers it); `None` preserves today's uncapped cluster-write behavior.
     let (sink, pm, cm) = cipher::stream_encrypt_for_put(
         &rt.public_key,
         payload,
@@ -1036,6 +1038,7 @@ async fn head_write_inner(
         key,
         write_offset,
         chunk_size,
+        None,
     )
     .await?;
 

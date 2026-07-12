@@ -75,7 +75,7 @@ Rules:
 
 - Daemon entry: `crates/y2qd/src/main.rs`
 - Config: `figment` (TOML + `Y2QD_*` env vars + `--set` flags); reference: `config.default.toml`
-- Crypto: `pqcrypto` for ML-KEM-768; `ring` for AES-256-GCM
+- Crypto: `pqcrypto` for ML-KEM-768; `aes-gcm` (RustCrypto) for AES-256-GCM
 - Storage: `FilesystemStorage` (default) or `UringStorage` (Linux only, always compiled in)
 - Errors: `thiserror` typed enums — no `anyhow` or `Box<dyn Error>`
 - Observability: `tracing` spans/events, Prometheus via `metrics` crate, optional Pyroscope profiling

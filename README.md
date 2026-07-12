@@ -21,7 +21,7 @@ Post-quantum secure object storage. `y2qd` is a REST daemon that encrypts every 
 
 ## Documentation
 
-- [docs/architecture.md](docs/architecture.md) - system design, encryption envelope (v1 + v2 chunked), storage backends, metadata index, sessions, authorization
+- [docs/architecture.md](docs/architecture.md) - system design, encryption envelope (v2 chunked), storage backends, metadata index, sessions, authorization
 - [docs/configuration.md](docs/configuration.md) - full config reference: every field, default, TLS, and override syntax
 - [docs/operations.md](docs/operations.md) - first run, user/role/ACL management, TLS, clustering, backup/recovery, runbook
 - [docs/api.md](docs/api.md) - complete HTTP API reference: routes, authorization model, schemas, error codes, examples
@@ -30,8 +30,8 @@ Post-quantum secure object storage. `y2qd` is a REST daemon that encrypts every 
 
 ## Features
 
-- **Post-quantum encryption at rest** - each object is encapsulated against an ML-KEM-768 public key; content is encrypted with AES-256-GCM via [ring](https://github.com/briansmith/ring) (5-7x faster than the pure-Rust aes-gcm crate)
-- **Streaming chunked envelope (v2)** - objects are encrypted in configurable plaintext chunks (default 4 MiB), so multi-GiB PUTs stream without buffering and `Range` GETs decrypt only the covering chunks
+- **Post-quantum encryption at rest** - each object is encapsulated against an ML-KEM-768 public key; content is encrypted with AES-256-GCM via the pure-Rust [aes-gcm](https://github.com/RustCrypto/AEADs) crate (hardware AES-NI/NEON accelerated where available, portable to any architecture Rust supports). There is no unauthenticated passthrough - unrecognized or legacy data is rejected outright
+- **Streaming chunked envelope** - objects are encrypted in configurable plaintext chunks (default 4 MiB), so multi-GiB PUTs stream without buffering and `Range` GETs decrypt only the covering chunks
 - **Post-quantum TLS (optional)** - native rustls listener offering the X25519MLKEM768 hybrid key exchange; `require_pq_kex` can refuse any client that won't negotiate it; optional mutual TLS via a client CA bundle
 - **Argon2id-protected secret key** - the ML-KEM private key is never stored in plaintext; it is wrapped under each user's password and only held in memory during an active session
 - **Token-based session auth** - Bearer tokens with configurable TTL, per-account lockout after repeated failures
@@ -411,7 +411,8 @@ Unmount with Ctrl+C, SIGTERM, or manually: `fusermount3 -u /mnt/y2q` on Linux, `
 | `--config <PATH>` | Config file path (default: platform config dir) |
 | `--bucket <BUCKET>` | Mount a single bucket as the filesystem root; default is all buckets |
 | `--read-only` | Disable all write operations |
-| `--allow-other` | Allow other users to access the mount; requires `user_allow_other` in `/etc/fuse.conf` |
+| `--allow-other` | Allow other users to access the mount; requires `user_allow_other` in `/etc/fuse.conf`. Without `--allow-other-gid`, every local user gets read access to every file (mode `0644`/`0755`), not just the intended one |
+| `--allow-other-gid <GID>` | Used with `--allow-other`: restrict the extra access it grants to group `GID` (mode `0640`/`0750`, group-owned by `GID`) instead of every local user |
 
 `y2q-fuse` logs to stderr via `RUST_LOG`, defaulting to `warn` when unset. See [docs/configuration.md#logging](docs/configuration.md#logging).
 

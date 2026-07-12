@@ -19,3 +19,6 @@ zeroize     = { workspace = true }
 y2q-client  = { path = "../y2q-client" }
 y2q-config  = { path = "../y2q-config" }
 fuser       = "0.17"
+
+[dev-dependencies]
+rustls = { workspace = true }

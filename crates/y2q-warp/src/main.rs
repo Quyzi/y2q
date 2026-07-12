@@ -293,6 +293,19 @@ async fn bench(
     Ok(())
 }
 
+/// A password on the command line is visible to any local user via `ps`/
+/// `/proc/<pid>/cmdline`, and typically persists in shell history — prefer
+/// the `Y2QWARP_PASSWORD` environment variable. `--password` and the env var
+/// share one clap field, so this can't distinguish which supplied the value
+/// and over-warns for legitimate env-var use; an acceptable tradeoff for a
+/// low-priority nudge.
+fn warn_password_on_cli_flag() {
+    tracing::warn!(
+        "a password was supplied via --password or Y2QWARP_PASSWORD; on the command line it \
+         is visible to other local users (via `ps`/`/proc`) and may be saved in shell history."
+    );
+}
+
 /// Initialise a Y2qClient for the given alias.
 /// Returns: (alias entry, authed client, token expiry secs, token string)
 async fn init_client(
@@ -316,6 +329,10 @@ async fn init_client(
     let profile = cfg.get_alias(alias)?.clone();
 
     let tls_opts = build_tls_options(&profile, tls.insecure, tls.ca_cert.as_deref())?;
+
+    if password.is_some() {
+        warn_password_on_cli_flag();
+    }
 
     // Build an unauthenticated client solely for the login call if needed.
     let base_client = y2q_client::Y2qClient::new(y2q_client::ClientConfig {
@@ -365,6 +382,9 @@ async fn init_nodes(
     let cfg = y2q_config::CliConfig::load(&cfg_path)?;
     let profile = cfg.get_alias(alias)?.clone();
     let tls_opts = build_tls_options(&profile, tls.insecure, tls.ca_cert.as_deref())?;
+    if password.is_some() {
+        warn_password_on_cli_flag();
+    }
     let effective_pw = password.or(profile.password.as_deref());
 
     let mut nodes = Vec::with_capacity(1 + extra_urls.len());

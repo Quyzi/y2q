@@ -41,8 +41,17 @@ struct Args {
 
     /// Allow other users to access the mount point.
     /// Requires `user_allow_other` in /etc/fuse.conf.
+    ///
+    /// Without --allow-other-gid, every local user gets read access to every
+    /// file (mode 0644/0755) — not just the intended one.
     #[arg(long)]
     allow_other: bool,
+
+    /// Used with --allow-other: restrict the extra access it grants to this
+    /// group (mode 0640/0750, group-owned by GID) instead of every local
+    /// user (0644/0755).
+    #[arg(long, value_name = "GID", requires = "allow_other")]
+    allow_other_gid: Option<u32>,
 
     /// Directory to mount the filesystem at.
     mountpoint: PathBuf,
@@ -57,6 +66,11 @@ fn main() -> Result<(), FuseError> {
         .init();
 
     let args = Args::parse();
+
+    // Best-effort: remove any write-buffer tempfiles orphaned by a prior
+    // SIGKILL/crash (normal exit cleans these up via Drop, which a hard kill
+    // skips). Never blocks or fails startup.
+    fs::sweep_orphaned_tempfiles();
 
     // Multi-threaded runtime kept alive for the duration of the mount.
     // The FUSE event loop runs in a background thread (via Session::spawn) and
@@ -76,7 +90,15 @@ fn main() -> Result<(), FuseError> {
     let uid = unsafe { libc::getuid() };
     let gid = unsafe { libc::getgid() };
 
-    let fs = Y2qFuse::new(client, handle.clone(), args.read_only, mode, uid, gid);
+    let fs = Y2qFuse::new(
+        client,
+        handle.clone(),
+        args.read_only,
+        mode,
+        uid,
+        gid,
+        args.allow_other_gid,
+    );
 
     let mut mount_options = vec![
         MountOption::FSName("y2q".into()),

@@ -16,9 +16,7 @@ use y2q_core::{CipherMetadata, PlaintextMetrics, StreamChecksum};
 
 use crate::error::AppError;
 
-/// Decrypt a GET body. If `bytes` is not a recognized y2q envelope (i.e.
-/// a legacy plaintext object written before encryption was wired in), return
-/// it as-is.
+/// Decrypt a GET body.
 ///
 /// Takes an owned [`BytesMut`] so the AEAD open can run in-place on the
 /// input allocation, avoiding a full ciphertext-sized copy that the older
@@ -29,9 +27,6 @@ pub fn decrypt_after_get(
     key: &str,
     bytes: BytesMut,
 ) -> Result<Bytes, AppError> {
-    if !envelope::looks_encrypted(&bytes) {
-        return Ok(bytes.freeze());
-    }
     match envelope::decrypt_owned(&keystore.secret_key, bytes) {
         Ok(pt) => Ok(pt),
         Err(y2q_core::crypto::CryptoError::UnsupportedVersion(v)) => {
@@ -88,13 +83,6 @@ pub fn decrypt_v2_chunks(
     )
 }
 
-/// True if the bytes on disk are a y2q envelope. Used by GET to decide
-/// whether a `Range` request can be answered (it cannot for encrypted
-/// objects — whole-object AEAD).
-pub fn is_encrypted_envelope(bytes: &[u8]) -> bool {
-    envelope::looks_encrypted(bytes)
-}
-
 /// Stream-encrypt a PUT payload directly to `file` using the v2 chunked
 /// envelope format, computing plaintext checksums along the way.
 ///
@@ -112,6 +100,13 @@ pub fn is_encrypted_envelope(bytes: &[u8]) -> bool {
 /// Only the deployment **public** key is needed (ML-KEM encapsulation), so this
 /// works both on the client PUT path (from the logged-in keystore) and on the
 /// cluster HEAD path (from the provisioned public keystore, no login).
+///
+/// `max_bytes`, when set, aborts the stream as soon as the running plaintext
+/// byte count exceeds it — enforced here (not just via a `Content-Length`
+/// pre-check) because chunked transfer encoding carries no `Content-Length`
+/// at all, and a pre-check alone would let such a request bypass any size
+/// cap entirely.
+#[allow(clippy::too_many_arguments)]
 pub async fn stream_encrypt_for_put(
     public_key: &[u8],
     mut stream: actix_web::web::Payload,
@@ -120,6 +115,7 @@ pub async fn stream_encrypt_for_put(
     key: &str,
     write_offset: u64,
     chunk_size: usize,
+    max_bytes: Option<u64>,
 ) -> Result<(StreamingSink, PlaintextMetrics, CipherMetadata), AppError> {
     use futures::StreamExt;
 
@@ -146,6 +142,15 @@ pub async fn stream_encrypt_for_put(
         })?;
         hasher.update(&chunk);
         plaintext_size += chunk.len() as u64;
+        if let Some(limit) = max_bytes
+            && plaintext_size > limit
+        {
+            return Err(AppError(y2q_core::Error::BodyTooLarge {
+                bucket: bucket.to_owned(),
+                key: key.to_owned(),
+                limit,
+            }));
+        }
         session.feed(&chunk).await.map_err(|_| {
             AppError(y2q_core::Error::EncryptionFailed {
                 bucket: bucket.to_owned(),
@@ -178,4 +183,90 @@ pub async fn stream_encrypt_for_put(
     };
 
     Ok((sink, plaintext_metrics, cipher_metadata))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use actix_web::{App, HttpResponse, test, web};
+    use pqcrypto::kem::mlkem768;
+    use pqcrypto_traits::kem::PublicKey as _;
+
+    async fn tempfile_sink() -> StreamingSink {
+        let path = std::env::temp_dir().join(format!(
+            "y2qd_cipher_test_{}.env",
+            std::process::id() as u64 * 1_000_003 + rand_u64()
+        ));
+        let file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .read(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .await
+            .unwrap();
+        StreamingSink::Tokio(file)
+    }
+
+    fn rand_u64() -> u64 {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos() as u64
+    }
+
+    /// Handler under test: a thin actix wrapper so `web::Payload` (which has
+    /// no public constructor outside the extractor machinery) can be driven
+    /// through real actix request handling.
+    async fn put_probe(
+        payload: web::Payload,
+        pk: web::Data<Vec<u8>>,
+    ) -> Result<HttpResponse, AppError> {
+        let sink = tempfile_sink().await;
+        let (_, _, _) = stream_encrypt_for_put(
+            &pk,
+            payload,
+            sink,
+            "bucket",
+            "key",
+            0,
+            y2q_core::crypto::envelope::DEFAULT_CHUNK_SIZE_BYTES,
+            Some(16),
+        )
+        .await?;
+        Ok(HttpResponse::Ok().finish())
+    }
+
+    #[actix_web::test]
+    async fn mid_stream_cap_rejects_oversized_body_with_no_content_length_reliance() {
+        let (pk, _sk) = mlkem768::keypair();
+        let pk_bytes = pk.as_bytes().to_vec();
+
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(pk_bytes))
+                .route("/put", web::post().to(put_probe)),
+        )
+        .await;
+
+        // Within the 16-byte cap: succeeds.
+        let req = test::TestRequest::post()
+            .uri("/put")
+            .set_payload(vec![0u8; 10])
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 200);
+
+        // Past the cap: the mid-stream check must reject it with 413, purely
+        // from the running byte count `stream_encrypt_for_put` tracks as it
+        // consumes the body — not from any `Content-Length` pre-check (there
+        // is none in this handler at all).
+        let req = test::TestRequest::post()
+            .uri("/put")
+            .set_payload(vec![0u8; 1024])
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 413);
+    }
 }

@@ -1,33 +1,15 @@
-//! AEAD envelope formats.
+//! AEAD envelope format (v2, chunked).
 //!
-//! **v1** (whole-object): Each PUT runs a fresh ML-KEM-768 encapsulation,
-//! derives an AES-256-GCM key via HKDF-SHA256, and encrypts the entire
-//! plaintext as a single AEAD ciphertext. Simple but requires buffering the
-//! whole object in memory — not suitable for multi-GiB uploads.
+//! Each PUT runs a fresh ML-KEM-768 encapsulation (once per object) and
+//! derives an AES-256-GCM key via HKDF-SHA256. The plaintext is split into
+//! fixed-size chunks (default 4 MiB, configurable per write and recorded in
+//! the header) each encrypted with an independently derived nonce
+//! (`nonce_base XOR chunk_idx`). Supports streaming writes: receive a chunk,
+//! encrypt it, write it to disk, repeat. Because every chunk but the last is
+//! full-size, plaintext offsets map deterministically to ciphertext offsets,
+//! enabling ranged decryption.
 //!
-//! **v2** (chunked): Same KEM encapsulation (once per object) and key
-//! derivation, but the plaintext is split into fixed-size chunks (default 4 MiB,
-//! configurable per write and recorded in the header) each encrypted with an
-//! independently derived nonce (`nonce_base XOR chunk_idx`). Supports streaming
-//! writes: receive a chunk, encrypt it, write it to disk, repeat. Because every
-//! chunk but the last is full-size, plaintext offsets map deterministically to
-//! ciphertext offsets, enabling ranged decryption.
-//!
-//! ## v1 on-disk layout
-//! ```text
-//! magic         [u8; 4]    = b"Y2Q1"
-//! format_ver    u16 BE     = 1
-//! kem_alg       u8         = 1 (ML-KEM-768)
-//! aead_alg      u8         = 1 (AES-256-GCM)
-//! nonce         [u8; 12]
-//! plaintext_len u64 BE
-//! kem_ct        [u8; 1088]
-//! aead_ct       [u8; N + 16]   // ciphertext || GCM tag
-//! ```
-//! Total fixed overhead = 28 (header) + 1088 (KEM CT) + 16 (tag) = 1132 bytes.
-//! AAD = 28-byte fixed header.
-//!
-//! ## v2 on-disk layout
+//! ## on-disk layout
 //! ```text
 //! magic         [u8; 4]    = b"Y2Q2"
 //! format_ver    u16 BE     = 2
@@ -41,7 +23,11 @@
 //! ```
 //! Fixed header = 32 bytes.  Preamble (header + KEM CT) = 1120 bytes.
 //! Chunk nonce_i = nonce_base XOR (i as u64 BE in bytes [4..12]).
-//! AAD for each chunk = the 32-byte v2 fixed header.
+//! AAD for each chunk = the 32-byte fixed header.
+//!
+//! Envelopes without the recognized magic (including the retired v1
+//! whole-object format) are rejected outright — there is no unauthenticated
+//! passthrough for unrecognized or legacy data.
 
 use aes_gcm::{Aes256Gcm, KeyInit, aead::AeadInOut};
 
@@ -58,16 +44,6 @@ use sha2::Sha256;
 use zeroize::Zeroize;
 
 use super::CryptoError;
-
-// ── v1 constants ─────────────────────────────────────────────────────────────
-
-/// Header bytes preceding the KEM ciphertext in a v1 envelope.
-///
-/// Layout: 4 magic + 2 version + 1 kem_alg + 1 aead_alg + 12 nonce + 8 plaintext_len.
-pub const ENVELOPE_HEADER_FIXED_LEN: usize = 4 + 2 + 1 + 1 + 12 + 8;
-
-const MAGIC_V1: &[u8; 4] = b"Y2Q1";
-const FORMAT_VER_V1: u16 = 1;
 
 // ── v2 constants ─────────────────────────────────────────────────────────────
 
@@ -95,10 +71,6 @@ pub const V2_PLAINTEXT_LEN_OFFSET: u64 = 20;
 const KEM_ALG_MLKEM768: u8 = 1;
 /// `aead_alg = 1` is reserved for AES-256-GCM with a 12-byte nonce and 16-byte tag.
 const AEAD_ALG_AES256GCM: u8 = 1;
-
-// Shared MAGIC / FORMAT_VER kept for backward-compat with existing call sites.
-const MAGIC: &[u8; 4] = MAGIC_V1;
-const FORMAT_VER: u16 = FORMAT_VER_V1;
 
 /// HKDF info string. Bumped if the KDF derivation changes.
 const HKDF_INFO: &[u8] = b"y2q/v1/content-key";
@@ -149,103 +121,29 @@ pub struct EnvelopeInfo {
     pub cipher_size: u64,
 }
 
-/// Encrypt `plaintext` under `pk` with a fresh per-call KEM encapsulation.
-///
-/// Returns the on-disk envelope bytes plus an [`EnvelopeInfo`] describing the
-/// ciphertext for metadata-sidecar use.
-pub fn encrypt(pk_bytes: &[u8], plaintext: &[u8]) -> Result<(Vec<u8>, EnvelopeInfo), CryptoError> {
-    let pk = mlkem768::PublicKey::from_bytes(pk_bytes)
-        .map_err(|_| CryptoError::KemDecode("public key"))?;
-
-    let (ss, kem_ct) = mlkem768::encapsulate(&pk);
-    let kem_ct_bytes = kem_ct.as_bytes();
-
-    let mut nonce_bytes = [0u8; 12];
-    rand::rng().fill_bytes(&mut nonce_bytes);
-
-    let header = build_header(&nonce_bytes, plaintext.len() as u64);
-
-    let mut key_bytes = derive_content_key(ss.as_bytes(), kem_ct_bytes)?;
-    let cipher = aes_key(&key_bytes);
-    key_bytes.zeroize();
-
-    // Encrypt plaintext into a buffer; aes-gcm appends the 16-byte GCM tag
-    // in-place, avoiding a separate ciphertext allocation.
-    let mut ct_buf: Vec<u8> = plaintext.to_vec();
-    cipher
-        .encrypt_in_place(&aes_nonce(&nonce_bytes), &header[..], &mut ct_buf)
-        .map_err(|_| CryptoError::Aead("encrypt"))?;
-
-    let mut out = Vec::with_capacity(ENVELOPE_HEADER_FIXED_LEN + kem_ct_bytes.len() + ct_buf.len());
-    out.extend_from_slice(&header);
-    out.extend_from_slice(kem_ct_bytes);
-    out.extend_from_slice(&ct_buf);
-
-    let info = EnvelopeInfo {
-        envelope_version: FORMAT_VER,
-        kem_alg: KEM_ALG_NAME,
-        aead_alg: AEAD_ALG_NAME,
-        cipher_size: out.len() as u64,
-    };
-    Ok((out, info))
-}
-
 /// Decrypt a complete envelope under `sk`.
 ///
-/// Dispatches to v1 (whole-object) or v2 (chunked) decryption based on the
-/// magic bytes. Returns the recovered plaintext on success.
+/// Returns the recovered plaintext on success, or an error if the magic bytes
+/// are unrecognized (including any pre-v2 or otherwise legacy data — there is
+/// no unauthenticated passthrough).
 pub fn decrypt(sk_bytes: &[u8], envelope: &[u8]) -> Result<Vec<u8>, CryptoError> {
     if envelope.len() < 4 {
         return Err(CryptoError::Envelope("truncated header"));
     }
     match &envelope[..4] {
-        m if m == MAGIC_V1 => decrypt_v1(sk_bytes, envelope),
         m if m == MAGIC_V2 => decrypt_v2(sk_bytes, envelope),
         _ => Err(CryptoError::Envelope("bad magic")),
     }
-}
-
-fn decrypt_v1(sk_bytes: &[u8], envelope: &[u8]) -> Result<Vec<u8>, CryptoError> {
-    let header = parse_and_validate_v1_header(envelope)?;
-    let kem_ct_start = ENVELOPE_HEADER_FIXED_LEN;
-    let kem_ct_end = kem_ct_start + mlkem768::ciphertext_bytes();
-    if envelope.len() < kem_ct_end + TAG_LEN {
-        return Err(CryptoError::Envelope("truncated envelope"));
-    }
-    let kem_ct_bytes = &envelope[kem_ct_start..kem_ct_end];
-    let aead_ct = &envelope[kem_ct_end..];
-
-    let sk = mlkem768::SecretKey::from_bytes(sk_bytes)
-        .map_err(|_| CryptoError::KemDecode("secret key"))?;
-    let kem_ct = mlkem768::Ciphertext::from_bytes(kem_ct_bytes)
-        .map_err(|_| CryptoError::KemDecode("kem ciphertext"))?;
-    let ss = mlkem768::decapsulate(&kem_ct, &sk);
-
-    let mut key_bytes = derive_content_key(ss.as_bytes(), kem_ct_bytes)?;
-    let cipher = aes_key(&key_bytes);
-    key_bytes.zeroize();
-
-    // Decrypt in-place: verifies the tag and truncates the buffer to plaintext,
-    // avoiding a second Vec allocation.
-    let mut ct_buf = aead_ct.to_vec();
-    cipher
-        .decrypt_in_place(
-            &aes_nonce(&header.nonce),
-            &envelope[..ENVELOPE_HEADER_FIXED_LEN],
-            &mut ct_buf,
-        )
-        .map_err(|_| CryptoError::AuthFailed)?;
-
-    if ct_buf.len() as u64 != header.plaintext_len {
-        return Err(CryptoError::Envelope("plaintext length mismatch"));
-    }
-    Ok(ct_buf)
 }
 
 fn decrypt_v2(sk_bytes: &[u8], envelope: &[u8]) -> Result<Vec<u8>, CryptoError> {
     let preamble_len = ENVELOPE_V2_HEADER_FIXED_LEN + mlkem768::ciphertext_bytes();
     if envelope.len() < preamble_len {
         return Err(CryptoError::Envelope("truncated v2 envelope"));
+    }
+    let ver = u16::from_be_bytes([envelope[4], envelope[5]]);
+    if ver != FORMAT_VER_V2 {
+        return Err(CryptoError::UnsupportedVersion(ver));
     }
     if envelope[6] != KEM_ALG_MLKEM768 {
         return Err(CryptoError::Envelope("unknown kem_alg"));
@@ -305,63 +203,28 @@ fn decrypt_v2(sk_bytes: &[u8], envelope: &[u8]) -> Result<Vec<u8>, CryptoError> 
 
 /// Decrypt a complete envelope, consuming an owned `BytesMut` buffer.
 ///
-/// Identical semantics to [`decrypt`], but lets v1/v2 reuse the input
-/// allocation for the in-place AEAD open instead of allocating a fresh
-/// ciphertext buffer per call. Returns the recovered plaintext as `Bytes`
-/// (zero-copy of the freed underlying allocation).
+/// Identical semantics to [`decrypt`], but reuses the input allocation for
+/// the in-place AEAD open instead of allocating a fresh ciphertext buffer per
+/// call. Returns the recovered plaintext as `Bytes` (zero-copy of the freed
+/// underlying allocation).
 pub fn decrypt_owned(sk_bytes: &[u8], envelope: BytesMut) -> Result<Bytes, CryptoError> {
     if envelope.len() < 4 {
         return Err(CryptoError::Envelope("truncated header"));
     }
     match &envelope[..4] {
-        m if m == MAGIC_V1 => decrypt_v1_owned(sk_bytes, envelope),
         m if m == MAGIC_V2 => decrypt_v2_owned(sk_bytes, envelope),
         _ => Err(CryptoError::Envelope("bad magic")),
     }
-}
-
-fn decrypt_v1_owned(sk_bytes: &[u8], mut envelope: BytesMut) -> Result<Bytes, CryptoError> {
-    let header = parse_and_validate_v1_header(&envelope)?;
-    let kem_ct_start = ENVELOPE_HEADER_FIXED_LEN;
-    let kem_ct_end = kem_ct_start + mlkem768::ciphertext_bytes();
-    if envelope.len() < kem_ct_end + TAG_LEN {
-        return Err(CryptoError::Envelope("truncated envelope"));
-    }
-    // Small fixed-size AAD snapshot — released before we split the body off.
-    let mut aad_bytes = [0u8; ENVELOPE_HEADER_FIXED_LEN];
-    aad_bytes.copy_from_slice(&envelope[..ENVELOPE_HEADER_FIXED_LEN]);
-    // ML-KEM ciphertext is small (1088 bytes); cheap to clone out so we can
-    // free the prefix and decrypt the (potentially huge) aead_ct in place.
-    let kem_ct_owned: Vec<u8> = envelope[kem_ct_start..kem_ct_end].to_vec();
-
-    let sk = mlkem768::SecretKey::from_bytes(sk_bytes)
-        .map_err(|_| CryptoError::KemDecode("secret key"))?;
-    let kem_ct = mlkem768::Ciphertext::from_bytes(&kem_ct_owned)
-        .map_err(|_| CryptoError::KemDecode("kem ciphertext"))?;
-    let ss = mlkem768::decapsulate(&kem_ct, &sk);
-
-    let mut key_bytes = derive_content_key(ss.as_bytes(), &kem_ct_owned)?;
-    let cipher = aes_key(&key_bytes);
-    key_bytes.zeroize();
-
-    // O(1) split: `body` owns the aead_ct region of the original allocation.
-    let body = envelope.split_off(kem_ct_end);
-    drop(envelope);
-    let mut body_vec: Vec<u8> = body.into();
-    cipher
-        .decrypt_in_place(&aes_nonce(&header.nonce), &aad_bytes[..], &mut body_vec)
-        .map_err(|_| CryptoError::AuthFailed)?;
-
-    if body_vec.len() as u64 != header.plaintext_len {
-        return Err(CryptoError::Envelope("plaintext length mismatch"));
-    }
-    Ok(Bytes::from(body_vec))
 }
 
 fn decrypt_v2_owned(sk_bytes: &[u8], mut envelope: BytesMut) -> Result<Bytes, CryptoError> {
     let preamble_len = ENVELOPE_V2_HEADER_FIXED_LEN + mlkem768::ciphertext_bytes();
     if envelope.len() < preamble_len {
         return Err(CryptoError::Envelope("truncated v2 envelope"));
+    }
+    let ver = u16::from_be_bytes([envelope[4], envelope[5]]);
+    if ver != FORMAT_VER_V2 {
+        return Err(CryptoError::UnsupportedVersion(ver));
     }
     if envelope[6] != KEM_ALG_MLKEM768 {
         return Err(CryptoError::Envelope("unknown kem_alg"));
@@ -735,67 +598,6 @@ fn aes_nonce(bytes: &[u8; 12]) -> Nonce {
     Nonce::from(*bytes)
 }
 
-/// Sniff the magic+version prefix to decide whether `bytes` is an encrypted
-/// y2q envelope (v1 or v2). Used by GET to fall through to plaintext for
-/// legacy objects written before encryption was enabled.
-pub fn looks_encrypted(bytes: &[u8]) -> bool {
-    if bytes.len() < 4 {
-        return false;
-    }
-    match &bytes[..4] {
-        m if m == MAGIC_V1 => {
-            bytes.len() >= ENVELOPE_HEADER_FIXED_LEN + mlkem768::ciphertext_bytes() + TAG_LEN
-        }
-        m if m == MAGIC_V2 => {
-            bytes.len() >= ENVELOPE_V2_HEADER_FIXED_LEN + mlkem768::ciphertext_bytes()
-        }
-        _ => false,
-    }
-}
-
-/// Parsed view of the 28-byte v1 fixed header.
-struct V1Header {
-    nonce: [u8; 12],
-    plaintext_len: u64,
-}
-
-fn build_header(nonce: &[u8; 12], plaintext_len: u64) -> Vec<u8> {
-    let mut h = Vec::with_capacity(ENVELOPE_HEADER_FIXED_LEN);
-    h.extend_from_slice(MAGIC);
-    h.extend_from_slice(&FORMAT_VER.to_be_bytes());
-    h.push(KEM_ALG_MLKEM768);
-    h.push(AEAD_ALG_AES256GCM);
-    h.extend_from_slice(nonce);
-    h.extend_from_slice(&plaintext_len.to_be_bytes());
-    h
-}
-
-fn parse_and_validate_v1_header(env: &[u8]) -> Result<V1Header, CryptoError> {
-    if env.len() < ENVELOPE_HEADER_FIXED_LEN {
-        return Err(CryptoError::Envelope("truncated header"));
-    }
-    if &env[0..4] != MAGIC_V1 {
-        return Err(CryptoError::Envelope("bad magic"));
-    }
-    let ver = u16::from_be_bytes([env[4], env[5]]);
-    if ver != FORMAT_VER_V1 {
-        return Err(CryptoError::UnsupportedVersion(ver));
-    }
-    if env[6] != KEM_ALG_MLKEM768 {
-        return Err(CryptoError::Envelope("unknown kem_alg"));
-    }
-    if env[7] != AEAD_ALG_AES256GCM {
-        return Err(CryptoError::Envelope("unknown aead_alg"));
-    }
-    let mut nonce = [0u8; 12];
-    nonce.copy_from_slice(&env[8..20]);
-    let plaintext_len = u64::from_be_bytes(env[20..28].try_into().unwrap());
-    Ok(V1Header {
-        nonce,
-        plaintext_len,
-    })
-}
-
 fn derive_content_key(ss: &[u8], kem_ct: &[u8]) -> Result<[u8; 32], CryptoError> {
     let hk = Hkdf::<Sha256>::new(Some(kem_ct), ss);
     let mut key = [0u8; 32];
@@ -809,97 +611,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn roundtrip_small() {
-        let (pk, sk) = mlkem768::keypair();
-        let pt = b"hello, post-quantum world";
-        let (env, info) = encrypt(pk.as_bytes(), pt).unwrap();
-        assert!(info.cipher_size as usize == env.len());
-        assert!(env.len() > pt.len() + 1000);
-        let recovered = decrypt(sk.as_bytes(), &env).unwrap();
-        assert_eq!(recovered, pt);
-    }
-
-    #[test]
-    fn roundtrip_empty() {
-        let (pk, sk) = mlkem768::keypair();
-        let (env, _) = encrypt(pk.as_bytes(), b"").unwrap();
-        let pt = decrypt(sk.as_bytes(), &env).unwrap();
-        assert!(pt.is_empty());
-    }
-
-    #[test]
-    fn roundtrip_large() {
-        let (pk, sk) = mlkem768::keypair();
-        let pt = vec![0xAB; 1 << 20];
-        let (env, _) = encrypt(pk.as_bytes(), &pt).unwrap();
-        let rec = decrypt(sk.as_bytes(), &env).unwrap();
-        assert_eq!(rec, pt);
-    }
-
-    #[test]
-    fn decrypt_owned_v1_roundtrip() {
-        let (pk, sk) = mlkem768::keypair();
-        let pt = vec![0xCD; 4096];
-        let (env, _) = encrypt(pk.as_bytes(), &pt).unwrap();
-        let rec = decrypt_owned(sk.as_bytes(), BytesMut::from(env.as_slice())).unwrap();
-        assert_eq!(rec.as_ref(), pt.as_slice());
-    }
-
-    #[test]
-    fn decrypt_owned_v1_tamper() {
-        let (pk, sk) = mlkem768::keypair();
-        let (mut env, _) = encrypt(pk.as_bytes(), b"abc").unwrap();
-        let last = env.len() - 1;
-        env[last] ^= 1;
-        assert!(matches!(
-            decrypt_owned(sk.as_bytes(), BytesMut::from(env.as_slice())),
-            Err(CryptoError::AuthFailed)
-        ));
-    }
-
-    #[test]
-    fn fresh_kem_per_call() {
-        let (pk, _sk) = mlkem768::keypair();
-        let (a, _) = encrypt(pk.as_bytes(), b"x").unwrap();
-        let (b, _) = encrypt(pk.as_bytes(), b"x").unwrap();
-        assert_ne!(a, b, "two encrypts of same plaintext must differ");
-    }
-
-    #[test]
-    fn tamper_byte_breaks_decrypt() {
-        let (pk, sk) = mlkem768::keypair();
-        let (mut env, _) = encrypt(pk.as_bytes(), b"some payload").unwrap();
-        let last = env.len() - 1;
-        env[last] ^= 1;
-        assert!(matches!(
-            decrypt(sk.as_bytes(), &env),
-            Err(CryptoError::AuthFailed)
-        ));
-    }
-
-    #[test]
-    fn wrong_key_breaks_decrypt() {
-        let (pk1, _) = mlkem768::keypair();
-        let (_, sk2) = mlkem768::keypair();
-        let (env, _) = encrypt(pk1.as_bytes(), b"hi").unwrap();
-        assert!(decrypt(sk2.as_bytes(), &env).is_err());
-    }
-
-    #[test]
     fn bad_magic_rejected() {
-        let mut env = vec![0u8; ENVELOPE_HEADER_FIXED_LEN + 2000];
-        env[0] = b'X';
+        let env = vec![0u8; ENVELOPE_V2_HEADER_FIXED_LEN + 2000];
         let (_, sk) = mlkem768::keypair();
         assert!(matches!(
             decrypt(sk.as_bytes(), &env),
             Err(CryptoError::Envelope("bad magic"))
         ));
+        assert!(matches!(
+            decrypt_owned(sk.as_bytes(), BytesMut::from(env.as_slice())),
+            Err(CryptoError::Envelope("bad magic"))
+        ));
     }
 
-    #[test]
-    fn unsupported_version_rejected() {
+    #[tokio::test]
+    async fn unsupported_version_rejected() {
         let (pk, sk) = mlkem768::keypair();
-        let (mut env, _) = encrypt(pk.as_bytes(), b"hi").unwrap();
+        let file = tempfile_v2().await;
+        let session = EncryptSession::new(file, pk.as_bytes(), 0, DEFAULT_CHUNK_SIZE_BYTES)
+            .await
+            .unwrap();
+        let (file, _) = session.finish().await.unwrap();
+        let mut env = read_file(file).await;
         env[4] = 0xff;
         env[5] = 0xff;
         assert!(matches!(
@@ -908,13 +641,37 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn looks_encrypted_works() {
-        let (pk, _) = mlkem768::keypair();
-        let (env, _) = encrypt(pk.as_bytes(), b"hi").unwrap();
-        assert!(looks_encrypted(&env));
-        assert!(!looks_encrypted(b"plain bytes"));
-        assert!(!looks_encrypted(b""));
+    #[tokio::test]
+    async fn v2_wrong_key_breaks_decrypt() {
+        let (pk1, _) = mlkem768::keypair();
+        let (_, sk2) = mlkem768::keypair();
+        let file = tempfile_v2().await;
+        let mut session = EncryptSession::new(file, pk1.as_bytes(), 0, DEFAULT_CHUNK_SIZE_BYTES)
+            .await
+            .unwrap();
+        session.feed(b"hi").await.unwrap();
+        let (file, _) = session.finish().await.unwrap();
+        let env = read_file(file).await;
+        assert!(decrypt(sk2.as_bytes(), &env).is_err());
+    }
+
+    #[tokio::test]
+    async fn v2_fresh_kem_per_call() {
+        let (pk, _sk) = mlkem768::keypair();
+        let mut envs = Vec::new();
+        for _ in 0..2 {
+            let file = tempfile_v2().await;
+            let mut session = EncryptSession::new(file, pk.as_bytes(), 0, DEFAULT_CHUNK_SIZE_BYTES)
+                .await
+                .unwrap();
+            session.feed(b"x").await.unwrap();
+            let (file, _) = session.finish().await.unwrap();
+            envs.push(read_file(file).await);
+        }
+        assert_ne!(
+            envs[0], envs[1],
+            "two encrypts of same plaintext must differ"
+        );
     }
 
     // ── v2 EncryptSession tests ───────────────────────────────────────────
@@ -931,7 +688,6 @@ mod tests {
         let (file, info) = session.finish().await.unwrap();
         assert_eq!(info.envelope_version, 2);
         let env = read_file(file).await;
-        assert!(looks_encrypted(&env));
         let recovered = decrypt(sk.as_bytes(), &env).unwrap();
         // The envelope zero-pads to a Padmé boundary to hide the exact size; the
         // higher layer trims to the true size from metadata. The recovered

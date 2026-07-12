@@ -19,7 +19,7 @@ impl Y2qClient {
     where
         W: AsyncWrite + Unpin,
     {
-        let url = self.url(&format!("{bucket}/{key}"));
+        let url = self.object_url(bucket, key)?;
         let resp = self.authed(self.inner.get(url)).send().await?;
         let resp = Self::check_status(resp).await?;
 
@@ -44,7 +44,7 @@ impl Y2qClient {
     where
         W: AsyncWrite + Unpin,
     {
-        let url = self.url(&format!("{bucket}/{key}"));
+        let url = self.object_url(bucket, key)?;
         let resp = self
             .authed(self.inner.get(url))
             .header(reqwest::header::RANGE, format!("bytes={start}-{end}"))
@@ -71,7 +71,7 @@ impl Y2qClient {
     where
         R: AsyncRead + Send + Unpin + 'static,
     {
-        let url = self.url(&format!("{bucket}/{key}"));
+        let url = self.object_url(bucket, key)?;
         let stream = ReaderStream::new(reader);
         let body = reqwest::Body::wrap_stream(stream);
 
@@ -93,7 +93,7 @@ impl Y2qClient {
     }
 
     pub async fn delete(&self, bucket: &str, key: &str) -> Result<(), ClientError> {
-        let url = self.url(&format!("{bucket}/{key}"));
+        let url = self.object_url(bucket, key)?;
         let resp = self.authed(self.inner.delete(url)).send().await?;
         Self::check_status(resp).await?;
         Ok(())
@@ -109,7 +109,7 @@ impl Y2qClient {
         op: &str,
         labels: &BTreeSet<(String, String)>,
     ) -> Result<BTreeSet<(String, String)>, ClientError> {
-        let url = self.url(&format!("{bucket}/{key}"));
+        let url = self.object_url(bucket, key)?;
         let mut rb = self.authed(self.inner.patch(url)).query(&[("op", op)]);
         for (k, v) in labels {
             rb = rb.header(format!("X-Y2Q-{k}"), v);
@@ -137,7 +137,7 @@ impl Y2qClient {
     }
 
     pub async fn head(&self, bucket: &str, key: &str) -> Result<ObjectHead, ClientError> {
-        let url = self.url(&format!("{bucket}/{key}"));
+        let url = self.object_url(bucket, key)?;
         let resp = self.authed(self.inner.head(url)).send().await?;
         let resp = Self::check_status(resp).await?;
         let headers = resp.headers();

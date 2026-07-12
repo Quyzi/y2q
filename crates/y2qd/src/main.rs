@@ -88,6 +88,7 @@ mod config;
 mod error;
 mod handlers;
 pub(crate) mod observability;
+mod rate_limit;
 mod request_id;
 mod span;
 mod tls;
@@ -435,6 +436,7 @@ async fn main() -> std::io::Result<()> {
     let default_sync = web::Data::new(cfg.storage.default_sync);
     let encryption_params = web::Data::new(config::EncryptionParams {
         chunk_size_bytes: cfg.crypto.envelope_chunk_size_bytes,
+        max_body_bytes: cfg.server.max_body_bytes as u64,
     });
 
     // Background dirty flusher: drains best-effort PUT paths and fsyncs them.

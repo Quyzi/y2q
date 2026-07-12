@@ -7,6 +7,7 @@
 //! Admin and auth routes live under `/api/v1/` and are also registered before
 //! the greedy tail pattern.
 
+use actix_governor::Governor;
 use actix_web::web;
 
 pub(crate) mod acl;
@@ -31,7 +32,11 @@ use crate::auth::handlers as auth_handlers;
 pub fn configure(cfg: &mut web::ServiceConfig) {
     // Auth and user-management endpoints. Registered before the greedy
     // /{bucket}/{tail}* pattern so they aren't shadowed.
-    cfg.service(web::resource("/api/v1/auth/login").route(web::post().to(auth_handlers::login)));
+    cfg.service(
+        web::resource("/api/v1/auth/login")
+            .wrap(Governor::new(&crate::rate_limit::LOGIN_GOVERNOR_CONFIG))
+            .route(web::post().to(auth_handlers::login)),
+    );
     cfg.service(
         web::resource("/api/v1/auth/refresh").route(web::post().to(auth_handlers::refresh)),
     );

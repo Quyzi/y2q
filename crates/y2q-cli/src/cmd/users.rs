@@ -17,6 +17,7 @@ pub async fn run(cmd: UserCmd, mode: OutputMode) -> Result<(), CliError> {
             role,
         } => {
             let pw = if let Some(p) = password {
+                crate::cmd::auth::warn_password_on_cli_flag();
                 Zeroizing::new(p)
             } else {
                 Zeroizing::new(

@@ -1,12 +1,11 @@
 //! Microbenchmarks for the y2q-core crypto hot path.
 //!
 //! Covers the isolated primitives called on every PUT (KEM encap, HKDF, AES-GCM
-//! encrypt) and every GET (KEM decap, HKDF, AES-GCM decrypt), plus full v1
-//! envelope round-trips at typical object sizes to show combined cost.
-//!
-//! v2 (chunked streaming) uses the same KEM/HKDF/AES-GCM primitives as v1 —
-//! only the I/O path differs. Isolating I/O from crypto is the purpose of these
-//! microbenchmarks, so v1 is the representative proxy here.
+//! encrypt) and every GET (KEM decap, HKDF, AES-GCM decrypt), plus full v2
+//! (chunked) envelope round-trips at typical object sizes to show combined
+//! cost. The v2 envelope streams to a [`StreamingSink`], so unlike the
+//! isolated-primitive benchmarks above, the envelope round-trip numbers
+//! include temp-file I/O, not crypto alone.
 //!
 //! ## Running
 //!
@@ -28,7 +27,8 @@ use pqcrypto_traits::kem::{
 use rand::Rng;
 use sha2::Sha256;
 use std::hint::black_box;
-use y2q_core::crypto::envelope::{decrypt, encrypt};
+use y2q_core::crypto::envelope::{DEFAULT_CHUNK_SIZE_BYTES, EncryptSession, decrypt};
+use y2q_core::storage::streaming_sink::StreamingSink;
 
 const KIB: usize = 1024;
 const MIB: usize = 1024 * KIB;
@@ -155,11 +155,46 @@ fn bench_aes_gcm_decrypt(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_envelope_v1_encrypt(c: &mut Criterion) {
+fn rand_u64() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .subsec_nanos() as u64
+}
+
+async fn tempfile_sink() -> (std::path::PathBuf, StreamingSink) {
+    let path = std::env::temp_dir().join(format!("y2q_bench_{}.env", rand_u64()));
+    let file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .read(true)
+        .create(true)
+        .truncate(true)
+        .open(&path)
+        .await
+        .unwrap();
+    (path, StreamingSink::Tokio(file))
+}
+
+async fn read_and_remove(path: &std::path::Path, sink: StreamingSink) -> Vec<u8> {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    let StreamingSink::Tokio(mut f) = sink else {
+        unreachable!("bench sinks are always Tokio-backed")
+    };
+    f.seek(std::io::SeekFrom::Start(0)).await.unwrap();
+    let mut buf = Vec::new();
+    f.read_to_end(&mut buf).await.unwrap();
+    drop(f);
+    let _ = tokio::fs::remove_file(path).await;
+    buf
+}
+
+fn bench_envelope_v2_encrypt(c: &mut Criterion) {
     let (pk, _sk) = mlkem768::keypair();
     let pk_bytes = pk.as_bytes().to_vec();
+    let rt = tokio::runtime::Runtime::new().unwrap();
 
-    let mut group = c.benchmark_group("envelope_v1_encrypt");
+    let mut group = c.benchmark_group("envelope_v2_encrypt");
     for size in [MIB, 16 * MIB] {
         if size >= 16 * MIB {
             group.sample_size(10);
@@ -168,28 +203,45 @@ fn bench_envelope_v1_encrypt(c: &mut Criterion) {
         let plaintext = vec![0xABu8; size];
 
         group.bench_with_input(BenchmarkId::from_parameter(size), &size, |b, _| {
-            b.iter(|| {
-                let (env, info) = encrypt(black_box(&pk_bytes), black_box(&plaintext)).unwrap();
-                black_box((env, info));
+            b.to_async(&rt).iter(|| async {
+                let (path, sink) = tempfile_sink().await;
+                let mut session =
+                    EncryptSession::new(sink, black_box(&pk_bytes), 0, DEFAULT_CHUNK_SIZE_BYTES)
+                        .await
+                        .unwrap();
+                session.feed(black_box(&plaintext)).await.unwrap();
+                let (sink, info) = session.finish().await.unwrap();
+                drop(sink);
+                let _ = tokio::fs::remove_file(&path).await;
+                black_box(info);
             });
         });
     }
     group.finish();
 }
 
-fn bench_envelope_v1_decrypt(c: &mut Criterion) {
+fn bench_envelope_v2_decrypt(c: &mut Criterion) {
     let (pk, sk) = mlkem768::keypair();
     let pk_bytes = pk.as_bytes().to_vec();
     let sk_bytes = sk.as_bytes().to_vec();
+    let rt = tokio::runtime::Runtime::new().unwrap();
 
-    let mut group = c.benchmark_group("envelope_v1_decrypt");
+    let mut group = c.benchmark_group("envelope_v2_decrypt");
     for size in [MIB, 16 * MIB] {
         if size >= 16 * MIB {
             group.sample_size(10);
         }
         group.throughput(Throughput::Bytes(size as u64));
         let plaintext = vec![0xABu8; size];
-        let (envelope, _) = encrypt(&pk_bytes, &plaintext).unwrap();
+        let envelope = rt.block_on(async {
+            let (path, sink) = tempfile_sink().await;
+            let mut session = EncryptSession::new(sink, &pk_bytes, 0, DEFAULT_CHUNK_SIZE_BYTES)
+                .await
+                .unwrap();
+            session.feed(&plaintext).await.unwrap();
+            let (sink, _) = session.finish().await.unwrap();
+            read_and_remove(&path, sink).await
+        });
 
         group.bench_with_input(BenchmarkId::from_parameter(size), &size, |b, _| {
             b.iter(|| {
@@ -208,7 +260,7 @@ criterion_group!(
     bench_hkdf_derive,
     bench_aes_gcm_encrypt,
     bench_aes_gcm_decrypt,
-    bench_envelope_v1_encrypt,
-    bench_envelope_v1_decrypt,
+    bench_envelope_v2_encrypt,
+    bench_envelope_v2_decrypt,
 );
 criterion_main!(benches);

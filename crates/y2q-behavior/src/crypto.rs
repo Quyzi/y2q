@@ -11,9 +11,10 @@ use bytes::{Bytes, BytesMut};
 
 /// Envelope encryption for object payloads.
 ///
-/// Supports two on-disk formats: v1, which seals the whole object in a single
-/// AEAD operation, and v2, which splits the payload into independently sealed,
+/// The v2 chunked format splits the payload into independently sealed,
 /// per-chunk-nonced segments so large objects can be decrypted in ranges.
+/// There is no unauthenticated passthrough: an envelope with an unrecognized
+/// magic is rejected outright rather than treated as legacy plaintext.
 pub trait ObjectCipher {
     /// Per-envelope metadata recorded alongside the ciphertext: envelope version,
     /// KEM and AEAD algorithm identifiers, and ciphertext size.
@@ -30,18 +31,18 @@ pub trait ObjectCipher {
         plaintext: &[u8],
     ) -> Result<(Vec<u8>, Self::EnvelopeInfo), Self::Error>;
 
-    /// Decapsulate with `sk_bytes` and open a whole-object (v1) envelope, copying
-    /// the recovered plaintext into a fresh buffer.
+    /// Decapsulate with `sk_bytes` and open an envelope, copying the recovered
+    /// plaintext into a fresh buffer.
     fn decrypt(&self, sk_bytes: &[u8], envelope: &[u8]) -> Result<Vec<u8>, Self::Error>;
 
-    /// Open a whole-object envelope in place, decrypting into the owned input
-    /// buffer and returning a view of the plaintext so no copy is made. Suited to
-    /// large objects already held in memory.
+    /// Open an envelope in place, decrypting into the owned input buffer and
+    /// returning a view of the plaintext so no copy is made. Suited to large
+    /// objects already held in memory.
     fn decrypt_owned(&self, sk_bytes: &[u8], envelope: BytesMut) -> Result<Bytes, Self::Error>;
 
-    /// Open a contiguous run of v2 chunks.
+    /// Open a contiguous run of chunks.
     ///
-    /// `preamble` is the fixed v2 header carrying the KEM ciphertext and geometry;
+    /// `preamble` is the fixed header carrying the KEM ciphertext and geometry;
     /// `chunks_ct` is the concatenation of the chunk ciphertexts to open; and
     /// `first_chunk_idx` is the index of the first supplied chunk, which seeds the
     /// per-chunk nonce derivation. Lets a range read decrypt only the chunks it
@@ -54,13 +55,9 @@ pub trait ObjectCipher {
         first_chunk_idx: u64,
     ) -> Result<Vec<u8>, Self::Error>;
 
-    /// Parse a v2 header, returning `(chunk_size, plaintext_len)`. Callers use the
+    /// Parse a header, returning `(chunk_size, plaintext_len)`. Callers use the
     /// geometry to map a requested byte range onto the chunks that cover it.
     fn parse_v2_geometry(&self, header: &[u8]) -> Result<(u32, u64), Self::Error>;
-
-    /// Test whether `bytes` begins with a recognized envelope magic. A cheap
-    /// prefix check used to distinguish encrypted objects from legacy plaintext.
-    fn looks_encrypted(&self, bytes: &[u8]) -> bool;
 }
 
 /// Incremental v2 encryptor that seals chunks into a write sink as plaintext
@@ -146,8 +143,8 @@ pub trait MetadataCipher {
     /// Seal a metadata JSON blob under `mek` for storage in the index.
     fn encrypt_meta(&self, mek: &[u8; 32], json: &[u8]) -> Result<Vec<u8>, Self::Error>;
 
-    /// Open a metadata blob under `mek`. Blobs written before encryption was
-    /// enabled are stored as plaintext and pass through unchanged.
+    /// Open a metadata blob under `mek`. A blob without the recognized version
+    /// byte is rejected rather than treated as legacy plaintext.
     fn decrypt_meta(&self, mek: &[u8; 32], blob: &[u8]) -> Result<Vec<u8>, Self::Error>;
 }
 

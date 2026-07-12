@@ -14,9 +14,8 @@
 //! Encrypted metadata wire format:
 //!     [0x01 | 12-byte random nonce | AES-256-GCM(meta_json)]
 //!
-//! Legacy metadata (written before encryption was enabled) begins with any
-//! byte other than 0x01 and is passed through as plain JSON for backward
-//! compatibility.
+//! A blob not beginning with `0x01` is rejected outright — there is no
+//! unauthenticated plaintext passthrough for legacy/pre-encryption metadata.
 
 use std::sync::RwLock;
 
@@ -201,13 +200,14 @@ pub fn encrypt_meta(mek: &[u8; 32], json: &[u8]) -> Result<Vec<u8>, CryptoError>
     Ok(out)
 }
 
-/// Decrypt or pass through a metadata blob.
+/// Decrypt a metadata blob.
 ///
-/// - First byte `0x01` → AES-256-GCM encrypted; decrypt and return the JSON.
-/// - Any other first byte → legacy plaintext JSON; return as-is.
+/// The first byte must be `0x01`; anything else (including legacy
+/// pre-encryption plaintext) is rejected rather than passed through
+/// unauthenticated.
 pub fn decrypt_meta(mek: &[u8; 32], blob: &[u8]) -> Result<Vec<u8>, CryptoError> {
     if blob.is_empty() || blob[0] != VERSION_BYTE {
-        return Ok(blob.to_vec());
+        return Err(CryptoError::Envelope("unrecognized metadata format"));
     }
     if blob.len() < MIN_ENCRYPTED_LEN {
         return Err(CryptoError::Envelope(
@@ -302,9 +302,20 @@ mod tests {
     }
 
     #[test]
-    fn legacy_plaintext_passes_through() {
-        // Any blob not starting with VERSION_BYTE is treated as legacy plaintext.
+    fn legacy_plaintext_is_rejected() {
+        // Any blob not starting with VERSION_BYTE is rejected, not passed through.
         let plain = b"{\"legacy\":true}";
-        assert_eq!(decrypt_meta(&derive_mek(b"sk"), plain).unwrap(), plain);
+        assert!(matches!(
+            decrypt_meta(&derive_mek(b"sk"), plain),
+            Err(CryptoError::Envelope(_))
+        ));
+    }
+
+    #[test]
+    fn empty_blob_is_rejected() {
+        assert!(matches!(
+            decrypt_meta(&derive_mek(b"sk"), b""),
+            Err(CryptoError::Envelope(_))
+        ));
     }
 }

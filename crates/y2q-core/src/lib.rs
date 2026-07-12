@@ -390,6 +390,20 @@ pub enum Error {
         incoming: u64,
     },
 
+    /// A PUT body exceeded the server-wide (or quota-headroom-limited) size
+    /// cap, detected mid-stream — enforced regardless of whether the client
+    /// sent `Content-Length` (chunked transfer encoding has none, so it
+    /// cannot be relied on to reject an oversized body up front).
+    #[error("object body for {bucket}/{key} exceeds the allowed size ({limit} bytes)")]
+    BodyTooLarge {
+        /// Bucket the object was being written to.
+        bucket: String,
+        /// Key the object was being written to.
+        key: String,
+        /// The size cap that was exceeded, in bytes.
+        limit: u64,
+    },
+
     /// The authenticated caller is not permitted to perform the requested
     /// action on `bucket`. Produced by the daemon's authorization layer (the
     /// caller can already see the bucket but lacks the required permission
@@ -472,11 +486,6 @@ pub enum Error {
         /// The version number found in the envelope header.
         version: u16,
     },
-
-    /// Range read attempted against a v1 whole-object AEAD envelope, where
-    /// partial decryption isn't possible. v2 chunked envelopes support ranges.
-    #[error("range reads are not supported on v1 whole-object encrypted objects")]
-    RangeReadOnEncrypted,
 
     /// A label search query failed to parse, or contained an invalid regex.
     #[error("invalid query: {message}")]

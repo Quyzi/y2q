@@ -113,8 +113,28 @@ impl CliConfig {
     }
 }
 
+/// Write `data` to `path` atomically (write to a temp file, then rename).
+///
+/// The temp file is created at mode `0600` from the moment it's created,
+/// not written-then-chmod'd afterward — files here (config, tokens) can
+/// carry a live bearer token, and a widen-then-narrow window would let
+/// another local user read it via the deterministic `<path>.tmp` name during
+/// that gap.
 pub fn atomic_write(path: &Path, data: &[u8]) -> Result<(), ConfigError> {
     let tmp = path.with_extension("tmp");
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        f.write_all(data)?;
+    }
+    #[cfg(not(unix))]
     std::fs::write(&tmp, data)?;
     std::fs::rename(&tmp, path)?;
     Ok(())
@@ -225,6 +245,23 @@ mod tests {
         assert!(got.insecure);
         assert_eq!(got.password, None);
         assert!(loaded.get_alias("missing").is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn atomic_write_creates_file_at_0600() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir =
+            std::env::temp_dir().join(format!("y2q-cfg-perm-{}-{:p}", std::process::id(), &2u8));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tokens.toml");
+
+        atomic_write(&path, b"secret-token-bytes").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
