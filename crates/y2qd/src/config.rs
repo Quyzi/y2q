@@ -908,10 +908,17 @@ fn validate_envelope_chunk_size(chunk: usize) -> Result<(), String> {
 }
 
 /// Encryption parameters registered as actix `web::Data` so the PUT handler can
-/// read the configured v2 chunk size without touching the whole [`Config`].
+/// read the configured v2 chunk size and body-size cap without touching the
+/// whole [`Config`].
 #[derive(Debug, Clone, Copy)]
 pub struct EncryptionParams {
     pub chunk_size_bytes: usize,
+    /// Maximum plaintext body size accepted for a PUT, enforced mid-stream so
+    /// it applies regardless of whether the client sends `Content-Length`
+    /// (chunked transfer encoding has none). `web::PayloadConfig` does not
+    /// cover this: it only applies to extractors that buffer the whole body
+    /// (e.g. `web::Bytes`), not the raw `web::Payload` stream PUT uses.
+    pub max_body_bytes: u64,
 }
 
 /// Parse a CLI string value as an integer, boolean, or string in that order.

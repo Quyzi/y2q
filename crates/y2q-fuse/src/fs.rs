@@ -13,6 +13,53 @@ use fuser::{
 use tempfile::NamedTempFile;
 use y2q_client::{AclBody, BucketConfig, ClientError, ListOptions, Y2qClient};
 
+/// Prefix on every write-buffer temp file this driver creates, so a stray
+/// file left behind by a `SIGKILL`/crash (temp files are otherwise cleaned
+/// up on `Drop`, which doesn't run on an abrupt kill) can be identified and
+/// swept on the next mount without touching any other process's temp files
+/// in the same shared directory.
+const WRITE_BUF_TEMPFILE_PREFIX: &str = "y2q-fuse-writebuf-";
+
+/// Create a new write-buffer temp file, tagged with
+/// [`WRITE_BUF_TEMPFILE_PREFIX`] so [`sweep_orphaned_tempfiles`] can find it
+/// if the process is killed before it's cleaned up normally.
+fn new_write_tempfile() -> std::io::Result<NamedTempFile> {
+    tempfile::Builder::new()
+        .prefix(WRITE_BUF_TEMPFILE_PREFIX)
+        .tempfile()
+}
+
+/// Best-effort cleanup of write-buffer temp files orphaned by a prior
+/// `SIGKILL`/crash (normal exits clean these up via `Drop`, which doesn't run
+/// on an abrupt kill). Only removes files whose name starts with
+/// [`WRITE_BUF_TEMPFILE_PREFIX`] in the OS temp directory — never touches
+/// anything else there. Never blocks or fails the mount: every error is
+/// logged and skipped.
+pub fn sweep_orphaned_tempfiles() {
+    let dir = std::env::temp_dir();
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::debug!(dir = %dir.display(), error = %e, "tempfile sweep: read_dir failed");
+            return;
+        }
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !name.starts_with(WRITE_BUF_TEMPFILE_PREFIX) {
+            continue;
+        }
+        if let Err(e) = std::fs::remove_file(entry.path()) {
+            tracing::debug!(path = %entry.path().display(), error = %e, "tempfile sweep: remove failed");
+        } else {
+            tracing::info!(path = %entry.path().display(), "removed orphaned write-buffer tempfile");
+        }
+    }
+}
+
 use crate::dir::{ChildEntry, list_children};
 use crate::error::to_errno;
 use crate::inode::{CachedMeta, InodePath, InodeTable, ROOT_INO};
@@ -48,6 +95,11 @@ pub struct Y2qFuse {
     mode: MountMode,
     uid: u32,
     gid: u32,
+    /// When set (alongside `--allow-other`), entries are reported as owned by
+    /// this group at `0640`/`0750` instead of the mounting user's group at
+    /// `0644`/`0755` — restricting the additional access `--allow-other`
+    /// grants to members of one group rather than every local user.
+    allow_other_gid: Option<u32>,
 }
 
 impl Y2qFuse {
@@ -58,6 +110,7 @@ impl Y2qFuse {
         mode: MountMode,
         uid: u32,
         gid: u32,
+        allow_other_gid: Option<u32>,
     ) -> Self {
         Self {
             client,
@@ -69,6 +122,7 @@ impl Y2qFuse {
             mode,
             uid,
             gid,
+            allow_other_gid,
         }
     }
 
@@ -95,10 +149,14 @@ impl Y2qFuse {
             ctime: created,
             crtime: created,
             kind: FileType::RegularFile,
-            perm: 0o644,
+            perm: if self.allow_other_gid.is_some() {
+                0o640
+            } else {
+                0o644
+            },
             nlink: 1,
             uid: self.uid,
-            gid: self.gid,
+            gid: self.allow_other_gid.unwrap_or(self.gid),
             rdev: 0,
             blksize: 512,
             flags: 0,
@@ -116,10 +174,14 @@ impl Y2qFuse {
             ctime: now,
             crtime: now,
             kind: FileType::Directory,
-            perm: 0o755,
+            perm: if self.allow_other_gid.is_some() {
+                0o750
+            } else {
+                0o755
+            },
             nlink: 2,
             uid: self.uid,
-            gid: self.gid,
+            gid: self.allow_other_gid.unwrap_or(self.gid),
             rdev: 0,
             blksize: 512,
             flags: 0,
@@ -224,7 +286,7 @@ impl Filesystem for Y2qFuse {
                                     checksum_gxhash: head.checksum_gxhash.clone(),
                                     labels: head.labels.clone(),
                                     cipher_size: head.cipher_size,
-                                    cipher_sha256: head.cipher_sha256.clone(),
+                                    cipher_checksum: head.cipher_checksum.clone(),
                                     kem_alg: head.kem_alg.clone(),
                                     aead_alg: head.aead_alg.clone(),
                                     envelope_version: head.envelope_version,
@@ -289,7 +351,7 @@ impl Filesystem for Y2qFuse {
                                     checksum_gxhash: head.checksum_gxhash.clone(),
                                     labels: head.labels.clone(),
                                     cipher_size: head.cipher_size,
-                                    cipher_sha256: head.cipher_sha256.clone(),
+                                    cipher_checksum: head.cipher_checksum.clone(),
                                     kem_alg: head.kem_alg.clone(),
                                     aead_alg: head.aead_alg.clone(),
                                     envelope_version: head.envelope_version,
@@ -366,7 +428,7 @@ impl Filesystem for Y2qFuse {
                                     checksum_gxhash: head.checksum_gxhash.clone(),
                                     labels: head.labels.clone(),
                                     cipher_size: head.cipher_size,
-                                    cipher_sha256: head.cipher_sha256.clone(),
+                                    cipher_checksum: head.cipher_checksum.clone(),
                                     kem_alg: head.kem_alg.clone(),
                                     aead_alg: head.aead_alg.clone(),
                                     envelope_version: head.envelope_version,
@@ -538,7 +600,7 @@ impl Filesystem for Y2qFuse {
                                         checksum_gxhash: meta.checksum_gxhash.clone(),
                                         labels: meta.labels.clone(),
                                         cipher_size: meta.cipher_size,
-                                        cipher_sha256: meta.cipher_sha256.clone(),
+                                        cipher_checksum: meta.cipher_checksum.clone(),
                                         kem_alg: meta.kem_alg.clone(),
                                         aead_alg: meta.aead_alg.clone(),
                                         envelope_version: meta.envelope_version,
@@ -597,7 +659,7 @@ impl Filesystem for Y2qFuse {
 
         let (write_buf, dirty) = if write_requested {
             let trunc = flags & libc::O_TRUNC != 0;
-            let mut tmp = match NamedTempFile::new() {
+            let mut tmp = match new_write_tempfile() {
                 Ok(f) => f,
                 Err(e) => {
                     tracing::error!("tempfile: {e}");
@@ -750,6 +812,10 @@ impl Filesystem for Y2qFuse {
         }
 
         let name = name.to_string_lossy().into_owned();
+        if !is_valid_entry_name(&name) {
+            reply.error(Errno::EINVAL);
+            return;
+        }
 
         let (bucket, prefix) = match self.inode_to_bucket_prefix(parent) {
             Some(bp) => bp,
@@ -761,7 +827,7 @@ impl Filesystem for Y2qFuse {
         };
 
         let key = format!("{prefix}{name}");
-        let buf = match NamedTempFile::new() {
+        let buf = match new_write_tempfile() {
             Ok(f) => f,
             Err(e) => {
                 tracing::error!("tempfile: {e}");
@@ -949,7 +1015,7 @@ impl Filesystem for Y2qFuse {
                 let fh = fh.0;
                 let mut guard = self.open_files.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(of) = guard.get_mut(&fh) {
-                    match NamedTempFile::new() {
+                    match new_write_tempfile() {
                         Ok(fresh) => {
                             of.write_buf = Some(fresh);
                             of.dirty = true;
@@ -995,6 +1061,10 @@ impl Filesystem for Y2qFuse {
         }
 
         let name = name.to_string_lossy().into_owned();
+        if !is_valid_entry_name(&name) {
+            reply.error(Errno::EINVAL);
+            return;
+        }
         let (bucket, prefix) = match self.inode_to_bucket_prefix(parent) {
             Some(bp) => bp,
             None => {
@@ -1161,6 +1231,10 @@ impl Filesystem for Y2qFuse {
 
         let name = name.to_string_lossy().into_owned();
         let newname = newname.to_string_lossy().into_owned();
+        if !is_valid_entry_name(&newname) {
+            reply.error(Errno::EINVAL);
+            return;
+        }
 
         let src_bkt_pfx = match self.inode_to_bucket_prefix(parent) {
             Some(bp) => bp,
@@ -1193,7 +1267,7 @@ impl Filesystem for Y2qFuse {
             return;
         }
 
-        let tmp = match tempfile::NamedTempFile::new() {
+        let tmp = match new_write_tempfile() {
             Ok(f) => f,
             Err(e) => {
                 tracing::error!("rename tempfile: {e}");
@@ -1368,7 +1442,7 @@ impl Filesystem for Y2qFuse {
                     "user.y2q.created",
                     "user.y2q.modified",
                     "user.y2q.cipher.size",
-                    "user.y2q.cipher.sha256",
+                    "user.y2q.cipher.checksum",
                     "user.y2q.kem.alg",
                     "user.y2q.aead.alg",
                     "user.y2q.envelope.version",
@@ -1418,7 +1492,7 @@ impl Filesystem for Y2qFuse {
                                 checksum_gxhash: head.checksum_gxhash,
                                 labels: head.labels.clone(),
                                 cipher_size: head.cipher_size,
-                                cipher_sha256: head.cipher_sha256,
+                                cipher_checksum: head.cipher_checksum,
                                 kem_alg: head.kem_alg,
                                 aead_alg: head.aead_alg,
                                 envelope_version: head.envelope_version,
@@ -1617,7 +1691,7 @@ impl Filesystem for Y2qFuse {
                         checksum_gxhash: head.checksum_gxhash,
                         labels: head.labels.clone(),
                         cipher_size: head.cipher_size,
-                        cipher_sha256: head.cipher_sha256,
+                        cipher_checksum: head.cipher_checksum,
                         kem_alg: head.kem_alg,
                         aead_alg: head.aead_alg,
                         envelope_version: head.envelope_version,
@@ -1714,7 +1788,7 @@ impl Filesystem for Y2qFuse {
                                     checksum_gxhash: head.checksum_gxhash,
                                     labels: head.labels,
                                     cipher_size: head.cipher_size,
-                                    cipher_sha256: head.cipher_sha256,
+                                    cipher_checksum: head.cipher_checksum,
                                     kem_alg: head.kem_alg,
                                     aead_alg: head.aead_alg,
                                     envelope_version: head.envelope_version,
@@ -1792,7 +1866,7 @@ impl Filesystem for Y2qFuse {
                                     checksum_gxhash: head.checksum_gxhash,
                                     labels: head.labels,
                                     cipher_size: head.cipher_size,
-                                    cipher_sha256: head.cipher_sha256,
+                                    cipher_checksum: head.cipher_checksum,
                                     kem_alg: head.kem_alg,
                                     aead_alg: head.aead_alg,
                                     envelope_version: head.envelope_version,
@@ -1891,6 +1965,19 @@ impl Y2qFuse {
     }
 }
 
+/// Reject directory-entry names that are empty, `.`/`..`, or contain an
+/// embedded `/` or NUL byte, before it's used to build an object key.
+///
+/// The kernel VFS already guarantees a FUSE `name` parameter can't be
+/// `.`/`..`/contain `/` (paths are split into individual dentry lookups
+/// before reaching the driver), but a corrupted or non-kernel FUSE frame
+/// could still deliver one, and downstream key construction (`format!` into
+/// a bucket-relative key, then a client HTTP path) has no other check for
+/// path-traversal-shaped input at this layer.
+fn is_valid_entry_name(name: &str) -> bool {
+    !name.is_empty() && name != "." && name != ".." && !name.contains('/') && !name.contains('\0')
+}
+
 fn xattr_reply(reply: ReplyXattr, size: u32, value: &[u8]) {
     if size == 0 {
         reply.size(value.len() as u32);
@@ -1915,8 +2002,8 @@ fn xattr_list(meta: &CachedMeta) -> Vec<u8> {
     if meta.cipher_size.is_some() {
         buf.extend_from_slice(b"user.y2q.cipher.size\0");
     }
-    if meta.cipher_sha256.is_some() {
-        buf.extend_from_slice(b"user.y2q.cipher.sha256\0");
+    if meta.cipher_checksum.is_some() {
+        buf.extend_from_slice(b"user.y2q.cipher.checksum\0");
     }
     if meta.kem_alg.is_some() {
         buf.extend_from_slice(b"user.y2q.kem.alg\0");
@@ -1944,7 +2031,10 @@ fn xattr_get(meta: &CachedMeta, name: &str) -> Option<Vec<u8>> {
         "user.y2q.created" => Some(meta.created.to_string().into_bytes()),
         "user.y2q.modified" => Some(meta.modified.to_string().into_bytes()),
         "user.y2q.cipher.size" => meta.cipher_size.map(|v| v.to_string().into_bytes()),
-        "user.y2q.cipher.sha256" => meta.cipher_sha256.as_deref().map(|v| v.as_bytes().to_vec()),
+        "user.y2q.cipher.checksum" => meta
+            .cipher_checksum
+            .as_deref()
+            .map(|v| v.as_bytes().to_vec()),
         "user.y2q.kem.alg" => meta.kem_alg.as_deref().map(|v| v.as_bytes().to_vec()),
         "user.y2q.aead.alg" => meta.aead_alg.as_deref().map(|v| v.as_bytes().to_vec()),
         "user.y2q.envelope.version" => meta.envelope_version.map(|v| v.to_string().into_bytes()),
@@ -2002,5 +2092,86 @@ fn bucket_xattr_get(cfg: &BucketConfig, acl: &AclBody, name: &str) -> Option<Vec
             }
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use y2q_client::{ClientConfig, Y2qClient};
+
+    fn test_fs(allow_other_gid: Option<u32>) -> Y2qFuse {
+        // reqwest (built with `rustls-tls-no-provider`) needs a process-wide
+        // rustls crypto provider installed before any `Client` can be built.
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let client = Y2qClient::new(ClientConfig::new("https://y2q.example/".to_owned())).unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let handle = rt.handle().clone();
+        std::mem::forget(rt); // keep the runtime alive for the test's duration
+        Y2qFuse::new(
+            Arc::new(RwLock::new(client)),
+            handle,
+            false,
+            MountMode::Multi,
+            1000,
+            1000,
+            allow_other_gid,
+        )
+    }
+
+    #[test]
+    fn file_and_dir_attr_are_world_readable_without_allow_other_gid() {
+        let fs = test_fs(None);
+        let f = fs.file_attr(1, 0, 0, 0);
+        assert_eq!(f.perm, 0o644);
+        assert_eq!(f.gid, 1000);
+        let d = fs.dir_attr(2);
+        assert_eq!(d.perm, 0o755);
+        assert_eq!(d.gid, 1000);
+    }
+
+    #[test]
+    fn file_and_dir_attr_are_group_scoped_with_allow_other_gid() {
+        let fs = test_fs(Some(4242));
+        let f = fs.file_attr(1, 0, 0, 0);
+        assert_eq!(f.perm, 0o640);
+        assert_eq!(f.gid, 4242);
+        let d = fs.dir_attr(2);
+        assert_eq!(d.perm, 0o750);
+        assert_eq!(d.gid, 4242);
+    }
+
+    #[test]
+    fn sweep_removes_only_matching_stray_tempfiles() {
+        let dir = std::env::temp_dir();
+        let unique = format!("{}-{}", std::process::id(), line!());
+        let ours = dir.join(format!("{WRITE_BUF_TEMPFILE_PREFIX}{unique}"));
+        let other = dir.join(format!("some-other-app-{unique}.tmp"));
+        std::fs::write(&ours, b"stray").unwrap();
+        std::fs::write(&other, b"not ours").unwrap();
+
+        sweep_orphaned_tempfiles();
+
+        assert!(!ours.exists(), "orphaned y2q-fuse tempfile must be removed");
+        assert!(other.exists(), "unrelated tempfile must be left alone");
+
+        let _ = std::fs::remove_file(&other);
+    }
+
+    #[test]
+    fn is_valid_entry_name_rejects_traversal_and_control_bytes() {
+        assert!(!is_valid_entry_name(""));
+        assert!(!is_valid_entry_name("."));
+        assert!(!is_valid_entry_name(".."));
+        assert!(!is_valid_entry_name("a/b"));
+        assert!(!is_valid_entry_name("a\0b"));
+    }
+
+    #[test]
+    fn is_valid_entry_name_accepts_ordinary_filenames() {
+        assert!(is_valid_entry_name("report.txt"));
+        assert!(is_valid_entry_name("Meeting Notes #3.docx"));
+        assert!(is_valid_entry_name("..hidden-but-not-dotdot"));
+        assert!(is_valid_entry_name("...three-dots"));
     }
 }

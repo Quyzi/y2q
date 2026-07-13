@@ -57,26 +57,9 @@ AES-256-GCM is implemented via the pure-Rust [aes-gcm](https://github.com/RustCr
 
 ### Envelope format
 
-There are two on-disk envelope formats, distinguished by their magic bytes. **v2 (chunked) is the default** for new writes; v1 (whole-object) is still readable for objects written by older builds. Both wrap one ML-KEM-768 ciphertext and AES-256-GCM ciphertext behind a fixed header that doubles as additional authenticated data (AAD), so tampering with any header field invalidates the tag.
+There is a single on-disk envelope format (v2, chunked), identified by its magic bytes. It wraps one ML-KEM-768 ciphertext and a sequence of AES-256-GCM-sealed chunks behind a fixed header, most of which doubles as additional authenticated data (AAD) so tampering with it invalidates the tag - see [AAD coverage](#aad-coverage) below for the one field that's deliberately excluded. An envelope with an unrecognized magic - including the retired v1 whole-object format used by builds before chunked streaming existed - is rejected outright; there is no unauthenticated passthrough for unrecognized or legacy data.
 
-#### v1 - whole-object (legacy)
-
-```mermaid
-%%{init: {"packet": {"showBits": false}}}%%
-packet-beta
-0-3: "magic b'Y2Q1' (4 B)"
-4-5: "format_ver (2 B)"
-6-6: "kem_alg (1)"
-7-7: "aead_alg (1)"
-8-19: "nonce - 12 B random"
-20-27: "plaintext_len (8 B, BE)"
-28-1115: "kem_ct - ML-KEM-768 ciphertext (1088 B)"
-1116-1131: "aead_ct - ciphertext || GCM tag (N+16 B)"
-```
-
-Fixed overhead is 1132 bytes (28 header + 1088 KEM + 16 tag). The whole object is one AEAD frame, so v1 cannot serve a partial decrypt - `Range` on a v1 object returns 501.
-
-#### v2 - chunked (default)
+#### v2 - chunked
 
 ```mermaid
 %%{init: {"packet": {"showBits": false}}}%%
@@ -92,19 +75,23 @@ packet-beta
 1120-1199: "aead_ct chunks - [chunk_pt + 16 tag] × N"
 ```
 
-The 32-byte fixed header plus the 1088-byte KEM ciphertext form a 1120-byte **preamble**, followed by `N` independently sealed chunks of `chunk_size` plaintext each (default 4 MiB, `crypto.envelope_chunk_size_bytes`). Chunk `i` uses `nonce_i = nonce_base XOR (i as u64 BE)`; the AAD for every chunk is the 32-byte fixed header. Because each chunk is its own frame at a deterministic offset, a `Range` GET reads and decrypts only the covering chunks (206), and a multi-GiB PUT streams chunk-by-chunk without buffering the whole object. `chunk_size` is recorded per object, so changing the config knob only affects future writes.
+The 32-byte fixed header plus the 1088-byte KEM ciphertext form a 1120-byte **preamble**, followed by `N` independently sealed chunks of `chunk_size` plaintext each (default 4 MiB, `crypto.envelope_chunk_size_bytes`). Chunk `i` uses `nonce_i = nonce_base XOR (i as u64 BE)`. Because each chunk is its own frame at a deterministic offset, a `Range` GET reads and decrypts only the covering chunks (206), and a multi-GiB PUT streams chunk-by-chunk without buffering the whole object. `chunk_size` is recorded per object, so changing the config knob only affects future writes.
+
+#### AAD coverage
+
+The AAD for every chunk is `magic || format_ver || kem_alg || aead_alg || nonce_base || chunk_size` (24 of the header's 32 bytes) - every fixed-header field *except* `plaintext_len`. `plaintext_len` is the one field genuinely unknown until streaming finishes (it's patched in via a seek after the last chunk is written), so a placeholder bound into the AAD at encrypt time could never match what's read back at decrypt time. `chunk_size`, by contrast, is fixed before the first byte is written and has no such excuse, so it *is* authenticated.
 
 ### Per-object key derivation
 
-The content key is derived fresh for every PUT:
+The content key is derived fresh for every PUT, and bound to the object's address:
 
 1. `(kem_ct, ss) := ML-KEM-768.encapsulate(public_key)` - fresh ephemeral, produces a 32-byte shared secret.
-2. `content_key := HKDF-SHA256(salt = kem_ct, ikm = ss, info = b"y2q/v1/content-key")` - 32 bytes.
-3. `ciphertext := AES-256-GCM.encrypt(content_key, nonce, plaintext, aad = header)`.
+2. `content_key := HKDF-SHA256(salt = kem_ct, ikm = ss, info = b"y2q/v1/content-key" || len(bucket) || bucket || len(key) || key)` - 32 bytes.
+3. `ciphertext := AES-256-GCM.encrypt(content_key, nonce, plaintext, aad)`.
 
-On GET the daemon does the reverse: parse the header, decapsulate with the in-memory secret key, re-derive the content key, decrypt and verify the tag.
+On GET the daemon does the reverse: parse the header, decapsulate with the in-memory secret key, re-derive the content key using the **requested** `bucket`/`key` (not anything read from the file), decrypt and verify the tag.
 
-The shared secret is *not* the content key directly. HKDF binds the content key to both `ss` and `kem_ct`, which means two encapsulations against the same public key can never collide on content key even if `ss` did.
+The shared secret is *not* the content key directly. HKDF binds the content key to `ss`, `kem_ct`, and the object's address, which means two encapsulations against the same public key can never collide on content key even if `ss` did, and - more importantly - an envelope decrypted under any address other than the one it was written for derives the wrong key and fails the tag check. The `bucket`/`key` binding costs nothing (HKDF's `info` parameter is never transmitted or stored, only supplied by the caller at both ends) and closes a real gap: without it, the ciphertext carries no identity of its own, so a filesystem-write attacker could copy one object's on-disk envelope onto a different object's storage location and have it decrypt successfully there, handing that object's plaintext to anyone with ordinary read access to the *target* address - no access to the source object required.
 
 ### Secret-key protection at rest
 
@@ -210,7 +197,7 @@ The `path_key` is derived from the login-gated MEK (deterministic from the deplo
 
 Bucket names: ASCII alphanumeric plus `-` and `_`; case-insensitive `"api"` is reserved (collides with `/api/v1/*`). Keys: up to 1024 bytes, no null bytes.
 
-The metadata blob embedded in each `.obj` is **encrypted at rest** under the MEK (`encrypt_meta`, AES-256-GCM; `MEK = SHA-256(sk || "y2q-metadata-encryption-key-v2")`), so labels, timestamps, checksums, and the cleartext key are not readable from the file without the deployment key. Decrypted, it has this logical shape:
+The metadata blob embedded in each `.obj` is **encrypted at rest** under the MEK (`encrypt_meta`, AES-256-GCM; `MEK = SHA-256(sk || "y2q-metadata-encryption-key-v2")`), so labels, timestamps, checksums, and the cleartext key are not readable from the file without the deployment key. Unlike the content key, the MEK is one fixed key for the whole deployment rather than per-object, so `encrypt_meta`/`decrypt_meta` bind the AEAD to the object's opaque on-disk id (the `.obj` filename stem, itself a keyed HMAC of `bucket`/`key`) via AAD - the same identity-binding principle as the envelope above, closing the same copy-attack: a metadata blob relocated to a different object's storage location fails the tag check instead of decrypting into a spoofed size/labels/checksums for the target object. Decrypted, it has this logical shape:
 
 ```json
 {
@@ -224,7 +211,7 @@ The metadata blob embedded in each `.obj` is **encrypted at rest** under the MEK
   "url_path":        "my-bucket/path/to/object",
   "labels":          { "owner": "alice" },
   "cipher_size":     13477,
-  "cipher_sha256":   "<b64>",
+  "cipher_checksum": "<b64 8-byte XXH3-64, 12 chars>",
   "kem_alg":         "ml-kem-768",
   "aead_alg":        "aes-256-gcm",
   "envelope_version": 2,

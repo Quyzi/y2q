@@ -14,13 +14,34 @@
 //! Encrypted metadata wire format:
 //!     [0x01 | 12-byte random nonce | AES-256-GCM(meta_json)]
 //!
-//! Legacy metadata (written before encryption was enabled) begins with any
-//! byte other than 0x01 and is passed through as plain JSON for backward
-//! compatibility.
+//! A blob not beginning with `0x01` is rejected outright — there is no
+//! unauthenticated plaintext passthrough for legacy/pre-encryption metadata.
+//!
+//! The AEAD is bound to the object's opaque on-disk id via AAD (see
+//! [`encrypt_meta`]/[`decrypt_meta`]), the same identity-binding principle
+//! used for object envelopes ([`super::envelope`]). The MEK is one fixed key
+//! for the whole deployment rather than per-object, so without this binding
+//! an attacker with filesystem write access could copy one object's
+//! encrypted metadata blob onto another object's location and have it
+//! decrypt successfully every time, splicing one object's
+//! labels/timestamps/checksums onto another.
+//!
+//! Binding is keyed to the opaque object id (the `.obj` filename stem — see
+//! `storage::filesystem::encode_object_id`) rather than the plaintext
+//! `(bucket, key)` strings directly. The id is recoverable from a file's own
+//! path with no decryption needed, which the index-rebuild scan depends on:
+//! it discovers each object's `(bucket, key)` only by decrypting its
+//! metadata, so binding to bucket/key strings would make that first decrypt
+//! impossible. Binding to the id instead gives the identical guarantee (a
+//! blob only opens at the exact path it was sealed for) without that
+//! chicken-and-egg problem.
 
 use std::sync::RwLock;
 
-use aes_gcm::{Aes256Gcm, KeyInit, aead::Aead};
+use aes_gcm::{
+    Aes256Gcm, KeyInit,
+    aead::{Aead, Payload},
+};
 use hmac::{Hmac, Mac};
 use rand::Rng;
 use sha2::{Digest, Sha256};
@@ -183,16 +204,25 @@ impl MekSlot {
     }
 }
 
-/// Encrypt `json` with AES-256-GCM under `mek`.
+/// Encrypt `json` with AES-256-GCM under `mek`, bound to `object_id` (the
+/// object's opaque on-disk id — see `storage::filesystem::encode_object_id`).
 ///
-/// Returns `[0x01 | 12-byte nonce | ciphertext]`.
-pub fn encrypt_meta(mek: &[u8; 32], json: &[u8]) -> Result<Vec<u8>, CryptoError> {
+/// Returns `[0x01 | 12-byte nonce | ciphertext]`. The blob only decrypts
+/// successfully for the same `object_id` it was encrypted for — copying it
+/// to a different object's storage location fails AEAD verification.
+pub fn encrypt_meta(mek: &[u8; 32], json: &[u8], object_id: &str) -> Result<Vec<u8>, CryptoError> {
     let cipher = Aes256Gcm::new(mek.into());
     let mut nonce_bytes = [0u8; NONCE_LEN];
     rand::rng().fill_bytes(&mut nonce_bytes);
     let nonce = &aes_gcm::Nonce::from(nonce_bytes);
     let ct = cipher
-        .encrypt(nonce, json)
+        .encrypt(
+            nonce,
+            Payload {
+                msg: json,
+                aad: object_id.as_bytes(),
+            },
+        )
         .map_err(|_| CryptoError::Aead("metadata encrypt"))?;
     let mut out = Vec::with_capacity(1 + NONCE_LEN + ct.len());
     out.push(VERSION_BYTE);
@@ -201,13 +231,17 @@ pub fn encrypt_meta(mek: &[u8; 32], json: &[u8]) -> Result<Vec<u8>, CryptoError>
     Ok(out)
 }
 
-/// Decrypt or pass through a metadata blob.
+/// Decrypt a metadata blob, requiring it to have been sealed for the same
+/// `object_id`.
 ///
-/// - First byte `0x01` → AES-256-GCM encrypted; decrypt and return the JSON.
-/// - Any other first byte → legacy plaintext JSON; return as-is.
-pub fn decrypt_meta(mek: &[u8; 32], blob: &[u8]) -> Result<Vec<u8>, CryptoError> {
+/// The first byte must be `0x01`; anything else (including legacy
+/// pre-encryption plaintext) is rejected rather than passed through
+/// unauthenticated. A blob relocated from a different object's storage
+/// location fails with [`CryptoError::AuthFailed`], the same as a corrupted
+/// or tampered blob.
+pub fn decrypt_meta(mek: &[u8; 32], blob: &[u8], object_id: &str) -> Result<Vec<u8>, CryptoError> {
     if blob.is_empty() || blob[0] != VERSION_BYTE {
-        return Ok(blob.to_vec());
+        return Err(CryptoError::Envelope("unrecognized metadata format"));
     }
     if blob.len() < MIN_ENCRYPTED_LEN {
         return Err(CryptoError::Envelope(
@@ -219,7 +253,13 @@ pub fn decrypt_meta(mek: &[u8; 32], blob: &[u8]) -> Result<Vec<u8>, CryptoError>
     let ct = &blob[1 + NONCE_LEN..];
     let cipher = Aes256Gcm::new(mek.into());
     cipher
-        .decrypt(nonce, ct)
+        .decrypt(
+            nonce,
+            Payload {
+                msg: ct,
+                aad: object_id.as_bytes(),
+            },
+        )
         .map_err(|_| CryptoError::AuthFailed)
 }
 
@@ -260,18 +300,38 @@ mod tests {
     #[test]
     fn encrypt_decrypt_roundtrip() {
         let mek = derive_mek(b"sk");
-        let blob = encrypt_meta(&mek, b"{\"hello\":\"world\"}").unwrap();
+        let blob = encrypt_meta(&mek, b"{\"hello\":\"world\"}", "obj-id-a").unwrap();
         assert_eq!(blob[0], VERSION_BYTE);
-        assert_eq!(decrypt_meta(&mek, &blob).unwrap(), b"{\"hello\":\"world\"}");
+        assert_eq!(
+            decrypt_meta(&mek, &blob, "obj-id-a").unwrap(),
+            b"{\"hello\":\"world\"}"
+        );
     }
 
     #[test]
     fn wrong_mek_fails_to_decrypt() {
-        let blob = encrypt_meta(&derive_mek(b"sk-a"), b"secret").unwrap();
+        let blob = encrypt_meta(&derive_mek(b"sk-a"), b"secret", "obj-id-a").unwrap();
         assert!(matches!(
-            decrypt_meta(&derive_mek(b"sk-b"), &blob),
+            decrypt_meta(&derive_mek(b"sk-b"), &blob, "obj-id-a"),
             Err(CryptoError::AuthFailed)
         ));
+    }
+
+    #[test]
+    fn meta_blob_cannot_be_relocated_to_a_different_object() {
+        let mek = derive_mek(b"sk");
+        let blob = encrypt_meta(&mek, b"{\"secret\":true}", "obj-id-a").unwrap();
+
+        // Same blob, different object id (as if copied to another object's path).
+        assert!(matches!(
+            decrypt_meta(&mek, &blob, "obj-id-b"),
+            Err(CryptoError::AuthFailed)
+        ));
+        // Genuine address still opens it.
+        assert_eq!(
+            decrypt_meta(&mek, &blob, "obj-id-a").unwrap(),
+            b"{\"secret\":true}"
+        );
     }
 
     #[test]
@@ -302,9 +362,20 @@ mod tests {
     }
 
     #[test]
-    fn legacy_plaintext_passes_through() {
-        // Any blob not starting with VERSION_BYTE is treated as legacy plaintext.
+    fn legacy_plaintext_is_rejected() {
+        // Any blob not starting with VERSION_BYTE is rejected, not passed through.
         let plain = b"{\"legacy\":true}";
-        assert_eq!(decrypt_meta(&derive_mek(b"sk"), plain).unwrap(), plain);
+        assert!(matches!(
+            decrypt_meta(&derive_mek(b"sk"), plain, "obj-id-a"),
+            Err(CryptoError::Envelope(_))
+        ));
+    }
+
+    #[test]
+    fn empty_blob_is_rejected() {
+        assert!(matches!(
+            decrypt_meta(&derive_mek(b"sk"), b"", "obj-id-a"),
+            Err(CryptoError::Envelope(_))
+        ));
     }
 }

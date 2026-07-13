@@ -203,6 +203,18 @@ pub(crate) fn bucket_dir_path(base_path: &Path, path_key: &[u8; 32], bucket: &st
     base_path.join(encode_bucket_dir(path_key, bucket))
 }
 
+/// Extract the opaque per-object id (the `.obj` filename stem produced by
+/// [`encode_object_id`]) from a path built by [`obj_path_for`].
+///
+/// Used to bind encrypted metadata to its physical storage location (see
+/// [`crate::crypto::metadata_key`]) without needing to already know the
+/// object's bucket/key — the index-rebuild scan discovers those only by
+/// decrypting the metadata itself, so the id must be derivable from the path
+/// alone.
+pub(crate) fn object_id_from_path(path: &Path) -> Option<&str> {
+    path.file_stem().and_then(|s| s.to_str())
+}
+
 /// Reserved bucket names that conflict with the `/api/v1/*` admin namespace.
 const RESERVED_BUCKETS: &[&str] = &["api"];
 
@@ -390,10 +402,11 @@ pub(crate) async fn set_labels_impl(
     let data = &bytes[data_start..meta_start];
     let meta_bytes = &bytes[meta_start..meta_end];
 
+    let object_id = object_id_from_path(&obj_path)
+        .ok_or_else(|| internal("cannot derive object id from path".to_owned()))?;
     let meta_json = match mek {
-        Some(k) => {
-            decrypt_meta(k, meta_bytes).map_err(|e| internal(format!("decrypt meta: {e}")))?
-        }
+        Some(k) => decrypt_meta(k, meta_bytes, object_id)
+            .map_err(|e| internal(format!("decrypt meta: {e}")))?,
         None => meta_bytes.to_vec(),
     };
     let mut metadata: Metadata =
@@ -406,9 +419,8 @@ pub(crate) async fn set_labels_impl(
         serde_json::to_vec(&metadata).map_err(|e| internal(format!("encode meta: {e}")))?;
     // Writes require an installed MEK; refuse rather than persisting plaintext.
     let new_meta = match mek {
-        Some(k) => {
-            encrypt_meta(k, &new_json).map_err(|e| internal(format!("encrypt meta: {e}")))?
-        }
+        Some(k) => encrypt_meta(k, &new_json, object_id)
+            .map_err(|e| internal(format!("encrypt meta: {e}")))?,
         None => {
             return Err(internal(
                 "metadata write attempted without an installed MEK".to_owned(),
@@ -587,7 +599,13 @@ async fn read_obj_metadata(
     let mut meta_buf = vec![0u8; header.meta_len as usize];
     file.read_exact(&mut meta_buf).await?;
     let json = if let Some(mek) = mek {
-        decrypt_meta(mek, &meta_buf)
+        let object_id = object_id_from_path(path).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "cannot derive object id from path",
+            )
+        })?;
+        decrypt_meta(mek, &meta_buf, object_id)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?
     } else {
         meta_buf
@@ -651,7 +669,7 @@ impl StreamingPutGuard {
             url_path: format!("{bucket}/{key}"),
             labels: options.labels,
             cipher_size: Some(cipher_size),
-            cipher_sha256: Some(cipher_metadata.cipher_sha256_b64),
+            cipher_checksum: Some(cipher_metadata.cipher_checksum_b64),
             kem_alg: Some(cipher_metadata.kem_alg),
             aead_alg: Some(cipher_metadata.aead_alg),
             envelope_version: Some(cipher_metadata.envelope_version),
@@ -666,12 +684,21 @@ impl StreamingPutGuard {
             message: format!("encode meta: {e}"),
         })?;
         let meta_bytes = match self.mek.mek() {
-            Some(mek) => encrypt_meta(&mek, &meta_json).map_err(|e| Error::InternalError {
-                bucket: bucket.to_owned(),
-                key: key.to_owned(),
-                operation: "put".to_owned(),
-                message: format!("encrypt meta: {e}"),
-            })?,
+            Some(mek) => {
+                let object_id =
+                    object_id_from_path(&self.obj_path).ok_or_else(|| Error::InternalError {
+                        bucket: bucket.to_owned(),
+                        key: key.to_owned(),
+                        operation: "put".to_owned(),
+                        message: "cannot derive object id from path".to_owned(),
+                    })?;
+                encrypt_meta(&mek, &meta_json, object_id).map_err(|e| Error::InternalError {
+                    bucket: bucket.to_owned(),
+                    key: key.to_owned(),
+                    operation: "put".to_owned(),
+                    message: format!("encrypt meta: {e}"),
+                })?
+            }
             None => {
                 return Err(Error::InternalError {
                     bucket: bucket.to_owned(),
@@ -1110,11 +1137,11 @@ impl Storage for FilesystemStorage {
                 Some(p) => (p.size, p.checksum_gxhash_b64.clone()),
                 None => (data.len() as u64, compute_checksum(data)),
             };
-            let (cipher_size, cipher_sha256, kem_alg, aead_alg, envelope_version) =
+            let (cipher_size, cipher_checksum, kem_alg, aead_alg, envelope_version) =
                 match &options.cipher_metadata {
                     Some(c) => (
                         Some(c.cipher_size),
-                        Some(c.cipher_sha256_b64.clone()),
+                        Some(c.cipher_checksum_b64.clone()),
                         Some(c.kem_alg.clone()),
                         Some(c.aead_alg.clone()),
                         Some(c.envelope_version),
@@ -1133,7 +1160,7 @@ impl Storage for FilesystemStorage {
                 url_path: format!("{bucket}/{key}"),
                 labels: options.labels,
                 cipher_size,
-                cipher_sha256,
+                cipher_checksum,
                 kem_alg,
                 aead_alg,
                 envelope_version,
@@ -1150,12 +1177,21 @@ impl Storage for FilesystemStorage {
                 message: e.to_string(),
             })?;
             let meta_bytes = match self.mek.mek() {
-                Some(mek) => encrypt_meta(&mek, &meta_json).map_err(|e| Error::InternalError {
-                    bucket: bucket.to_owned(),
-                    key: key.to_owned(),
-                    operation: "put".to_owned(),
-                    message: e.to_string(),
-                })?,
+                Some(mek) => {
+                    let object_id =
+                        object_id_from_path(&obj_path).ok_or_else(|| Error::InternalError {
+                            bucket: bucket.to_owned(),
+                            key: key.to_owned(),
+                            operation: "put".to_owned(),
+                            message: "cannot derive object id from path".to_owned(),
+                        })?;
+                    encrypt_meta(&mek, &meta_json, object_id).map_err(|e| Error::InternalError {
+                        bucket: bucket.to_owned(),
+                        key: key.to_owned(),
+                        operation: "put".to_owned(),
+                        message: e.to_string(),
+                    })?
+                }
                 None => {
                     return Err(Error::InternalError {
                         bucket: bucket.to_owned(),
@@ -2586,7 +2622,7 @@ mod tests {
     fn cipher_metadata(cipher_size: u64) -> crate::CipherMetadata {
         crate::CipherMetadata {
             cipher_size,
-            cipher_sha256_b64: "x".to_owned(),
+            cipher_checksum_b64: "x".to_owned(),
             kem_alg: "ml-kem-768".to_owned(),
             aead_alg: "aes-256-gcm".to_owned(),
             envelope_version: 1,

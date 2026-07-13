@@ -98,8 +98,31 @@ pub struct UserStore {
 
 impl UserStore {
     /// Open or create the user-records database at `path`.
+    ///
+    /// Every record stores a user's Argon2id KDF parameters and their wrapped
+    /// copy of the deployment secret key, so the file is created at mode
+    /// `0600` from the moment it's created (not widen-then-chmod) to close
+    /// any window where it would be world/group-readable. An already-existing
+    /// file (e.g. from a build predating this hardening) has its permissions
+    /// re-tightened on every open as defense in depth.
     pub fn open(path: &Path) -> Result<Self, CryptoError> {
-        let db = Database::create(path)
+        let mut open_options = std::fs::OpenOptions::new();
+        open_options.read(true).write(true).create(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            open_options.mode(0o600);
+        }
+        let file = open_options
+            .open(path)
+            .map_err(|e| CryptoError::UserStore(format!("open {}: {e}", path.display())))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+        }
+        let db = redb::Builder::new()
+            .create_file(file)
             .map_err(|e| CryptoError::UserStore(format!("open {}: {e}", path.display())))?;
         let txn = db
             .begin_write()
@@ -282,5 +305,17 @@ mod tests {
         assert!(s.delete("alice").unwrap());
         assert!(!s.delete("alice").unwrap());
         assert_eq!(s.count().unwrap(), 1);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn opens_with_0600_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("u.redb");
+        let _s = UserStore::open(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
 }

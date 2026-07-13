@@ -11,9 +11,15 @@ use bytes::{Bytes, BytesMut};
 
 /// Envelope encryption for object payloads.
 ///
-/// Supports two on-disk formats: v1, which seals the whole object in a single
-/// AEAD operation, and v2, which splits the payload into independently sealed,
+/// The v2 chunked format splits the payload into independently sealed,
 /// per-chunk-nonced segments so large objects can be decrypted in ranges.
+/// There is no unauthenticated passthrough: an envelope with an unrecognized
+/// magic is rejected outright rather than treated as legacy plaintext. The
+/// content key is bound to the object's `(bucket, key)` address (folded into
+/// the HKDF derivation), so a ciphertext valid for one object fails to
+/// decrypt if presented under a different address — copying one object's
+/// on-disk envelope onto another object's storage location does not grant
+/// access to it.
 pub trait ObjectCipher {
     /// Per-envelope metadata recorded alongside the ciphertext: envelope version,
     /// KEM and AEAD algorithm identifiers, and ciphertext size.
@@ -22,45 +28,61 @@ pub trait ObjectCipher {
     type Error: std::error::Error + Send + Sync + 'static;
 
     /// Encapsulate a shared secret to the recipient public key `pk_bytes`, derive
-    /// the content key, and seal `plaintext`. Returns the complete envelope bytes
-    /// and the [`EnvelopeInfo`](Self::EnvelopeInfo) describing what was produced.
+    /// the content key (bound to `bucket`/`key`), and seal `plaintext`. Returns
+    /// the complete envelope bytes and the [`EnvelopeInfo`](Self::EnvelopeInfo)
+    /// describing what was produced.
     fn encrypt(
         &self,
         pk_bytes: &[u8],
         plaintext: &[u8],
+        bucket: &str,
+        key: &str,
     ) -> Result<(Vec<u8>, Self::EnvelopeInfo), Self::Error>;
 
-    /// Decapsulate with `sk_bytes` and open a whole-object (v1) envelope, copying
-    /// the recovered plaintext into a fresh buffer.
-    fn decrypt(&self, sk_bytes: &[u8], envelope: &[u8]) -> Result<Vec<u8>, Self::Error>;
+    /// Decapsulate with `sk_bytes` and open an envelope addressed to
+    /// `bucket`/`key`, copying the recovered plaintext into a fresh buffer.
+    /// Fails if `bucket`/`key` don't match the address the envelope was
+    /// originally encrypted for.
+    fn decrypt(
+        &self,
+        sk_bytes: &[u8],
+        envelope: &[u8],
+        bucket: &str,
+        key: &str,
+    ) -> Result<Vec<u8>, Self::Error>;
 
-    /// Open a whole-object envelope in place, decrypting into the owned input
-    /// buffer and returning a view of the plaintext so no copy is made. Suited to
-    /// large objects already held in memory.
-    fn decrypt_owned(&self, sk_bytes: &[u8], envelope: BytesMut) -> Result<Bytes, Self::Error>;
+    /// Open an envelope in place, decrypting into the owned input buffer and
+    /// returning a view of the plaintext so no copy is made. Suited to large
+    /// objects already held in memory. Same `bucket`/`key` binding as
+    /// [`decrypt`](Self::decrypt).
+    fn decrypt_owned(
+        &self,
+        sk_bytes: &[u8],
+        envelope: BytesMut,
+        bucket: &str,
+        key: &str,
+    ) -> Result<Bytes, Self::Error>;
 
-    /// Open a contiguous run of v2 chunks.
+    /// Open a contiguous run of chunks.
     ///
-    /// `preamble` is the fixed v2 header carrying the KEM ciphertext and geometry;
+    /// `preamble` is the fixed header carrying the KEM ciphertext and geometry;
     /// `chunks_ct` is the concatenation of the chunk ciphertexts to open; and
     /// `first_chunk_idx` is the index of the first supplied chunk, which seeds the
     /// per-chunk nonce derivation. Lets a range read decrypt only the chunks it
-    /// touches.
+    /// touches. Same `bucket`/`key` binding as [`decrypt`](Self::decrypt).
     fn decrypt_v2_chunks(
         &self,
         sk_bytes: &[u8],
         preamble: &[u8],
         chunks_ct: &[u8],
         first_chunk_idx: u64,
+        bucket: &str,
+        key: &str,
     ) -> Result<Vec<u8>, Self::Error>;
 
-    /// Parse a v2 header, returning `(chunk_size, plaintext_len)`. Callers use the
+    /// Parse a header, returning `(chunk_size, plaintext_len)`. Callers use the
     /// geometry to map a requested byte range onto the chunks that cover it.
     fn parse_v2_geometry(&self, header: &[u8]) -> Result<(u32, u64), Self::Error>;
-
-    /// Test whether `bytes` begins with a recognized envelope magic. A cheap
-    /// prefix check used to distinguish encrypted objects from legacy plaintext.
-    fn looks_encrypted(&self, bytes: &[u8]) -> bool;
 }
 
 /// Incremental v2 encryptor that seals chunks into a write sink as plaintext
@@ -143,12 +165,27 @@ pub trait MetadataCipher {
     /// label values into fixed-size, lookup-stable index entries.
     fn prf(&self, key: &[u8; 32], data: &[u8]) -> [u8; 32];
 
-    /// Seal a metadata JSON blob under `mek` for storage in the index.
-    fn encrypt_meta(&self, mek: &[u8; 32], json: &[u8]) -> Result<Vec<u8>, Self::Error>;
+    /// Seal a metadata JSON blob under `mek` for storage in the index, bound
+    /// to the object's opaque on-disk `object_id` via AAD so the blob cannot
+    /// be relocated to a different object's storage location and still
+    /// decrypt.
+    fn encrypt_meta(
+        &self,
+        mek: &[u8; 32],
+        json: &[u8],
+        object_id: &str,
+    ) -> Result<Vec<u8>, Self::Error>;
 
-    /// Open a metadata blob under `mek`. Blobs written before encryption was
-    /// enabled are stored as plaintext and pass through unchanged.
-    fn decrypt_meta(&self, mek: &[u8; 32], blob: &[u8]) -> Result<Vec<u8>, Self::Error>;
+    /// Open a metadata blob under `mek`, requiring it to have been sealed for
+    /// the same `object_id`. A blob without the recognized version byte is
+    /// rejected rather than treated as legacy plaintext; a blob sealed for a
+    /// different object fails the same way as a tampered blob.
+    fn decrypt_meta(
+        &self,
+        mek: &[u8; 32],
+        blob: &[u8],
+        object_id: &str,
+    ) -> Result<Vec<u8>, Self::Error>;
 }
 
 /// Shared, in-memory holder for the active metadata encryption key and its

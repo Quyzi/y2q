@@ -51,9 +51,9 @@ pub struct MetadataView {
     /// Total bytes on disk (encrypted envelope), if encryption is enabled.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cipher_size: Option<u64>,
-    /// Standard-base64 SHA-256 of the on-disk envelope bytes.
+    /// Standard-base64 XXH3-64 checksum of the on-disk envelope bytes.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub cipher_sha256: Option<String>,
+    pub cipher_checksum: Option<String>,
     /// Symbolic KEM algorithm name (e.g. `"ml-kem-768"`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kem_alg: Option<String>,
@@ -77,7 +77,7 @@ impl From<Metadata> for MetadataView {
             url_path: m.url_path,
             labels: m.labels.into_iter().collect(),
             cipher_size: m.cipher_size,
-            cipher_sha256: m.cipher_sha256,
+            cipher_checksum: m.cipher_checksum,
             kem_alg: m.kem_alg,
             aead_alg: m.aead_alg,
             envelope_version: m.envelope_version,

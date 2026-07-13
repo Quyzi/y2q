@@ -21,7 +21,7 @@ use async_channel::Sender;
 use bytes::Bytes;
 use tokio::sync::oneshot;
 
-use crate::storage::locks::LockGuard;
+use crate::storage::{filesystem::object_id_from_path, locks::LockGuard};
 
 use crate::{
     CipherMetadata, Error, Metadata, MetadataIndex, PlaintextMetrics, PutOptions, SyncLevel,
@@ -121,7 +121,7 @@ impl UringStreamingPutGuard {
             url_path: format!("{bucket}/{key}"),
             labels: options.labels,
             cipher_size: Some(cipher_size),
-            cipher_sha256: Some(cipher_metadata.cipher_sha256_b64),
+            cipher_checksum: Some(cipher_metadata.cipher_checksum_b64),
             kem_alg: Some(cipher_metadata.kem_alg),
             aead_alg: Some(cipher_metadata.aead_alg),
             envelope_version: Some(cipher_metadata.envelope_version),
@@ -137,12 +137,21 @@ impl UringStreamingPutGuard {
         })?;
         // Writes require an installed MEK; refuse rather than persisting plaintext.
         let meta_bytes = match self.mek {
-            Some(ref mek) => encrypt_meta(mek, &meta_json).map_err(|e| Error::InternalError {
-                bucket: bucket.to_owned(),
-                key: key.to_owned(),
-                operation: "put".to_owned(),
-                message: format!("encrypt meta: {e}"),
-            })?,
+            Some(ref mek) => {
+                let object_id =
+                    object_id_from_path(&self.obj_path).ok_or_else(|| Error::InternalError {
+                        bucket: bucket.to_owned(),
+                        key: key.to_owned(),
+                        operation: "put".to_owned(),
+                        message: "cannot derive object id from path".to_owned(),
+                    })?;
+                encrypt_meta(mek, &meta_json, object_id).map_err(|e| Error::InternalError {
+                    bucket: bucket.to_owned(),
+                    key: key.to_owned(),
+                    operation: "put".to_owned(),
+                    message: format!("encrypt meta: {e}"),
+                })?
+            }
             None => {
                 return Err(Error::InternalError {
                     bucket: bucket.to_owned(),

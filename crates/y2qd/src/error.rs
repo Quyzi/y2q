@@ -33,17 +33,17 @@ pub struct ErrorBody {
 /// | `RebuildAlreadyRunning`       | 409         |
 /// | `Forbidden`                   | 403         |
 /// | `InvalidAcl`                  | 400         |
-/// | `Index`                       | 500         |
-/// | `InternalError`               | 500         |
-/// | `KdfFailed`                   | 500         |
+/// | `Index`                       | 500 (generic body) |
+/// | `InternalError`               | 500 (generic body) |
+/// | `KdfFailed`                   | 500 (generic body) |
 /// | `EncryptionFailed`            | 500         |
 /// | `DecryptionFailed`            | 500 (generic body) |
 /// | `EnvelopeMalformed`           | 500 (generic body) |
 /// | `UnsupportedEnvelopeVersion`  | 500         |
 /// | `KeystoreNotFound`            | 503         |
-/// | `KeystoreCorrupt`             | 500         |
-/// | `RangeReadOnEncrypted`        | 501         |
+/// | `KeystoreCorrupt`             | 500 (generic body) |
 /// | `Query`                       | 400         |
+/// | `BodyTooLarge`                | 413         |
 #[derive(Debug)]
 pub struct AppError(pub CoreError);
 
@@ -90,7 +90,9 @@ impl ResponseError for AppError {
             | CoreError::InvalidStaleLockThreshold { .. } => StatusCode::BAD_REQUEST,
             CoreError::Locked { .. } | CoreError::RebuildAlreadyRunning => StatusCode::CONFLICT,
             CoreError::Forbidden { .. } => StatusCode::FORBIDDEN,
-            CoreError::QuotaExceeded { .. } => StatusCode::PAYLOAD_TOO_LARGE,
+            CoreError::QuotaExceeded { .. } | CoreError::BodyTooLarge { .. } => {
+                StatusCode::PAYLOAD_TOO_LARGE
+            }
             CoreError::Index { .. }
             | CoreError::InternalError { .. }
             | CoreError::KdfFailed { .. }
@@ -100,7 +102,6 @@ impl ResponseError for AppError {
             | CoreError::UnsupportedEnvelopeVersion { .. }
             | CoreError::KeystoreCorrupt { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             CoreError::KeystoreNotFound { .. } => StatusCode::SERVICE_UNAVAILABLE,
-            CoreError::RangeReadOnEncrypted => StatusCode::NOT_IMPLEMENTED,
         }
     }
 
@@ -109,6 +110,10 @@ impl ResponseError for AppError {
         // For decryption / envelope errors we deliberately return a generic
         // message — the underlying `reason` may distinguish a tag mismatch
         // from a malformed header, which is a side channel about disk state.
+        // Internal/backend errors carry raw OS or storage-backend detail
+        // (filesystem paths, redb error text) that's useful for an operator
+        // but not for a client — log it server-side and return a generic
+        // body instead of echoing it back.
         let body = match &self.0 {
             CoreError::DecryptionFailed { .. } => ErrorBody {
                 error: "decryption failed".to_owned(),
@@ -116,10 +121,67 @@ impl ResponseError for AppError {
             CoreError::EnvelopeMalformed { .. } => ErrorBody {
                 error: "object format error".to_owned(),
             },
+            CoreError::Index { .. }
+            | CoreError::InternalError { .. }
+            | CoreError::KdfFailed { .. }
+            | CoreError::KeystoreCorrupt { .. } => {
+                tracing::error!(error = %self.0, "internal error");
+                ErrorBody {
+                    error: "internal error".to_owned(),
+                }
+            }
             _ => ErrorBody {
                 error: self.to_string(),
             },
         };
         HttpResponse::build(status).json(body)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn body_text(err: &AppError) -> String {
+        let resp = err.error_response();
+        let bytes =
+            futures::executor::block_on(actix_web::body::to_bytes(resp.into_body())).unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    #[test]
+    fn internal_error_body_does_not_leak_raw_detail() {
+        let err = AppError(CoreError::InternalError {
+            bucket: "b".to_owned(),
+            key: "k".to_owned(),
+            operation: "open".to_owned(),
+            message: "/var/lib/y2q/secret/path: permission denied".to_owned(),
+        });
+        let text = body_text(&err);
+        assert!(!text.contains("/var/lib/y2q"));
+        assert!(text.contains("internal error"));
+    }
+
+    #[test]
+    fn keystore_corrupt_body_does_not_leak_raw_path() {
+        let err = AppError(CoreError::KeystoreCorrupt {
+            path: "/var/lib/y2q/keystore/pubkey.json".to_owned(),
+            reason: "bad length".to_owned(),
+        });
+        let text = body_text(&err);
+        assert!(!text.contains("/var/lib/y2q"));
+        assert!(text.contains("internal error"));
+    }
+
+    #[test]
+    fn not_found_body_is_still_specific() {
+        // Only internal/backend-detail variants get genericized — everything
+        // else keeps its normal, already-safe message.
+        let err = AppError(CoreError::NotFound {
+            bucket: "b".to_owned(),
+            key: "k".to_owned(),
+        });
+        let text = body_text(&err);
+        assert!(text.contains("b") && text.contains("k"));
     }
 }
