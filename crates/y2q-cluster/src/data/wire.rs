@@ -42,9 +42,10 @@ pub struct PrepareMeta {
     pub checksum_gxhash_b64: String,
     /// On-disk envelope size in bytes.
     pub cipher_size: u64,
-    /// SHA-256 of the envelope, standard base64 (empty when the HEAD did not
-    /// compute it — matches the single-node streaming PUT path).
-    pub cipher_sha256_b64: String,
+    /// XXH3-64 checksum of the envelope, standard base64. Non-cryptographic
+    /// (corruption/divergence detection, not tamper detection) — computed
+    /// incrementally by the HEAD as each chunk was written, no read-back.
+    pub cipher_checksum_b64: String,
     /// Symbolic KEM algorithm name.
     pub kem_alg: String,
     /// Symbolic AEAD algorithm name.
@@ -91,7 +92,7 @@ impl PrepareMeta {
     pub fn cipher_metadata(&self) -> CipherMetadata {
         CipherMetadata {
             cipher_size: self.cipher_size,
-            cipher_sha256_b64: self.cipher_sha256_b64.clone(),
+            cipher_checksum_b64: self.cipher_checksum_b64.clone(),
             kem_alg: self.kem_alg.clone(),
             aead_alg: self.aead_alg.clone(),
             envelope_version: self.envelope_version,
@@ -167,8 +168,9 @@ pub struct BackfillEntry {
     pub key: String,
     /// Committed CRAQ version (`None` for legacy/unversioned objects).
     pub version: Option<u64>,
-    /// Standard-base64 SHA-256 of the on-disk envelope (`None` if not recorded).
-    pub cipher_sha256: Option<String>,
+    /// Standard-base64 XXH3-64 checksum of the on-disk envelope (`None` if not
+    /// recorded).
+    pub cipher_checksum: Option<String>,
 }
 
 /// A backfill manifest page: the objects a peer holds locally.
@@ -193,8 +195,9 @@ pub struct BackfillObjectMeta {
     pub checksum_gxhash_b64: String,
     /// On-disk envelope size in bytes.
     pub cipher_size: u64,
-    /// SHA-256 of the envelope, standard base64 (empty when unknown).
-    pub cipher_sha256_b64: String,
+    /// XXH3-64 checksum of the envelope, standard base64. Non-cryptographic
+    /// (corruption/divergence detection, not tamper detection).
+    pub cipher_checksum_b64: String,
     /// Symbolic KEM algorithm name.
     pub kem_alg: String,
     /// Symbolic AEAD algorithm name.
@@ -220,7 +223,7 @@ impl BackfillObjectMeta {
             plaintext_size: self.plaintext_size,
             checksum_gxhash_b64: self.checksum_gxhash_b64.clone(),
             cipher_size: self.cipher_size,
-            cipher_sha256_b64: self.cipher_sha256_b64.clone(),
+            cipher_checksum_b64: self.cipher_checksum_b64.clone(),
             kem_alg: self.kem_alg.clone(),
             aead_alg: self.aead_alg.clone(),
             envelope_version: self.envelope_version,
@@ -325,7 +328,7 @@ mod tests {
             plaintext_size: 4000,
             checksum_gxhash_b64: "Y2hrc3VtAAA=".into(),
             cipher_size: 5200,
-            cipher_sha256_b64: String::new(),
+            cipher_checksum_b64: String::new(),
             kem_alg: "ml-kem-768".into(),
             aead_alg: "aes-256-gcm".into(),
             envelope_version: 2,

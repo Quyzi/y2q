@@ -2,8 +2,8 @@
 //!
 //! Every PUT runs a fresh ML-KEM-768 encapsulation against the deployment's
 //! single public key; the resulting shared secret is fed through HKDF-SHA256
-//! to derive an AES-256-GCM content key that encrypts the whole object body.
-//! Range reads on encrypted objects are not supported.
+//! to derive an AES-256-GCM content key that encrypts the object body in
+//! fixed-size chunks, supporting ranged reads.
 //!
 //! Submodules:
 //! - [`envelope`] — on-disk format and whole-object AEAD.
@@ -21,7 +21,7 @@ pub mod keystore;
 pub mod metadata_key;
 pub mod user_store;
 
-pub use envelope::{ENVELOPE_HEADER_FIXED_LEN, EnvelopeInfo};
+pub use envelope::EnvelopeInfo;
 pub use kdf::{Argon2Params, WrappedSk, default_argon2_params};
 pub use keys::{DecryptedKeystore, Keystore};
 pub use keystore::{KeystoreFiles, PubkeyFile};

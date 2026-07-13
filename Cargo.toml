@@ -16,6 +16,7 @@ resolver = "2"
 version = "0.2.0"
 
 [workspace.dependencies]
+actix-governor              = "0.10"
 actix-web                   = "4"
 aead                        = "0.6"
 aes-gcm                     = "0.11"
@@ -37,6 +38,7 @@ figment                     = { version = "0.10.19", features = ["toml", "env"] 
 flume                       = "0.12"
 fs2                         = "0.4"
 futures                     = "0.3"
+governor                    = "0.10"
 hdrhistogram                = "7"
 hkdf                        = "0.13"
 hmac                        = "0.13"

@@ -68,7 +68,7 @@ Every error response carries this body:
 Status codes follow the table in each endpoint section. A few semantics worth knowing up front:
 
 - **401** uses `WWW-Authenticate: Bearer` for auth errors.
-- **429** on login uses `Retry-After: <seconds>` for lockouts.
+- **429** on login can come from two independent layers: a per-source-IP rate limit (a handful of requests per few seconds, checked first, before any credential work) or the per-username lockout described below. The lockout response sets `Retry-After: <seconds>`; the IP rate limit's 429 does not carry a body worth parsing.
 - **`401 invalid credentials`** is returned identically whether the username doesn't exist or the password is wrong. By design - probing user existence isn't possible.
 - **`500 decryption failed`** and **`500 object format error`** are deliberately generic. They cover both genuine corruption and adversarial probing.
 
@@ -107,7 +107,7 @@ Authenticate a user and mint a session token.
 | 200 | Logged in |
 | 400 | `ttl_seconds` out of range or malformed username |
 | 401 | Invalid credentials (user-doesn't-exist and wrong-password are indistinguishable) |
-| 429 | Account locked out - `Retry-After` header set |
+| 429 | Per-source-IP rate limit exceeded (checked first, before credentials), or account locked out after repeated failures - the latter sets `Retry-After` |
 
 **Example:**
 ```sh
@@ -268,7 +268,7 @@ Keys: up to 1024 bytes, no null bytes, non-empty.
 Store an object. The body is encrypted (envelope + ML-KEM-768 + AES-256-GCM) and written to disk.
 
 **Request:**
-- Body: raw bytes, any Content-Type. Up to `server.max_body_bytes` (default 256 MiB).
+- Body: raw bytes, any Content-Type. Up to `server.max_body_bytes` (default 256 MiB), or less if the bucket has a `quota_bytes` limit with less headroom remaining. Enforced as the body streams in - regardless of whether `Content-Length` is sent (chunked transfer encoding has none).
 - Headers (optional):
 
 | Header | Values | Default | Effect |
@@ -287,6 +287,7 @@ Reserved label names (rejected case-insensitively): `Created`, `Modified`, `Chec
 | 400 | Invalid bucket, key, label, or `X-Y2Q-Sync` value |
 | 401 | Token missing or invalid |
 | 409 | Object is currently locked (a PUT to this key is already in progress, or a stale lock is present) |
+| 413 | Body exceeds `server.max_body_bytes`, or would exceed the bucket's `quota_bytes` |
 | 500 | Encryption or storage failure |
 
 **Example:**
@@ -306,7 +307,7 @@ Retrieve and decrypt an object.
 
 | Header | Effect |
 |---|---|
-| `Range: bytes=N-M` | Closed inclusive byte range over the plaintext. For v2-chunked encrypted objects (the default) only the covering ciphertext chunks are read and decrypted (206). Legacy plaintext objects are sliced directly (206). v1 whole-object encrypted objects cannot be partially decrypted and return 501. The range must be well-formed (`N <= M`) and lie within the object, else 416. |
+| `Range: bytes=N-M` | Closed inclusive byte range over the plaintext. Only the covering ciphertext chunks are read and decrypted (206). The range must be well-formed (`N <= M`) and lie within the object, else 416. |
 
 **Response (200):** raw object bytes, `Content-Type: application/octet-stream`. The full set of metadata headers from `HEAD` is also present.
 
@@ -315,14 +316,13 @@ Retrieve and decrypt an object.
 | Code | Meaning |
 |---|---|
 | 200 | Full object |
-| 206 | Partial Content (Range; v2-encrypted or plaintext) |
+| 206 | Partial Content (Range) |
 | 400 | Invalid bucket or key |
 | 401 | Token missing or invalid |
 | 404 | Not found |
 | 409 | Object locked |
 | 416 | Range not satisfiable (inverted or out of bounds); `Content-Range: bytes */<size>` |
 | 500 | Decryption or storage failure (intentionally generic message) |
-| 501 | `Range` on a v1 whole-object encrypted object |
 
 ### `HEAD /{bucket}/{key}`
 
@@ -338,11 +338,11 @@ Metadata only - no body.
 | `X-Y2Q-Created` | yes | Nanoseconds since Unix epoch when first written |
 | `X-Y2Q-Modified` | yes | Nanoseconds since Unix epoch when last overwritten |
 | `X-Y2Q-Checksum-GxHash` | yes | 8-byte gxhash64 digest of the plaintext, standard base64 (12 chars). Non-cryptographic; for accidental-corruption detection, not tamper detection |
-| `X-Y2Q-Cipher-Size` | encrypted only | On-disk envelope size in bytes |
-| `X-Y2Q-Cipher-SHA256` | encrypted only | SHA-256 of the envelope, base64 |
-| `X-Y2Q-Kem-Alg` | encrypted only | `ml-kem-768` |
-| `X-Y2Q-Aead-Alg` | encrypted only | `aes-256-gcm` |
-| `X-Y2Q-Envelope-Version` | encrypted only | `2` for chunked (default), `1` for legacy whole-object |
+| `X-Y2Q-Cipher-Size` | yes | On-disk envelope size in bytes |
+| `X-Y2Q-Cipher-Checksum` | yes | 8-byte XXH3-64 checksum of the on-disk envelope, base64 (12 chars). Non-cryptographic, same as `X-Y2Q-Checksum-GxHash` above - for corruption/replica-divergence detection, not tamper detection (the per-chunk AEAD tag is what authenticates the envelope) |
+| `X-Y2Q-Kem-Alg` | yes | `ml-kem-768` |
+| `X-Y2Q-Aead-Alg` | yes | `aes-256-gcm` |
+| `X-Y2Q-Envelope-Version` | yes | `2` (chunked; the only supported format) |
 | `X-Y2Q-<label>` | per-object | Each custom label attached on PUT, echoed back lowercased |
 
 | Code | Meaning |
@@ -456,7 +456,7 @@ List objects in a bucket, paginated.
       "url_path":         "photos/2024/05/cat.jpg",
       "labels":           [["owner", "alice"], ["album", "vacation"]],
       "cipher_size":      13477,
-      "cipher_sha256":    "<b64>",
+      "cipher_checksum":  "<b64>",
       "kem_alg":          "ml-kem-768",
       "aead_alg":         "aes-256-gcm",
       "envelope_version": 2
@@ -724,16 +724,16 @@ These are served **only** when `[server] unauthenticated_metrics = true`, and th
 | 201 | New object or user created |
 | 202 | Rebuild kicked off |
 | 204 | Successful mutation with no body (logout, password change, delete) |
-| 206 | Partial Content (Range on a v2-encrypted or plaintext object) |
+| 206 | Partial Content (Range) |
 | 400 | Bad bucket name, key, label, request body, or query parameter |
 | 401 | Auth missing/invalid, or login credentials wrong |
 | 403 | Authenticated but not permitted - not an admin, or lacks the bucket permission for this action (on a bucket you can see) |
 | 404 | Object or user not found; also a bucket you have no permission on (existence is hidden) |
 | 409 | Conflict - object locked, rebuild already running, username taken, last-user/last-admin deletion |
+| 413 | PUT body exceeds `server.max_body_bytes` or the bucket's `quota_bytes` |
 | 416 | `Range` not satisfiable (inverted or out of bounds) |
-| 429 | Login lockout - see `Retry-After` |
+| 429 | Login: per-source-IP rate limit, or per-username lockout - see `Retry-After` |
 | 500 | Internal failure: encryption, decryption, index, or storage |
-| 501 | `Range` request on a v1 whole-object encrypted object |
 | 503 | `KeystoreUnavailable` - daemon has no SK in memory (idle-dropped). Log in to install it. |
 
 ## Source

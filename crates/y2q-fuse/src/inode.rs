@@ -22,7 +22,7 @@ pub struct CachedMeta {
     pub checksum_gxhash: String,
     pub labels: BTreeSet<(String, String)>,
     pub cipher_size: Option<u64>,
-    pub cipher_sha256: Option<String>,
+    pub cipher_checksum: Option<String>,
     pub kem_alg: Option<String>,
     pub aead_alg: Option<String>,
     pub envelope_version: Option<u16>,

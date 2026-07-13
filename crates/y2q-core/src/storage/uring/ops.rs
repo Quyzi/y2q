@@ -25,7 +25,7 @@ use tokio_uring::fs::{File, OpenOptions};
 use crate::{
     Error, LabelSet, Metadata, Object, SyncLevel,
     crypto::{decrypt_meta, encrypt_meta},
-    storage::{bufpool, locks::LockRegistry},
+    storage::{bufpool, filesystem::object_id_from_path, locks::LockRegistry},
 };
 
 use super::{
@@ -324,6 +324,7 @@ async fn open_and_read_header(
 async fn read_meta_blob(
     file: &File,
     header: &Header,
+    obj_path: &Path,
     bucket: &str,
     key: &str,
     op_name: &str,
@@ -336,7 +337,19 @@ async fn read_meta_blob(
     res.map_err(|e| internal(bucket, key, op_name, format!("read meta: {e}")))?;
 
     if let Some(mek) = mek {
-        let plaintext = decrypt_meta(mek, &buf)
+        let object_id = match object_id_from_path(obj_path) {
+            Some(id) => id,
+            None => {
+                bufpool::release(buf);
+                return Err(internal(
+                    bucket,
+                    key,
+                    op_name,
+                    "cannot derive object id from path",
+                ));
+            }
+        };
+        let plaintext = decrypt_meta(mek, &buf, object_id)
             .map_err(|e| internal(bucket, key, op_name, format!("decrypt meta: {e}")))?;
         bufpool::release(buf);
         serde_json::from_slice(&plaintext)
@@ -360,7 +373,16 @@ async fn do_describe(
 ) -> Result<Metadata, Error> {
     locks.check_not_locked(&bucket, &key)?;
     let (file, header) = open_and_read_header(&obj_path, &bucket, &key, "describe").await?;
-    let meta = read_meta_blob(&file, &header, &bucket, &key, "describe", mek.as_ref()).await;
+    let meta = read_meta_blob(
+        &file,
+        &header,
+        &obj_path,
+        &bucket,
+        &key,
+        "describe",
+        mek.as_ref(),
+    )
+    .await;
     let _ = file.close().await;
     meta
 }
@@ -404,8 +426,15 @@ async fn do_read_object_meta(path: PathBuf, mek: Option<[u8; 32]>) -> Result<Met
     res.map_err(|e| make_err(format!("read meta: {e}")))?;
 
     if let Some(ref mek) = mek {
-        let plaintext =
-            decrypt_meta(mek, &meta_buf).map_err(|e| make_err(format!("decrypt meta: {e}")))?;
+        let object_id = match object_id_from_path(&path) {
+            Some(id) => id,
+            None => {
+                bufpool::release(meta_buf);
+                return Err(make_err("cannot derive object id from path".to_owned()));
+            }
+        };
+        let plaintext = decrypt_meta(mek, &meta_buf, object_id)
+            .map_err(|e| make_err(format!("decrypt meta: {e}")))?;
         bufpool::release(meta_buf);
         serde_json::from_slice(&plaintext).map_err(|e| make_err(format!("decode meta: {e}")))
     } else {
@@ -526,7 +555,7 @@ async fn do_put(
     // gives us its prior `created` timestamp for preservation.
     let (is_overwrite, prior_created) = match File::open(&obj_path).await {
         Ok(file) => {
-            let prior = read_existing_created(&file, mek.as_ref()).await;
+            let prior = read_existing_created(&file, &obj_path, mek.as_ref()).await;
             let _ = file.close().await;
             (true, prior)
         }
@@ -551,10 +580,11 @@ async fn do_put(
             crate::checksum::checksum_b64(&payload),
         ),
     };
-    let (cipher_size, cipher_sha256, kem_alg, aead_alg, envelope_version) = match cipher_metadata {
+    let (cipher_size, cipher_checksum, kem_alg, aead_alg, envelope_version) = match cipher_metadata
+    {
         Some(c) => (
             Some(c.cipher_size),
-            Some(c.cipher_sha256_b64),
+            Some(c.cipher_checksum_b64),
             Some(c.kem_alg),
             Some(c.aead_alg),
             Some(c.envelope_version),
@@ -575,7 +605,7 @@ async fn do_put(
         url_path,
         labels,
         cipher_size,
-        cipher_sha256,
+        cipher_checksum,
         kem_alg,
         aead_alg,
         envelope_version,
@@ -589,8 +619,18 @@ async fn do_put(
         .map_err(|e| internal(&bucket, &key, "put", format!("encode meta: {e}")))?;
     // Writes require an installed MEK; refuse rather than persisting plaintext.
     let meta_bytes = match mek {
-        Some(ref mek) => encrypt_meta(mek, &meta_json)
-            .map_err(|e| internal(&bucket, &key, "put", format!("encrypt meta: {e}")))?,
+        Some(ref mek) => {
+            let object_id = object_id_from_path(&obj_path).ok_or_else(|| {
+                internal(
+                    &bucket,
+                    &key,
+                    "put",
+                    "cannot derive object id from path".to_owned(),
+                )
+            })?;
+            encrypt_meta(mek, &meta_json, object_id)
+                .map_err(|e| internal(&bucket, &key, "put", format!("encrypt meta: {e}")))?
+        }
         None => {
             return Err(internal(
                 &bucket,
@@ -951,7 +991,11 @@ async fn do_stream_rename(from: PathBuf, to: PathBuf, sync: SyncLevel) -> Result
     Ok(())
 }
 
-async fn read_existing_created(file: &File, mek: Option<&[u8; 32]>) -> Option<u64> {
+async fn read_existing_created(
+    file: &File,
+    obj_path: &Path,
+    mek: Option<&[u8; 32]>,
+) -> Option<u64> {
     // SAFETY: read_exact_at writes exactly HEADER_SIZE bytes on Ok.
     let buf = unsafe { bufpool::acquire_uninit(HEADER_SIZE) };
     let (res, buf) = file.read_exact_at(buf, 0).await;
@@ -970,7 +1014,8 @@ async fn read_existing_created(file: &File, mek: Option<&[u8; 32]>) -> Option<u6
         return None;
     }
     let m: Option<Metadata> = if let Some(mek) = mek {
-        let plaintext = decrypt_meta(mek, &meta_buf).ok();
+        let plaintext = object_id_from_path(obj_path)
+            .and_then(|object_id| decrypt_meta(mek, &meta_buf, object_id).ok());
         bufpool::release(meta_buf);
         plaintext.and_then(|p| serde_json::from_slice(&p).ok())
     } else {

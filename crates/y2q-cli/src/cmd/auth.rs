@@ -12,6 +12,17 @@ fn prompt_password(prompt: &str) -> Result<Zeroizing<String>, CliError> {
         .map_err(CliError::Io)
 }
 
+/// A password on the command line is visible to any local user via `ps`/
+/// `/proc/<pid>/cmdline`, and typically persists in shell history. Omit the
+/// flag to use the interactive (non-echoing) prompt instead.
+pub(crate) fn warn_password_on_cli_flag() {
+    tracing::warn!(
+        "a password was passed on the command line; it is visible to other local users \
+         (via `ps`/`/proc`) and may be saved in shell history. Omit the flag to be prompted \
+         interactively instead."
+    );
+}
+
 pub async fn login(
     alias: &str,
     user: Option<String>,
@@ -29,6 +40,7 @@ pub async fn login(
         .unwrap_or_default();
 
     let pw = if let Some(p) = password {
+        warn_password_on_cli_flag();
         Zeroizing::new(p)
     } else if let Some(ref p) = entry.password {
         Zeroizing::new(p.clone())
@@ -108,11 +120,13 @@ pub async fn passwd(
         .ok_or_else(|| CliError::Client(y2q_client::ClientError::Unauthenticated))?;
 
     let current_pw = if let Some(p) = current {
+        warn_password_on_cli_flag();
         Zeroizing::new(p)
     } else {
         prompt_password("Current password: ")?
     };
     let new_pw = if let Some(p) = new {
+        warn_password_on_cli_flag();
         Zeroizing::new(p)
     } else {
         prompt_password("New password: ")?

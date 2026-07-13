@@ -84,6 +84,46 @@ impl Y2qClient {
         self.base_url.join(path).expect("path join failed")
     }
 
+    /// Build the URL for an object operation on `bucket`/`key`.
+    ///
+    /// Unlike [`Self::url`], this does **not** go through `Url::join` on a
+    /// `format!`-interpolated string: `join` performs RFC 3986 dot-segment
+    /// resolution and strips `#`/`?` as a fragment/query, so a `key`
+    /// containing `../`, `#`, or `?` would silently escape the intended
+    /// bucket or truncate before reaching the server. Object keys are
+    /// otherwise unrestricted (they may contain any character, including
+    /// embedded `/`), so those cases are realistic, not just adversarial.
+    /// Pushing each already-decoded path segment via
+    /// [`Url::path_segments_mut`] instead percent-encodes `#`/`?` as literal
+    /// key bytes, matching the server's `/{bucket}/{tail}*` route, which
+    /// reconstructs the key from every segment after `bucket` including
+    /// embedded slashes.
+    ///
+    /// A `.`/`..` path component is rejected outright rather than passed
+    /// through: `path_segments_mut` silently *drops* (not resolves, not
+    /// encodes) any segment equal to `.` or `..`, so letting one through
+    /// would silently request a different key than the caller asked for.
+    pub(crate) fn object_url(&self, bucket: &str, key: &str) -> Result<Url, ClientError> {
+        let mut url = self.base_url.clone();
+        {
+            let mut segs = url
+                .path_segments_mut()
+                .expect("base_url is not a cannot-be-a-base URL");
+            segs.push(bucket);
+            for part in key.split('/') {
+                if part == "." || part == ".." {
+                    return Err(ClientError::BadRequest {
+                        message: format!(
+                            "invalid object key {key:?}: \".\" and \"..\" path components are not allowed"
+                        ),
+                    });
+                }
+                segs.push(part);
+            }
+        }
+        Ok(url)
+    }
+
     pub(crate) fn authed(&self, rb: RequestBuilder) -> RequestBuilder {
         match &self.token {
             Some(t) => rb.bearer_auth(t.as_str()),
@@ -237,5 +277,59 @@ impl ServerCertVerifier for NoVerifier {
         self.provider
             .signature_verification_algorithms
             .supported_schemes()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn client() -> Y2qClient {
+        // reqwest (built here with `rustls-tls-no-provider`) needs a process-wide
+        // rustls crypto provider installed before any `Client` can be built;
+        // ignore the error from a second test installing it after the first.
+        let _ = aws_lc_rs::default_provider().install_default();
+        Y2qClient {
+            inner: reqwest::Client::new(),
+            base_url: Url::parse("https://y2q.example/").unwrap(),
+            token: None,
+        }
+    }
+
+    #[test]
+    fn object_url_rejects_dot_dot_instead_of_letting_it_escape_or_vanish() {
+        // `Url::join` on a naively-formatted string would resolve `..` away
+        // and escape `bucket` entirely. `path_segments_mut` doesn't do that,
+        // but it also doesn't preserve `..` as a literal segment — it
+        // silently drops it. Neither behavior is acceptable, so this must be
+        // a loud, explicit error instead.
+        assert!(
+            client()
+                .object_url("bucket", "../other-bucket/secret")
+                .is_err()
+        );
+        assert!(client().object_url("bucket", "a/../b").is_err());
+        assert!(client().object_url("bucket", ".").is_err());
+    }
+
+    #[test]
+    fn object_url_keeps_hash_and_question_mark_as_literal_key_bytes() {
+        // `Url::join` treats `#`/`?` as the start of a fragment/query, which
+        // are not sent to the server at all — silently truncating the key.
+        let url = client().object_url("bucket", "report#2.txt").unwrap();
+        assert_eq!(url.path(), "/bucket/report%232.txt");
+        assert!(url.fragment().is_none());
+
+        let url = client().object_url("bucket", "a?b=c").unwrap();
+        assert_eq!(url.path(), "/bucket/a%3Fb=c");
+        assert!(url.query().is_none());
+    }
+
+    #[test]
+    fn object_url_preserves_embedded_slashes_as_separate_segments() {
+        let url = client()
+            .object_url("bucket", "nested/path/to/file.txt")
+            .unwrap();
+        assert_eq!(url.path(), "/bucket/nested/path/to/file.txt");
     }
 }

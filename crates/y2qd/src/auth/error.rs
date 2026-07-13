@@ -129,9 +129,17 @@ impl ResponseError for AuthError {
             }
             _ => {}
         }
-        builder.json(ErrorBody {
-            error: self.to_string(),
-        })
+        // `Backend` wraps raw underlying-store error text (reachable even
+        // pre-auth, via login) — log it server-side and return a generic
+        // message instead of the raw detail.
+        let message = match self {
+            AuthError::Backend(detail) => {
+                tracing::error!(error = %detail, "auth backend error");
+                "internal error".to_owned()
+            }
+            other => other.to_string(),
+        };
+        builder.json(ErrorBody { error: message })
     }
 }
 
@@ -184,5 +192,16 @@ mod tests {
         for (err, code) in cases {
             assert_eq!(err.status_code(), code, "{err:?}");
         }
+    }
+
+    #[test]
+    fn backend_error_body_does_not_leak_raw_detail() {
+        let err = AuthError::Backend("open /var/lib/y2q/users.redb: permission denied".into());
+        let resp = err.error_response();
+        let body = actix_web::body::to_bytes(resp.into_body());
+        let body = futures::executor::block_on(body).unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!text.contains("/var/lib/y2q"));
+        assert!(text.contains("internal error"));
     }
 }

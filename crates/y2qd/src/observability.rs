@@ -220,20 +220,19 @@ pub async fn metrics_middleware<B: MessageBody>(
 
     let method = res.request().method().as_str().to_owned();
     // match_pattern is the *route* (e.g. "/{bucket}/{tail}*"), not the literal
-    // path — so it has bounded cardinality and naturally omits the key.
+    // path — so it has bounded cardinality. Unlike `path`, the `{bucket}`
+    // path segment is attacker-controlled and unauthenticated (this
+    // middleware runs before auth), so it is deliberately never used as a
+    // label value — doing so would let anyone mint unbounded Prometheus
+    // label combinations (a memory-exhaustion DoS) just by hitting distinct
+    // bucket names.
     let path = res
         .request()
         .match_pattern()
         .unwrap_or_else(|| "<unmatched>".to_owned());
-    let bucket = res.request().match_info().get("bucket").map(str::to_owned);
     let status = res.status().as_u16().to_string();
 
-    let mut request_labels: Vec<(&'static str, String)> = Vec::with_capacity(3);
-    request_labels.push(("method", method));
-    request_labels.push(("path", path));
-    if let Some(b) = bucket {
-        request_labels.push(("bucket", b));
-    }
+    let request_labels: Vec<(&'static str, String)> = vec![("method", method), ("path", path)];
 
     counter!(METRIC_REQUESTS_RECEIVED, &request_labels).increment(1);
     if let Some(bytes) = request_payload {

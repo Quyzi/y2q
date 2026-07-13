@@ -21,7 +21,7 @@ Post-quantum secure object storage. `y2qd` is a REST daemon that encrypts every 
 
 ## Documentation
 
-- [docs/architecture.md](docs/architecture.md) - system design, encryption envelope (v1 + v2 chunked), storage backends, metadata index, sessions, authorization
+- [docs/architecture.md](docs/architecture.md) - system design, encryption envelope (v2 chunked), storage backends, metadata index, sessions, authorization
 - [docs/configuration.md](docs/configuration.md) - full config reference: every field, default, TLS, and override syntax
 - [docs/operations.md](docs/operations.md) - first run, user/role/ACL management, TLS, clustering, backup/recovery, runbook
 - [docs/api.md](docs/api.md) - complete HTTP API reference: routes, authorization model, schemas, error codes, examples
@@ -30,8 +30,8 @@ Post-quantum secure object storage. `y2qd` is a REST daemon that encrypts every 
 
 ## Features
 
-- **Post-quantum encryption at rest** - each object is encapsulated against an ML-KEM-768 public key; content is encrypted with AES-256-GCM via [ring](https://github.com/briansmith/ring) (5-7x faster than the pure-Rust aes-gcm crate)
-- **Streaming chunked envelope (v2)** - objects are encrypted in configurable plaintext chunks (default 4 MiB), so multi-GiB PUTs stream without buffering and `Range` GETs decrypt only the covering chunks
+- **Post-quantum encryption at rest** - each object is encapsulated against an ML-KEM-768 public key; content is encrypted with AES-256-GCM via the pure-Rust [aes-gcm](https://github.com/RustCrypto/AEADs) crate (hardware AES-NI/NEON accelerated where available, portable to any architecture Rust supports). There is no unauthenticated passthrough - unrecognized or legacy data is rejected outright
+- **Streaming chunked envelope** - objects are encrypted in configurable plaintext chunks (default 4 MiB), so multi-GiB PUTs stream without buffering and `Range` GETs decrypt only the covering chunks
 - **Post-quantum TLS (optional)** - native rustls listener offering the X25519MLKEM768 hybrid key exchange; `require_pq_kex` can refuse any client that won't negotiate it; optional mutual TLS via a client CA bundle
 - **Argon2id-protected secret key** - the ML-KEM private key is never stored in plaintext; it is wrapped under each user's password and only held in memory during an active session
 - **Token-based session auth** - Bearer tokens with configurable TTL, per-account lockout after repeated failures
@@ -411,7 +411,8 @@ Unmount with Ctrl+C, SIGTERM, or manually: `fusermount3 -u /mnt/y2q` on Linux, `
 | `--config <PATH>` | Config file path (default: platform config dir) |
 | `--bucket <BUCKET>` | Mount a single bucket as the filesystem root; default is all buckets |
 | `--read-only` | Disable all write operations |
-| `--allow-other` | Allow other users to access the mount; requires `user_allow_other` in `/etc/fuse.conf` |
+| `--allow-other` | Allow other users to access the mount; requires `user_allow_other` in `/etc/fuse.conf`. Without `--allow-other-gid`, every local user gets read access to every file (mode `0644`/`0755`), not just the intended one |
+| `--allow-other-gid <GID>` | Used with `--allow-other`: restrict the extra access it grants to group `GID` (mode `0640`/`0750`, group-owned by `GID`) instead of every local user |
 
 `y2q-fuse` logs to stderr via `RUST_LOG`, defaulting to `warn` when unset. See [docs/configuration.md#logging](docs/configuration.md#logging).
 
@@ -548,10 +549,10 @@ Full design, configuration, internal API, failure handling, and migration: [docs
 
 | What is protected | How | Where |
 |---|---|---|
-| **Object contents** | Per-object ML-KEM-768 encapsulation -> HKDF-SHA256 -> AES-256-GCM content key. v2 objects seal the plaintext in independent chunks (each its own AEAD frame). The encapsulated key and ciphertext are stored together; nothing is decryptable without the deployment secret key. | [crypto/envelope.rs](crates/y2q-core/src/crypto/envelope.rs) |
-| **Tamper / integrity** | The AEAD tag authenticates every chunk; the fixed envelope header is bound as AAD, so altering any header field invalidates the tag. A non-cryptographic gxhash64 plaintext digest catches accidental corruption. | envelope.rs |
+| **Object contents** | Per-object ML-KEM-768 encapsulation -> HKDF-SHA256 -> AES-256-GCM content key, bound to the object's `(bucket, key)` address. Plaintext is sealed in independent chunks (each its own AEAD frame). The encapsulated key and ciphertext are stored together; nothing is decryptable without the deployment secret key, and a ciphertext valid for one object fails to decrypt under a different object's address - copying one object's on-disk envelope onto another object's storage location does not grant access to it. | [crypto/envelope.rs](crates/y2q-core/src/crypto/envelope.rs) |
+| **Tamper / integrity** | The AEAD tag authenticates every chunk; almost the entire fixed envelope header is bound as AAD (everything except `plaintext_len`, which is only known after streaming completes), so altering any other header field invalidates the tag. Two non-cryptographic XXH3-64 checksums (of the plaintext, and of the on-disk envelope, both computed incrementally with no read-back) catch accidental corruption and replica divergence - not tamper detection, which is the AEAD tag's job. | envelope.rs |
 | **Secret key at rest** | The ML-KEM private key is never on disk in plaintext - it is Argon2id-wrapped under each user's password, unwrapped into memory only during an active session, zeroized on drop, and idle-dropped after `auth.keystore_idle_drop_seconds`. | [crypto/kdf.rs](crates/y2q-core/src/crypto/kdf.rs), [auth/keystore.rs](crates/y2qd/src/auth/keystore.rs) |
-| **Object metadata at rest** | The per-object metadata blob (labels, timestamps, checksums, the cleartext key) embedded in each `.obj` is itself encrypted with AES-256-GCM under the login-gated master key (MEK) - not stored in the clear. | [crypto/metadata_key.rs](crates/y2q-core/src/crypto/metadata_key.rs) |
+| **Object metadata at rest** | The per-object metadata blob (labels, timestamps, checksums, the cleartext key) embedded in each `.obj` is itself encrypted with AES-256-GCM under the login-gated master key (MEK) - not stored in the clear. The MEK is one fixed key for the whole deployment, so the AEAD is additionally bound to the object's opaque on-disk id via AAD: a metadata blob copied onto a different object's storage location fails to decrypt there, the same anti-relocation property as the object envelope above. | [crypto/metadata_key.rs](crates/y2q-core/src/crypto/metadata_key.rs) |
 | **Listing index at rest** | The whole redb metadata index is encrypted (per-4 KiB-block AES-256-GCM, block index bound as AAD) under a key derived from the MEK. It is opened on first login and closed on idle - while idle, only ciphertext remains on disk. | [storage/index.rs](crates/y2q-core/src/storage/index.rs) |
 | **File and bucket names** | On-disk directory and file names are irreversible keyed HMAC-SHA256 under the login-gated path key, so the storage tree leaks **neither bucket names nor object keys** to anyone who can read the directory. | [storage/filesystem.rs](crates/y2q-core/src/storage/filesystem.rs) |
 | **Object size** | Plaintext length is rounded up with Padmé padding before encryption, so the on-disk size leaks at most O(log log n) bits about the true size (<~12% overhead). The exact size lives only in the encrypted metadata. | envelope.rs (`padme_len`) |

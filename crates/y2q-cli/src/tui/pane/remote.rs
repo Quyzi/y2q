@@ -189,7 +189,7 @@ mod tests {
             url_path: String::new(),
             labels: Default::default(),
             cipher_size: None,
-            cipher_sha256: None,
+            cipher_checksum: None,
             kem_alg: None,
             aead_alg: None,
             envelope_version: None,

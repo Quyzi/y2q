@@ -346,7 +346,7 @@ epoch:
 
 **Back-fill** ([`backfill_pass`](../crates/y2q-cluster/src/data/mod.rs)): the
 recovering node pulls each Active peer's manifest
-(`/internal/v1/backfill/manifest` - `(key, version, cipher_sha256)` per object),
+(`/internal/v1/backfill/manifest` - `(key, version, cipher_checksum)` per object),
 keeps only objects it *prospectively* holds (ring computed over the active
 membership **plus itself**, so a node excluded from the active ring still discovers
 what to pull), and for each it is missing/behind/digest-divergent on
@@ -372,7 +372,7 @@ greedy `/{bucket}/{key}` route ([`cluster.rs`](../crates/y2qd/src/cluster.rs)):
 | GET | `/internal/v1/read` | TAIL returns the committed ciphertext envelope verbatim |
 | GET | `/internal/v1/describe` | TAIL returns committed object metadata (HEAD/stat), no body |
 | GET | `/internal/v1/list` | one node's local list/search page for scatter-gather |
-| GET | `/internal/v1/backfill/manifest` | `(key, version, cipher_sha256)` for recovery diff |
+| GET | `/internal/v1/backfill/manifest` | `(key, version, cipher_checksum)` for recovery diff |
 | GET | `/internal/v1/backfill/object` | one object's ciphertext envelope, verbatim |
 | GET | `/internal/v1/health` | liveness, status, epoch, raft last-applied |
 

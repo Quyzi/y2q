@@ -86,12 +86,42 @@ pub enum MatchOp {
     Suffix(String),
 }
 
+/// Maximum nesting depth of parenthesized sub-expressions a query may contain.
+///
+/// The grammar's `primary = _{ condition | "(" ~ expr ~ ")" }` rule recurses
+/// once per `(`, with pest's generated parser (and this module's own
+/// post-parse Pratt-tree walk) recursing on the native call stack — pest has
+/// no built-in depth or length limit. Without a cap, a short string of
+/// thousands of nested parens drives unbounded recursion and crashes the
+/// process with a stack overflow before any bucket-authorization check runs.
+/// 32 is comfortably deeper than any real query while staying far below where
+/// stack exhaustion becomes a risk.
+const MAX_PAREN_DEPTH: u32 = 32;
+
 impl LabelQuery {
     /// Parse a query string into an evaluable [`LabelQuery`].
     ///
     /// Regexes are compiled here, so a bad pattern surfaces as a parse error
-    /// rather than failing later during evaluation.
+    /// rather than failing later during evaluation. Rejects inputs whose
+    /// parenthesis nesting exceeds [`MAX_PAREN_DEPTH`] before doing any actual
+    /// parsing, since the recursion depth is what could otherwise be driven
+    /// into a stack overflow.
     pub fn parse(input: &str) -> Result<LabelQuery, Error> {
+        let mut depth: u32 = 0;
+        for c in input.chars() {
+            match c {
+                '(' => {
+                    depth += 1;
+                    if depth > MAX_PAREN_DEPTH {
+                        return Err(Error::Query {
+                            message: format!("query nesting exceeds {MAX_PAREN_DEPTH} levels"),
+                        });
+                    }
+                }
+                ')' => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+        }
         let mut pairs = QueryParser::parse(Rule::query, input).map_err(|e| Error::Query {
             message: e.to_string(),
         })?;
@@ -232,6 +262,35 @@ mod tests {
         assert!(q.matches(&labels(&[("env", "dev")])));
         // Missing label: inequality holds.
         assert!(q.matches(&labels(&[])));
+    }
+
+    #[test]
+    fn deep_paren_nesting_is_rejected_before_parsing() {
+        // Deep enough that an unbounded recursive-descent parse would risk a
+        // stack overflow; the guard must reject it well before that point.
+        let query = "(".repeat(1000) + "env == prod" + &")".repeat(1000);
+        assert!(matches!(
+            LabelQuery::parse(&query),
+            Err(Error::Query { .. })
+        ));
+    }
+
+    #[test]
+    fn paren_nesting_at_the_limit_is_accepted() {
+        let query = "(".repeat(MAX_PAREN_DEPTH as usize)
+            + "env == prod"
+            + &")".repeat(MAX_PAREN_DEPTH as usize);
+        assert!(LabelQuery::parse(&query).is_ok());
+    }
+
+    #[test]
+    fn paren_nesting_one_over_the_limit_is_rejected() {
+        let over = MAX_PAREN_DEPTH as usize + 1;
+        let query = "(".repeat(over) + "env == prod" + &")".repeat(over);
+        assert!(matches!(
+            LabelQuery::parse(&query),
+            Err(Error::Query { .. })
+        ));
     }
 
     #[test]

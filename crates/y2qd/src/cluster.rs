@@ -1028,6 +1028,8 @@ async fn head_write_inner(
         .begin_streaming_put(bucket, key)
         .await
         .map_err(AppError::from)?;
+    // Cluster-mode max-body/quota enforcement is not yet wired up (single-node
+    // covers it); `None` preserves today's uncapped cluster-write behavior.
     let (sink, pm, cm) = cipher::stream_encrypt_for_put(
         &rt.public_key,
         payload,
@@ -1036,6 +1038,7 @@ async fn head_write_inner(
         key,
         write_offset,
         chunk_size,
+        None,
     )
     .await?;
 
@@ -1058,7 +1061,7 @@ async fn head_write_inner(
         plaintext_size,
         checksum_gxhash_b64: pm.checksum_gxhash_b64.clone(),
         cipher_size,
-        cipher_sha256_b64: cm.cipher_sha256_b64.clone(),
+        cipher_checksum_b64: cm.cipher_checksum_b64.clone(),
         kem_alg: cm.kem_alg.clone(),
         aead_alg: cm.aead_alg.clone(),
         envelope_version: cm.envelope_version,
@@ -1702,7 +1705,7 @@ async fn backfill_object(
         plaintext_size: md.size,
         checksum_gxhash_b64: md.checksum_gxhash,
         cipher_size: md.cipher_size.unwrap_or(0),
-        cipher_sha256_b64: md.cipher_sha256.unwrap_or_default(),
+        cipher_checksum_b64: md.cipher_checksum.unwrap_or_default(),
         kem_alg: md.kem_alg.unwrap_or_default(),
         aead_alg: md.aead_alg.unwrap_or_default(),
         envelope_version: md.envelope_version.unwrap_or(2),

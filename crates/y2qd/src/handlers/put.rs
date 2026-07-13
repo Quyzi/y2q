@@ -75,11 +75,16 @@ pub async fn handle(
     let sync = parse_sync_header(&req, *default_sync.get_ref())?;
 
     // Quota enforcement: only buckets that actually set a quota pay the usage
-    // scan cost. Uses the request Content-Length as the incoming size estimate.
+    // scan cost. The Content-Length-based check below is a fast-reject
+    // optimization only (skipped by chunked transfer encoding, which has no
+    // Content-Length) — `max_bytes`, enforced mid-stream in
+    // `stream_encrypt_for_put`, is what actually bounds both the server-wide
+    // cap and any bucket quota regardless of how the body is transferred.
     let cfg = storage
         .get_bucket_config(&bucket)
         .await
         .map_err(AppError::from)?;
+    let mut max_bytes = encryption.max_body_bytes;
     if let Some(limit) = cfg.quota_bytes {
         let incoming = req
             .headers()
@@ -99,6 +104,7 @@ pub async fn handle(
                 incoming,
             }));
         }
+        max_bytes = max_bytes.min(limit.saturating_sub(used));
     }
 
     // Clustered: route the write through the chain instead of writing locally.
@@ -167,6 +173,7 @@ pub async fn handle(
         &key,
         write_offset,
         encryption.chunk_size_bytes,
+        Some(max_bytes),
     )
     .await?;
 

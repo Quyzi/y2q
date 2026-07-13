@@ -38,7 +38,7 @@ use crate::error::{AppError, ErrorBody};
             `X-Y2Q-Created` (ns since epoch), `X-Y2Q-Modified` (ns since epoch), \
             `X-Y2Q-Checksum-GxHash` (base64, 12 chars), \
             plus any `X-Y2Q-<label>` headers attached on PUT. \
-            Encrypted objects also expose `X-Y2Q-Cipher-Size`, `X-Y2Q-Cipher-SHA256`, \
+            Encrypted objects also expose `X-Y2Q-Cipher-Size`, `X-Y2Q-Cipher-Checksum`, \
             `X-Y2Q-Kem-Alg`, `X-Y2Q-Aead-Alg`, and `X-Y2Q-Envelope-Version`."),
         (status = 400, description = "Invalid bucket or key", body = ErrorBody, content_type = "application/json"),
         (status = 401, description = "Authentication required", body = ErrorBody, content_type = "application/json"),
@@ -91,8 +91,8 @@ fn build_response(meta: &Metadata) -> HttpResponse {
     if let Some(v) = meta.cipher_size {
         builder.insert_header(("X-Y2Q-Cipher-Size", v.to_string()));
     }
-    if let Some(ref v) = meta.cipher_sha256 {
-        builder.insert_header(("X-Y2Q-Cipher-SHA256", v.clone()));
+    if let Some(ref v) = meta.cipher_checksum {
+        builder.insert_header(("X-Y2Q-Cipher-Checksum", v.clone()));
     }
     if let Some(ref v) = meta.kem_alg {
         builder.insert_header(("X-Y2Q-Kem-Alg", v.clone()));

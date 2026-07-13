@@ -2,9 +2,8 @@
 //!
 //! Range requests are served from the chunk-addressable v2 envelope: only the
 //! ciphertext chunks covering the requested plaintext bytes are read from
-//! storage and decrypted (206 Partial Content). Legacy plaintext objects also
-//! support range reads. v1 (whole-object AEAD) objects cannot be partially
-//! decrypted and return **501 Not Implemented** for range requests.
+//! storage and decrypted (206 Partial Content). Every object is always
+//! encrypted; there is no unauthenticated plaintext passthrough.
 
 use std::sync::Arc;
 
@@ -27,11 +26,10 @@ const TAG_LEN: u64 = 16;
 /// Retrieve a stored object.
 ///
 /// If a `Range: bytes=N-M` header is present, returns 206 Partial Content with
-/// a `Content-Range` header: for v2-chunked encrypted objects only the covering
-/// ciphertext chunks are read and decrypted; legacy plaintext objects are sliced
-/// directly. v1 encrypted objects return 501. A malformed or out-of-bounds range
-/// returns 416. Without a `Range` header, returns 200 OK with the full body.
-/// Requires a valid Bearer token.
+/// a `Content-Range` header: only the covering ciphertext chunks are read and
+/// decrypted. A malformed or out-of-bounds range returns 416. Without a
+/// `Range` header, returns 200 OK with the full body. Requires a valid Bearer
+/// token.
 #[utoipa::path(
     get,
     operation_id = "get_object",
@@ -39,7 +37,7 @@ const TAG_LEN: u64 = 16;
     params(
         ("bucket" = String, Path, description = "Bucket name (alphanumeric, `-`, `_`)"),
         ("key" = String, Path, description = "Object key; may contain `/` to represent nested paths"),
-        ("Range" = Option<String>, Header, description = "Byte range to retrieve, e.g. `bytes=0-1023`. Returns 206 for v2-encrypted and plaintext objects, 501 for v1 whole-object objects, 416 if out of bounds."),
+        ("Range" = Option<String>, Header, description = "Byte range to retrieve, e.g. `bytes=0-1023`. Returns 206, or 416 if out of bounds."),
     ),
     responses(
         (status = 200, description = "Full object body", content_type = "application/octet-stream"),
@@ -50,7 +48,6 @@ const TAG_LEN: u64 = 16;
         (status = 409, description = "Object is locked (write in progress)", body = ErrorBody, content_type = "application/json"),
         (status = 416, description = "Requested range not satisfiable (inverted or out of bounds)", body = ErrorBody, content_type = "application/json"),
         (status = 500, description = "Internal error", body = ErrorBody, content_type = "application/json"),
-        (status = 501, description = "Range read attempted on a v1 whole-object encrypted object", body = ErrorBody, content_type = "application/json"),
     ),
     security(("bearer" = [])),
     tag = "objects",
@@ -86,37 +83,32 @@ pub async fn handle(
         }
     }
 
-    // No Range header: return the full object (decrypting in place if encrypted).
+    // No Range header: return the full object, decrypted in place.
     let Some((start, end)) = range_header else {
         let object = storage.get(&bucket, &key).await.map_err(AppError::from)?;
         let stored = object.into_inner();
-        if cipher::is_encrypted_envelope(&stored) {
-            // Consume the storage allocation so the AEAD open happens in place;
-            // fall back to a copy if the buffer is shared.
-            let buf = stored
-                .try_into_mut()
-                .unwrap_or_else(|b| BytesMut::from(b.as_ref()));
-            let plaintext = cipher::decrypt_after_get(&auth.keystore, &bucket, &key, buf)?;
-            // v2 envelopes are zero-padded to a Padmé boundary to hide the exact
-            // object size, so the decrypted plaintext may carry trailing pad
-            // bytes. Trim to the true size recorded in the (encrypted) metadata.
-            let size = storage
-                .describe(&bucket, &key)
-                .await
-                .map_err(AppError::from)?
-                .size as usize;
-            let plaintext = if plaintext.len() > size {
-                plaintext.slice(0..size)
-            } else {
-                plaintext
-            };
-            return Ok(HttpResponse::Ok()
-                .content_type("application/octet-stream")
-                .body(plaintext));
-        }
+        // Consume the storage allocation so the AEAD open happens in place;
+        // fall back to a copy if the buffer is shared.
+        let buf = stored
+            .try_into_mut()
+            .unwrap_or_else(|b| BytesMut::from(b.as_ref()));
+        let plaintext = cipher::decrypt_after_get(&auth.keystore, &bucket, &key, buf)?;
+        // v2 envelopes are zero-padded to a Padmé boundary to hide the exact
+        // object size, so the decrypted plaintext may carry trailing pad
+        // bytes. Trim to the true size recorded in the (encrypted) metadata.
+        let size = storage
+            .describe(&bucket, &key)
+            .await
+            .map_err(AppError::from)?
+            .size as usize;
+        let plaintext = if plaintext.len() > size {
+            plaintext.slice(0..size)
+        } else {
+            plaintext
+        };
         return Ok(HttpResponse::Ok()
             .content_type("application/octet-stream")
-            .body(stored));
+            .body(plaintext));
     };
 
     // Range request: consult metadata (index lookup, no whole-file read) to learn
@@ -133,7 +125,8 @@ pub async fn handle(
     }
 
     match md.envelope_version {
-        // v2 chunked: read only the covering ciphertext chunks and decrypt them.
+        // v2 chunked (the only supported format): read only the covering
+        // ciphertext chunks and decrypt them.
         Some(2) => {
             let preamble_len = envelope::v2_preamble_len() as u64;
             let preamble = storage
@@ -177,20 +170,11 @@ pub async fn handle(
             let body = Bytes::from(chunks_pt).slice(trim_front..trim_front + take);
             Ok(partial_content(start, end, size, body))
         }
-        // v1 whole-object AEAD: cannot serve a partial decrypt.
-        Some(1) => Err(AppError(y2q_core::Error::RangeReadOnEncrypted)),
-        // Unknown future envelope version.
-        Some(v) => Err(AppError(y2q_core::Error::UnsupportedEnvelopeVersion {
-            version: v,
+        // Any other (unknown, or pre-v2/legacy) envelope version is rejected —
+        // there is no unauthenticated plaintext passthrough to fall back to.
+        other => Err(AppError(y2q_core::Error::UnsupportedEnvelopeVersion {
+            version: other.unwrap_or(0),
         })),
-        // Legacy plaintext object (pre-encryption): slice the ciphertext-free body.
-        None => {
-            let body = storage
-                .get_range(&bucket, &key, (start..=end).into())
-                .await
-                .map_err(AppError::from)?;
-            Ok(partial_content(start, end, size, body))
-        }
     }
 }
 
@@ -207,17 +191,12 @@ fn serve_remote_envelope(
     bucket: &str,
     key: &str,
 ) -> Result<HttpResponse, AppError> {
-    let plaintext: Bytes = if cipher::is_encrypted_envelope(&envelope) {
-        let buf = BytesMut::from(envelope.as_ref());
-        let pt = cipher::decrypt_after_get(&auth.keystore, bucket, key, buf)?;
-        if pt.len() as u64 > size {
-            pt.slice(0..size as usize)
-        } else {
-            pt
-        }
+    let buf = BytesMut::from(envelope.as_ref());
+    let plaintext = cipher::decrypt_after_get(&auth.keystore, bucket, key, buf)?;
+    let plaintext: Bytes = if plaintext.len() as u64 > size {
+        plaintext.slice(0..size as usize)
     } else {
-        // Legacy plaintext object (pre-encryption) stored verbatim.
-        envelope
+        plaintext
     };
 
     let Some((start, end)) = range else {
