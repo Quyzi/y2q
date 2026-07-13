@@ -62,7 +62,7 @@ dependencies = [
  "mime",
  "percent-encoding",
  "pin-project-lite",
- "rand 0.10.1",
+ "rand 0.10.2",
  "sha1",
  "smallvec",
  "tokio",
@@ -3910,9 +3910,9 @@ dependencies = [
 
 [[package]]
 name = "rand"
-version = "0.10.1"
+version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d2e8e8bcc7961af1fdac401278c6a831614941f6164ee3bf4ce61b7edb162207"
+checksum = "c7f5fa3a058cd35567ef9bfa5e75732bee0f9e4c55fa90477bef2dfcdbc4be80"
 dependencies = [
  "chacha20",
  "getrandom 0.4.3",
@@ -5016,7 +5016,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -6306,7 +6306,7 @@ dependencies = [
  "dashmap",
  "futures",
  "openraft",
- "rand 0.10.1",
+ "rand 0.10.2",
  "redb",
  "reqwest 0.12.28",
  "rustls",
@@ -6359,7 +6359,7 @@ dependencies = [
  "pest_derive",
  "pqcrypto",
  "pqcrypto-traits",
- "rand 0.10.1",
+ "rand 0.10.2",
  "redb",
  "regex",
  "serde",
@@ -6406,7 +6406,7 @@ dependencies = [
  "futures",
  "hdrhistogram",
  "humantime",
- "rand 0.10.1",
+ "rand 0.10.2",
  "ratatui",
  "reqwest 0.12.28",
  "serde",
@@ -6444,7 +6444,7 @@ dependencies = [
  "pqcrypto",
  "pqcrypto-traits",
  "pyroscope",
- "rand 0.10.1",
+ "rand 0.10.2",
  "rustls",
  "rustls-pemfile",
  "serde",
