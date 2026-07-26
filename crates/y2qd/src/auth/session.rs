@@ -394,7 +394,10 @@ mod tests {
         }
         // The oldest entry (epoch 0) was evicted; the newest survives.
         assert!(info.cached_bucket_key("b", 0).is_none());
-        assert!(info.cached_bucket_key("b", MAX_SESSION_BUCKET_KEYS as u32).is_some());
+        assert!(
+            info.cached_bucket_key("b", MAX_SESSION_BUCKET_KEYS as u32)
+                .is_some()
+        );
     }
 
     #[test]

@@ -18,7 +18,9 @@ use std::time::Duration;
 
 use y2q_core::crypto::keystore;
 use y2q_core::crypto::node_key;
-use y2q_core::crypto::{derive_bucket_config_key, derive_node_key_verifier, derive_object_metadata_key, derive_path_key};
+use y2q_core::crypto::{
+    derive_bucket_config_key, derive_node_key_verifier, derive_object_metadata_key, derive_path_key,
+};
 use y2q_core::storage::rotation::rotate_storage_tree;
 use y2q_core::{CacheRebuildStatus, FilesystemStorage, Listing, StorageExt};
 
@@ -26,7 +28,8 @@ use crate::config::Config;
 
 /// Message the daemon's normal boot path exits with when an interrupted
 /// rotation's journal is found. Shared so the two call sites stay in sync.
-pub const INTERRUPTED_MESSAGE: &str = "node key rotation was interrupted; re-run y2qd --rotate-node-key to finish it";
+pub const INTERRUPTED_MESSAGE: &str =
+    "node key rotation was interrupted; re-run y2qd --rotate-node-key to finish it";
 
 fn other(msg: impl std::fmt::Display) -> std::io::Error {
     std::io::Error::other(msg.to_string())
@@ -44,17 +47,24 @@ pub async fn run(cfg: &Config, new_node_key_file: &str) -> std::io::Result<()> {
     // concurrent rotation attempts refuse each other too.
     let _flock = keystore::acquire_lock(&keystore_dir).map_err(other)?;
 
-    let old_nk = *node_key::load_node_key(&cfg.crypto.node_key_file).map_err(|e| other(format!("old node key: {e}")))?;
-    let new_nk =
-        *node_key::load_new_node_key(new_node_key_file).map_err(|e| other(format!("new node key (Y2QD_NEW_NODE_KEY / --new-node-key-file): {e}")))?;
+    let old_nk = *node_key::load_node_key(&cfg.crypto.node_key_file)
+        .map_err(|e| other(format!("old node key: {e}")))?;
+    let new_nk = *node_key::load_new_node_key(new_node_key_file).map_err(|e| {
+        other(format!(
+            "new node key (Y2QD_NEW_NODE_KEY / --new-node-key-file): {e}"
+        ))
+    })?;
 
     if old_nk == new_nk {
-        return Err(other("--rotate-node-key: the new node key canonicalizes to the same 32 bytes as the old one"));
+        return Err(other(
+            "--rotate-node-key: the new node key canonicalizes to the same 32 bytes as the old one",
+        ));
     }
 
     // Verifies the old key against keystore.json (NodeKeyMismatch on a
     // wrong key) and that users.redb opens cleanly.
-    keystore::load(&keystore_dir, &old_nk).map_err(|e| other(format!("verify old node key against keystore: {e}")))?;
+    keystore::load(&keystore_dir, &old_nk)
+        .map_err(|e| other(format!("verify old node key against keystore: {e}")))?;
 
     match keystore::read_rotation_journal(&keystore_dir).map_err(other)? {
         Some(journal) => {
@@ -98,12 +108,14 @@ pub async fn run(cfg: &Config, new_node_key_file: &str) -> std::io::Result<()> {
     // gone) rather than trusting a failed old-key open on faith: silently
     // skipping a walk that was *not* actually done would rebuild an empty
     // index against still-old-keyed data and look like total data loss.
-    let old_probe = FilesystemStorage::new(&base_path, &index_path).map_err(|e| other(format!("open storage: {e}")))?;
+    let old_probe = FilesystemStorage::new(&base_path, &index_path)
+        .map_err(|e| other(format!("open storage: {e}")))?;
     old_probe.install_node_key(old_nk);
     let buckets_needing_walk = match old_probe.list_buckets().await {
         Ok(buckets) => Some(buckets),
         Err(_) => {
-            let new_probe = FilesystemStorage::new(&base_path, &index_path).map_err(|e| other(format!("open storage: {e}")))?;
+            let new_probe = FilesystemStorage::new(&base_path, &index_path)
+                .map_err(|e| other(format!("open storage: {e}")))?;
             new_probe.install_node_key(new_nk);
             let new_opens = new_probe.list_buckets().await.is_ok();
             let file_missing = !tokio::fs::try_exists(&index_path).await.unwrap_or(true);
@@ -120,10 +132,25 @@ pub async fn run(cfg: &Config, new_node_key_file: &str) -> std::io::Result<()> {
 
     match buckets_needing_walk {
         Some(buckets) => {
-            tracing::info!(buckets = buckets.len(), "rotating {} bucket(s)", buckets.len());
-            let stats = rotate_storage_tree(&base_path, &buckets, &old_path_key, &new_path_key, &old_omk, &new_omk, &old_bck, &new_bck)
-                .await
-                .map_err(|e| other(format!("rotate storage tree: {e}")))?;
+            tracing::info!(
+                buckets = buckets.len(),
+                "rotating {} bucket(s)",
+                buckets.len()
+            );
+            let stats = rotate_storage_tree(
+                &base_path,
+                &buckets,
+                &y2q_core::storage::rotation::RotationKeys {
+                    old_path_key: &old_path_key,
+                    new_path_key: &new_path_key,
+                    old_omk: &old_omk,
+                    new_omk: &new_omk,
+                    old_bck: &old_bck,
+                    new_bck: &new_bck,
+                },
+            )
+            .await
+            .map_err(|e| other(format!("rotate storage tree: {e}")))?;
             tracing::info!(
                 buckets_migrated = stats.buckets_migrated,
                 objects_migrated = stats.objects_migrated,
@@ -132,20 +159,32 @@ pub async fn run(cfg: &Config, new_node_key_file: &str) -> std::io::Result<()> {
             );
         }
         None => {
-            tracing::info!("storage tree already fully rotated by a prior interrupted run; skipping straight to the index rebuild");
+            tracing::info!(
+                "storage tree already fully rotated by a prior interrupted run; skipping straight to the index rebuild"
+            );
         }
     }
     // The index is a pure cache reconstructed from the (now new-key-sealed)
     // sidecars — delete and rebuild fresh under the new IFK/IK rather than
     // trying to re-key it in place.
     let _ = std::fs::remove_file(&index_path);
-    let new_storage = FilesystemStorage::new(&base_path, &index_path).map_err(|e| other(format!("open storage: {e}")))?;
+    let new_storage = FilesystemStorage::new(&base_path, &index_path)
+        .map_err(|e| other(format!("open storage: {e}")))?;
     new_storage.install_node_key(new_nk);
-    new_storage.rebuild_cache().await.map_err(|e| other(format!("start index rebuild: {e}")))?;
+    new_storage
+        .rebuild_cache()
+        .await
+        .map_err(|e| other(format!("start index rebuild: {e}")))?;
     loop {
-        match new_storage.rebuild_progress().await.map_err(|e| other(format!("index rebuild status: {e}")))? {
+        match new_storage
+            .rebuild_progress()
+            .await
+            .map_err(|e| other(format!("index rebuild status: {e}")))?
+        {
             CacheRebuildStatus::Completed => break,
-            CacheRebuildStatus::Failed(msg) => return Err(other(format!("index rebuild failed: {msg}"))),
+            CacheRebuildStatus::Failed(msg) => {
+                return Err(other(format!("index rebuild failed: {msg}")));
+            }
             CacheRebuildStatus::Idle | CacheRebuildStatus::Running(_) => {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
@@ -153,8 +192,10 @@ pub async fn run(cfg: &Config, new_node_key_file: &str) -> std::io::Result<()> {
     }
     tracing::info!("index rebuilt under the new node key");
 
-    keystore::rewrite_verifier(&keystore_dir, &new_nk).map_err(|e| other(format!("rewrite keystore verifier: {e}")))?;
-    keystore::delete_rotation_journal(&keystore_dir).map_err(|e| other(format!("delete rotation journal: {e}")))?;
+    keystore::rewrite_verifier(&keystore_dir, &new_nk)
+        .map_err(|e| other(format!("rewrite keystore verifier: {e}")))?;
+    keystore::delete_rotation_journal(&keystore_dir)
+        .map_err(|e| other(format!("delete rotation journal: {e}")))?;
 
     tracing::info!("node-key rotation complete");
     Ok(())

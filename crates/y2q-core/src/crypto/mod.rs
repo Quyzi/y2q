@@ -35,8 +35,12 @@ pub use node_keys::{
     derive_index_file_key, derive_index_key, derive_node_key_verifier, derive_object_metadata_key,
     derive_path_key, encrypt_meta, prf,
 };
-pub use seal::{SealedKey, bucket_grant_aad, bucket_sk_wrap_aad, open_sealed, seal_to, seal_to_slots};
-pub use user_store::{CREDENTIAL_SLOTS, CredentialSlot, Role, SlotPayload, UserRecord, UserStore, UserSummary};
+pub use seal::{
+    SealedKey, bucket_grant_aad, bucket_sk_wrap_aad, open_sealed, seal_to, seal_to_slots,
+};
+pub use user_store::{
+    CREDENTIAL_SLOTS, CredentialSlot, Role, SlotPayload, UserRecord, UserStore, UserSummary,
+};
 
 use crate::Error;
 
@@ -103,12 +107,16 @@ pub enum CryptoError {
 
     /// The supplied node key's verifier does not match the one stored in
     /// `keystore.json` — wrong key, or a keystore from another deployment.
-    #[error("node key does not match this keystore (wrong key, or keystore from another deployment)")]
+    #[error(
+        "node key does not match this keystore (wrong key, or keystore from another deployment)"
+    )]
     NodeKeyMismatch,
 
     /// The keystore directory still holds a pre-hierarchy `pubkey.json`.
     /// There is no conversion path — re-initialize the deployment.
-    #[error("keystore at {0} predates the per-bucket key hierarchy; re-initialize the deployment (this build cannot read it)")]
+    #[error(
+        "keystore at {0} predates the per-bucket key hierarchy; re-initialize the deployment (this build cannot read it)"
+    )]
     LegacyKeystore(String),
 }
 

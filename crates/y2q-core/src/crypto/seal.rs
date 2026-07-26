@@ -120,7 +120,11 @@ pub struct SealedKey {
 /// derives an AES-256-GCM key from the shared secret, and encrypts
 /// `plaintext` under a fresh random 12-byte nonce with `aad` as AEAD
 /// associated data.
-pub fn seal_to(recipient_pk: &[u8], plaintext: &[u8], aad: &[u8]) -> Result<SealedKey, CryptoError> {
+pub fn seal_to(
+    recipient_pk: &[u8],
+    plaintext: &[u8],
+    aad: &[u8],
+) -> Result<SealedKey, CryptoError> {
     let pk = mlkem768::PublicKey::from_bytes(recipient_pk)
         .map_err(|_| CryptoError::KemDecode("public key"))?;
     let (ss, kem_ct) = mlkem768::encapsulate(&pk);
@@ -260,7 +264,8 @@ mod tests {
         );
 
         // Only the real slot's secret key recovers the genuine secret.
-        let opened = open_sealed(keypairs[real_idx].1.as_bytes(), &grants[real_idx], b"aad").unwrap();
+        let opened =
+            open_sealed(keypairs[real_idx].1.as_bytes(), &grants[real_idx], b"aad").unwrap();
         assert_eq!(&opened[..], &secret[..]);
 
         // A padding slot's own secret key opens to random bytes of the same

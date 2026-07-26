@@ -21,7 +21,9 @@ pub async fn run(cmd: PersonaCmd, mode: OutputMode) -> Result<(), CliError> {
             // in shell history or `ps`/`/proc/<pid>/cmdline`.
             let pw = prompt_password(&format!("New password for persona slot {slot}: "))?;
             let client = make_client(&alias).await?;
-            let resp = crate::ops::personas::add(&client, slot, pw.as_str(), role.as_deref(), duress).await?;
+            let resp =
+                crate::ops::personas::add(&client, slot, pw.as_str(), role.as_deref(), duress)
+                    .await?;
             if mode == OutputMode::Json {
                 print_json(&serde_json::json!({ "slot": slot, "warning": resp.warning }));
             } else {
@@ -62,7 +64,10 @@ pub async fn run(cmd: PersonaCmd, mode: OutputMode) -> Result<(), CliError> {
             if mode == OutputMode::Json {
                 print_json(&serde_json::json!({ "granted_slot": slot, "buckets": buckets }));
             } else {
-                println!("Shared {} bucket(s) with persona slot {slot}.", buckets.len());
+                println!(
+                    "Shared {} bucket(s) with persona slot {slot}.",
+                    buckets.len()
+                );
             }
         }
 
@@ -76,7 +81,10 @@ pub async fn run(cmd: PersonaCmd, mode: OutputMode) -> Result<(), CliError> {
             if mode == OutputMode::Json {
                 print_json(&serde_json::json!({ "revoked_slot": slot, "buckets": buckets }));
             } else {
-                println!("Revoked {} bucket(s) from persona slot {slot}.", buckets.len());
+                println!(
+                    "Revoked {} bucket(s) from persona slot {slot}.",
+                    buckets.len()
+                );
             }
         }
     }

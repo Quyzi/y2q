@@ -121,14 +121,22 @@ pub async fn stream_encrypt_for_put(
 ) -> Result<(StreamingSink, PlaintextMetrics, CipherMetadata), AppError> {
     use futures::StreamExt;
 
-    let mut session = envelope::EncryptSession::new(sink, bucket_pk, key_epoch, bucket, key, write_offset, chunk_size)
-        .await
-        .map_err(|_| {
-            AppError(y2q_core::Error::EncryptionFailed {
-                bucket: bucket.to_owned(),
-                key: key.to_owned(),
-            })
-        })?;
+    let mut session = envelope::EncryptSession::new(
+        sink,
+        bucket_pk,
+        key_epoch,
+        bucket,
+        key,
+        write_offset,
+        chunk_size,
+    )
+    .await
+    .map_err(|_| {
+        AppError(y2q_core::Error::EncryptionFailed {
+            bucket: bucket.to_owned(),
+            key: key.to_owned(),
+        })
+    })?;
 
     let mut hasher = StreamChecksum::new();
     let mut plaintext_size: u64 = 0;
@@ -196,6 +204,7 @@ pub async fn stream_encrypt_for_put(
 /// plaintext there comes from decrypting an existing object rather than a
 /// client's request body, so there is no [`actix_web::web::Payload`] to
 /// consume from.
+#[allow(clippy::too_many_arguments)]
 pub async fn encrypt_bytes_for_put(
     bucket_pk: &[u8],
     key_epoch: u32,
@@ -206,14 +215,22 @@ pub async fn encrypt_bytes_for_put(
     write_offset: u64,
     chunk_size: usize,
 ) -> Result<(StreamingSink, PlaintextMetrics, CipherMetadata), AppError> {
-    let mut session = envelope::EncryptSession::new(sink, bucket_pk, key_epoch, bucket, key, write_offset, chunk_size)
-        .await
-        .map_err(|_| {
-            AppError(y2q_core::Error::EncryptionFailed {
-                bucket: bucket.to_owned(),
-                key: key.to_owned(),
-            })
-        })?;
+    let mut session = envelope::EncryptSession::new(
+        sink,
+        bucket_pk,
+        key_epoch,
+        bucket,
+        key,
+        write_offset,
+        chunk_size,
+    )
+    .await
+    .map_err(|_| {
+        AppError(y2q_core::Error::EncryptionFailed {
+            bucket: bucket.to_owned(),
+            key: key.to_owned(),
+        })
+    })?;
 
     session.feed(plaintext).await.map_err(|_| {
         AppError(y2q_core::Error::EncryptionFailed {

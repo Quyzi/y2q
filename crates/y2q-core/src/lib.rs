@@ -518,7 +518,9 @@ pub enum Error {
     /// maximum number of retained key epochs; a rekey must prune old epochs
     /// (see [`crate::Error::RekeyAlreadyRunning`]'s sibling endpoint) before
     /// another rotation is allowed.
-    #[error("bucket `{bucket}` has {count} retained key epochs (max {max}); run rekey to prune before rotating again")]
+    #[error(
+        "bucket `{bucket}` has {count} retained key epochs (max {max}); run rekey to prune before rotating again"
+    )]
     TooManyBucketKeyEpochs {
         /// Bucket the rotation was refused on.
         bucket: String,

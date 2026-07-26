@@ -554,7 +554,11 @@ pub enum PersonaCmd {
     /// Overwrite a persona slot (`1..=3`) with a fresh decoy and revoke any
     /// live session opened through it.
     #[command(alias = "remove")]
-    Rm { alias: String, #[arg(long)] slot: u8 },
+    Rm {
+        alias: String,
+        #[arg(long)]
+        slot: u8,
+    },
     /// Show the current session's persona slot, role, and duress flag.
     Whoami { alias: String },
     /// Share buckets your current persona holds with one of your own

@@ -20,7 +20,8 @@ use pqcrypto_traits::kem::{PublicKey as KemPublicKeyTrait, SecretKey as KemSecre
 use rand::Rng;
 use std::collections::BTreeMap;
 use y2q_core::crypto::{
-    CREDENTIAL_SLOTS, bucket_grant_aad, bucket_sk_wrap_aad, open_sealed, seal_to, unwrap_with_key, wrap_with_key,
+    CREDENTIAL_SLOTS, bucket_grant_aad, bucket_sk_wrap_aad, open_sealed, seal_to, unwrap_with_key,
+    wrap_with_key,
 };
 use y2q_core::{BucketConfig, BucketKeyVersion, Error};
 use zeroize::Zeroizing;
@@ -63,7 +64,8 @@ pub fn new_bucket_key_version(
     rand::rng().fill_bytes(&mut *bwk);
 
     let sk_aad = bucket_sk_wrap_aad(bucket, epoch);
-    let sk_blob = wrap_with_key(sk.as_bytes(), &bwk, &sk_aad).map_err(|e| crypto_err(bucket, "new_bucket_key", e))?;
+    let sk_blob = wrap_with_key(sk.as_bytes(), &bwk, &sk_aad)
+        .map_err(|e| crypto_err(bucket, "new_bucket_key", e))?;
 
     let mut grants = BTreeMap::new();
     for (username, slots) in grantees {
@@ -115,17 +117,30 @@ pub fn current_grantees(
 
     let mut grantees = Vec::with_capacity(usernames.len());
     for username in usernames {
-        let Some(rec) = user_store.get(&username).map_err(|e| crypto_err(bucket, "rotate_key", e))? else {
+        let Some(rec) = user_store
+            .get(&username)
+            .map_err(|e| crypto_err(bucket, "rotate_key", e))?
+        else {
             continue;
         };
-        let identity_pks_b64: Vec<String> = rec.slots.iter().map(|s| s.identity_pk_b64.clone()).collect();
+        let identity_pks_b64: Vec<String> = rec
+            .slots
+            .iter()
+            .map(|s| s.identity_pk_b64.clone())
+            .collect();
         let mut authorized = vec![false; CREDENTIAL_SLOTS];
         if username == caller_username {
             authorized[caller_persona as usize] = true;
         } else {
             authorized[0] = true;
         }
-        grantees.push((username, GranteeSlots { identity_pks_b64, authorized }));
+        grantees.push((
+            username,
+            GranteeSlots {
+                identity_pks_b64,
+                authorized,
+            },
+        ));
     }
     Ok(grantees)
 }
@@ -141,16 +156,25 @@ fn seal_grant_slots(
     slots: &GranteeSlots,
     bwk: &[u8; 32],
 ) -> Result<Vec<y2q_core::crypto::SealedKey>, Error> {
-    if slots.identity_pks_b64.len() != CREDENTIAL_SLOTS || slots.authorized.len() != CREDENTIAL_SLOTS {
+    if slots.identity_pks_b64.len() != CREDENTIAL_SLOTS
+        || slots.authorized.len() != CREDENTIAL_SLOTS
+    {
         return Err(Error::InternalError {
             bucket: bucket.to_owned(),
             key: String::new(),
             operation: "bucket-key-grant".to_owned(),
-            message: format!("expected {CREDENTIAL_SLOTS} credential slots for {username}, found a mismatched count"),
+            message: format!(
+                "expected {CREDENTIAL_SLOTS} credential slots for {username}, found a mismatched count"
+            ),
         });
     }
     let mut sealed = Vec::with_capacity(CREDENTIAL_SLOTS);
-    for (slot, (pk_b64, &authorized)) in slots.identity_pks_b64.iter().zip(slots.authorized.iter()).enumerate() {
+    for (slot, (pk_b64, &authorized)) in slots
+        .identity_pks_b64
+        .iter()
+        .zip(slots.authorized.iter())
+        .enumerate()
+    {
         let identity_pk = STANDARD
             .decode(pk_b64)
             .map_err(|_| crypto_decode_err(bucket, "identity public key"))?;
@@ -162,7 +186,10 @@ fn seal_grant_slots(
             rand::rng().fill_bytes(&mut decoy);
             decoy
         };
-        sealed.push(seal_to(&identity_pk, &payload, &aad).map_err(|e| crypto_err(bucket, "seal-grant", e))?);
+        sealed.push(
+            seal_to(&identity_pk, &payload, &aad)
+                .map_err(|e| crypto_err(bucket, "seal-grant", e))?,
+        );
     }
     Ok(sealed)
 }
@@ -172,7 +199,13 @@ fn seal_grant_slots(
 /// `slots` and decoys to the rest. Used both for a brand-new grantee and to
 /// re-seal an existing grantee's row (e.g. adding a persona's access via
 /// `set_acl`, or a duress persona re-sharing its own access — phase 5).
-pub fn put_grant_slot(kv: &mut BucketKeyVersion, bucket: &str, username: &str, slots: &GranteeSlots, bwk: &[u8; 32]) -> Result<(), Error> {
+pub fn put_grant_slot(
+    kv: &mut BucketKeyVersion,
+    bucket: &str,
+    username: &str,
+    slots: &GranteeSlots,
+    bwk: &[u8; 32],
+) -> Result<(), Error> {
     let sealed = seal_grant_slots(bucket, kv.epoch, username, slots, bwk)?;
     kv.grants.insert(username.to_owned(), sealed);
     Ok(())
@@ -196,14 +229,21 @@ pub fn open_bwk(
     slot: usize,
     identity_sk: &[u8],
 ) -> Result<[u8; 32], Error> {
-    let kv = config.keys.iter().find(|k| k.epoch == epoch).ok_or_else(|| forbidden(bucket))?;
+    let kv = config
+        .keys
+        .iter()
+        .find(|k| k.epoch == epoch)
+        .ok_or_else(|| forbidden(bucket))?;
     let sealed_slots = kv.grants.get(username).ok_or_else(|| forbidden(bucket))?;
     if sealed_slots.len() != CREDENTIAL_SLOTS {
         return Err(Error::InternalError {
             bucket: bucket.to_owned(),
             key: String::new(),
             operation: "bucket-key-grant".to_owned(),
-            message: format!("expected {CREDENTIAL_SLOTS} credential slots for {username}, found {}", sealed_slots.len()),
+            message: format!(
+                "expected {CREDENTIAL_SLOTS} credential slots for {username}, found {}",
+                sealed_slots.len()
+            ),
         });
     }
     let sealed = sealed_slots.get(slot).ok_or_else(|| forbidden(bucket))?;
@@ -234,7 +274,11 @@ pub fn read_key(
     slot: usize,
     identity_sk: &[u8],
 ) -> Result<Zeroizing<Vec<u8>>, Error> {
-    let kv = config.keys.iter().find(|k| k.epoch == epoch).ok_or_else(|| forbidden(bucket))?;
+    let kv = config
+        .keys
+        .iter()
+        .find(|k| k.epoch == epoch)
+        .ok_or_else(|| forbidden(bucket))?;
     let bwk = open_bwk(config, bucket, epoch, username, slot, identity_sk)?;
     let sk_aad = bucket_sk_wrap_aad(bucket, epoch);
     let sk_bytes = unwrap_with_key(&kv.sk_blob, &bwk, &sk_aad).map_err(|_| forbidden(bucket))?;
@@ -261,7 +305,14 @@ pub fn resolve_read_key(
     if let Some(cached) = session.cached_bucket_key(bucket, epoch) {
         return Ok(cached);
     }
-    let sk = read_key(config, bucket, epoch, &session.username, session.persona as usize, &session.identity_sk)?;
+    let sk = read_key(
+        config,
+        bucket,
+        epoch,
+        &session.username,
+        session.persona as usize,
+        &session.identity_sk,
+    )?;
     let sk = std::sync::Arc::new(sk);
     session.cache_bucket_key(bucket.to_owned(), epoch, std::sync::Arc::clone(&sk));
     Ok(sk)
@@ -277,7 +328,11 @@ pub fn resolve_read_key(
 /// reports `false` even though its row is structurally present. Returns
 /// `false` (not an error) for a bucket with no key material yet, since
 /// there is nothing to be granted to.
-pub fn is_visible(session: &crate::auth::session::SessionInfo, config: &BucketConfig, bucket: &str) -> bool {
+pub fn is_visible(
+    session: &crate::auth::session::SessionInfo,
+    config: &BucketConfig,
+    bucket: &str,
+) -> bool {
     match current_key(config) {
         Some(kv) => resolve_read_key(session, config, bucket, kv.epoch).is_ok(),
         None => false,
@@ -304,9 +359,18 @@ pub fn new_owner_key(
             operation: "claim_ownership".to_owned(),
             message: "claiming user's record vanished".to_owned(),
         })?;
-    let identity_pks_b64: Vec<String> = rec.slots.iter().map(|s| s.identity_pk_b64.clone()).collect();
-    let authorized: Vec<bool> = (0..CREDENTIAL_SLOTS).map(|i| i == session.persona as usize).collect();
-    let slots = GranteeSlots { identity_pks_b64, authorized };
+    let identity_pks_b64: Vec<String> = rec
+        .slots
+        .iter()
+        .map(|s| s.identity_pk_b64.clone())
+        .collect();
+    let authorized: Vec<bool> = (0..CREDENTIAL_SLOTS)
+        .map(|i| i == session.persona as usize)
+        .collect();
+    let slots = GranteeSlots {
+        identity_pks_b64,
+        authorized,
+    };
     let (kv, _bwk) = new_bucket_key_version(0, bucket, &[(session.username.clone(), slots)])?;
     Ok(kv)
 }
@@ -330,7 +394,9 @@ pub fn resolve_write_key(config: &BucketConfig, bucket: &str) -> Result<(u32, Ve
 }
 
 fn forbidden(bucket: &str) -> Error {
-    Error::Forbidden { bucket: bucket.to_owned() }
+    Error::Forbidden {
+        bucket: bucket.to_owned(),
+    }
 }
 
 fn crypto_err(bucket: &str, operation: &str, e: y2q_core::crypto::CryptoError) -> Error {
@@ -358,7 +424,9 @@ mod tests {
     fn slots_for(pks: &[String], authorized_idx: &[usize]) -> GranteeSlots {
         GranteeSlots {
             identity_pks_b64: pks.to_vec(),
-            authorized: (0..CREDENTIAL_SLOTS).map(|i| authorized_idx.contains(&i)).collect(),
+            authorized: (0..CREDENTIAL_SLOTS)
+                .map(|i| authorized_idx.contains(&i))
+                .collect(),
         }
     }
 
@@ -377,7 +445,8 @@ mod tests {
         let (junk3, _) = identity(3);
         let pks = vec![alice_pk0, junk1, junk2, junk3];
 
-        let (kv, _bwk) = new_bucket_key_version(0, "b", &[("alice".to_owned(), slots_for(&pks, &[0]))]).unwrap();
+        let (kv, _bwk) =
+            new_bucket_key_version(0, "b", &[("alice".to_owned(), slots_for(&pks, &[0]))]).unwrap();
 
         let mut cfg = BucketConfig::default();
         cfg.keys.push(kv);
@@ -397,18 +466,25 @@ mod tests {
         let pks = vec![alice_pk0, junk1, junk2, junk3];
 
         // Nobody authorized.
-        let (kv, _bwk) = new_bucket_key_version(0, "b", &[("alice".to_owned(), slots_for(&pks, &[]))]).unwrap();
+        let (kv, _bwk) =
+            new_bucket_key_version(0, "b", &[("alice".to_owned(), slots_for(&pks, &[]))]).unwrap();
         let mut cfg = BucketConfig::default();
         cfg.keys.push(kv);
 
-        assert!(matches!(read_key(&cfg, "b", 0, "alice", 0, &alice_sk0), Err(Error::Forbidden { .. })));
+        assert!(matches!(
+            read_key(&cfg, "b", 0, "alice", 0, &alice_sk0),
+            Err(Error::Forbidden { .. })
+        ));
     }
 
     #[test]
     fn unknown_user_is_forbidden_not_missing() {
         let cfg = BucketConfig::default();
         let (_, sk) = identity(0);
-        assert!(matches!(read_key(&cfg, "b", 0, "nobody", 0, &sk), Err(Error::Forbidden { .. })));
+        assert!(matches!(
+            read_key(&cfg, "b", 0, "nobody", 0, &sk),
+            Err(Error::Forbidden { .. })
+        ));
     }
 
     #[test]
@@ -420,12 +496,16 @@ mod tests {
         let pks = vec![alice_pk0, alice_pk1, junk2, junk3];
 
         // Only slot 1 is authorized.
-        let (kv, _bwk) = new_bucket_key_version(0, "b", &[("alice".to_owned(), slots_for(&pks, &[1]))]).unwrap();
+        let (kv, _bwk) =
+            new_bucket_key_version(0, "b", &[("alice".to_owned(), slots_for(&pks, &[1]))]).unwrap();
         let mut cfg = BucketConfig::default();
         cfg.keys.push(kv);
 
         // Slot 0's real secret key exists but its slot isn't authorized.
-        assert!(matches!(read_key(&cfg, "b", 0, "alice", 0, &alice_sk0), Err(Error::Forbidden { .. })));
+        assert!(matches!(
+            read_key(&cfg, "b", 0, "alice", 0, &alice_sk0),
+            Err(Error::Forbidden { .. })
+        ));
     }
 
     #[test]
@@ -435,7 +515,9 @@ mod tests {
         let (j2, _) = identity(2);
         let (j3, _) = identity(3);
         let alice_pks = vec![alice_pk0, j1, j2, j3];
-        let (mut kv, bwk) = new_bucket_key_version(0, "b", &[("alice".to_owned(), slots_for(&alice_pks, &[0]))]).unwrap();
+        let (mut kv, bwk) =
+            new_bucket_key_version(0, "b", &[("alice".to_owned(), slots_for(&alice_pks, &[0]))])
+                .unwrap();
 
         let (bob_pk0, bob_sk0) = identity(4);
         let (j5, _) = identity(5);
@@ -449,7 +531,6 @@ mod tests {
         assert!(read_key(&cfg, "b", 0, "bob", 0, &bob_sk0).is_ok());
     }
 
-
     #[test]
     fn grant_row_is_byte_shape_uniform_across_authorized_and_decoy_slots() {
         // Deniability property: a grant row always carries exactly
@@ -462,11 +543,15 @@ mod tests {
         let (j3, _) = identity(3);
         let pks = vec![alice_pk0, j1, j2, j3];
         // Only slot 0 is authorized - slots 1..3 are decoys.
-        let (kv, _bwk) = new_bucket_key_version(0, "b", &[("alice".to_owned(), slots_for(&pks, &[0]))]).unwrap();
+        let (kv, _bwk) =
+            new_bucket_key_version(0, "b", &[("alice".to_owned(), slots_for(&pks, &[0]))]).unwrap();
 
         let sealed = kv.grants.get("alice").unwrap();
         assert_eq!(sealed.len(), CREDENTIAL_SLOTS);
         let lens: Vec<usize> = sealed.iter().map(|s| s.ct_b64.len()).collect();
-        assert!(lens.iter().all(|&l| l == lens[0]), "sealed grant lengths differ: {lens:?}");
+        assert!(
+            lens.iter().all(|&l| l == lens[0]),
+            "sealed grant lengths differ: {lens:?}"
+        );
     }
 }

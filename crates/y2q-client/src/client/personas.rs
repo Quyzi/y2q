@@ -57,12 +57,20 @@ impl Y2qClient {
 
     /// Re-seal every bucket in `buckets` so `slot` no longer holds real
     /// access. The caller's own persona keeps its access.
-    pub async fn revoke_persona_grant(&self, slot: u8, buckets: &[String]) -> Result<(), ClientError> {
+    pub async fn revoke_persona_grant(
+        &self,
+        slot: u8,
+        buckets: &[String],
+    ) -> Result<(), ClientError> {
         let url = self.url(&format!("api/v1/personas/{slot}/grant"));
         let body = PersonaGrantBody {
             buckets: buckets.to_vec(),
         };
-        let resp = self.authed(self.inner.delete(url)).json(&body).send().await?;
+        let resp = self
+            .authed(self.inner.delete(url))
+            .json(&body)
+            .send()
+            .await?;
         Self::check_status(resp).await?;
         Ok(())
     }

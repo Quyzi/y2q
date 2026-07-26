@@ -323,7 +323,10 @@ mod tests {
 
     #[test]
     fn derivations_differ_across_node_keys() {
-        assert_ne!(derive_object_metadata_key(&nk(1)), derive_object_metadata_key(&nk(2)));
+        assert_ne!(
+            derive_object_metadata_key(&nk(1)),
+            derive_object_metadata_key(&nk(2))
+        );
     }
 
     #[test]
@@ -339,7 +342,8 @@ mod tests {
 
     #[test]
     fn wrong_omk_fails_to_decrypt() {
-        let blob = encrypt_meta(&derive_object_metadata_key(&nk(1)), b"secret", "obj-id-a").unwrap();
+        let blob =
+            encrypt_meta(&derive_object_metadata_key(&nk(1)), b"secret", "obj-id-a").unwrap();
         assert!(matches!(
             decrypt_meta(&derive_object_metadata_key(&nk(2)), &blob, "obj-id-a"),
             Err(CryptoError::AuthFailed)
@@ -378,10 +382,7 @@ mod tests {
             slot.object_metadata_key(),
             Some(derive_object_metadata_key(&k))
         );
-        assert_eq!(
-            slot.bucket_config_key(),
-            Some(derive_bucket_config_key(&k))
-        );
+        assert_eq!(slot.bucket_config_key(), Some(derive_bucket_config_key(&k)));
     }
 
     #[test]

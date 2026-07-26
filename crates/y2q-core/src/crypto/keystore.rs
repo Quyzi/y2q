@@ -134,13 +134,12 @@ pub fn load(dir: &Path, nk: &[u8; 32]) -> Result<UserStore, CryptoError> {
         });
     }
 
-    let actual_verifier =
-        STANDARD
-            .decode(&parsed.node_key_verifier_b64)
-            .map_err(|e| CryptoError::KeystoreCorrupt {
-                path: files.manifest.display().to_string(),
-                reason: format!("verifier base64 decode: {e}"),
-            })?;
+    let actual_verifier = STANDARD
+        .decode(&parsed.node_key_verifier_b64)
+        .map_err(|e| CryptoError::KeystoreCorrupt {
+            path: files.manifest.display().to_string(),
+            reason: format!("verifier base64 decode: {e}"),
+        })?;
     let expected_verifier = derive_node_key_verifier(nk);
     let verifier_matches = actual_verifier.len() == expected_verifier.len()
         && bool::from(actual_verifier.ct_eq(&expected_verifier));
@@ -216,7 +215,6 @@ pub fn first_run(
     })
 }
 
-
 fn write_manifest(path: &Path, manifest: &KeystoreManifest) -> Result<(), CryptoError> {
     let json = serde_json::to_vec_pretty(manifest)
         .map_err(|e| CryptoError::KeystoreIo(format!("serialize keystore manifest: {e}")))?;
@@ -266,7 +264,11 @@ pub fn rotation_journal_exists(dir: &Path) -> bool {
 /// Write the rotation journal for `(old_nk, new_nk)`. Must be called before
 /// any object, bucket, or the index is touched — it's what makes the
 /// rotation's "offline" property crash-safe rather than merely advisory.
-pub fn write_rotation_journal(dir: &Path, old_nk: &[u8; 32], new_nk: &[u8; 32]) -> Result<(), CryptoError> {
+pub fn write_rotation_journal(
+    dir: &Path,
+    old_nk: &[u8; 32],
+    new_nk: &[u8; 32],
+) -> Result<(), CryptoError> {
     let journal = RotationJournal {
         old_verifier_b64: STANDARD.encode(derive_node_key_verifier(old_nk)),
         new_verifier_b64: STANDARD.encode(derive_node_key_verifier(new_nk)),
@@ -349,8 +351,9 @@ pub fn rewrite_verifier(dir: &Path, new_nk: &[u8; 32]) -> Result<(), CryptoError
     f.sync_all()
         .map_err(|e| CryptoError::KeystoreIo(format!("fsync {}: {e}", tmp.display())))?;
     drop(f);
-    fs::rename(&tmp, &files.manifest)
-        .map_err(|e| CryptoError::KeystoreIo(format!("rename {}: {e}", files.manifest.display())))?;
+    fs::rename(&tmp, &files.manifest).map_err(|e| {
+        CryptoError::KeystoreIo(format!("rename {}: {e}", files.manifest.display()))
+    })?;
     Ok(())
 }
 
@@ -396,8 +399,8 @@ pub fn acquire_lock(dir: &Path) -> Result<File, CryptoError> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::user_store::CREDENTIAL_SLOTS;
+    use super::*;
     use tempfile::tempdir;
 
     fn nk(seed: u8) -> [u8; 32] {

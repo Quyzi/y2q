@@ -6,7 +6,7 @@ use actix_web::{HttpRequest, HttpResponse, web};
 use y2q_cluster::Role;
 use y2q_core::{AnyStorage, BucketPermission, Listing, PutOptions, SyncLevel};
 
-use crate::auth::{Authenticated, AuthState};
+use crate::auth::{AuthState, Authenticated};
 use crate::authz::{Decision, authorize_bucket, claim_ownership};
 use crate::cipher;
 use crate::cluster::{self, ClusterRuntime};
@@ -90,9 +90,14 @@ pub async fn handle(
             cluster::cluster_claim_owner(rt, &state.user_store, &bucket, &auth.session).await?
         }
         (None, Decision::ClaimOwnership) => {
-            claim_ownership(&storage, &state.user_store, &bucket, &auth.session).await?.0
+            claim_ownership(&storage, &state.user_store, &bucket, &auth.session)
+                .await?
+                .0
         }
-        (_, Decision::Allowed) => storage.get_bucket_config(&bucket).await.map_err(AppError::from)?,
+        (_, Decision::Allowed) => storage
+            .get_bucket_config(&bucket)
+            .await
+            .map_err(AppError::from)?,
     };
 
     // Quota enforcement: only buckets that actually set a quota pay the usage
@@ -123,7 +128,6 @@ pub async fn handle(
         }
         max_bytes = max_bytes.min(limit.saturating_sub(used));
     }
-
 
     // Clustered: route the write through the chain instead of writing locally.
     // The contact node either is the HEAD (encrypt + replicate here) or proxies
@@ -175,7 +179,8 @@ pub async fn handle(
         });
     }
 
-    let (bucket_epoch, bucket_pk) = crate::bucket_keys::resolve_write_key(&cfg, &bucket).map_err(AppError)?;
+    let (bucket_epoch, bucket_pk) =
+        crate::bucket_keys::resolve_write_key(&cfg, &bucket).map_err(AppError)?;
 
     let (guard, sink, write_offset) = storage
         .begin_streaming_put(&bucket, &key)

@@ -438,7 +438,9 @@ mod tests {
             .slots
             .iter()
             .enumerate()
-            .filter(|(i, s)| kdf::unwrap_slot(&s.wrapped, &kek, &kdf::slot_wrap_aad("alice", *i)).is_ok())
+            .filter(|(i, s)| {
+                kdf::unwrap_slot(&s.wrapped, &kek, &kdf::slot_wrap_aad("alice", *i)).is_ok()
+            })
             .map(|(i, _)| i)
             .collect();
         assert_eq!(opened, vec![0]);
@@ -448,7 +450,9 @@ mod tests {
             .slots
             .iter()
             .enumerate()
-            .filter(|(i, s)| kdf::unwrap_slot(&s.wrapped, &wrong_kek, &kdf::slot_wrap_aad("alice", *i)).is_ok())
+            .filter(|(i, s)| {
+                kdf::unwrap_slot(&s.wrapped, &wrong_kek, &kdf::slot_wrap_aad("alice", *i)).is_ok()
+            })
             .count();
         assert_eq!(opened_wrong, 0);
     }

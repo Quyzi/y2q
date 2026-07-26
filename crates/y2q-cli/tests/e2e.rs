@@ -329,7 +329,8 @@ fn e2e_node_key_rotation_crash_safety() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let base = std::env::temp_dir().join(format!("y2q-rotate-e2e-{}-{}", std::process::id(), nanos));
+    let base =
+        std::env::temp_dir().join(format!("y2q-rotate-e2e-{}-{}", std::process::id(), nanos));
     let data = base.join("data");
     let keys = base.join("keys");
     let cfg_home = base.join("cfg");
@@ -404,8 +405,16 @@ fn e2e_node_key_rotation_crash_safety() {
             .expect("spawn y2q")
     };
     let url = format!("http://127.0.0.1:{port}");
-    assert!(y2q(&["alias", "set", "test", &url, "--user", "root"]).status.success());
-    assert!(y2q(&["login", "test", "--password", &password]).status.success());
+    assert!(
+        y2q(&["alias", "set", "test", &url, "--user", "root"])
+            .status
+            .success()
+    );
+    assert!(
+        y2q(&["login", "test", "--password", &password])
+            .status
+            .success()
+    );
 
     const BUCKETS: usize = 4;
     const OBJECTS_PER_BUCKET: usize = 40;
@@ -419,14 +428,21 @@ fn e2e_node_key_rotation_crash_safety() {
             std::fs::write(&local, &content).unwrap();
             let object = format!("{bucket}/obj{i}.txt");
             let out = y2q(&["cp", local.to_str().unwrap(), &object]);
-            assert!(out.status.success(), "seed cp failed: {}", String::from_utf8_lossy(&out.stderr));
+            assert!(
+                out.status.success(),
+                "seed cp failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
             expected.push((object, content));
         }
     }
 
     // Stop the daemon cleanly (SIGTERM), then snapshot the pre-rotation tree
     // so the timing-calibration rotation below can be undone.
-    let _ = Command::new("kill").arg("-TERM").arg(child.id().to_string()).status();
+    let _ = Command::new("kill")
+        .arg("-TERM")
+        .arg(child.id().to_string())
+        .status();
     for _ in 0..40 {
         if matches!(child.try_wait(), Ok(Some(_))) {
             break;
@@ -438,8 +454,18 @@ fn e2e_node_key_rotation_crash_safety() {
 
     let copy_tree = |from: &std::path::Path, to: &std::path::Path| {
         let _ = std::fs::remove_dir_all(to);
-        let status = Command::new("cp").args(["-r", "-p"]).arg(from).arg(to).status().expect("cp -r");
-        assert!(status.success(), "cp -r {} {} failed", from.display(), to.display());
+        let status = Command::new("cp")
+            .args(["-r", "-p"])
+            .arg(from)
+            .arg(to)
+            .status()
+            .expect("cp -r");
+        assert!(
+            status.success(),
+            "cp -r {} {} failed",
+            from.display(),
+            to.display()
+        );
     };
     std::fs::create_dir_all(&snapshot).unwrap();
     copy_tree(&data, &snapshot.join("data"));
@@ -483,7 +509,10 @@ fn e2e_node_key_rotation_crash_safety() {
         "rotation already finished before the calibrated kill point — timing assumption broke; \
          increase OBJECTS_PER_BUCKET or lower the kill fraction"
     );
-    let _ = Command::new("kill").arg("-KILL").arg(rot.id().to_string()).status();
+    let _ = Command::new("kill")
+        .arg("-KILL")
+        .arg(rot.id().to_string())
+        .status();
     let _ = rot.wait();
 
     let journal_path = keys.join("node-key-rotation.json");
@@ -508,14 +537,24 @@ fn e2e_node_key_rotation_crash_safety() {
             // doesn't leak a listening daemon.
             let _ = refused_child.kill();
             let _ = refused_child.wait();
-            panic!("daemon started successfully despite an interrupted rotation journal being present");
+            panic!(
+                "daemon started successfully despite an interrupted rotation journal being present"
+            );
         }
     };
-    assert!(!status.success(), "boot with an interrupted rotation journal present must fail");
+    assert!(
+        !status.success(),
+        "boot with an interrupted rotation journal present must fail"
+    );
     let stderr = {
         use std::io::Read;
         let mut s = String::new();
-        refused_child.stderr.take().unwrap().read_to_string(&mut s).ok();
+        refused_child
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut s)
+            .ok();
         s
     };
     assert!(
@@ -531,35 +570,59 @@ fn e2e_node_key_rotation_crash_safety() {
         "resumed rotation failed: {}",
         String::from_utf8_lossy(&resume_out.stderr)
     );
-    assert!(!journal_path.exists(), "journal must be deleted once the rotation completes");
+    assert!(
+        !journal_path.exists(),
+        "journal must be deleted once the rotation completes"
+    );
 
     // ── Phase 6: boot under the new key and verify every object ────────────
     let mut boot2 = Command::new(&bin);
     apply_common_env(&mut boot2);
-    boot2.env("Y2QD_NODE_KEY", &new_key).stdout(Stdio::null()).stderr(Stdio::null());
+    boot2
+        .env("Y2QD_NODE_KEY", &new_key)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     let mut child2 = boot2.spawn().expect("spawn y2qd under new key");
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         if TcpStream::connect(("127.0.0.1", port)).is_ok() {
             break;
         }
-        assert!(Instant::now() < deadline, "y2qd did not become ready under the new key");
+        assert!(
+            Instant::now() < deadline,
+            "y2qd did not become ready under the new key"
+        );
         std::thread::sleep(Duration::from_millis(50));
     }
 
     // A fresh daemon process starts with an empty in-memory session store —
     // the token cached from before rotation is gone. Node-key rotation
     // never touches user identity/auth, so the same password logs back in.
-    assert!(y2q(&["login", "test", "--password", &password]).status.success());
+    assert!(
+        y2q(&["login", "test", "--password", &password])
+            .status
+            .success()
+    );
 
     for (object, content) in &expected {
         let dl = base.join("verify.tmp");
         let out = y2q(&["get", object, dl.to_str().unwrap()]);
-        assert!(out.status.success(), "get {object} failed after rotation: {}", String::from_utf8_lossy(&out.stderr));
-        assert_eq!(&std::fs::read(&dl).unwrap(), content.as_bytes(), "content mismatch for {object} after rotation");
+        assert!(
+            out.status.success(),
+            "get {object} failed after rotation: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            &std::fs::read(&dl).unwrap(),
+            content.as_bytes(),
+            "content mismatch for {object} after rotation"
+        );
     }
 
-    let _ = Command::new("kill").arg("-TERM").arg(child2.id().to_string()).status();
+    let _ = Command::new("kill")
+        .arg("-TERM")
+        .arg(child2.id().to_string())
+        .status();
     for _ in 0..40 {
         if matches!(child2.try_wait(), Ok(Some(_))) {
             break;
@@ -572,8 +635,13 @@ fn e2e_node_key_rotation_crash_safety() {
     // ── Phase 7: the old key is rejected outright post-rotation ────────────
     let mut boot3 = Command::new(&bin);
     apply_common_env(&mut boot3);
-    boot3.env("Y2QD_NODE_KEY", &old_key).stdout(Stdio::null()).stderr(Stdio::piped());
-    let mut child3 = boot3.spawn().expect("spawn y2qd with the old key post-rotation");
+    boot3
+        .env("Y2QD_NODE_KEY", &old_key)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let mut child3 = boot3
+        .spawn()
+        .expect("spawn y2qd with the old key post-rotation");
     let status3 = match wait_for_exit(&mut child3, Duration::from_secs(10)) {
         Some(s) => s,
         None => {
@@ -582,7 +650,10 @@ fn e2e_node_key_rotation_crash_safety() {
             panic!("daemon started successfully with the OLD key after rotation completed");
         }
     };
-    assert!(!status3.success(), "the old node key must be rejected after rotation");
+    assert!(
+        !status3.success(),
+        "the old node key must be rejected after rotation"
+    );
 
     let _ = std::fs::remove_dir_all(&base);
 }
@@ -894,15 +965,17 @@ fn e2e_bucket_acl_grant_and_revoke() {
     server.ok(&["mb", "test/shared"]);
     let local = server.base.join("secret.txt");
     std::fs::write(&local, b"top secret payload").unwrap();
-    server.ok(&[
-        "cp",
-        local.to_str().unwrap(),
-        "test/shared/secret.txt",
-    ]);
+    server.ok(&["cp", local.to_str().unwrap(), "test/shared/secret.txt"]);
 
     // Create a second user and log them in under their own alias.
     server.ok(&[
-        "admin", "user", "add", "test", "bob", "--password", "bob-secure-passphrase-1",
+        "admin",
+        "user",
+        "add",
+        "test",
+        "bob",
+        "--password",
+        "bob-secure-passphrase-1",
     ]);
     server.ok(&["alias", "set", "bob", &url, "--user", "bob"]);
     server.ok(&["login", "bob", "--password", "bob-secure-passphrase-1"]);
@@ -945,10 +1018,22 @@ fn e2e_delete_user_bucket_owner_guard() {
 
     // carol owns a bucket; dave is just a plain user with none.
     server.ok(&[
-        "admin", "user", "add", "test", "carol", "--password", "carol-secure-passphrase-1",
+        "admin",
+        "user",
+        "add",
+        "test",
+        "carol",
+        "--password",
+        "carol-secure-passphrase-1",
     ]);
     server.ok(&[
-        "admin", "user", "add", "test", "dave", "--password", "dave-secure-passphrase-1",
+        "admin",
+        "user",
+        "add",
+        "test",
+        "dave",
+        "--password",
+        "dave-secure-passphrase-1",
     ]);
     server.ok(&["alias", "set", "carol", &url, "--user", "carol"]);
     server.ok(&["login", "carol", "--password", "carol-secure-passphrase-1"]);
@@ -1002,14 +1087,24 @@ fn e2e_rotate_key_and_rekey() {
     // Grant eve read, then revoke it — her real grant on epoch 0 is now
     // stale but still technically present until a rekey prunes it.
     server.ok(&[
-        "admin", "user", "add", "test", "eve", "--password", "eve-secure-passphrase-1",
+        "admin",
+        "user",
+        "add",
+        "test",
+        "eve",
+        "--password",
+        "eve-secure-passphrase-1",
     ]);
     server.ok(&["admin", "acl", "grant", "test", "alpha", "eve", "read"]);
     server.ok(&["admin", "acl", "revoke", "test", "alpha", "eve"]);
 
     // Rotate to a fresh epoch eve never held.
     let out = server.y2q(&["--json", "admin", "rotate-key", "test", "alpha"]);
-    assert!(ok(&out), "rotate-key failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        ok(&out),
+        "rotate-key failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let rotate: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(rotate["epoch"], 1);
     assert_eq!(rotate["key_epochs"], serde_json::json!([0, 1]));
@@ -1030,7 +1125,10 @@ fn e2e_rotate_key_and_rekey() {
             "completed" => break,
             "failed" => panic!("rekey failed: {status:?}"),
             _ => {
-                assert!(std::time::Instant::now() < deadline, "rekey did not complete in time");
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "rekey did not complete in time"
+                );
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
         }
@@ -1067,10 +1165,22 @@ fn e2e_reset_identity() {
     server.ok(&["login", "test", "--password", &pw]);
 
     server.ok(&[
-        "admin", "user", "add", "test", "frank", "--password", "frank-old-passphrase-1",
+        "admin",
+        "user",
+        "add",
+        "test",
+        "frank",
+        "--password",
+        "frank-old-passphrase-1",
     ]);
     server.ok(&[
-        "admin", "user", "add", "test", "gina", "--password", "gina-secure-passphrase-1",
+        "admin",
+        "user",
+        "add",
+        "test",
+        "gina",
+        "--password",
+        "gina-secure-passphrase-1",
     ]);
     server.ok(&["alias", "set", "frank", &url, "--user", "frank"]);
     server.ok(&["login", "frank", "--password", "frank-old-passphrase-1"]);
@@ -1093,9 +1203,19 @@ fn e2e_reset_identity() {
 
     // Root resets frank's identity under a new password.
     let out = server.y2q(&[
-        "--json", "admin", "reset-identity", "test", "frank", "--password", "frank-new-passphrase-2",
+        "--json",
+        "admin",
+        "reset-identity",
+        "test",
+        "frank",
+        "--password",
+        "frank-new-passphrase-2",
     ]);
-    assert!(ok(&out), "reset-identity failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        ok(&out),
+        "reset-identity failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let resp: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     let orphaned: Vec<String> = resp["orphaned_buckets"]
         .as_array()
@@ -1103,13 +1223,22 @@ fn e2e_reset_identity() {
         .iter()
         .map(|v| v.as_str().unwrap().to_owned())
         .collect();
-    assert_eq!(orphaned, vec!["solo".to_owned()], "only the sole-grantee bucket should orphan");
+    assert_eq!(
+        orphaned,
+        vec!["solo".to_owned()],
+        "only the sole-grantee bucket should orphan"
+    );
 
     // frank's live session (under the old identity) is dead.
     assert!(!ok(&server.y2q(&["stat", "frank/shared/shared.txt"])));
 
     // The old password no longer works; the new one does.
-    assert!(!ok(&server.y2q(&["login", "frank", "--password", "frank-old-passphrase-1"])));
+    assert!(!ok(&server.y2q(&[
+        "login",
+        "frank",
+        "--password",
+        "frank-old-passphrase-1"
+    ])));
     server.ok(&["login", "frank", "--password", "frank-new-passphrase-2"]);
 
     // frank's new identity holds no grant anywhere — even the shared bucket
@@ -1189,10 +1318,22 @@ fn e2e_bucket_blast_radius() {
     // alice and carol are ordinary users; alice is granted read on alpha
     // only. carol gets nothing.
     server.ok(&[
-        "admin", "user", "add", "test", "alice", "--password", "alice-secure-passphrase-1",
+        "admin",
+        "user",
+        "add",
+        "test",
+        "alice",
+        "--password",
+        "alice-secure-passphrase-1",
     ]);
     server.ok(&[
-        "admin", "user", "add", "test", "carol", "--password", "carol-secure-passphrase-1",
+        "admin",
+        "user",
+        "add",
+        "test",
+        "carol",
+        "--password",
+        "carol-secure-passphrase-1",
     ]);
     server.ok(&["admin", "acl", "grant", "test", "alpha", "alice", "read"]);
     server.ok(&["alias", "set", "alice", &url, "--user", "alice"]);
@@ -1210,13 +1351,19 @@ fn e2e_bucket_blast_radius() {
     let out = server.y2q(&["stat", "alice/beta/secret.txt"]);
     assert!(!ok(&out), "alice must not read beta");
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("not found"), "expected 404 not found, got: {stderr}");
+    assert!(
+        stderr.contains("not found"),
+        "expected 404 not found, got: {stderr}"
+    );
 
     // carol has zero relationship to alpha either -> same 404.
     let out = server.y2q(&["stat", "carol/alpha/secret.txt"]);
     assert!(!ok(&out), "carol must not read alpha");
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("not found"), "expected 404 not found, got: {stderr}");
+    assert!(
+        stderr.contains("not found"),
+        "expected 404 not found, got: {stderr}"
+    );
 
     // dave is a global ADMIN with no bucket grant anywhere. This is the
     // core claim of the whole plan: a compromised admin account cannot
@@ -1226,7 +1373,15 @@ fn e2e_bucket_blast_radius() {
     // through on role alone, then `bucket_keys::resolve_read_key` fails
     // because dave holds no real sealed grant, surfacing as 403.
     server.ok(&[
-        "admin", "user", "add", "test", "dave", "--role", "admin", "--password", "dave-secure-passphrase-1",
+        "admin",
+        "user",
+        "add",
+        "test",
+        "dave",
+        "--role",
+        "admin",
+        "--password",
+        "dave-secure-passphrase-1",
     ]);
     server.ok(&["alias", "set", "dave", &url, "--user", "dave"]);
     server.ok(&["login", "dave", "--password", "dave-secure-passphrase-1"]);
@@ -1234,7 +1389,10 @@ fn e2e_bucket_blast_radius() {
     let out = server.y2q(&["ls", "dave/"]);
     assert!(ok(&out), "admin must be able to list buckets");
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("alpha") && stdout.contains("beta"), "expected both bucket names, got: {stdout}");
+    assert!(
+        stdout.contains("alpha") && stdout.contains("beta"),
+        "expected both bucket names, got: {stdout}"
+    );
 
     // `stat`/HEAD never decrypts the body (only Metadata, tier-0/node-key
     // material an admin can already see) - use a real GET, the only path
@@ -1243,30 +1401,53 @@ fn e2e_bucket_blast_radius() {
     let out = server.y2q(&["get", "dave/alpha/secret.txt", dave_dl.to_str().unwrap()]);
     assert!(!ok(&out), "admin must not read alpha's plaintext");
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("forbidden"), "expected 403 forbidden, got: {stderr}");
+    assert!(
+        stderr.contains("forbidden"),
+        "expected 403 forbidden, got: {stderr}"
+    );
 
     // Even the ACL endpoint itself refuses dave: granting requires sealing
     // a new grant against the bucket wrap key, which only a real grantee
     // can recover.
     let out = server.y2q(&["admin", "acl", "grant", "dave", "alpha", "dave", "read"]);
-    assert!(!ok(&out), "admin must not be able to self-grant a bucket key");
+    assert!(
+        !ok(&out),
+        "admin must not be able to self-grant a bucket key"
+    );
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("forbidden"), "expected 403 forbidden, got: {stderr}");
+    assert!(
+        stderr.contains("forbidden"),
+        "expected 403 forbidden, got: {stderr}"
+    );
 
     // Root grants carol writeonly on alpha: she can write, but reading back
     // what she just wrote is refused - a writeonly grantee never gets a
     // real bucket-key grant sealed to them at all.
-    server.ok(&["admin", "acl", "grant", "test", "alpha", "carol", "writeonly"]);
+    server.ok(&[
+        "admin",
+        "acl",
+        "grant",
+        "test",
+        "alpha",
+        "carol",
+        "writeonly",
+    ]);
     let dropbox = server.base.join("dropbox.txt");
     std::fs::write(&dropbox, b"carol's write").unwrap();
     server.ok(&["cp", dropbox.to_str().unwrap(), "carol/alpha/dropbox.txt"]);
     let out = server.y2q(&["stat", "carol/alpha/dropbox.txt"]);
-    assert!(!ok(&out), "writeonly grantee must not read back her own write");
+    assert!(
+        !ok(&out),
+        "writeonly grantee must not read back her own write"
+    );
     let stderr = String::from_utf8_lossy(&out.stderr);
     // HEAD responses carry no body per HTTP spec, so the client falls back
     // to the bare status text ("Forbidden") rather than the detailed JSON
     // error message - check the status code instead.
-    assert!(stderr.contains("403"), "expected 403 forbidden, got: {stderr}");
+    assert!(
+        stderr.contains("403"),
+        "expected 403 forbidden, got: {stderr}"
+    );
 
     // alice is the sole grantee (owner) of a bucket of her own - deleting
     // her without --force is refused, since her identity is the only
@@ -1275,9 +1456,15 @@ fn e2e_bucket_blast_radius() {
     // so alice alone is never "sole" there.)
     server.ok(&["mb", "alice/mine"]);
     let out = server.y2q(&["admin", "user", "rm", "test", "alice"]);
-    assert!(!ok(&out), "deleting the sole grantee without --force must fail");
+    assert!(
+        !ok(&out),
+        "deleting the sole grantee without --force must fail"
+    );
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("only key holder"), "expected sole-grantee guard message, got: {stderr}");
+    assert!(
+        stderr.contains("only key holder"),
+        "expected sole-grantee guard message, got: {stderr}"
+    );
     server.ok(&["admin", "user", "rm", "test", "alice", "--force"]);
 }
 
@@ -1299,17 +1486,28 @@ async fn e2e_duress_persona_deniability() {
     let mk = || y2q_client::Y2qClient::new(y2q_client::ClientConfig::new(url.clone())).unwrap();
 
     let mut root = mk();
-    let root_tok = root.login("root", &server.password, None).await.expect("root login");
+    let root_tok = root
+        .login("root", &server.password, None)
+        .await
+        .expect("root login");
     root.set_token(root_tok.token);
-    root.add_user("alice", "password-A", Some("user")).await.expect("add alice");
+    root.add_user("alice", "password-A", Some("user"))
+        .await
+        .expect("add alice");
 
     // 1. As alice (password A / slot 0): create real-bucket+secret.txt and
     // decoy-bucket+plausible.txt.
     let mut alice_a = mk();
-    let tok_a = alice_a.login("alice", "password-A", None).await.expect("alice login A");
+    let tok_a = alice_a
+        .login("alice", "password-A", None)
+        .await
+        .expect("alice login A");
     alice_a.set_token(tok_a.token.clone());
 
-    alice_a.create_bucket("real-bucket").await.expect("create real-bucket");
+    alice_a
+        .create_bucket("real-bucket")
+        .await
+        .expect("create real-bucket");
     let real_secret: &[u8] = b"the real secret";
     alice_a
         .put_from_reader(
@@ -1322,7 +1520,10 @@ async fn e2e_duress_persona_deniability() {
         )
         .await
         .expect("put secret.txt");
-    alice_a.create_bucket("decoy-bucket").await.expect("create decoy-bucket");
+    alice_a
+        .create_bucket("decoy-bucket")
+        .await
+        .expect("create decoy-bucket");
     let plausible: &[u8] = b"nothing to see here";
     alice_a
         .put_from_reader(
@@ -1357,13 +1558,22 @@ async fn e2e_duress_persona_deniability() {
     // A held live A-session (separate from `alice_a`, minted before B's
     // duress login below) to prove it dies when password B logs in.
     let mut held_a = mk();
-    let held_tok = held_a.login("alice", "password-A", None).await.expect("mint held A session");
+    let held_tok = held_a
+        .login("alice", "password-A", None)
+        .await
+        .expect("mint held A session");
     held_a.set_token(held_tok.token);
-    held_a.whoami_persona().await.expect("held A session works before duress login");
+    held_a
+        .whoami_persona()
+        .await
+        .expect("held A session works before duress login");
 
     // 4. Log in with password B.
     let mut alice_b = mk();
-    let tok_b = alice_b.login("alice", "password-B", None).await.expect("alice login B");
+    let tok_b = alice_b
+        .login("alice", "password-B", None)
+        .await
+        .expect("alice login B");
     alice_b.set_token(tok_b.token.clone());
 
     let view = alice_b.whoami_persona().await.expect("whoami as B");
@@ -1372,7 +1582,11 @@ async fn e2e_duress_persona_deniability() {
     assert!(view.revoke_other_sessions);
 
     let buckets = alice_b.list_buckets().await.expect("list buckets as B");
-    assert_eq!(buckets, vec!["decoy-bucket".to_owned()], "B must see only the decoy bucket");
+    assert_eq!(
+        buckets,
+        vec!["decoy-bucket".to_owned()],
+        "B must see only the decoy bucket"
+    );
 
     let mut got = Vec::new();
     alice_b
@@ -1392,17 +1606,26 @@ async fn e2e_duress_persona_deniability() {
 
     // Duress session revocation: the held A session, live since before B's
     // login, is now dead; B's own session keeps working.
-    let err = held_a.whoami_persona().await.expect_err("held A session must die on duress login");
+    let err = held_a
+        .whoami_persona()
+        .await
+        .expect_err("held A session must die on duress login");
     assert!(
         matches!(err, y2q_client::ClientError::Unauthenticated),
         "expected 401, got: {err:?}"
     );
-    alice_b.whoami_persona().await.expect("B's own session keeps working");
+    alice_b
+        .whoami_persona()
+        .await
+        .expect("B's own session keeps working");
 
     // 5. A fresh login with password A again - the duress persona changed
     // nothing about the real one.
     let mut alice_a2 = mk();
-    let tok_a2 = alice_a2.login("alice", "password-A", None).await.expect("alice re-login A");
+    let tok_a2 = alice_a2
+        .login("alice", "password-A", None)
+        .await
+        .expect("alice re-login A");
     alice_a2.set_token(tok_a2.token);
     let mut got2 = Vec::new();
     alice_a2
