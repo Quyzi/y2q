@@ -5,12 +5,14 @@
 #
 # node1 bootstraps the raft cluster and admits node2..node5 as voters
 # (voter_seeds = [1,2,3,4,5]); objects replicate at replication_factor = 3.
-# The `init` service generates one shared deployment keystore + a random root
-# password (the provisioned unlock secret); every node gets its own copy.
+# The `init` service generates one shared node key + keystore.json + a random
+# root password; every node gets its own copy of the keystore and reads the
+# node key directly from the shared /seed mount (the shared-key invariant -
+# every node derives identical tier-0 keys from one node key).
 #
 # Endpoints (host -> container :8080): node1 :8080, node2 :8081, node3 :8082,
 # node4 :8083, node5 :8084. Root password: `docker compose run --rm \
-# -v cluster_seed:/seed cgr.dev/chainguard/wolfi-base cat /seed/unlock_secret.txt`
+# -v cluster_seed:/seed cgr.dev/chainguard/wolfi-base cat /seed/root_password.txt`
 # or read deploy/cluster/README.md.
 
 x-node: &node

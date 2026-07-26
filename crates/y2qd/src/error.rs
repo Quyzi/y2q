@@ -172,7 +172,7 @@ mod tests {
     #[test]
     fn keystore_corrupt_body_does_not_leak_raw_path() {
         let err = AppError(CoreError::KeystoreCorrupt {
-            path: "/var/lib/y2q/keystore/pubkey.json".to_owned(),
+            path: "/var/lib/y2q/keystore/keystore.json".to_owned(),
             reason: "bad length".to_owned(),
         });
         let text = body_text(&err);

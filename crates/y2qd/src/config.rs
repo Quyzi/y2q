@@ -319,7 +319,7 @@ pub struct CryptoConfig {
     /// Argon2id parameters for new user records.
     #[serde(default)]
     pub argon2: Argon2Config,
-    /// Plaintext chunk size (bytes) for v2 streaming encryption. Default 4 MiB.
+    /// Plaintext chunk size (bytes) for v3 streaming encryption. Default 4 MiB.
     /// Stored per-object in the envelope header, so changing this only affects
     /// objects written afterwards; existing objects keep decrypting with their
     /// own stored chunk size. Bounds enforced at load: 64 KiB ..= 256 MiB.

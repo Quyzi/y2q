@@ -396,8 +396,11 @@ pub async fn change_password(
     Ok(HttpResponse::NoContent().finish())
 }
 
-/// `PUT /api/v1/users/add` — wrap the SK from the active session under a new
-/// user's password and persist the record.
+/// `PUT /api/v1/users/add` — admin-only: create a user with a brand-new,
+/// independent identity keypair (slot 0) wrapped under the given password,
+/// plus decoy slots 1..3. Unrelated to the caller's own identity: this does
+/// not require the caller's session to hold any bucket access, only the
+/// `admin` role.
 #[utoipa::path(
     put,
     path = "/api/v1/users/add",

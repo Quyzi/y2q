@@ -52,24 +52,31 @@ flowchart TD
 
 ## Shared-key invariant (the foundation)
 
-Every node loads the **same deployment keystore**. `derive_mek(sk)` and the derived
-Path Key are pure functions of the deployment secret key, so every node derives the
-*identical* MEK and Path Key. Two consequences make the whole data plane possible:
+Every node is given the **same operator-supplied node key** (`Y2QD_NODE_KEY` or
+`[crypto] node_key_file`, copied out-of-band by the operator - see [Key hierarchy
+and identity protection at rest](architecture.md#key-hierarchy-and-identity-protection-at-rest)).
+The tier-0 keys (index file key, path key, object-metadata key, and the node-key
+verifier `NKV`) are pure functions of the node key, so every node derives
+*identical* values. Two consequences make the whole data plane possible:
 
 1. The on-disk path for `(bucket, key)` is `HMAC(path_key, …)` - **identical on
    every node**.
-2. Any node can decrypt any other node's envelope. **Ciphertext is portable
-   between nodes verbatim - re-encryption never happens.**
+2. Any node can decrypt any other node's metadata sidecar and serve reads no
+   other node wrote. **Ciphertext is portable between nodes verbatim -
+   re-encryption never happens.**
 
 The HEAD encrypts an object exactly once; every downstream replica writes the
 received bytes byte-for-byte. The Raft leader refuses to admit a node whose
-deployment-key fingerprint differs ([`NodeMeta::fingerprint`](../crates/y2q-cluster/src/control/types.rs)),
+node-key fingerprint (`NKV`) differs ([`NodeMeta::fingerprint`](../crates/y2q-cluster/src/control/types.rs)),
 guarding this invariant loudly.
 
-In cluster mode the SK is recovered at boot via **provisioned unlock**
-(`Y2QD_CLUSTER__UNLOCK_SECRET` or `cluster.unlock_secret_file` unwraps
-`cluster.unlock_user`'s wrapped SK), and idle-drop is disabled, so peer-forwarded
-writes commit unattended for the process lifetime.
+There is no boot-time unlock secret to provision: the node key is loaded
+directly at startup (the same way as single-node boot) and stays resident for
+the daemon's whole lifetime - there is no process-wide idle-drop. A
+persona's identity secret key (tier 1) still lives only inside that login's
+session, bounded by `[auth] max_ttl_seconds`/`default_ttl_seconds`, and object
+plaintext still requires the caller's own bucket grant (tier 2/3) regardless of
+which node serves the request.
 
 ---
 
@@ -130,7 +137,7 @@ sequenceDiagram
     N1->>N1: raft.initialize({1})  (raft.bootstrap = true, once)
     N1->>N1: AddNode(1, addr, fp)  → Active
     N2->>N1: POST /api/v1/cluster/join (admin-authed)
-    N1->>N1: verify fingerprint matches deployment key
+    N1->>N1: verify fingerprint matches node key
     N1->>N1: add_learner(2)  +  AddNode(2, addr, fp)
     N1->>N1: if 2 in voter_seeds → change_membership
     N1-->>N2: replicate log (ControlState converges)
@@ -279,7 +286,8 @@ TAIL - driven by the consistency mode:
 A non-member always fetches the committed envelope from the TAIL (it holds no
 copy). The TAIL is the commit point, so its `version` answer is authoritative: a
 dirty member never promotes its `.tmp` over its `.obj` until the TAIL's commit for
-that version is confirmed. Fetched envelopes are decrypted locally (shared key) and
+that version is confirmed. Fetched envelopes are decrypted locally using the
+caller's own session bucket-key context (the same as a single-node read) and
 trimmed to the true plaintext size. This is the apportioned-read win: clean reads
 fan out across all `R` replicas; only in-flight keys pay the version-query round
 trip.
@@ -313,9 +321,9 @@ inherits every bucket config and user record.
 For users, the projector preserves the node-local `last_login` (an observation,
 not replicated state - login stays a node-local data-plane operation) and revokes
 the user's local sessions when their role changes, so a demote/disable takes
-effect on **every** node, not only where the admin ran it. The wrapped SK carried
-in a `UserRecord` is the same ciphertext-at-rest already stored on disk; sessions
-themselves are never replicated.
+effect on **every** node, not only where the admin ran it. A credential slot's
+wrapped identity secret key in a `UserRecord` is the same ciphertext-at-rest
+already stored on disk; sessions themselves are never replicated.
 
 ### LIST / SEARCH scatter-gather
 
@@ -382,7 +390,7 @@ Admin (under `/api/v1/cluster/`, admin-authed): `POST /join`, `GET /status`,
 **Peer auth:** v1 uses a constant-time shared-secret header (`cluster.auth =
 "shared-secret"`, `Y2QD_CLUSTER__SHARED_SECRET`). Production posture is
 `cluster.auth = "mtls"`, reusing the server's `client_ca_path`. User Bearer tokens
-are never reused for peer traffic (they idle-drop).
+are never reused for peer traffic.
 
 ---
 
@@ -413,9 +421,9 @@ objects are skipped (digest match).
   run standalone (`cluster.enabled = false`). The single-node `.obj` format is
   byte-identical, so the detached node serves the data directly.
 
-**Precondition (both directions):** every node already shares the deployment
-keystore (the shared-key invariant), so ciphertext is portable verbatim. Migration
-is a one-shot operator tool, not part of the steady-state read/write path.
+**Precondition (both directions):** every node already shares the same node key
+(the shared-key invariant), so ciphertext is portable verbatim. Migration is a
+one-shot operator tool, not part of the steady-state read/write path.
 
 ## Configuration reference
 
@@ -438,9 +446,6 @@ auth = "shared-secret"           # shared-secret | mtls
 shared_secret = ""               # prefer Y2QD_CLUSTER__SHARED_SECRET
 health_probe_interval_ms = 1000
 health_fail_threshold = 3
-unlock = "provisioned"           # SK unwrapped at boot from a provisioned secret
-unlock_secret_file = ""          # or Y2QD_CLUSTER__UNLOCK_SECRET
-unlock_user = "root"             # whose wrapped SK the unlock secret recovers
 peers = []                       # [{ id = 2, url = "https://10.0.0.2:8443" }, …]
 
 [cluster.raft]

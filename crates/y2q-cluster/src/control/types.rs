@@ -38,8 +38,8 @@ pub struct NodeMeta {
     /// Full base URL (`scheme://host:port`) other nodes dial for the internal
     /// API; the data plane appends the endpoint path to it.
     pub addr: String,
-    /// Deployment public-key fingerprint (SHA-256 hex). The controller refuses to
-    /// admit a node whose fingerprint differs, guarding the shared-MEK invariant.
+    /// Node-key fingerprint (`NKV`, SHA-256 hex). The controller refuses to
+    /// admit a node whose fingerprint differs, guarding the shared-node-key invariant.
     pub fingerprint: String,
     /// Current liveness/role status.
     pub status: NodeStatus,
@@ -54,7 +54,7 @@ pub enum ControlCmd {
         node_id: NodeId,
         /// Its advertised `host:port`.
         addr: String,
-        /// Its deployment-key fingerprint.
+        /// Its node-key fingerprint.
         fingerprint: String,
     },
     /// Remove a node from the cluster entirely.
@@ -119,10 +119,12 @@ pub enum ControlCmd {
         /// Bucket name.
         bucket: String,
     },
-    /// Insert or replace a user's durable record cluster-wide (create, or
-    /// password change which re-wraps the SK). The wrapped SK in the record is
-    /// the same ciphertext-at-rest already stored on disk; the daemon projects
-    /// the record into each node's local user store on apply.
+    /// Insert or replace a user's durable record cluster-wide (create, a
+    /// password change which re-wraps slot 0, or a persona/reset-identity
+    /// change which replaces the whole slot array). The wrapped secret
+    /// key material in the record is the same ciphertext-at-rest already
+    /// stored on disk; the daemon projects the record into each node's
+    /// local user store on apply.
     UpsertUser {
         /// The complete user record to store (keyed by its username).
         record: UserRecord,
