@@ -10,7 +10,7 @@ use core::range::RangeInclusive;
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use crate::crypto::metadata_key::MekSlot;
+use crate::crypto::node_keys::NodeKeySlot;
 
 use bytes::Bytes;
 
@@ -243,35 +243,22 @@ impl AnyStreamingPutGuard {
 }
 
 impl AnyStorage {
-    /// Install the Metadata Encryption Key on the active backend. Derived from
-    /// the deployment secret key when a login unwraps it; idempotent.
-    pub fn install_mek(&self, mek: [u8; 32]) {
+    /// Install the node key on the active backend. Supplied by the operator
+    /// at boot; idempotent.
+    pub fn install_node_key(&self, nk: [u8; 32]) {
         match self {
-            Self::Filesystem(s) => s.install_mek(mek),
+            Self::Filesystem(s) => s.install_node_key(nk),
             #[cfg(target_os = "linux")]
-            Self::Uring(s) => s.install_mek(mek),
+            Self::Uring(s) => s.install_node_key(nk),
         }
     }
 
-    /// Shared handle to the active backend's MEK slot.
-    pub fn mek_slot(&self) -> Arc<MekSlot> {
+    /// Shared handle to the active backend's node-key slot.
+    pub fn node_key_slot(&self) -> Arc<NodeKeySlot> {
         match self {
-            Self::Filesystem(s) => s.mek_slot(),
+            Self::Filesystem(s) => s.node_key_slot(),
             #[cfg(target_os = "linux")]
-            Self::Uring(s) => s.mek_slot(),
-        }
-    }
-
-    /// Zeroize and drop the installed MEK on the active backend and close the
-    /// whole-file-encrypted metadata index, leaving only ciphertext on disk.
-    /// Called when the daemon goes idle, in step with the secret-key drop.
-    /// Returns `true` if a key was present. A later login re-installs and
-    /// reopens.
-    pub fn clear_mek(&self) -> bool {
-        match self {
-            Self::Filesystem(s) => s.clear_mek(),
-            #[cfg(target_os = "linux")]
-            Self::Uring(s) => s.clear_mek(),
+            Self::Uring(s) => s.node_key_slot(),
         }
     }
 

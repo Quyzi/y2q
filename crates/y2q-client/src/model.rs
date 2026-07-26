@@ -63,6 +63,9 @@ pub struct AclBody {
     /// Per-user grants: username → `"read"` | `"write"` | `"admin"`.
     #[serde(default)]
     pub grants: BTreeMap<String, String>,
+    /// Retained bucket key epochs, ascending. Read-only.
+    #[serde(default)]
+    pub key_epochs: Vec<u32>,
 }
 
 // ── Objects ───────────────────────────────────────────────────────────────────
@@ -169,6 +172,28 @@ pub struct RebuildStatus {
     pub reason: Option<String>,
 }
 
+/// Response body for `POST /api/v1/buckets/{bucket}/rotate-key`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RotateKeyResponse {
+    pub epoch: u32,
+    pub key_epochs: Vec<u32>,
+}
+
+/// Response body for `GET /api/v1/buckets/{bucket}/rekey`. Mirrors
+/// [`RebuildStatus`]'s shape, scoped per bucket.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RekeyStatus {
+    pub state: String,
+    pub percent: Option<u8>,
+    pub reason: Option<String>,
+}
+
+/// Response body for `POST /api/v1/users/{user}/reset-identity`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ResetIdentityResponse {
+    pub orphaned_buckets: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StaleLockEntry {
     pub bucket: String,
@@ -180,4 +205,39 @@ pub struct StaleLockEntry {
 #[derive(Debug, Deserialize)]
 pub struct ClearStaleLocksResponse {
     pub removed: u64,
+}
+
+// ── Personas ─────────────────────────────────────────────────────────────────
+
+/// Request body for `POST /api/v1/personas`.
+#[derive(Debug, Serialize)]
+pub struct PersonaCreateRequest {
+    pub slot: u8,
+    pub password: String,
+    /// Effective role for sessions opened through this persona. Omitted
+    /// (server defaults to `user`) when `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    #[serde(default)]
+    pub revoke_other_sessions: bool,
+}
+
+/// Response body for `POST /api/v1/personas`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PersonaCreateResponse {
+    pub warning: String,
+}
+
+/// Response body for `GET /api/v1/personas/me`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersonaView {
+    pub slot: u8,
+    pub role: String,
+    pub revoke_other_sessions: bool,
+}
+
+/// Request body for `POST`/`DELETE /api/v1/personas/{slot}/grant`.
+#[derive(Debug, Serialize)]
+pub struct PersonaGrantBody {
+    pub buckets: Vec<String>,
 }

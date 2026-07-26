@@ -6,7 +6,7 @@ use actix_web::{HttpRequest, HttpResponse, web};
 use y2q_cluster::Role;
 use y2q_core::{AnyStorage, BucketPermission, Listing, PutOptions, SyncLevel};
 
-use crate::auth::Authenticated;
+use crate::auth::{Authenticated, AuthState};
 use crate::authz::{Decision, authorize_bucket, claim_ownership};
 use crate::cipher;
 use crate::cluster::{self, ClusterRuntime};
@@ -63,6 +63,7 @@ pub async fn handle(
     req: HttpRequest,
     payload: web::Payload,
     storage: web::Data<Arc<AnyStorage>>,
+    state: web::Data<AuthState>,
     limits: web::Data<LabelLimits>,
     default_sync: web::Data<SyncLevel>,
     encryption: web::Data<crate::config::EncryptionParams>,
@@ -74,16 +75,32 @@ pub async fn handle(
     let labels = extract_labels(&req, limits.get_ref())?;
     let sync = parse_sync_header(&req, *default_sync.get_ref())?;
 
+    // Claiming a brand-new bucket seeds its owner and epoch-0 key material
+    // together (see `claim_ownership`'s docs); an existing bucket just needs
+    // its config read. Either way `cfg` is what quota enforcement and the
+    // bucket-key resolution below both need — a single fetch serves both.
+    // Clustered claims go through raft (`cluster_claim_owner`) so every node
+    // agrees on the same key material instead of each generating its own;
+    // this always runs on the contact node, before any forward to the HEAD,
+    // so by the time `head_write`/`internal_put` runs the config (and its
+    // key material) is already committed and visible via the locally
+    // raft-projected `AnyStorage` copy.
+    let cfg = match (cluster.as_ref(), decision) {
+        (Some(rt), Decision::ClaimOwnership) => {
+            cluster::cluster_claim_owner(rt, &state.user_store, &bucket, &auth.session).await?
+        }
+        (None, Decision::ClaimOwnership) => {
+            claim_ownership(&storage, &state.user_store, &bucket, &auth.session).await?.0
+        }
+        (_, Decision::Allowed) => storage.get_bucket_config(&bucket).await.map_err(AppError::from)?,
+    };
+
     // Quota enforcement: only buckets that actually set a quota pay the usage
     // scan cost. The Content-Length-based check below is a fast-reject
     // optimization only (skipped by chunked transfer encoding, which has no
     // Content-Length) — `max_bytes`, enforced mid-stream in
     // `stream_encrypt_for_put`, is what actually bounds both the server-wide
     // cap and any bucket quota regardless of how the body is transferred.
-    let cfg = storage
-        .get_bucket_config(&bucket)
-        .await
-        .map_err(AppError::from)?;
     let mut max_bytes = encryption.max_body_bytes;
     if let Some(limit) = cfg.quota_bytes {
         let incoming = req
@@ -106,6 +123,7 @@ pub async fn handle(
         }
         max_bytes = max_bytes.min(limit.saturating_sub(used));
     }
+
 
     // Clustered: route the write through the chain instead of writing locally.
     // The contact node either is the HEAD (encrypt + replicate here) or proxies
@@ -150,9 +168,6 @@ pub async fn handle(
             }
         };
 
-        if matches!(decision, Decision::ClaimOwnership) {
-            cluster::cluster_claim_owner(rt, &bucket, &auth.username).await?;
-        }
         return Ok(if was_overwrite {
             HttpResponse::Ok().finish()
         } else {
@@ -160,13 +175,16 @@ pub async fn handle(
         });
     }
 
+    let (bucket_epoch, bucket_pk) = crate::bucket_keys::resolve_write_key(&cfg, &bucket).map_err(AppError)?;
+
     let (guard, sink, write_offset) = storage
         .begin_streaming_put(&bucket, &key)
         .await
         .map_err(AppError::from)?;
 
     let (sink, plaintext_metrics, cipher_metadata) = cipher::stream_encrypt_for_put(
-        &auth.keystore.public.public_key,
+        &bucket_pk,
+        bucket_epoch,
         payload,
         sink,
         &bucket,
@@ -190,12 +208,6 @@ pub async fn handle(
         )
         .await
         .map_err(AppError::from)?;
-
-    // A PUT to a brand-new bucket implicitly creates it; record the writer as
-    // its owner so subsequent access is governed by ownership/ACL.
-    if matches!(decision, Decision::ClaimOwnership) {
-        claim_ownership(&storage, &bucket, &auth.username).await?;
-    }
 
     if was_overwrite {
         Ok(HttpResponse::Ok().finish())

@@ -1,10 +1,10 @@
 //! Multi-node cluster end-to-end harness.
 //!
-//! Spawns N real `y2qd` processes that share one deployment keystore (so every
-//! node derives the identical MEK/Path Key — the shared-MEK invariant), a shared
-//! cluster secret, and a provisioned unlock secret, then drives the cluster over
-//! plaintext HTTP to verify CRAQ replication, apportioned reads, overwrite
-//! consistency, and scatter-gather listing.
+//! Spawns N real `y2qd` processes that share one deployment keystore and one
+//! operator-supplied node key (so every node derives the identical node-key
+//! verifier — the cluster admission invariant), plus a shared cluster secret,
+//! then drives the cluster over plaintext HTTP to verify CRAQ replication,
+//! apportioned reads, overwrite consistency, and scatter-gather listing.
 //!
 //! These tests are `#[ignore]` by default: they build the `y2qd` binary on
 //! demand, spawn several processes, and poll for raft convergence, so they are
@@ -12,11 +12,14 @@
 //! -- --ignored`). They are also tolerant of a missing/unbuildable binary
 //! (return early) so they never hard-fail in an environment without it.
 //!
-//! Keystore sharing: a throwaway non-cluster node first-runs once to generate
-//! `pubkey.json` + `users.redb` and print the root password. Each cluster node
-//! gets its own *copy* of that keystore (the daemon holds `users.redb` open for
-//! the process lifetime, so copies — not a shared file — are required), and the
-//! captured root password doubles as the provisioned unlock secret.
+//! Keystore sharing: a throwaway non-cluster node first-runs once (under the
+//! same node key every cluster node will use) to generate `keystore.json` +
+//! `users.redb` and print the root password. Each cluster node gets its own
+//! *copy* of that keystore (the daemon holds `users.redb` open for the
+//! process lifetime, so copies — not a shared file — are required); every
+//! node is then started with the identical `Y2QD_NODE_KEY`, which is what
+//! lets them admit each other (matching node-key verifiers) with no
+//! provisioned unlock secret anywhere.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -206,15 +209,19 @@ fn create_bucket(port: u16, token: &str, bucket: &str) -> u16 {
 /// PUT an object (`PUT /{bucket}/{key}`).
 fn put_object(port: u16, token: &str, bucket: &str, key: &str, body: &[u8]) -> u16 {
     let bearer = auth_header(token);
-    http(
+    let r = http(
         port,
         "PUT",
         &format!("/{bucket}/{key}"),
         &[("Authorization", &bearer)],
         body,
-    )
-    .map(|(s, _)| s)
-    .unwrap_or(0)
+    );
+    if let Ok((s, b)) = &r
+        && *s >= 400
+    {
+        eprintln!("DEBUG put_object {s}: {}", String::from_utf8_lossy(b));
+    }
+    r.map(|(s, _)| s).unwrap_or(0)
 }
 
 /// GET an object (`GET /{bucket}/{key}`) returning `(status, body)`.
@@ -352,7 +359,7 @@ fn wait_port(port: u16, secs: u64) -> bool {
 
 /// First-run a throwaway non-cluster node to generate a keystore, capture the
 /// root password, then shut it down. Returns the keystore dir and the password.
-fn gen_keystore(bin: &Path, base: &Path) -> Option<(PathBuf, String)> {
+fn gen_keystore(bin: &Path, base: &Path, node_key: &str) -> Option<(PathBuf, String)> {
     let keys = base.join("seed-keys");
     let data = base.join("seed-data");
     for d in [&keys, &data] {
@@ -365,6 +372,7 @@ fn gen_keystore(bin: &Path, base: &Path) -> Option<(PathBuf, String)> {
         .env("Y2QD_SERVER__TLS__ENABLED", "false")
         .env("Y2QD_STORAGE__BASE_PATH", &data)
         .env("Y2QD_CRYPTO__KEYSTORE_DIR", &keys)
+        .env("Y2QD_NODE_KEY", node_key)
         .env("Y2QD_CRYPTO__ARGON2__M_COST_KIB", "8")
         .env("Y2QD_CRYPTO__ARGON2__T_COST", "1")
         .env("Y2QD_CRYPTO__ARGON2__P_COST", "1")
@@ -420,16 +428,16 @@ fn gen_keystore(bin: &Path, base: &Path) -> Option<(PathBuf, String)> {
     let _ = child.kill();
     let _ = child.wait();
 
-    if password.is_empty() || !keys.join("pubkey.json").exists() {
+    if password.is_empty() || !keys.join("keystore.json").exists() {
         return None;
     }
     Some((keys, password))
 }
 
-/// Copy the deployment keystore (public key + user records) into `dst`.
+/// Copy the deployment keystore (manifest + user records) into `dst`.
 fn copy_keystore(src: &Path, dst: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dst)?;
-    for f in ["pubkey.json", "users.redb"] {
+    for f in ["keystore.json", "users.redb"] {
         std::fs::copy(src.join(f), dst.join(f))?;
     }
     Ok(())
@@ -444,7 +452,7 @@ struct ClusterNode {
     base: PathBuf,
     cfg: PathBuf,
     bin: PathBuf,
-    password: String,
+    node_key: String,
 }
 
 /// SIGTERM a child and reap it, returning once it has exited (or been killed).
@@ -463,16 +471,16 @@ fn stop_child(child: &mut Child) {
     let _ = child.wait();
 }
 
-/// Spawn one cluster daemon with the shared secret + provisioned unlock secret,
-/// logging stdout/stderr to `<base>/stderr.log`.
-fn spawn_child(bin: &Path, cfg: &Path, base: &Path, password: &str) -> Option<Child> {
+/// Spawn one cluster daemon with the shared secret + shared node key, logging
+/// stdout/stderr to `<base>/stderr.log`.
+fn spawn_child(bin: &Path, cfg: &Path, base: &Path, node_key: &str) -> Option<Child> {
     let log = std::fs::File::create(base.join("stderr.log")).ok()?;
     let log2 = log.try_clone().ok()?;
     Command::new(bin)
         .arg("--config")
         .arg(cfg)
         .env("Y2QD_CLUSTER__SHARED_SECRET", SHARED_SECRET)
-        .env("Y2QD_CLUSTER__UNLOCK_SECRET", password)
+        .env("Y2QD_NODE_KEY", node_key)
         .env("RUST_LOG", "error")
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(log2))
@@ -493,7 +501,7 @@ impl ClusterNode {
         if self.child.is_some() {
             return true;
         }
-        self.child = spawn_child(&self.bin, &self.cfg, &self.base, &self.password);
+        self.child = spawn_child(&self.bin, &self.cfg, &self.base, &self.node_key);
         self.child.is_some()
     }
 }
@@ -507,7 +515,8 @@ impl Drop for ClusterNode {
     }
 }
 
-/// A spawned cluster plus the captured root password / unlock secret.
+/// A spawned cluster plus the captured root password (the shared node key
+/// lives per-node on `ClusterNode`, needed for respawn).
 struct Cluster {
     nodes: Vec<ClusterNode>,
     password: String,
@@ -552,7 +561,6 @@ fn write_node_config(
     toml.push_str(&format!("node_id = \"{id}\"\n"));
     toml.push_str(&format!("advertise_addr = \"127.0.0.1:{port}\"\n"));
     toml.push_str(&format!("replication_factor = {rf}\n"));
-    toml.push_str("unlock_user = \"root\"\n");
     if id == 1 {
         for (i, p) in ports.iter().enumerate() {
             let peer_id = (i + 1) as u64;
@@ -581,7 +589,8 @@ fn start_cluster(n: usize, rf: usize) -> Option<Cluster> {
     let base = std::env::temp_dir().join(format!("y2q-cluster-{}-{}", std::process::id(), nanos));
     std::fs::create_dir_all(&base).ok()?;
 
-    let (seed_keys, password) = match gen_keystore(&bin, &base) {
+    let node_key = "cd".repeat(32);
+    let (seed_keys, password) = match gen_keystore(&bin, &base, &node_key) {
         Some(v) => v,
         None => {
             eprintln!("skipping cluster e2e: could not generate keystore");
@@ -602,7 +611,7 @@ fn start_cluster(n: usize, rf: usize) -> Option<Cluster> {
         let cfg = node_base.join("config.toml");
         write_node_config(&cfg, &data, &keys, ports[i], id, rf, n, &ports);
 
-        let child = spawn_child(&bin, &cfg, &node_base, &password)?;
+        let child = spawn_child(&bin, &cfg, &node_base, &node_key)?;
         nodes.push(ClusterNode {
             child: Some(child),
             port: ports[i],
@@ -610,7 +619,7 @@ fn start_cluster(n: usize, rf: usize) -> Option<Cluster> {
             base: node_base,
             cfg,
             bin: bin.clone(),
-            password: password.clone(),
+            node_key: node_key.clone(),
         });
     }
 
@@ -739,6 +748,13 @@ fn cluster_replication_and_apportioned_reads() {
     let key = "alpha/object.bin";
     let body = b"hello-from-the-cluster";
     let s = put_object(cluster.nodes[0].port, &tokens[0], bucket, key, body);
+    if s != 201 {
+        for node in &cluster.nodes {
+            let log = std::fs::read_to_string(node.base.join("stderr.log")).unwrap_or_default();
+            let tail: String = log.lines().rev().take(40).collect::<Vec<_>>().join("\n");
+            eprintln!("--- node {} (port {}) stderr tail ---\n{tail}", node.id, node.port);
+        }
+    }
     assert_eq!(s, 201, "PUT (create) via node 0");
 
     // GET from EVERY node returns the object: chain members serve locally, the

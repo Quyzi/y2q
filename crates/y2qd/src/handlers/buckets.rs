@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use y2q_core::{AnyStorage, BucketConfig, BucketPermission, Listing};
 
-use crate::auth::Authenticated;
+use crate::auth::{AuthState, Authenticated};
 use crate::authz::{Decision, authorize_bucket, claim_ownership};
 use crate::cluster::{self, ClusterRuntime};
 use crate::error::{AppError, ErrorBody};
@@ -50,6 +50,7 @@ pub struct DeleteBucketResponse {
 pub async fn create(
     path: web::Path<String>,
     storage: web::Data<Arc<AnyStorage>>,
+    state: web::Data<AuthState>,
     cluster: Option<web::Data<ClusterRuntime>>,
     auth: Authenticated,
 ) -> Result<HttpResponse, AppError> {
@@ -60,19 +61,22 @@ pub async fn create(
     let created = if let Some(rt) = cluster.as_ref() {
         let created = cluster::cluster_register_bucket(rt, &bucket).await?;
         if matches!(decision, Decision::ClaimOwnership) {
-            cluster::cluster_claim_owner(rt, &bucket, &auth.username).await?;
+            cluster::cluster_claim_owner(rt, &state.user_store, &bucket, &auth.session).await?;
         }
         created
     } else {
-        let created = storage
-            .create_bucket(&bucket)
-            .await
-            .map_err(AppError::from)?;
-        // Explicitly creating a brand-new bucket makes the caller its owner.
-        if matches!(decision, Decision::ClaimOwnership) {
-            claim_ownership(&storage, &bucket, &auth.username).await?;
+        match decision {
+            Decision::ClaimOwnership => {
+                let (_cfg, created) =
+                    claim_ownership(&storage, &state.user_store, &bucket, &auth.session).await?;
+                created
+            }
+            // `Decision::Allowed` here always means the bucket already
+            // exists (or authorization is disabled and it does) — never
+            // call `create_bucket` a second time; `claim_ownership`'s own
+            // internal call already made that determination.
+            Decision::Allowed => false,
         }
-        created
     };
     Ok(HttpResponse::Ok().json(CreateBucketResponse { bucket, created }))
 }
@@ -193,12 +197,18 @@ pub async fn set_config(
     authorize_bucket(&auth, &storage, &bucket, BucketPermission::Admin).await?;
     let body = body.into_inner();
     // Read-modify-write: this endpoint only edits the quota/SSE/CORS fields and
-    // must preserve the bucket's owner and ACL (which are managed separately via
-    // the ACL endpoints, never through this public config body).
-    let mut cfg = storage
-        .get_bucket_config(&bucket)
-        .await
-        .map_err(AppError::from)?;
+    // must preserve the bucket's owner, ACL, and key material (which are
+    // managed separately via the ACL endpoints / claim flow, never through
+    // this public config body). Clustered: read the raft *authoritative*
+    // in-memory state, not the local filesystem projection — the projector
+    // that mirrors raft-committed changes onto disk runs asynchronously, so
+    // a local read can lag behind a claim/config change another node just
+    // committed, and this endpoint's full-replace write would silently roll
+    // that change back (most dangerously the bucket's `keys`).
+    let mut cfg = match cluster.as_ref() {
+        Some(rt) => rt.controller.control_state().await.buckets.get(&bucket).cloned().unwrap_or_default(),
+        None => storage.get_bucket_config(&bucket).await.map_err(AppError::from)?,
+    };
     cfg.quota_bytes = body.quota_bytes;
     cfg.default_sse = body.default_sse;
     cfg.cors_allow_origin = body.cors_allow_origin;

@@ -8,6 +8,7 @@ name = "y2q"
 path = "src/main.rs"
 
 [dependencies]
+base64              = { workspace = true }
 bytes               = { workspace = true }
 chrono              = { workspace = true }
 clap                = { workspace = true }
@@ -19,6 +20,7 @@ futures             = { workspace = true }
 glob                = "0.3"
 humantime           = { workspace = true }
 indexmap            = { workspace = true }
+rand                = { workspace = true }
 ratatui             = { workspace = true }
 rpassword           = { workspace = true }
 serde               = { workspace = true }

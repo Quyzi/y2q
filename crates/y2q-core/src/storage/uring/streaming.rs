@@ -127,6 +127,7 @@ impl UringStreamingPutGuard {
             envelope_version: Some(cipher_metadata.envelope_version),
             version: options.version,
             committed_at: options.version.map(|_| now),
+            key_epoch: Some(cipher_metadata.key_epoch),
         };
 
         let meta_json = serde_json::to_vec(&metadata).map_err(|e| Error::InternalError {
@@ -135,7 +136,7 @@ impl UringStreamingPutGuard {
             operation: "put".to_owned(),
             message: format!("encode meta: {e}"),
         })?;
-        // Writes require an installed MEK; refuse rather than persisting plaintext.
+        // Writes require an installed node key; refuse rather than persisting plaintext.
         let meta_bytes = match self.mek {
             Some(ref mek) => {
                 let object_id =
@@ -157,7 +158,7 @@ impl UringStreamingPutGuard {
                     bucket: bucket.to_owned(),
                     key: key.to_owned(),
                     operation: "put".to_owned(),
-                    message: "metadata write attempted without an installed MEK".to_owned(),
+                    message: "metadata write attempted without an installed node key".to_owned(),
                 });
             }
         };
@@ -243,7 +244,7 @@ impl Drop for UringStreamingPutGuard {
     }
 }
 
-/// Byte offset within the uring tmp file at which the v2 envelope starts.
+/// Byte offset within the uring tmp file at which the v3 envelope starts.
 ///
 /// Equals `HEADER_SIZE` (64): the `.obj` header occupies the first 64 bytes.
 /// Passed as `write_offset` to [`crate::crypto::envelope::EncryptSession::new`]

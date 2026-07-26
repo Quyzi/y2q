@@ -4,7 +4,8 @@
 //! (no padding) — a 43-character ASCII string. We store only the hash so a
 //! memory dump of the daemon doesn't leak replay-able credentials.
 
-use std::sync::Arc;
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -12,6 +13,7 @@ use dashmap::DashMap;
 use rand::Rng;
 use sha2::{Digest, Sha256};
 use y2q_core::crypto::Role;
+use zeroize::Zeroizing;
 
 use super::error::AuthError;
 
@@ -42,8 +44,42 @@ pub fn hash_token(token: &str) -> [u8; 32] {
     out
 }
 
+/// Bucket keys already opened by a session, keyed by `(bucket, epoch)`.
+/// FIFO-evicted at [`MAX_SESSION_BUCKET_KEYS`] entries so a session touching
+/// many buckets can't grow this cache unbounded. Keying by epoch (not just
+/// bucket) means a rotation can never serve a stale key from the cache — the
+/// new epoch simply misses and gets opened fresh.
+///
+/// Wired up by `bucket_keys.rs`'s `resolve_read_key`/`is_visible`.
+#[derive(Default)]
+struct BucketKeyCache {
+    entries: HashMap<(String, u32), Arc<Zeroizing<Vec<u8>>>>,
+    order: VecDeque<(String, u32)>,
+}
+
+/// FIFO eviction width for [`BucketKeyCache`].
+const MAX_SESSION_BUCKET_KEYS: usize = 32;
+
+impl BucketKeyCache {
+    fn get(&self, bucket: &str, epoch: u32) -> Option<Arc<Zeroizing<Vec<u8>>>> {
+        self.entries.get(&(bucket.to_owned(), epoch)).cloned()
+    }
+
+    fn insert(&mut self, bucket: String, epoch: u32, key: Arc<Zeroizing<Vec<u8>>>) {
+        let id = (bucket, epoch);
+        if !self.entries.contains_key(&id) {
+            self.order.push_back(id.clone());
+            if self.order.len() > MAX_SESSION_BUCKET_KEYS
+                && let Some(oldest) = self.order.pop_front()
+            {
+                self.entries.remove(&oldest);
+            }
+        }
+        self.entries.insert(id, key);
+    }
+}
+
 /// Per-session state held in the [`SessionStore`] map.
-#[derive(Debug, Clone)]
 pub struct SessionInfo {
     pub username: String,
     /// Global role captured at login, used to authorize admin endpoints and
@@ -55,11 +91,83 @@ pub struct SessionInfo {
     #[allow(dead_code)]
     pub created_at: SystemTime,
     pub expires_at: SystemTime,
+    /// Which credential slot opened this session. Needed so a duress login
+    /// (phase 5) can revoke only *other* personas' sessions, and so bucket
+    /// grants (phase 3) resolve per persona rather than per username.
+    pub persona: u8,
+    /// This persona's duress flag, captured at login. Reported verbatim by
+    /// `GET /api/v1/personas/me` — there is no other way to recover it
+    /// post-login, since it lives only in the encrypted `SlotPayload`, not
+    /// on the user record's cleartext fields.
+    pub revoke_other_sessions: bool,
+    /// The unwrapped identity secret key of the persona this session logged
+    /// in as. Lives exactly as long as the session; zeroized when the entry
+    /// is dropped from the store.
+    pub identity_sk: Zeroizing<Vec<u8>>,
+    /// Bucket keys already opened by this session. See [`BucketKeyCache`].
+    bucket_keys: Mutex<BucketKeyCache>,
+}
+
+// `Zeroizing` only scrubs on drop — it forwards `Debug` to the inner type, so
+// a derived impl here would print the raw secret key. Redact it explicitly.
+impl std::fmt::Debug for SessionInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionInfo")
+            .field("username", &self.username)
+            .field("role", &self.role)
+            .field("created_at", &self.created_at)
+            .field("expires_at", &self.expires_at)
+            .field("persona", &self.persona)
+            .field("revoke_other_sessions", &self.revoke_other_sessions)
+            .field("identity_sk", &"<redacted>")
+            .finish_non_exhaustive()
+    }
 }
 
 impl SessionInfo {
+    /// Build a fresh session for `persona`'s `identity_sk`. The bucket-key
+    /// cache starts empty.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        username: String,
+        role: Role,
+        created_at: SystemTime,
+        expires_at: SystemTime,
+        persona: u8,
+        revoke_other_sessions: bool,
+        identity_sk: Zeroizing<Vec<u8>>,
+    ) -> Self {
+        Self {
+            username,
+            role,
+            created_at,
+            expires_at,
+            persona,
+            revoke_other_sessions,
+            identity_sk,
+            bucket_keys: Mutex::new(BucketKeyCache::default()),
+        }
+    }
+
     pub fn is_expired(&self, now: SystemTime) -> bool {
         now >= self.expires_at
+    }
+
+    /// A cached bucket key for `(bucket, epoch)`, if this session has
+    /// already opened it.
+    pub fn cached_bucket_key(&self, bucket: &str, epoch: u32) -> Option<Arc<Zeroizing<Vec<u8>>>> {
+        self.bucket_keys
+            .lock()
+            .expect("bucket key cache poisoned")
+            .get(bucket, epoch)
+    }
+
+    /// Cache a newly-opened bucket key for `(bucket, epoch)`.
+    pub fn cache_bucket_key(&self, bucket: String, epoch: u32, key: Arc<Zeroizing<Vec<u8>>>) {
+        self.bucket_keys
+            .lock()
+            .expect("bucket key cache poisoned")
+            .insert(bucket, epoch, key);
     }
 }
 
@@ -123,6 +231,46 @@ impl SessionStore {
         n
     }
 
+    /// Revoke every session belonging to `username` *except* those opened
+    /// through `keep_persona`. Used by a duress-flagged login
+    /// (`revoke_other_sessions`) to drop the real persona's live sessions
+    /// without touching its own. Returns the count removed.
+    pub fn revoke_user_except(&self, username: &str, keep_persona: u8) -> usize {
+        let victims: Vec<[u8; 32]> = self
+            .inner
+            .iter()
+            .filter_map(|r| {
+                let info = r.value();
+                (info.username == username && info.persona != keep_persona).then_some(*r.key())
+            })
+            .collect();
+        let n = victims.len();
+        for k in victims {
+            self.inner.remove(&k);
+        }
+        n
+    }
+
+    /// Revoke every session belonging to `username` opened through exactly
+    /// `persona`. Used by `DELETE /api/v1/personas/{slot}` so overwriting a
+    /// slot with a fresh decoy immediately kills any live session still
+    /// carrying the old identity secret key. Returns the count removed.
+    pub fn revoke_user_persona(&self, username: &str, persona: u8) -> usize {
+        let victims: Vec<[u8; 32]> = self
+            .inner
+            .iter()
+            .filter_map(|r| {
+                let info = r.value();
+                (info.username == username && info.persona == persona).then_some(*r.key())
+            })
+            .collect();
+        let n = victims.len();
+        for k in victims {
+            self.inner.remove(&k);
+        }
+        n
+    }
+
     /// Total number of (possibly expired) entries — used to decide when to
     /// drop the in-memory SK.
     pub fn len(&self) -> usize {
@@ -167,15 +315,22 @@ pub fn compute_expiry(
 mod tests {
     use super::*;
 
+    fn test_session(username: &str, persona: u8, expires_at: SystemTime) -> SessionInfo {
+        SessionInfo::new(
+            username.to_owned(),
+            Role::User,
+            SystemTime::now(),
+            expires_at,
+            persona,
+            false,
+            Zeroizing::new(vec![0u8; 8]),
+        )
+    }
+
     #[test]
     fn insert_lookup_revoke() {
         let s = SessionStore::new();
-        let info = SessionInfo {
-            username: "alice".into(),
-            role: Role::User,
-            created_at: SystemTime::now(),
-            expires_at: SystemTime::now() + Duration::from_secs(60),
-        };
+        let info = test_session("alice", 0, SystemTime::now() + Duration::from_secs(60));
         let token = s.insert(info);
         let hash = token.hash();
         let found = s.get_active(&hash).unwrap();
@@ -187,12 +342,7 @@ mod tests {
     #[test]
     fn expired_session_returns_expired() {
         let s = SessionStore::new();
-        let info = SessionInfo {
-            username: "alice".into(),
-            role: Role::User,
-            created_at: SystemTime::now() - Duration::from_secs(120),
-            expires_at: SystemTime::now() - Duration::from_secs(1),
-        };
+        let info = test_session("alice", 0, SystemTime::now() - Duration::from_secs(1));
         let token = s.insert(info);
         assert!(matches!(
             s.get_active(&token.hash()),
@@ -209,20 +359,42 @@ mod tests {
     fn sweep_removes_expired() {
         let s = SessionStore::new();
         let now = SystemTime::now();
-        s.insert(SessionInfo {
-            username: "a".into(),
-            role: Role::User,
-            created_at: now,
-            expires_at: now + Duration::from_secs(60),
-        });
-        s.insert(SessionInfo {
-            username: "b".into(),
-            role: Role::User,
-            created_at: now - Duration::from_secs(120),
-            expires_at: now - Duration::from_secs(1),
-        });
+        s.insert(test_session("a", 0, now + Duration::from_secs(60)));
+        s.insert(test_session("b", 0, now - Duration::from_secs(1)));
         assert_eq!(s.sweep(), 1);
         assert_eq!(s.len(), 1);
+    }
+
+    #[test]
+    fn revoke_user_except_keeps_only_the_named_persona() {
+        let s = SessionStore::new();
+        let future = SystemTime::now() + Duration::from_secs(60);
+        let tok_a = s.insert(test_session("alice", 0, future));
+        let tok_b = s.insert(test_session("alice", 1, future));
+        let tok_c = s.insert(test_session("bob", 0, future));
+
+        assert_eq!(s.revoke_user_except("alice", 1), 1);
+        assert!(matches!(
+            s.get_active(&tok_a.hash()),
+            Err(AuthError::TokenInvalid)
+        ));
+        assert!(s.get_active(&tok_b.hash()).is_ok());
+        assert!(s.get_active(&tok_c.hash()).is_ok());
+    }
+
+    #[test]
+    fn bucket_key_cache_evicts_oldest_past_the_limit() {
+        let info = test_session("alice", 0, SystemTime::now() + Duration::from_secs(60));
+        for epoch in 0..(MAX_SESSION_BUCKET_KEYS as u32 + 1) {
+            info.cache_bucket_key(
+                "b".to_owned(),
+                epoch,
+                Arc::new(Zeroizing::new(vec![epoch as u8])),
+            );
+        }
+        // The oldest entry (epoch 0) was evicted; the newest survives.
+        assert!(info.cached_bucket_key("b", 0).is_none());
+        assert!(info.cached_bucket_key("b", MAX_SESSION_BUCKET_KEYS as u32).is_some());
     }
 
     #[test]
@@ -231,5 +403,23 @@ mod tests {
         assert!(compute_expiry(Some(100_000), 3600, 86400).is_err());
         assert!(compute_expiry(Some(3600), 3600, 86400).is_ok());
         assert!(compute_expiry(None, 3600, 86400).is_ok());
+    }
+
+    #[test]
+    fn revoke_user_persona_only_removes_that_slot() {
+        let s = SessionStore::new();
+        let future = SystemTime::now() + Duration::from_secs(60);
+        let tok_a = s.insert(test_session("alice", 0, future));
+        let tok_b = s.insert(test_session("alice", 1, future));
+        let tok_c = s.insert(test_session("bob", 1, future));
+
+        assert_eq!(s.revoke_user_persona("alice", 1), 1);
+        assert!(s.get_active(&tok_a.hash()).is_ok());
+        assert!(matches!(
+            s.get_active(&tok_b.hash()),
+            Err(AuthError::TokenInvalid)
+        ));
+        // A different user's session at the same persona index is untouched.
+        assert!(s.get_active(&tok_c.hash()).is_ok());
     }
 }

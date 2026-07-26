@@ -17,9 +17,11 @@ pub mod filesystem;
 /// Shared on-disk `.obj` single-file format used by both storage backends.
 pub mod format;
 pub mod index;
+pub mod locks;
+/// Offline node-key rotation across the whole storage tree.
+pub mod rotation;
 
 pub use encrypted_backend::EncryptedFileBackend;
-pub mod locks;
 pub mod streaming_sink;
 
 #[cfg(target_os = "linux")]

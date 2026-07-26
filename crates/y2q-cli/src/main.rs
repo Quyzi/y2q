@@ -206,8 +206,17 @@ async fn dispatch_rest(command: Commands, mode: OutputMode) -> Result<(), CliErr
             AdminCmd::Rebuild { cmd } => cmd::admin::rebuild(cmd, mode).await,
             AdminCmd::Locks { cmd } => cmd::admin::locks(cmd, mode).await,
             AdminCmd::Acl { cmd } => cmd::acl::run(cmd, mode).await,
+            AdminCmd::RotateKey { alias, bucket } => cmd::admin::rotate_key(&alias, &bucket, mode).await,
+            AdminCmd::Rekey { cmd } => cmd::admin::rekey(cmd, mode).await,
             AdminCmd::Trace { alias, errors } => cmd::admin::trace(&alias, errors).await,
+            AdminCmd::GenNodeKey => cmd::admin::gen_node_key(),
+            AdminCmd::ResetIdentity {
+                alias,
+                username,
+                password,
+            } => cmd::admin::reset_identity(&alias, &username, password, mode).await,
         },
+        Commands::Persona { cmd } => cmd::personas::run(cmd, mode).await,
         // All remaining variants are handled in `run`.
         _ => unreachable!("handled in run()"),
     }

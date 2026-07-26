@@ -174,9 +174,27 @@ default_sync = "durable"
 # ---------------------------------------------------------------------------
 [crypto]
 
-# Directory holding pubkey.json, users.redb, and the daemon-wide lock file.
+# Directory holding keystore.json, users.redb, and the daemon-wide lock file.
 # Must NOT be located under storage.base_path — keep keys and data separate.
 keystore_dir = "/var/lib/y2q/keys"  # required
+
+# Node key: protects the metadata index, the on-disk path blinding, and
+# object metadata sidecars. REQUIRED — never auto-generated. The file may
+# hold raw bytes, hex, or base64; Y2QD_NODE_KEY takes precedence and accepts
+# the same text forms. Minimum 32 bytes; more is accepted but adds nothing,
+# because every key derived from it is 256-bit.
+#
+# It MUST be CSPRNG output. A passphrase will be accepted if it happens to
+# decode to 32+ bytes, and it will be crackable: anyone holding the storage
+# tree can test candidates offline at HMAC speed. Generate it with
+# `y2q admin gen-node-key`, `openssl rand -base64 32`, or
+# `head -c 32 /dev/urandom > node.key`.
+#
+# Do NOT place this file inside storage.base_path or crypto.keystore_dir —
+# the daemon refuses to start if you do, because a copy of the data would
+# carry the key that protects it. Every node in a cluster must use the SAME
+# node key.
+# node_key_file = "/run/secrets/y2q-node-key"
 
 # Plaintext chunk size (bytes) for v2 streaming encryption. Default 4 MiB.
 # Recorded per-object in the envelope header, so changing it only affects objects
@@ -215,11 +233,6 @@ max_failed_logins = 10
 
 # How long an account stays locked after exceeding max_failed_logins.
 lockout_seconds = 900  # 15 minutes
-
-# Drop the in-memory decrypted secret key this many seconds after the last
-# session expires. 0 drops it immediately. Raise this value to tolerate brief
-# gaps between sessions without requiring a keystore unlock each time.
-keystore_idle_drop_seconds = 0
 
 # Enforce bucket ownership/ACLs and the global admin role. When true (default),
 # new buckets are private to their creator, access is governed by per-bucket
@@ -263,8 +276,8 @@ sample_rate = 100   # pprof sampling rate in Hz
 #
 # Disabled by default: with `enabled = false` the daemon runs as a single node
 # with no clustering behavior whatsoever. The whole section is optional and every
-# key is defaulted. Enabling clustering requires the SAME deployment keystore on
-# every node (the metadata key is derived deterministically from it).
+# key is defaulted. Enabling clustering requires the SAME node key on every node
+# (the node-key verifier is the cluster admission fingerprint).
 # ---------------------------------------------------------------------------
 [cluster]
 enabled = false                  # master switch; false => single node
@@ -281,8 +294,6 @@ auth                   = "shared-secret" # shared-secret | mtls
 # shared_secret    = ""          # prefer Y2QD_CLUSTER__SHARED_SECRET
 health_probe_interval_ms = 1000
 health_fail_threshold    = 3     # consecutive failed probes before suspect/down
-unlock                 = "provisioned" # SK unwrapped at boot so peer writes commit unattended
-# unlock_secret_file = ""        # or set Y2QD_CLUSTER__UNLOCK_SECRET
 
 # Embedded raft control plane (replicates only topology + auth/bucket metadata).
 [cluster.raft]

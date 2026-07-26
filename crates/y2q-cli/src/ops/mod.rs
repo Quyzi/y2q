@@ -11,3 +11,4 @@ pub mod buckets;
 pub mod health;
 pub mod listing;
 pub mod objects;
+pub mod personas;

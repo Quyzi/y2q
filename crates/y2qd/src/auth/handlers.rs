@@ -8,15 +8,19 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use actix_web::{HttpResponse, web};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
-use y2q_core::crypto::{DecryptedKeystore, Role, UserRecord, UserSummary, kdf};
+use y2q_core::crypto::{CREDENTIAL_SLOTS, CredentialSlot, Role, SlotPayload, UserRecord, UserSummary, kdf};
+use y2q_core::{AnyStorage, BucketConfig, Listing};
+use zeroize::Zeroizing;
 
 use super::error::AuthError;
 use super::session::{SessionInfo, compute_expiry};
 use super::state::AuthState;
 use super::users::validate as validate_username;
 use super::{AdminAuthenticated, AdminReadAuthenticated, Authenticated};
+use crate::bucket_keys;
 use crate::cluster::{self, ClusterRuntime};
 
 /// Parse a role name (case-insensitive) into a [`Role`], with a clean 400 on a
@@ -187,29 +191,37 @@ pub async fn login(
     };
 
     match result {
-        Ok((rec, sk)) => {
-            // A disabled account authenticates but may not obtain a session.
-            if rec.role == Role::Disabled {
+        Ok((rec, slot_idx, payload)) => {
+            // A disabled persona authenticates but may not obtain a session.
+            if payload.role == Role::Disabled {
                 record_login("disabled", None);
                 apply_floor(state.config.min_login_response_ms, started).await;
                 return Err(AuthError::AccountDisabled);
             }
-            // Successful auth — derive and install the MEK from the unwrapped
-            // secret key (gates metadata encryption on login), then install SK
-            // if absent and mint session.
-            state.install_mek_from_sk(&sk);
-            let pk = state.public_keystore.clone();
-            let ks = Arc::new(DecryptedKeystore::new(pk, sk));
-            state.keystore.install(ks);
+            let identity_sk = STANDARD
+                .decode(&payload.identity_sk_b64)
+                .map_err(|e| AuthError::Backend(format!("decode identity sk: {e}")))?;
 
-            let info = SessionInfo {
-                username: rec.username.clone(),
-                role: rec.role,
-                created_at: SystemTime::now(),
+            let info = SessionInfo::new(
+                rec.username.clone(),
+                payload.role,
+                SystemTime::now(),
                 expires_at,
-            };
+                slot_idx as u8,
+                payload.revoke_other_sessions,
+                Zeroizing::new(identity_sk),
+            );
             let token = state.sessions.insert(info);
             record_login("success", Some(state.sessions.len()));
+
+            // A duress-flagged persona revokes every other persona's live
+            // sessions on login — no alert, no log line distinguishing it
+            // from an ordinary login.
+            if payload.revoke_other_sessions {
+                state
+                    .sessions
+                    .revoke_user_except(&rec.username, slot_idx as u8);
+            }
 
             // Update last_login + reset failure counter.
             let mut updated = rec.clone();
@@ -274,12 +286,15 @@ pub async fn refresh(
         state.config.default_ttl_seconds,
         state.config.max_ttl_seconds,
     )?;
-    let info = SessionInfo {
-        username: auth.username.clone(),
-        role: auth.role,
-        created_at: SystemTime::now(),
+    let info = SessionInfo::new(
+        auth.username.clone(),
+        auth.role,
+        SystemTime::now(),
         expires_at,
-    };
+        auth.session.persona,
+        auth.session.revoke_other_sessions,
+        auth.session.identity_sk.clone(),
+    );
     let token = state.sessions.insert(info);
     state.sessions.revoke(&auth.token_hash);
     Ok(HttpResponse::Ok().json(TokenResponse {
@@ -343,24 +358,32 @@ pub async fn change_password(
         .get(&username)
         .map_err(|e| AuthError::Backend(e.to_string()))?
         .ok_or(AuthError::InvalidCredentials)?;
-    let (rec, sk) = attempt_unwrap(rec, current).await?;
+    let (rec, slot_idx, payload) = attempt_unwrap(rec, current).await?;
 
-    let new_params = state.new_argon2_params();
-    let wrap_params = new_params.clone();
-    let wrapped =
-        tokio::task::spawn_blocking(move || kdf::wrap_sk(&sk, new.as_bytes(), &wrap_params))
-            .await
-            .map_err(|e| AuthError::Backend(format!("kdf join: {e}")))?
-            .map_err(|e| AuthError::Backend(e.to_string()))?;
+    // Re-wrap ONLY this slot, under the record's EXISTING salt (a fresh salt
+    // would invalidate the other three slots' KEK derivation, since all four
+    // share one Argon2Params). Every other slot, and every persona's grants,
+    // are untouched — changing a duress password must not disturb the real
+    // one and vice versa.
+    let params = rec.kdf.clone();
+    let username_for_aad = rec.username.clone();
+    let new_password = new.clone();
+    let identity_pk_b64 = rec.slots[slot_idx].identity_pk_b64.clone();
+    let new_slot = tokio::task::spawn_blocking(move || {
+        let payload_bytes = payload.to_bytes()?;
+        let aad = kdf::slot_wrap_aad(&username_for_aad, slot_idx);
+        let wrapped = kdf::wrap_slot(&payload_bytes, new_password.as_bytes(), &params, &aad)?;
+        Ok::<CredentialSlot, y2q_core::crypto::CryptoError>(CredentialSlot {
+            identity_pk_b64,
+            wrapped,
+        })
+    })
+    .await
+    .map_err(|e| AuthError::Backend(format!("kdf join: {e}")))?
+    .map_err(|e| AuthError::Backend(e.to_string()))?;
 
-    let updated = UserRecord {
-        username: rec.username.clone(),
-        created_at: rec.created_at,
-        last_login: rec.last_login,
-        kdf: new_params,
-        wrapped_sk: wrapped,
-        role: rec.role,
-    };
+    let mut updated = rec.clone();
+    updated.slots[slot_idx] = new_slot;
     // Clustered: replicate the re-wrapped record through raft; local otherwise.
     if let Some(rt) = cluster.as_ref() {
         cluster::cluster_upsert_user(rt, state.get_ref(), &updated).await?;
@@ -394,7 +417,7 @@ pub async fn add_user(
     auth: AdminAuthenticated,
     body: web::Json<AddUserRequest>,
 ) -> Result<HttpResponse, AuthError> {
-    let auth = auth.0;
+    let _ = &auth;
     let username = body.username.clone();
     let password = body.password.clone();
     let role = body.role;
@@ -427,11 +450,14 @@ pub async fn add_user(
         return Err(AuthError::UserExists { username });
     }
 
-    let sk_bytes = auth.keystore.secret_key.to_vec();
     let params = state.new_argon2_params();
-    let wrap_params = params.clone();
-    let wrapped = tokio::task::spawn_blocking(move || {
-        kdf::wrap_sk(&sk_bytes, password.as_bytes(), &wrap_params)
+    let username_for_slots = username.clone();
+    let (slots, params) = tokio::task::spawn_blocking(move || {
+        let slot0 = kdf::new_slot(&username_for_slots, 0, password.as_bytes(), &params, role, false)?;
+        let decoys = kdf::decoy_slots_from(&username_for_slots, 1, &params)?;
+        let mut slots = vec![slot0];
+        slots.extend(decoys);
+        Ok::<_, y2q_core::crypto::CryptoError>((slots, params))
     })
     .await
     .map_err(|e| AuthError::Backend(format!("kdf join: {e}")))?
@@ -442,7 +468,7 @@ pub async fn add_user(
         created_at: now_ns(),
         last_login: None,
         kdf: params,
-        wrapped_sk: wrapped,
+        slots,
         role,
     };
     if let Some(rt) = cluster.as_ref() {
@@ -480,31 +506,106 @@ pub async fn list_users(
     }))
 }
 
+/// Query params for `DELETE /api/v1/users/{user}`.
+#[derive(Debug, Deserialize)]
+pub struct DeleteUserQuery {
+    /// Skip the bucket-ownership orphan guard and delete anyway.
+    #[serde(default)]
+    force: bool,
+}
+
+/// Buckets where `username` is the *sole* grantee (real or decoy — any
+/// username appearing as a key in the newest epoch's `grants` map at all,
+/// since a decoy slot only ever gets added as one of an *existing* real
+/// grantee's four slots, never as a brand-new map key — see
+/// `bucket_keys::seal_grant_slots`) of the newest key epoch: read from the
+/// authoritative bucket registry, the replicated control state in a
+/// cluster (so every node enforces the guard identically regardless of how
+/// far its local filesystem projection has caught up), or the local store
+/// single-node. Used by [`delete_user`] to warn before stranding a bucket:
+/// once its sole grantee's user record is gone, nobody can ever grant
+/// fresh access to it again (existing objects stay readable to whoever
+/// already holds a live grant, but the grant list is now frozen). A bucket
+/// with no key material yet (never claimed/written to) has nothing to
+/// strand and is never included.
+async fn sole_grantee_buckets(
+    storage: &AnyStorage,
+    cluster: Option<&ClusterRuntime>,
+    username: &str,
+) -> Result<Vec<String>, AuthError> {
+    let is_sole_grantee = |cfg: &BucketConfig| -> bool {
+        match bucket_keys::current_key(cfg) {
+            Some(kv) => kv.grants.len() == 1 && kv.grants.contains_key(username),
+            None => false,
+        }
+    };
+    if let Some(rt) = cluster {
+        let state = rt.controller.control_state().await;
+        return Ok(state
+            .buckets
+            .into_iter()
+            .filter(|(_, cfg)| is_sole_grantee(cfg))
+            .map(|(bucket, _)| bucket)
+            .collect());
+    }
+    let buckets = storage
+        .list_buckets()
+        .await
+        .map_err(|e| AuthError::Backend(e.to_string()))?;
+    let mut sole = Vec::new();
+    for bucket in buckets {
+        let cfg = storage
+            .get_bucket_config(&bucket)
+            .await
+            .map_err(|e| AuthError::Backend(e.to_string()))?;
+        if is_sole_grantee(&cfg) {
+            sole.push(bucket);
+        }
+    }
+    Ok(sole)
+}
+
 /// `DELETE /api/v1/users/{user}` — remove a user record. Refuses if it would
-/// leave zero users.
+/// leave zero users, remove the last administrator, or strand a bucket the
+/// user owns (pass `?force=true` to delete anyway).
 #[utoipa::path(
     delete,
     path = "/api/v1/users/{user}",
     params(
         ("user" = String, Path, description = "Username to delete"),
+        ("force" = Option<bool>, Query, description = "Delete even if it would strand an owned bucket"),
     ),
     responses(
         (status = 204, description = "User deleted"),
         (status = 401, description = "Token missing/invalid"),
         (status = 404, description = "User not found"),
-        (status = 409, description = "Cannot delete the last remaining user"),
+        (status = 409, description = "Cannot delete the last remaining user, the last admin, or (without ?force=true) a bucket owner"),
     ),
     tag = "users",
 )]
-#[tracing::instrument(skip(state, cluster, auth), fields(actor = %auth.0.username, target = %path))]
+#[tracing::instrument(skip(state, storage, cluster, auth), fields(actor = %auth.0.username, target = %path))]
 pub async fn delete_user(
     state: web::Data<AuthState>,
+    storage: web::Data<Arc<AnyStorage>>,
     cluster: Option<web::Data<ClusterRuntime>>,
     auth: AdminAuthenticated,
     path: web::Path<String>,
+    query: web::Query<DeleteUserQuery>,
 ) -> Result<HttpResponse, AuthError> {
     let _ = &auth;
     let username = path.into_inner();
+
+    if !query.force {
+        let sole = sole_grantee_buckets(
+            storage.get_ref(),
+            cluster.as_ref().map(|d| d.get_ref()),
+            &username,
+        )
+        .await?;
+        if !sole.is_empty() {
+            return Err(AuthError::CannotDeleteSoleGrantee { buckets: sole });
+        }
+    }
 
     // (username, role) over the authoritative set: the replicated registry in a
     // cluster (so a freshly-joined node enforces the guards correctly), or the
@@ -645,20 +746,208 @@ pub async fn set_role(
     Ok(HttpResponse::NoContent().finish())
 }
 
-/// Run Argon2id-unwrap on a worker thread (CPU-bound).
+/// `POST /api/v1/users/{user}/reset-identity` request body.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ResetIdentityRequest {
+    pub password: String,
+}
+
+/// `POST /api/v1/users/{user}/reset-identity` response body.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ResetIdentityResponse {
+    /// Buckets left with zero grantees on their newest key epoch once this
+    /// user's (now-unrecoverable) grants were scrubbed.
+    pub orphaned_buckets: Vec<String>,
+}
+
+/// `POST /api/v1/users/{user}/reset-identity` — the honest replacement for an
+/// admin password reset. Rebuilds the target's record with a fresh identity
+/// keypair (slot 0) under the supplied password and fresh decoys in slots
+/// 1..4, revokes their live sessions, and scrubs every bucket-key grant they
+/// held across every bucket — those grants were sealed to the identity
+/// public key that just got replaced, so they are unrecoverable garbage the
+/// moment this runs, whether or not this endpoint bothers to delete them.
+///
+/// This restores login. It does not restore access: the target holds no
+/// bucket key until someone re-grants their new identity, and the caller
+/// (an admin) never touches bucket-key material in the process, so this
+/// cannot be used to escalate. It also destroys every persona the user had,
+/// including any duress ones — there is no partial reset.
+#[utoipa::path(
+    post,
+    path = "/api/v1/users/{user}/reset-identity",
+    request_body = ResetIdentityRequest,
+    params(("user" = String, Path, description = "Username to reset")),
+    responses(
+        (status = 200, description = "Identity reset", body = ResetIdentityResponse, content_type = "application/json"),
+        (status = 400, description = "Empty password"),
+        (status = 401, description = "Token missing/invalid"),
+        (status = 404, description = "User not found"),
+    ),
+    tag = "users",
+)]
+#[tracing::instrument(skip(state, storage, cluster, auth, body), fields(actor = %auth.0.username, target = %path))]
+pub async fn reset_identity(
+    state: web::Data<AuthState>,
+    storage: web::Data<Arc<AnyStorage>>,
+    cluster: Option<web::Data<ClusterRuntime>>,
+    auth: AdminAuthenticated,
+    path: web::Path<String>,
+    body: web::Json<ResetIdentityRequest>,
+) -> Result<HttpResponse, AuthError> {
+    let _ = &auth;
+    let username = path.into_inner();
+    if body.password.is_empty() {
+        return Err(AuthError::InvalidBody {
+            reason: "password must not be empty".to_owned(),
+        });
+    }
+
+    let mut rec = match cluster.as_ref() {
+        Some(rt) => rt.controller.control_state().await.users.get(&username).cloned(),
+        None => state
+            .user_store
+            .get(&username)
+            .map_err(|e| AuthError::Backend(e.to_string()))?,
+    }
+    .ok_or_else(|| AuthError::UserNotFound {
+        username: username.clone(),
+    })?;
+
+    let password = body.password.clone();
+    let username_for_slots = username.clone();
+    let role = rec.role;
+    let params = rec.kdf.clone();
+    let slots = tokio::task::spawn_blocking(move || {
+        let slot0 = kdf::new_slot(&username_for_slots, 0, password.as_bytes(), &params, role, false)?;
+        let decoys = kdf::decoy_slots_from(&username_for_slots, 1, &params)?;
+        let mut slots = vec![slot0];
+        slots.extend(decoys);
+        Ok::<_, y2q_core::crypto::CryptoError>(slots)
+    })
+    .await
+    .map_err(|e| AuthError::Backend(format!("kdf join: {e}")))?
+    .map_err(|e| AuthError::Backend(e.to_string()))?;
+    rec.slots = slots;
+
+    if let Some(rt) = cluster.as_ref() {
+        cluster::cluster_upsert_user(rt, state.get_ref(), &rec).await?;
+    } else {
+        state
+            .user_store
+            .upsert(&rec)
+            .map_err(|e| AuthError::Backend(e.to_string()))?;
+    }
+    // Every live session carries the old (now-replaced) identity secret key.
+    state.sessions.revoke_user(&username);
+
+    let orphaned = scrub_user_grants(storage.get_ref(), cluster.as_ref().map(|d| d.get_ref()), &username).await?;
+
+    Ok(HttpResponse::Ok().json(ResetIdentityResponse {
+        orphaned_buckets: orphaned,
+    }))
+}
+
+/// Remove `username`'s grant-map entry from every retained key epoch of
+/// every bucket. Their sealed entries are already unrecoverable garbage
+/// once [`reset_identity`] replaces their identity keypair — this just
+/// keeps `BucketKeyVersion::grants` from accumulating dead rows and reports
+/// which buckets' *newest* epoch drops to zero grantees as a result (the
+/// caller surfaces that as `orphaned_buckets`).
+async fn scrub_user_grants(
+    storage: &AnyStorage,
+    cluster: Option<&ClusterRuntime>,
+    username: &str,
+) -> Result<Vec<String>, AuthError> {
+    let buckets = match cluster {
+        Some(rt) => rt
+            .controller
+            .control_state()
+            .await
+            .buckets
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>(),
+        None => storage
+            .list_buckets()
+            .await
+            .map_err(|e| AuthError::Backend(e.to_string()))?,
+    };
+
+    let mut orphaned = Vec::new();
+    for bucket in buckets {
+        let mut cfg = match cluster {
+            Some(rt) => rt
+                .controller
+                .control_state()
+                .await
+                .buckets
+                .get(&bucket)
+                .cloned()
+                .unwrap_or_default(),
+            None => storage
+                .get_bucket_config(&bucket)
+                .await
+                .map_err(|e| AuthError::Backend(e.to_string()))?,
+        };
+        let mut changed = false;
+        for kv in cfg.keys.iter_mut() {
+            if kv.grants.remove(username).is_some() {
+                changed = true;
+            }
+        }
+        if !changed {
+            continue;
+        }
+        if let Some(newest) = cfg.keys.last()
+            && newest.grants.is_empty()
+        {
+            orphaned.push(bucket.clone());
+        }
+        if let Some(rt) = cluster {
+            cluster::cluster_set_bucket_config(rt, &bucket, &cfg)
+                .await
+                .map_err(|e| AuthError::Backend(e.to_string()))?;
+        } else {
+            storage
+                .set_bucket_config(&bucket, &cfg)
+                .await
+                .map_err(|e| AuthError::Backend(e.to_string()))?;
+        }
+    }
+    Ok(orphaned)
+}
+
+/// Run Argon2id-derivation + all-four-slot-unwrap on a worker thread
+/// (CPU-bound). Tries every slot's AEAD open regardless of whether an
+/// earlier one already matched — timing must not reveal which slot opened
+/// or how many of the four are real.
 async fn attempt_unwrap(
     rec: UserRecord,
     password: String,
-) -> Result<(UserRecord, Vec<u8>), AuthError> {
+) -> Result<(UserRecord, usize, SlotPayload), AuthError> {
     let params = rec.kdf.clone();
-    let wrapped = rec.wrapped_sk.clone();
-    let sk_result =
-        tokio::task::spawn_blocking(move || kdf::unwrap_sk(&wrapped, password.as_bytes(), &params))
-            .await
-            .map_err(|e| AuthError::Backend(format!("kdf join: {e}")))?;
-    match sk_result {
-        Ok(sk) => Ok((rec, sk)),
-        Err(_) => Err(AuthError::InvalidCredentials),
+    let slots = rec.slots.clone();
+    let username = rec.username.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let kek = params.derive_kek(password.as_bytes()).ok()?;
+        let mut opened: Option<(usize, SlotPayload)> = None;
+        for (i, slot) in slots.iter().enumerate() {
+            let aad = kdf::slot_wrap_aad(&username, i);
+            if let Ok(payload_bytes) = kdf::unwrap_slot(&slot.wrapped, &kek, &aad)
+                && opened.is_none()
+                && let Ok(payload) = SlotPayload::from_bytes(&payload_bytes)
+            {
+                opened = Some((i, payload));
+            }
+        }
+        opened
+    })
+    .await
+    .map_err(|e| AuthError::Backend(format!("kdf join: {e}")))?;
+    match result {
+        Some((slot, payload)) => Ok((rec, slot, payload)),
+        None => Err(AuthError::InvalidCredentials),
     }
 }
 
@@ -676,4 +965,206 @@ fn now_ns() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0)
+}
+
+/// `POST /api/v1/personas` request body.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct PersonaCreateRequest {
+    /// Credential slot to write: must be `1..=3`. Slot 0 is the primary
+    /// persona, changed only via `POST /api/v1/auth/password`.
+    pub slot: u8,
+    pub password: String,
+    /// Effective role for sessions opened through this persona. Must not
+    /// exceed the account's own global role — enforced server-side, not
+    /// merely a UI suggestion.
+    #[serde(default)]
+    #[schema(value_type = String, example = "user")]
+    pub role: Role,
+    /// When true, a login through this persona revokes every other live
+    /// session of this account. What makes a persona usable as a duress
+    /// slot.
+    #[serde(default)]
+    pub revoke_other_sessions: bool,
+}
+
+/// `POST /api/v1/personas` response body.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct PersonaCreateResponse {
+    /// Always present, regardless of whether the slot held a live persona
+    /// before this call — the daemon cannot tell the two apart without
+    /// leaking exactly that.
+    pub warning: String,
+}
+
+/// `GET /api/v1/personas/me` response body.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct PersonaView {
+    pub slot: u8,
+    #[schema(value_type = String, example = "user")]
+    pub role: Role,
+    pub revoke_other_sessions: bool,
+}
+
+/// `POST /api/v1/personas` — write a new persona into the caller's own
+/// record at `slot` (`1..=3`), unconditionally overwriting whatever was
+/// there. Acts only on the caller's own record: there is no admin route to
+/// add a persona for someone else, because such a route would be the first
+/// thing a coercer with an admin account would reach for.
+#[utoipa::path(
+    post,
+    path = "/api/v1/personas",
+    request_body = PersonaCreateRequest,
+    responses(
+        (status = 201, description = "Persona written", body = PersonaCreateResponse, content_type = "application/json"),
+        (status = 400, description = "Slot out of range, role exceeds the account's global role, or empty password"),
+        (status = 401, description = "Token missing/invalid"),
+        (status = 409, description = "Password already opens one of the caller's credential slots"),
+    ),
+    security(("bearer" = [])),
+    tag = "personas",
+)]
+#[tracing::instrument(skip(state, auth, body), fields(username = %auth.username))]
+pub async fn create_persona(
+    state: web::Data<AuthState>,
+    auth: Authenticated,
+    body: web::Json<PersonaCreateRequest>,
+) -> Result<HttpResponse, AuthError> {
+    let slot = body.slot as usize;
+    if !(1..CREDENTIAL_SLOTS).contains(&slot) {
+        return Err(AuthError::InvalidPersonaSlot {
+            reason: "slot must be 1..=3 (slot 0 is the primary persona)",
+        });
+    }
+    if body.password.is_empty() {
+        return Err(AuthError::InvalidBody {
+            reason: "password must not be empty".to_owned(),
+        });
+    }
+    let role = body.role;
+
+    let rec = state
+        .user_store
+        .get(&auth.username)
+        .map_err(|e| AuthError::Backend(e.to_string()))?
+        .ok_or(AuthError::InvalidCredentials)?;
+
+    if !crate::authz::role_permits(role, rec.role) {
+        return Err(AuthError::RoleExceedsAccount);
+    }
+
+    let username = rec.username.clone();
+    let params = rec.kdf.clone();
+    let password = body.password.clone();
+    let revoke_other_sessions = body.revoke_other_sessions;
+    let existing_slots = rec.slots.clone();
+    let new_slot = tokio::task::spawn_blocking(
+        move || -> Result<Option<CredentialSlot>, y2q_core::crypto::CryptoError> {
+            // Password-distinctness: one Argon2 derivation, then try every
+            // *current* slot's unwrap without short-circuiting — a reused
+            // password must be rejected without timing revealing *which*
+            // existing slot it collides with.
+            let kek = params.derive_kek(password.as_bytes())?;
+            let mut collides = false;
+            for (i, s) in existing_slots.iter().enumerate() {
+                let aad = kdf::slot_wrap_aad(&username, i);
+                if kdf::unwrap_slot(&s.wrapped, &kek, &aad).is_ok() {
+                    collides = true;
+                }
+            }
+            if collides {
+                return Ok(None);
+            }
+            let fresh = kdf::new_slot(&username, slot, password.as_bytes(), &params, role, revoke_other_sessions)?;
+            Ok(Some(fresh))
+        },
+    )
+    .await
+    .map_err(|e| AuthError::Backend(format!("kdf join: {e}")))?
+    .map_err(|e| AuthError::Backend(e.to_string()))?
+    .ok_or(AuthError::PasswordReused)?;
+
+    let mut updated = rec.clone();
+    updated.slots[slot] = new_slot;
+    state
+        .user_store
+        .upsert(&updated)
+        .map_err(|e| AuthError::Backend(e.to_string()))?;
+
+    Ok(HttpResponse::Created().json(PersonaCreateResponse {
+        warning: format!("slot {slot} overwritten; any grants sealed to it are gone"),
+    }))
+}
+
+/// `DELETE /api/v1/personas/{slot}` — overwrite `slot` (`1..=3`) with a
+/// fresh decoy and revoke any live session opened through it. Idempotent:
+/// deleting an already-decoy slot is a no-op that still returns 204, and
+/// must not reveal which it was.
+#[utoipa::path(
+    delete,
+    path = "/api/v1/personas/{slot}",
+    params(("slot" = u8, Path, description = "Credential slot, 1..=3")),
+    responses(
+        (status = 204, description = "Slot overwritten with a decoy"),
+        (status = 400, description = "Slot out of range"),
+        (status = 401, description = "Token missing/invalid"),
+    ),
+    security(("bearer" = [])),
+    tag = "personas",
+)]
+#[tracing::instrument(skip(state, auth), fields(username = %auth.username))]
+pub async fn delete_persona(
+    state: web::Data<AuthState>,
+    auth: Authenticated,
+    path: web::Path<u8>,
+) -> Result<HttpResponse, AuthError> {
+    let slot = path.into_inner() as usize;
+    if !(1..CREDENTIAL_SLOTS).contains(&slot) {
+        return Err(AuthError::InvalidPersonaSlot {
+            reason: "slot must be 1..=3 (slot 0 is the primary persona)",
+        });
+    }
+    let rec = state
+        .user_store
+        .get(&auth.username)
+        .map_err(|e| AuthError::Backend(e.to_string()))?
+        .ok_or(AuthError::InvalidCredentials)?;
+
+    let username = rec.username.clone();
+    let params = rec.kdf.clone();
+    let decoy = tokio::task::spawn_blocking(move || kdf::decoy_slot(&username, slot, &params))
+        .await
+        .map_err(|e| AuthError::Backend(format!("kdf join: {e}")))?
+        .map_err(|e| AuthError::Backend(e.to_string()))?;
+
+    let mut updated = rec.clone();
+    updated.slots[slot] = decoy;
+    state
+        .user_store
+        .upsert(&updated)
+        .map_err(|e| AuthError::Backend(e.to_string()))?;
+
+    state.sessions.revoke_user_persona(&auth.username, slot as u8);
+    Ok(HttpResponse::NoContent().finish())
+}
+
+/// `GET /api/v1/personas/me` — the calling session's own persona slot,
+/// role, and duress flag. Never lists any other slot: this is the only
+/// introspection offered, and it is deliberately useless to a coercer.
+#[utoipa::path(
+    get,
+    path = "/api/v1/personas/me",
+    responses(
+        (status = 200, description = "Current persona", body = PersonaView, content_type = "application/json"),
+        (status = 401, description = "Token missing/invalid"),
+    ),
+    security(("bearer" = [])),
+    tag = "personas",
+)]
+#[tracing::instrument(skip(auth), fields(username = %auth.username))]
+pub async fn whoami_persona(auth: Authenticated) -> Result<HttpResponse, AuthError> {
+    Ok(HttpResponse::Ok().json(PersonaView {
+        slot: auth.session.persona,
+        role: auth.session.role,
+        revoke_other_sessions: auth.session.revoke_other_sessions,
+    }))
 }

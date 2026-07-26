@@ -1,35 +1,42 @@
 //! Post-quantum encryption layer for stored objects.
 //!
 //! Every PUT runs a fresh ML-KEM-768 encapsulation against the deployment's
-//! single public key; the resulting shared secret is fed through HKDF-SHA256
-//! to derive an AES-256-GCM content key that encrypts the object body in
-//! fixed-size chunks, supporting ranged reads.
+//! single public key (transitional through phases 1-2 — phase 3 replaces it
+//! with per-bucket keys); the resulting shared secret is fed through
+//! HKDF-SHA256 to derive an AES-256-GCM content key that encrypts the
+//! object body in fixed-size chunks, supporting ranged reads.
 //!
 //! Submodules:
 //! - [`envelope`] — on-disk format and whole-object AEAD.
-//! - [`kdf`] — Argon2id wrap/unwrap of the deployment secret key under a user
-//!   password.
-//! - [`keystore`] — public-key file (`pubkey.json`) plus first-run generation.
-//! - [`user_store`] — redb-backed table of user records (each carrying its own
-//!   wrapped copy of the secret key).
-//! - [`keys`] — in-memory holders for the live keypair, with zeroize on drop.
+//! - [`kdf`] — Argon2id wrap/unwrap of credential-slot payloads.
+//! - [`keystore`] — keystore manifest (`keystore.json`) plus first-run
+//!   generation.
+//! - [`node_key`] — resolves the operator-supplied node key at boot.
+//! - [`node_keys`] — derives every server-structural key from the node key.
+//! - [`seal`] — ML-KEM-768 public-key sealing (wrap under a recipient's
+//!   public key rather than a password).
+//! - [`user_store`] — redb-backed table of user records, each carrying
+//!   [`user_store::CREDENTIAL_SLOTS`] credential slots.
 
 pub mod envelope;
 pub mod kdf;
-pub mod keys;
 pub mod keystore;
-pub mod metadata_key;
+pub mod node_key;
+pub mod node_keys;
+pub mod seal;
 pub mod user_store;
 
 pub use envelope::EnvelopeInfo;
-pub use kdf::{Argon2Params, WrappedSk, default_argon2_params};
-pub use keys::{DecryptedKeystore, Keystore};
-pub use keystore::{KeystoreFiles, PubkeyFile};
-pub use metadata_key::{
-    decrypt_meta, derive_index_file_key, derive_index_key, derive_mek, derive_path_key,
-    encrypt_meta, prf,
+pub use kdf::{Argon2Params, WrappedSk, default_argon2_params, unwrap_with_key, wrap_with_key};
+pub use keystore::KeystoreFiles;
+pub use node_key::load_node_key;
+pub use node_keys::{
+    NodeKeySlot, decrypt_meta, derive_bucket_config_key, derive_control_store_key,
+    derive_index_file_key, derive_index_key, derive_node_key_verifier, derive_object_metadata_key,
+    derive_path_key, encrypt_meta, prf,
 };
-pub use user_store::{Role, UserRecord, UserStore, UserSummary};
+pub use seal::{SealedKey, bucket_grant_aad, bucket_sk_wrap_aad, open_sealed, seal_to, seal_to_slots};
+pub use user_store::{CREDENTIAL_SLOTS, CredentialSlot, Role, SlotPayload, UserRecord, UserStore, UserSummary};
 
 use crate::Error;
 
@@ -84,6 +91,25 @@ pub enum CryptoError {
     /// User-store (redb) operation failed.
     #[error("user store: {0}")]
     UserStore(String),
+
+    /// Neither `Y2QD_NODE_KEY` nor `[crypto] node_key_file` supplied a node
+    /// key at boot.
+    #[error("node key not supplied: set Y2QD_NODE_KEY or [crypto] node_key_file")]
+    NodeKeyMissing,
+
+    /// The supplied node key material failed to decode or was too short.
+    #[error("node key malformed: {0}")]
+    NodeKeyMalformed(String),
+
+    /// The supplied node key's verifier does not match the one stored in
+    /// `keystore.json` — wrong key, or a keystore from another deployment.
+    #[error("node key does not match this keystore (wrong key, or keystore from another deployment)")]
+    NodeKeyMismatch,
+
+    /// The keystore directory still holds a pre-hierarchy `pubkey.json`.
+    /// There is no conversion path — re-initialize the deployment.
+    #[error("keystore at {0} predates the per-bucket key hierarchy; re-initialize the deployment (this build cannot read it)")]
+    LegacyKeystore(String),
 }
 
 impl CryptoError {
@@ -115,6 +141,28 @@ impl CryptoError {
                 Error::KeystoreCorrupt { path, reason }
             }
             CryptoError::UserStore(msg) => Error::Index { message: msg },
+            CryptoError::NodeKeyMissing => Error::InternalError {
+                bucket: bucket.to_owned(),
+                key: key.to_owned(),
+                operation: "node-key".to_owned(),
+                message: "node key not supplied".to_owned(),
+            },
+            CryptoError::NodeKeyMalformed(reason) => Error::InternalError {
+                bucket: bucket.to_owned(),
+                key: key.to_owned(),
+                operation: "node-key".to_owned(),
+                message: reason,
+            },
+            CryptoError::NodeKeyMismatch => Error::InternalError {
+                bucket: bucket.to_owned(),
+                key: key.to_owned(),
+                operation: "node-key".to_owned(),
+                message: "node key does not match this keystore".to_owned(),
+            },
+            CryptoError::LegacyKeystore(path) => Error::KeystoreCorrupt {
+                path,
+                reason: "legacy pre-hierarchy keystore; re-initialize the deployment".to_owned(),
+            },
         }
     }
 }
@@ -169,6 +217,22 @@ mod into_storage_error_tests {
         assert!(matches!(
             CryptoError::UserStore("x".into()).into_storage_error("b", "k"),
             Error::Index { .. }
+        ));
+        assert!(matches!(
+            CryptoError::NodeKeyMissing.into_storage_error("b", "k"),
+            Error::InternalError { .. }
+        ));
+        assert!(matches!(
+            CryptoError::NodeKeyMalformed("x".into()).into_storage_error("b", "k"),
+            Error::InternalError { .. }
+        ));
+        assert!(matches!(
+            CryptoError::NodeKeyMismatch.into_storage_error("b", "k"),
+            Error::InternalError { .. }
+        ));
+        assert!(matches!(
+            CryptoError::LegacyKeystore("p".into()).into_storage_error("b", "k"),
+            Error::KeystoreCorrupt { .. }
         ));
     }
 }

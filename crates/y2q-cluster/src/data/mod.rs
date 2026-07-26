@@ -831,6 +831,7 @@ impl DistributedStorage {
             kem_alg: md.kem_alg.clone().unwrap_or_default(),
             aead_alg: md.aead_alg.clone().unwrap_or_default(),
             envelope_version: md.envelope_version.unwrap_or(2),
+            key_epoch: md.key_epoch.unwrap_or(0),
             labels: md.labels.iter().cloned().collect(),
         };
         let pmeta = bmeta.to_prepare(bucket, key, chain_id(bucket, key), route.epoch);
@@ -1258,7 +1259,7 @@ async fn stage_envelope(
     // backfill it here to keep this replica's envelope byte-identical.
     sink.write_all_at(
         &meta.plaintext_len.to_be_bytes(),
-        write_offset + envelope::V2_PLAINTEXT_LEN_OFFSET,
+        write_offset + envelope::V3_PLAINTEXT_LEN_OFFSET,
     )
     .await
     .map_err(|e| DataError::Io(e.to_string()))?;
@@ -1314,10 +1315,10 @@ mod tests {
     use y2q_core::FilesystemStorage;
     use y2q_core::Storage;
 
-    /// Build a tempdir-backed local AnyStorage with a MEK installed.
+    /// Build a tempdir-backed local AnyStorage with a node key installed.
     fn local_storage(dir: &std::path::Path) -> Arc<AnyStorage> {
         let fs = FilesystemStorage::new(dir.join("data"), dir.join("index.redb")).unwrap();
-        fs.install_mek([7u8; 32]);
+        fs.install_node_key([7u8; 32]);
         Arc::new(AnyStorage::Filesystem(fs))
     }
 
@@ -1412,7 +1413,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let local = local_storage(dir.path());
 
-        // 64-byte stand-in "envelope"; the patch lands at offset 20.
+        // 64-byte stand-in "envelope"; the patch lands at offset 24.
         let mut env = vec![0u8; 64];
         for (i, b) in env.iter_mut().enumerate() {
             *b = i as u8;
@@ -1432,7 +1433,8 @@ mod tests {
             cipher_checksum_b64: String::new(),
             kem_alg: "ml-kem-768".into(),
             aead_alg: "aes-256-gcm".into(),
-            envelope_version: 2,
+            envelope_version: 3,
+            key_epoch: 0,
             sync_durable: false,
             labels: vec![],
         };
@@ -1445,7 +1447,7 @@ mod tests {
 
         let got = local.get("bkt", "obj").await.unwrap();
         let mut expected = env.clone();
-        expected[20..28].copy_from_slice(&plaintext_len.to_be_bytes());
+        expected[24..32].copy_from_slice(&plaintext_len.to_be_bytes());
         assert_eq!(&got[..], &expected[..]);
 
         // Re-writing the same key reports an overwrite.
@@ -1477,7 +1479,8 @@ mod tests {
             cipher_checksum_b64: String::new(),
             kem_alg: "ml-kem-768".into(),
             aead_alg: "aes-256-gcm".into(),
-            envelope_version: 2,
+            envelope_version: 3,
+            key_epoch: 0,
             sync_durable: false,
             labels: vec![],
         };
@@ -1516,6 +1519,7 @@ mod tests {
             envelope_version: None,
             version,
             committed_at: None,
+            key_epoch: None,
         }
     }
 

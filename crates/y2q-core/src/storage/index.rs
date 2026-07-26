@@ -11,16 +11,15 @@
 //! ## Encryption
 //!
 //! The entire redb file is encrypted at rest by [`EncryptedFileBackend`], which
-//! transparently encrypts every block under a key derived from the login-gated
-//! MEK ([`crate::crypto::derive_index_file_key`]). Inside the database, table
-//! keys are stored as plaintext length-prefixed composites and values as plain
-//! JSON - the whole-file layer is the sole protection.
+//! transparently encrypts every block under a key derived from the
+//! operator-supplied node key ([`crate::crypto::derive_index_file_key`]).
+//! Inside the database, table keys are stored as plaintext length-prefixed
+//! composites and values as plain JSON - the whole-file layer is the sole
+//! protection.
 //!
-//! Because the file key only exists while a session is active, the database is
-//! opened on the first login ([`MetadataIndex::set_mek`]) and closed when the
-//! daemon goes idle ([`MetadataIndex::close`]). While closed, every index
-//! operation returns [`Error::Index`] ("metadata index locked"); only ciphertext
-//! remains on disk.
+//! The node key is installed once at boot ([`MetadataIndex::set_node_key`])
+//! and never dropped — the daemon cannot serve anything without it, so unlike
+//! the pre-hierarchy MEK there is no idle-drop / re-open cycle.
 //!
 //! **Migration**: a pre-encryption (plaintext redb) index file is incompatible.
 //! On first open the backend detects the missing magic, recreates the file
@@ -37,7 +36,7 @@ use redb::{Builder, Database, Durability, ReadableDatabase, ReadableTable, Table
 
 use crate::{
     Error, LabelQuery, ListPage, Metadata, SyncLevel,
-    crypto::{derive_index_file_key, metadata_key::MekSlot},
+    crypto::{derive_index_file_key, node_keys::NodeKeySlot},
     storage::EncryptedFileBackend,
 };
 
@@ -59,48 +58,44 @@ const BUCKETS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("buckets");
 /// A persistent secondary index over object metadata, backed by a
 /// whole-file-encrypted redb file.
 ///
-/// The database is opened lazily on the first login (when the file key becomes
-/// derivable from the MEK) and closed when the daemon goes idle. While closed,
-/// `db` is `None` and every operation returns [`Error::Index`].
+/// The database is opened once at boot, when the node key is installed.
 pub struct MetadataIndex {
     /// On-disk path of the encrypted redb file.
     path: PathBuf,
-    /// The open database, or `None` while the index is locked (no session).
+    /// The open database, or `None` if the boot-time open failed.
     db: RwLock<Option<Arc<Database>>>,
-    /// Shared, clearable holder for the MEK. Empty until a login installs it;
-    /// zeroized when the daemon goes idle. The file key for [`Self::db`] is
-    /// derived from this MEK.
-    slot: Arc<MekSlot>,
+    /// Shared holder for the node key. Installed once at boot, then never
+    /// cleared. The file key for [`Self::db`] is derived from it.
+    slot: Arc<NodeKeySlot>,
 }
 
 impl MetadataIndex {
     /// Create an unopened index handle for the redb file at `path`.
     ///
-    /// Performs no I/O: the encrypted file is only opened once a login installs
-    /// the MEK via [`Self::set_mek`].
+    /// Performs no I/O: the encrypted file is only opened once boot installs
+    /// the node key via [`Self::set_node_key`].
     pub fn new(path: impl Into<PathBuf>) -> Self {
         Self {
             path: path.into(),
             db: RwLock::new(None),
-            slot: Arc::new(MekSlot::new()),
+            slot: Arc::new(NodeKeySlot::new()),
         }
     }
 
-    /// Install the MEK and open the encrypted database if not already open.
+    /// Install the node key and open the encrypted database if not already
+    /// open. Called exactly once, at boot.
     ///
-    /// Idempotent: a re-login while already open is a no-op for the database.
-    /// The MEK is deterministic from the deployment secret key, so the file key
-    /// (and hence the existing encrypted file) is recovered unchanged after an
-    /// idle [`Self::close`]. An open failure is logged and leaves the index
-    /// locked (operations error until a subsequent successful open); the index
-    /// is a rebuildable cache, so a login is not failed on its account.
-    pub fn set_mek(&self, mek: [u8; 32]) {
-        self.slot.install(mek);
+    /// Idempotent for the database: a repeat call while already open is a
+    /// no-op. An open failure is logged and leaves the index locked
+    /// (operations error until the daemon restarts) — the index is a
+    /// rebuildable cache, so this does not abort boot on its own.
+    pub fn set_node_key(&self, nk: [u8; 32]) {
+        self.slot.install(nk);
         let mut guard = self.db.write().expect("index db poisoned");
         if guard.is_some() {
             return;
         }
-        match Self::open_db(&self.path, &mek) {
+        match Self::open_db(&self.path, &nk) {
             Ok(db) => *guard = Some(Arc::new(db)),
             Err(e) => {
                 tracing::error!(error = %e, path = %self.path.display(),
@@ -109,16 +104,10 @@ impl MetadataIndex {
         }
     }
 
-    /// Close the database, releasing the file handle. Called on idle drop so
-    /// only ciphertext remains on disk. A subsequent [`Self::set_mek`] reopens.
-    pub fn close(&self) {
-        *self.db.write().expect("index db poisoned") = None;
-    }
-
     /// Open (or create) the encrypted redb file at `path` under the file key
-    /// derived from `mek`, ensuring both tables exist.
-    fn open_db(path: &Path, mek: &[u8; 32]) -> Result<Database, Error> {
-        let file_key = derive_index_file_key(mek);
+    /// derived from `nk`, ensuring both tables exist.
+    fn open_db(path: &Path, nk: &[u8; 32]) -> Result<Database, Error> {
+        let file_key = derive_index_file_key(nk);
         let backend = EncryptedFileBackend::open(path, file_key).map_err(map_redb)?;
         let db = Builder::new()
             .create_with_backend(backend)
@@ -145,9 +134,9 @@ impl MetadataIndex {
             })
     }
 
-    /// Return a handle to the shared MEK slot so a storage backend can share the
-    /// same slot and observe installs/clears the moment they happen.
-    pub fn mek_slot(&self) -> Arc<MekSlot> {
+    /// Return a handle to the shared node-key slot so a storage backend can
+    /// share the same slot.
+    pub fn node_key_slot(&self) -> Arc<NodeKeySlot> {
         Arc::clone(&self.slot)
     }
 

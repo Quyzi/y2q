@@ -15,6 +15,7 @@ pub mod listing;
 pub mod mirror;
 pub mod mv;
 pub mod objects;
+pub mod personas;
 pub mod pipe;
 pub mod search;
 pub mod tag;
