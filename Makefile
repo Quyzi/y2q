@@ -61,8 +61,8 @@ release-y2q-warp: ## Release build -- y2q-warp only
 # Test
 # ---------------------------------------------------------------------------
 
-test: ## Run all tests
-	$(CARGO) test
+test: ## Run all tests (serialized - e2e/cluster_e2e spawn real servers on OS-assigned ports and can collide when run concurrently)
+	$(CARGO) test -- --test-threads=1
 
 # ---------------------------------------------------------------------------
 # Bench
