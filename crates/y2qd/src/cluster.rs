@@ -215,7 +215,8 @@ pub async fn cluster_claim_owner(
         // nontrivial, so skip it when a claim has clearly already landed.
         // The actual "who wins" decision is the raft apply's own
         // `cfg.owner.is_none()` check, not this client-side guess.
-        let key = crate::bucket_keys::new_owner_key(user_store, bucket, session).map_err(AppError)?;
+        let key =
+            crate::bucket_keys::new_owner_key(user_store, bucket, session).map_err(AppError)?;
         rt.propose_control(ControlCmd::ClaimBucketOwner {
             bucket: bucket.to_owned(),
             owner: session.username.clone(),
@@ -694,7 +695,6 @@ async fn set_status_resplice(rt: &ClusterRuntime, id: u64, status: NodeStatus) -
     }
 }
 
-
 /// Initialize a single-node cluster on the bootstrap node, then spawn a task
 /// that registers this node, admits the configured peers (verifying each one's
 /// node-key verifier), and promotes the voter set.
@@ -998,8 +998,12 @@ async fn head_write_inner(
         .unwrap_or(0);
     let version = prior_version + 1;
 
-    let cfg = local.get_bucket_config(bucket).await.map_err(AppError::from)?;
-    let (bucket_epoch, bucket_pk) = crate::bucket_keys::resolve_write_key(&cfg, bucket).map_err(AppError)?;
+    let cfg = local
+        .get_bucket_config(bucket)
+        .await
+        .map_err(AppError::from)?;
+    let (bucket_epoch, bucket_pk) =
+        crate::bucket_keys::resolve_write_key(&cfg, bucket).map_err(AppError)?;
 
     let (guard, sink, write_offset) = local
         .begin_streaming_put(bucket, key)

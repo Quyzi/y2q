@@ -752,7 +752,10 @@ fn cluster_replication_and_apportioned_reads() {
         for node in &cluster.nodes {
             let log = std::fs::read_to_string(node.base.join("stderr.log")).unwrap_or_default();
             let tail: String = log.lines().rev().take(40).collect::<Vec<_>>().join("\n");
-            eprintln!("--- node {} (port {}) stderr tail ---\n{tail}", node.id, node.port);
+            eprintln!(
+                "--- node {} (port {}) stderr tail ---\n{tail}",
+                node.id, node.port
+            );
         }
     }
     assert_eq!(s, 201, "PUT (create) via node 0");

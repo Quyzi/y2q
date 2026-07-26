@@ -42,7 +42,10 @@ fn validate_slot(slot: usize) -> Result<(), AppError> {
         Ok(())
     } else {
         Err(AppError(CoreError::InvalidPersonaRequest {
-            reason: format!("invalid persona slot {slot}: must be 1..={}", CREDENTIAL_SLOTS - 1),
+            reason: format!(
+                "invalid persona slot {slot}: must be 1..={}",
+                CREDENTIAL_SLOTS - 1
+            ),
         }))
     }
 }
@@ -138,20 +141,43 @@ async fn share_or_revoke(
     let rec = state
         .user_store
         .get(&auth.username)
-        .map_err(|e| AppError(CoreError::Index { message: e.to_string() }))?
+        .map_err(|e| {
+            AppError(CoreError::Index {
+                message: e.to_string(),
+            })
+        })?
         .ok_or_else(|| {
             AppError(CoreError::InvalidPersonaRequest {
                 reason: "caller's own record is missing".to_owned(),
             })
         })?;
-    let identity_pks_b64: Vec<String> = rec.slots.iter().map(|s| s.identity_pk_b64.clone()).collect();
+    let identity_pks_b64: Vec<String> = rec
+        .slots
+        .iter()
+        .map(|s| s.identity_pk_b64.clone())
+        .collect();
 
     for bucket in &body.buckets {
         let cfg = match cluster {
-            Some(rt) => rt.controller.control_state().await.buckets.get(bucket).cloned(),
+            Some(rt) => rt
+                .controller
+                .control_state()
+                .await
+                .buckets
+                .get(bucket)
+                .cloned(),
             None => {
-                if storage.bucket_exists(bucket).await.map_err(AppError::from)? {
-                    Some(storage.get_bucket_config(bucket).await.map_err(AppError::from)?)
+                if storage
+                    .bucket_exists(bucket)
+                    .await
+                    .map_err(AppError::from)?
+                {
+                    Some(
+                        storage
+                            .get_bucket_config(bucket)
+                            .await
+                            .map_err(AppError::from)?,
+                    )
                 } else {
                     None
                 }
@@ -185,7 +211,8 @@ async fn share_or_revoke(
                 identity_pks_b64: identity_pks_b64.clone(),
                 authorized,
             };
-            bucket_keys::put_grant_slot(&mut cfg.keys[i], bucket, &auth.username, &slots, &bwk).map_err(AppError)?;
+            bucket_keys::put_grant_slot(&mut cfg.keys[i], bucket, &auth.username, &slots, &bwk)
+                .map_err(AppError)?;
             changed = true;
         }
         if !changed {
@@ -194,7 +221,10 @@ async fn share_or_revoke(
         if let Some(rt) = cluster {
             cluster::cluster_set_bucket_config(rt, bucket, &cfg).await?;
         } else {
-            storage.set_bucket_config(bucket, &cfg).await.map_err(AppError::from)?;
+            storage
+                .set_bucket_config(bucket, &cfg)
+                .await
+                .map_err(AppError::from)?;
         }
     }
     Ok(())

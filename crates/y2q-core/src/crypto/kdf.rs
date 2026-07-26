@@ -175,7 +175,11 @@ pub fn new_slot(
 /// length, same wrapped-payload length (see
 /// [`SlotPayload::to_bytes`](super::user_store::SlotPayload::to_bytes) for
 /// why the payload encoding is fixed-width).
-pub fn decoy_slot(username: &str, slot: usize, params: &Argon2Params) -> Result<CredentialSlot, CryptoError> {
+pub fn decoy_slot(
+    username: &str,
+    slot: usize,
+    params: &Argon2Params,
+) -> Result<CredentialSlot, CryptoError> {
     let (pk, sk) = mlkem768::keypair();
     let payload = SlotPayload {
         identity_sk_b64: STANDARD.encode(sk.as_bytes()),
@@ -215,10 +219,7 @@ pub fn wrap_with_key(payload: &[u8], key: &[u8; 32], aad: &[u8]) -> Result<Wrapp
     let ct = cipher
         .encrypt(
             &aes_gcm::Nonce::from(nonce_bytes),
-            Payload {
-                msg: payload,
-                aad,
-            },
+            Payload { msg: payload, aad },
         )
         .map_err(|_| CryptoError::Aead("wrap encrypt"))?;
     Ok(WrappedSk {
@@ -229,7 +230,11 @@ pub fn wrap_with_key(payload: &[u8], key: &[u8; 32], aad: &[u8]) -> Result<Wrapp
 
 /// Unwrap `wrapped` directly under `key` (no password derivation). Inverse
 /// of [`wrap_with_key`].
-pub fn unwrap_with_key(wrapped: &WrappedSk, key: &[u8; 32], aad: &[u8]) -> Result<Vec<u8>, CryptoError> {
+pub fn unwrap_with_key(
+    wrapped: &WrappedSk,
+    key: &[u8; 32],
+    aad: &[u8],
+) -> Result<Vec<u8>, CryptoError> {
     let cipher = Aes256Gcm::new(key.into());
     cipher
         .decrypt(
@@ -304,7 +309,15 @@ mod tests {
     #[test]
     fn new_slot_round_trips_through_login_shaped_unwrap() {
         let params = fast_params();
-        let slot = new_slot("alice", 0, b"correct horse battery staple", &params, Role::Admin, true).unwrap();
+        let slot = new_slot(
+            "alice",
+            0,
+            b"correct horse battery staple",
+            &params,
+            Role::Admin,
+            true,
+        )
+        .unwrap();
         let kek = params.derive_kek(b"correct horse battery staple").unwrap();
         let aad = slot_wrap_aad("alice", 0);
         let recovered = unwrap_slot(&slot.wrapped, &kek, &aad).unwrap();

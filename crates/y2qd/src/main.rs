@@ -313,7 +313,9 @@ async fn main() -> std::io::Result<()> {
     // same keystore.
     let keystore_dir = PathBuf::from(&cfg.crypto.keystore_dir);
     if keystore_mod::rotation_journal_exists(&keystore_dir) {
-        return Err(std::io::Error::other(node_key_rotation::INTERRUPTED_MESSAGE));
+        return Err(std::io::Error::other(
+            node_key_rotation::INTERRUPTED_MESSAGE,
+        ));
     }
     let _flock = keystore_mod::acquire_lock(&keystore_dir)
         .map_err(|e| std::io::Error::other(format!("acquire keystore lock: {e}")))?;
@@ -346,9 +348,8 @@ async fn main() -> std::io::Result<()> {
                 dir = %keystore_dir.display(),
                 "no keystore found; running first-run setup"
             );
-            let outcome =
-                keystore_mod::first_run(&keystore_dir, "root", argon2_for_first_run, &nk)
-                    .map_err(|e| std::io::Error::other(format!("first-run setup: {e}")))?;
+            let outcome = keystore_mod::first_run(&keystore_dir, "root", argon2_for_first_run, &nk)
+                .map_err(|e| std::io::Error::other(format!("first-run setup: {e}")))?;
             print_first_run_password(&outcome.root_username, &outcome.root_password);
             tracing::info!(dir = %keystore_dir.display(), "keystore initialized");
             outcome.user_store

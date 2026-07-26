@@ -35,7 +35,11 @@ impl Y2qClient {
     pub async fn delete_user(&self, username: &str, force: bool) -> Result<(), ClientError> {
         let url = self.url(&format!("api/v1/users/{username}"));
         let req = self.authed(self.inner.delete(url));
-        let req = if force { req.query(&[("force", "true")]) } else { req };
+        let req = if force {
+            req.query(&[("force", "true")])
+        } else {
+            req
+        };
         let resp = req.send().await?;
         Self::check_status(resp).await?;
         Ok(())
@@ -54,7 +58,11 @@ impl Y2qClient {
     /// Reset a user's identity keypair (all four credential slots) and
     /// scrub every bucket-key grant they held. Restores login under the new
     /// password; does not restore access.
-    pub async fn reset_identity(&self, username: &str, password: &str) -> Result<ResetIdentityResponse, ClientError> {
+    pub async fn reset_identity(
+        &self,
+        username: &str,
+        password: &str,
+    ) -> Result<ResetIdentityResponse, ClientError> {
         let url = self.url(&format!("api/v1/users/{username}/reset-identity"));
         let body = serde_json::json!({ "password": password });
         let resp = self.authed(self.inner.post(url)).json(&body).send().await?;

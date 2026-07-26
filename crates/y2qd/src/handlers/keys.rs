@@ -18,7 +18,10 @@ use actix_web::{HttpResponse, web};
 use bytes::BytesMut;
 use serde::Serialize;
 use utoipa::ToSchema;
-use y2q_core::{AnyStorage, BucketConfig, BucketPermission, ListOptions, Listing, PutOptions, Storage, SyncLevel};
+use y2q_core::{
+    AnyStorage, BucketConfig, BucketPermission, ListOptions, Listing, PutOptions, Storage,
+    SyncLevel,
+};
 use zeroize::Zeroizing;
 
 use crate::auth::{AuthState, Authenticated};
@@ -51,11 +54,18 @@ impl RekeyRegistry {
     }
 
     fn get(&self, bucket: &str) -> Option<RekeyState> {
-        self.inner.lock().expect("rekey registry poisoned").get(bucket).cloned()
+        self.inner
+            .lock()
+            .expect("rekey registry poisoned")
+            .get(bucket)
+            .cloned()
     }
 
     fn set(&self, bucket: String, state: RekeyState) {
-        self.inner.lock().expect("rekey registry poisoned").insert(bucket, state);
+        self.inner
+            .lock()
+            .expect("rekey registry poisoned")
+            .insert(bucket, state);
     }
 
     /// Claim the right to start a rekey job for `bucket`. Fails if one is
@@ -116,13 +126,18 @@ pub async fn rotate_key(
 ) -> Result<HttpResponse, AppError> {
     let bucket = path.into_inner();
     authorize_bucket(&auth, &storage, &bucket, BucketPermission::Admin).await?;
-    if !storage.bucket_exists(&bucket).await.map_err(AppError::from)? {
+    if !storage
+        .bucket_exists(&bucket)
+        .await
+        .map_err(AppError::from)?
+    {
         return Err(not_found(&bucket));
     }
 
     // Clustered: read the raft *authoritative* in-memory state, not the
     // local filesystem projection — same reasoning as `set_acl`.
-    let mut cfg = authoritative_config(&storage, cluster.as_ref().map(|d| d.get_ref()), &bucket).await?;
+    let mut cfg =
+        authoritative_config(&storage, cluster.as_ref().map(|d| d.get_ref()), &bucket).await?;
 
     let newest = bucket_keys::current_key(&cfg).cloned().ok_or_else(|| {
         AppError(y2q_core::Error::InternalError {
@@ -153,16 +168,33 @@ pub async fn rotate_key(
         auth.session.persona as usize,
         &auth.session.identity_sk,
     )
-    .map_err(|_| AppError(y2q_core::Error::Forbidden { bucket: bucket.clone() }))?;
+    .map_err(|_| {
+        AppError(y2q_core::Error::Forbidden {
+            bucket: bucket.clone(),
+        })
+    })?;
 
-    let grantees = bucket_keys::current_grantees(&state.user_store, &cfg, &bucket, &auth.username, auth.session.persona)
-        .map_err(AppError)?;
+    let grantees = bucket_keys::current_grantees(
+        &state.user_store,
+        &cfg,
+        &bucket,
+        &auth.username,
+        auth.session.persona,
+    )
+    .map_err(AppError)?;
     let new_epoch = newest.epoch + 1;
-    let (kv, _bwk) = bucket_keys::new_bucket_key_version(new_epoch, &bucket, &grantees).map_err(AppError)?;
+    let (kv, _bwk) =
+        bucket_keys::new_bucket_key_version(new_epoch, &bucket, &grantees).map_err(AppError)?;
     cfg.keys.push(kv);
     let key_epochs: Vec<u32> = cfg.keys.iter().map(|k| k.epoch).collect();
 
-    persist_config(&storage, cluster.as_ref().map(|d| d.get_ref()), &bucket, &cfg).await?;
+    persist_config(
+        &storage,
+        cluster.as_ref().map(|d| d.get_ref()),
+        &bucket,
+        &cfg,
+    )
+    .await?;
 
     Ok(HttpResponse::Ok().json(RotateKeyResponse {
         epoch: new_epoch,
@@ -211,10 +243,15 @@ pub async fn start_rekey(
 ) -> Result<HttpResponse, AppError> {
     let bucket = path.into_inner();
     authorize_bucket(&auth, &storage, &bucket, BucketPermission::Admin).await?;
-    if !storage.bucket_exists(&bucket).await.map_err(AppError::from)? {
+    if !storage
+        .bucket_exists(&bucket)
+        .await
+        .map_err(AppError::from)?
+    {
         return Err(not_found(&bucket));
     }
-    let cfg = authoritative_config(&storage, cluster.as_ref().map(|d| d.get_ref()), &bucket).await?;
+    let cfg =
+        authoritative_config(&storage, cluster.as_ref().map(|d| d.get_ref()), &bucket).await?;
     let newest = bucket_keys::current_key(&cfg).cloned().ok_or_else(|| {
         AppError(y2q_core::Error::InternalError {
             bucket: bucket.clone(),
@@ -231,7 +268,11 @@ pub async fn start_rekey(
         auth.session.persona as usize,
         &auth.session.identity_sk,
     )
-    .map_err(|_| AppError(y2q_core::Error::Forbidden { bucket: bucket.clone() }))?;
+    .map_err(|_| {
+        AppError(y2q_core::Error::Forbidden {
+            bucket: bucket.clone(),
+        })
+    })?;
 
     registry.try_start(&bucket)?;
 
@@ -304,10 +345,15 @@ async fn run_rekey(
     let cfg = authoritative_config(storage, cluster, bucket)
         .await
         .map_err(|e| e.to_string())?;
-    let newest = bucket_keys::current_key(&cfg).cloned().ok_or("bucket has no key material")?;
-    let new_pk = base64_decode(&newest.public_key_b64).map_err(|_| "malformed bucket public key".to_owned())?;
+    let newest = bucket_keys::current_key(&cfg)
+        .cloned()
+        .ok_or("bucket has no key material")?;
+    let new_pk = base64_decode(&newest.public_key_b64)
+        .map_err(|_| "malformed bucket public key".to_owned())?;
 
-    let stale = collect_stale_keys(storage, bucket, newest.epoch).await.map_err(|e| e.to_string())?;
+    let stale = collect_stale_keys(storage, bucket, newest.epoch)
+        .await
+        .map_err(|e| e.to_string())?;
     let total = stale.len();
 
     for (i, (key, old_epoch)) in stale.iter().enumerate() {
@@ -316,9 +362,17 @@ async fn run_rekey(
             .ok_or_else(|| format!("no cached key for epoch {old_epoch} (object {key})"))?;
 
         let obj = storage.get(bucket, key).await.map_err(|e| e.to_string())?;
-        let existing = storage.describe(bucket, key).await.map_err(|e| e.to_string())?;
-        let padded = cipher::decrypt_after_get(old_sk, bucket, key, BytesMut::from(obj.into_inner().as_ref()))
+        let existing = storage
+            .describe(bucket, key)
+            .await
             .map_err(|e| e.to_string())?;
+        let padded = cipher::decrypt_after_get(
+            old_sk,
+            bucket,
+            key,
+            BytesMut::from(obj.into_inner().as_ref()),
+        )
+        .map_err(|e| e.to_string())?;
         // `decrypt_after_get` returns the Padmé-padded plaintext (padding is
         // stripped on GET using `Metadata::size`, not by the decrypt call
         // itself) — trim to the recorded true size before re-encrypting, or
@@ -330,11 +384,22 @@ async fn run_rekey(
             padded
         };
 
-        let (guard, sink, write_offset) = storage.begin_streaming_put(bucket, key).await.map_err(|e| e.to_string())?;
-        let (sink, plaintext_metrics, cipher_metadata) =
-            cipher::encrypt_bytes_for_put(&new_pk, newest.epoch, &plaintext, sink, bucket, key, write_offset, chunk_size)
-                .await
-                .map_err(|e| e.to_string())?;
+        let (guard, sink, write_offset) = storage
+            .begin_streaming_put(bucket, key)
+            .await
+            .map_err(|e| e.to_string())?;
+        let (sink, plaintext_metrics, cipher_metadata) = cipher::encrypt_bytes_for_put(
+            &new_pk,
+            newest.epoch,
+            &plaintext,
+            sink,
+            bucket,
+            key,
+            write_offset,
+            chunk_size,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
         guard
             .commit(
                 sink,
@@ -354,18 +419,25 @@ async fn run_rekey(
     }
 
     // Prune every epoch below the newest and persist.
-    let mut cfg = authoritative_config(storage, cluster, bucket).await.map_err(|e| e.to_string())?;
+    let mut cfg = authoritative_config(storage, cluster, bucket)
+        .await
+        .map_err(|e| e.to_string())?;
     cfg.keys.retain(|k| k.epoch == newest.epoch);
-    persist_config(storage, cluster, bucket, &cfg).await.map_err(|e| e.to_string())?;
+    persist_config(storage, cluster, bucket, &cfg)
+        .await
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
-
 
 /// Enumerate every `(key, key_epoch)` pair in `bucket` whose recorded epoch
 /// is older than `current_epoch`. Buffers the whole (typically small,
 /// shrinking-over-time) stale set in memory up front so [`run_rekey`] can
 /// report a real percentage rather than an unbounded running count.
-async fn collect_stale_keys(storage: &AnyStorage, bucket: &str, current_epoch: u32) -> Result<Vec<(String, u32)>, y2q_core::Error> {
+async fn collect_stale_keys(
+    storage: &AnyStorage,
+    bucket: &str,
+    current_epoch: u32,
+) -> Result<Vec<(String, u32)>, y2q_core::Error> {
     let mut out = Vec::new();
     let mut after = None;
     loop {
@@ -401,19 +473,41 @@ fn base64_decode(s: &str) -> Result<Vec<u8>, base64::DecodeError> {
 /// Read `bucket`'s config from the authoritative source: raft in-memory
 /// state when clustered (the local filesystem projection can lag), the local
 /// sidecar otherwise. Same pattern `set_acl` uses.
-async fn authoritative_config(storage: &AnyStorage, cluster: Option<&ClusterRuntime>, bucket: &str) -> Result<BucketConfig, AppError> {
+async fn authoritative_config(
+    storage: &AnyStorage,
+    cluster: Option<&ClusterRuntime>,
+    bucket: &str,
+) -> Result<BucketConfig, AppError> {
     match cluster {
-        Some(rt) => Ok(rt.controller.control_state().await.buckets.get(bucket).cloned().unwrap_or_default()),
-        None => storage.get_bucket_config(bucket).await.map_err(AppError::from),
+        Some(rt) => Ok(rt
+            .controller
+            .control_state()
+            .await
+            .buckets
+            .get(bucket)
+            .cloned()
+            .unwrap_or_default()),
+        None => storage
+            .get_bucket_config(bucket)
+            .await
+            .map_err(AppError::from),
     }
 }
 
 /// Persist `cfg` for `bucket` through the same path `set_acl` uses: raft
 /// `SetBucketConfig` when clustered, the local sidecar otherwise.
-async fn persist_config(storage: &AnyStorage, cluster: Option<&ClusterRuntime>, bucket: &str, cfg: &BucketConfig) -> Result<(), AppError> {
+async fn persist_config(
+    storage: &AnyStorage,
+    cluster: Option<&ClusterRuntime>,
+    bucket: &str,
+    cfg: &BucketConfig,
+) -> Result<(), AppError> {
     match cluster {
         Some(rt) => cluster::cluster_set_bucket_config(rt, bucket, cfg).await,
-        None => storage.set_bucket_config(bucket, cfg).await.map_err(AppError::from),
+        None => storage
+            .set_bucket_config(bucket, cfg)
+            .await
+            .map_err(AppError::from),
     }
 }
 

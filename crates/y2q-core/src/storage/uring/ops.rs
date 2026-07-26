@@ -580,18 +580,18 @@ async fn do_put(
             crate::checksum::checksum_b64(&payload),
         ),
     };
-    let (cipher_size, cipher_checksum, kem_alg, aead_alg, envelope_version, key_epoch) = match cipher_metadata
-    {
-        Some(c) => (
-            Some(c.cipher_size),
-            Some(c.cipher_checksum_b64),
-            Some(c.kem_alg),
-            Some(c.aead_alg),
-            Some(c.envelope_version),
-            Some(c.key_epoch),
-        ),
-        None => (None, None, None, None, None, None),
-    };
+    let (cipher_size, cipher_checksum, kem_alg, aead_alg, envelope_version, key_epoch) =
+        match cipher_metadata {
+            Some(c) => (
+                Some(c.cipher_size),
+                Some(c.cipher_checksum_b64),
+                Some(c.kem_alg),
+                Some(c.aead_alg),
+                Some(c.envelope_version),
+                Some(c.key_epoch),
+            ),
+            None => (None, None, None, None, None, None),
+        };
 
     let now = now_nanos();
     let created = prior_created.unwrap_or(now);

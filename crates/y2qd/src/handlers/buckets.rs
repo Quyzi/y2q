@@ -206,8 +206,18 @@ pub async fn set_config(
     // committed, and this endpoint's full-replace write would silently roll
     // that change back (most dangerously the bucket's `keys`).
     let mut cfg = match cluster.as_ref() {
-        Some(rt) => rt.controller.control_state().await.buckets.get(&bucket).cloned().unwrap_or_default(),
-        None => storage.get_bucket_config(&bucket).await.map_err(AppError::from)?,
+        Some(rt) => rt
+            .controller
+            .control_state()
+            .await
+            .buckets
+            .get(&bucket)
+            .cloned()
+            .unwrap_or_default(),
+        None => storage
+            .get_bucket_config(&bucket)
+            .await
+            .map_err(AppError::from)?,
     };
     cfg.quota_bytes = body.quota_bytes;
     cfg.default_sse = body.default_sse;

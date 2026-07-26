@@ -214,14 +214,24 @@ pub trait MetadataCipher {
     /// metadata, the bucket config key for bucket config) for storage,
     /// bound to `object_id` via AAD so the blob cannot be relocated to a
     /// different object's/bucket's storage location and still decrypt.
-    fn encrypt_meta(&self, key: &[u8; 32], json: &[u8], object_id: &str) -> Result<Vec<u8>, Self::Error>;
+    fn encrypt_meta(
+        &self,
+        key: &[u8; 32],
+        json: &[u8],
+        object_id: &str,
+    ) -> Result<Vec<u8>, Self::Error>;
 
     /// Open a metadata blob under a derived key, requiring it to have been
     /// sealed for the same `object_id`. A blob without the recognized
     /// version byte is rejected rather than treated as legacy plaintext; a
     /// blob sealed for a different object fails the same way as a tampered
     /// blob.
-    fn decrypt_meta(&self, key: &[u8; 32], blob: &[u8], object_id: &str) -> Result<Vec<u8>, Self::Error>;
+    fn decrypt_meta(
+        &self,
+        key: &[u8; 32],
+        blob: &[u8],
+        object_id: &str,
+    ) -> Result<Vec<u8>, Self::Error>;
 }
 
 /// Shared, in-memory holder for the node-derived structural keys (Index Key,

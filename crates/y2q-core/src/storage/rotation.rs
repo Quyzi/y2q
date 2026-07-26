@@ -73,6 +73,18 @@ fn io_err(bucket: &str, operation: &str, e: std::io::Error) -> Error {
     internal(bucket, operation, e.to_string())
 }
 
+/// The six old/new key pairs [`rotate_storage_tree`] needs, grouped to avoid
+/// a six-`&[u8; 32]`-argument footgun (transposing old/new or path/omk/bck by
+/// position is an easy mistake with bare positional args).
+pub struct RotationKeys<'a> {
+    pub old_path_key: &'a [u8; 32],
+    pub new_path_key: &'a [u8; 32],
+    pub old_omk: &'a [u8; 32],
+    pub new_omk: &'a [u8; 32],
+    pub old_bck: &'a [u8; 32],
+    pub new_bck: &'a [u8; 32],
+}
+
 /// Rotate every bucket in `buckets` (plaintext names, read from the
 /// still-old-key-openable index by the caller before this runs) from the
 /// old node-derived keys to the new ones. Safe to re-run after an
@@ -80,13 +92,16 @@ fn io_err(bucket: &str, operation: &str, e: std::io::Error) -> Error {
 pub async fn rotate_storage_tree(
     base_path: &Path,
     buckets: &[String],
-    old_path_key: &[u8; 32],
-    new_path_key: &[u8; 32],
-    old_omk: &[u8; 32],
-    new_omk: &[u8; 32],
-    old_bck: &[u8; 32],
-    new_bck: &[u8; 32],
+    keys: &RotationKeys<'_>,
 ) -> Result<RotationStats, Error> {
+    let RotationKeys {
+        old_path_key,
+        new_path_key,
+        old_omk,
+        new_omk,
+        old_bck,
+        new_bck,
+    } = *keys;
     let mut stats = RotationStats::default();
     for bucket in buckets {
         let old_dir = bucket_dir_path(base_path, old_path_key, bucket);
@@ -109,7 +124,8 @@ pub async fn rotate_storage_tree(
             .await
             .map_err(|e| io_err(bucket, "rotate-node-key", e))?;
         for path in obj_files {
-            let migrated = migrate_object_file(&path, old_omk, new_omk, new_path_key, bucket).await?;
+            let migrated =
+                migrate_object_file(&path, old_omk, new_omk, new_path_key, bucket).await?;
             if migrated {
                 stats.objects_migrated += 1;
             } else {
@@ -117,7 +133,15 @@ pub async fn rotate_storage_tree(
             }
         }
 
-        migrate_bucket_config(&old_dir, bucket, old_path_key, new_path_key, old_bck, new_bck).await?;
+        migrate_bucket_config(
+            &old_dir,
+            bucket,
+            old_path_key,
+            new_path_key,
+            old_bck,
+            new_bck,
+        )
+        .await?;
 
         // Rename the bucket directory itself — last, so a crash before this
         // point still finds the bucket under its old name.
@@ -140,12 +164,24 @@ async fn migrate_object_file(
     bucket: &str,
 ) -> Result<bool, Error> {
     let current_id = object_id_from_path(path)
-        .ok_or_else(|| internal(bucket, "rotate-node-key", "cannot derive object id from path".to_owned()))?
+        .ok_or_else(|| {
+            internal(
+                bucket,
+                "rotate-node-key",
+                "cannot derive object id from path".to_owned(),
+            )
+        })?
         .to_owned();
 
-    let bytes = tokio::fs::read(path).await.map_err(|e| io_err(bucket, "rotate-node-key", e))?;
+    let bytes = tokio::fs::read(path)
+        .await
+        .map_err(|e| io_err(bucket, "rotate-node-key", e))?;
     if bytes.len() < HEADER_SIZE {
-        return Err(internal(bucket, "rotate-node-key", "object file shorter than header".to_owned()));
+        return Err(internal(
+            bucket,
+            "rotate-node-key",
+            "object file shorter than header".to_owned(),
+        ));
     }
     let mut header_buf = [0u8; HEADER_SIZE];
     header_buf.copy_from_slice(&bytes[..HEADER_SIZE]);
@@ -155,7 +191,11 @@ async fn migrate_object_file(
     let meta_start = header.meta_offset() as usize;
     let meta_end = meta_start + header.meta_len as usize;
     if meta_end > bytes.len() {
-        return Err(internal(bucket, "rotate-node-key", "meta block extends past end of file".to_owned()));
+        return Err(internal(
+            bucket,
+            "rotate-node-key",
+            "meta block extends past end of file".to_owned(),
+        ));
     }
     let data = &bytes[data_start..meta_start];
     let meta_bytes = &bytes[meta_start..meta_end];
@@ -173,11 +213,17 @@ async fn migrate_object_file(
         .map_err(|e| internal(bucket, "rotate-node-key", format!("parse metadata: {e}")))?;
 
     let new_id = encode_object_id(new_path_key, &metadata.bucket, &metadata.key);
-    let bucket_dir = path
-        .ancestors()
-        .nth(3)
-        .ok_or_else(|| internal(bucket, "rotate-node-key", "object path too shallow".to_owned()))?;
-    let new_path = bucket_dir.join(&new_id[0..2]).join(&new_id[2..4]).join(format!("{new_id}.obj"));
+    let bucket_dir = path.ancestors().nth(3).ok_or_else(|| {
+        internal(
+            bucket,
+            "rotate-node-key",
+            "object path too shallow".to_owned(),
+        )
+    })?;
+    let new_path = bucket_dir
+        .join(&new_id[0..2])
+        .join(&new_id[2..4])
+        .join(format!("{new_id}.obj"));
 
     if tokio::fs::try_exists(&new_path).await.unwrap_or(false) {
         // The new file was already written by a prior interrupted run; only
@@ -188,8 +234,13 @@ async fn migrate_object_file(
         return Ok(false);
     }
 
-    let new_meta = encrypt_meta(new_omk, &plain_json, &new_id)
-        .map_err(|e| internal(bucket, "rotate-node-key", format!("re-encrypt metadata: {e}")))?;
+    let new_meta = encrypt_meta(new_omk, &plain_json, &new_id).map_err(|e| {
+        internal(
+            bucket,
+            "rotate-node-key",
+            format!("re-encrypt metadata: {e}"),
+        )
+    })?;
     // AES-256-GCM ciphertext length is exactly plaintext length + fixed
     // overhead, so re-encrypting the same plaintext always yields the same
     // length — the header's `meta_len` needs no change.
@@ -208,10 +259,16 @@ async fn migrate_object_file(
             .map_err(|e| io_err(bucket, "rotate-node-key", e))?;
     }
     let tmp_path = new_path.with_extension("obj.rotate-tmp");
-    tokio::fs::write(&tmp_path, &out).await.map_err(|e| io_err(bucket, "rotate-node-key", e))?;
-    tokio::fs::rename(&tmp_path, &new_path).await.map_err(|e| io_err(bucket, "rotate-node-key", e))?;
+    tokio::fs::write(&tmp_path, &out)
+        .await
+        .map_err(|e| io_err(bucket, "rotate-node-key", e))?;
+    tokio::fs::rename(&tmp_path, &new_path)
+        .await
+        .map_err(|e| io_err(bucket, "rotate-node-key", e))?;
     if new_path != path {
-        tokio::fs::remove_file(path).await.map_err(|e| io_err(bucket, "rotate-node-key", e))?;
+        tokio::fs::remove_file(path)
+            .await
+            .map_err(|e| io_err(bucket, "rotate-node-key", e))?;
     }
     Ok(true)
 }
@@ -239,14 +296,28 @@ async fn migrate_bucket_config(
         return Ok(()); // already migrated
     }
     let old_aad = encode_bucket_dir(old_path_key, bucket);
-    let plain = decrypt_meta(old_bck, &bytes, &old_aad)
-        .map_err(|_| internal(bucket, "rotate-node-key", "bucket config decrypts under neither the old nor the new node key".to_owned()))?;
+    let plain = decrypt_meta(old_bck, &bytes, &old_aad).map_err(|_| {
+        internal(
+            bucket,
+            "rotate-node-key",
+            "bucket config decrypts under neither the old nor the new node key".to_owned(),
+        )
+    })?;
 
-    let new_bytes = encrypt_meta(new_bck, &plain, &new_aad)
-        .map_err(|e| internal(bucket, "rotate-node-key", format!("re-encrypt bucket config: {e}")))?;
+    let new_bytes = encrypt_meta(new_bck, &plain, &new_aad).map_err(|e| {
+        internal(
+            bucket,
+            "rotate-node-key",
+            format!("re-encrypt bucket config: {e}"),
+        )
+    })?;
     let tmp = path.with_extension("json.rotate-tmp");
-    tokio::fs::write(&tmp, &new_bytes).await.map_err(|e| io_err(bucket, "rotate-node-key", e))?;
-    tokio::fs::rename(&tmp, &path).await.map_err(|e| io_err(bucket, "rotate-node-key", e))?;
+    tokio::fs::write(&tmp, &new_bytes)
+        .await
+        .map_err(|e| io_err(bucket, "rotate-node-key", e))?;
+    tokio::fs::rename(&tmp, &path)
+        .await
+        .map_err(|e| io_err(bucket, "rotate-node-key", e))?;
     Ok(())
 }
 

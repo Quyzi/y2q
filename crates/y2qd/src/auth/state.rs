@@ -31,11 +31,7 @@ pub struct AuthState {
 }
 
 impl AuthState {
-    pub fn new(
-        user_store: UserStore,
-        config: AuthConfig,
-        argon2_config: Argon2Config,
-    ) -> Self {
+    pub fn new(user_store: UserStore, config: AuthConfig, argon2_config: Argon2Config) -> Self {
         let dummy_record = Self::build_dummy_record(&argon2_config);
         Self {
             user_store,

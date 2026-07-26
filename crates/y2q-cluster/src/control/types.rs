@@ -10,8 +10,8 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
-use y2q_core::{BucketConfig, BucketKeyVersion};
 use y2q_core::crypto::{Role, UserRecord};
+use y2q_core::{BucketConfig, BucketKeyVersion};
 
 use crate::hashing::chain::ChainTable;
 use crate::hashing::ring::Ring;

@@ -466,14 +466,13 @@ pub(crate) async fn get_bucket_config_impl(
     match tokio::fs::read(&path).await {
         Ok(bytes) => {
             let object_id = encode_bucket_dir(path_key, bucket);
-            let plain = decrypt_meta(config_key, &bytes, &object_id).map_err(|e| {
-                Error::InternalError {
+            let plain =
+                decrypt_meta(config_key, &bytes, &object_id).map_err(|e| Error::InternalError {
                     bucket: bucket.to_owned(),
                     key: String::new(),
                     operation: "get_bucket_config".to_owned(),
                     message: format!("decrypt config: {e}"),
-                }
-            })?;
+                })?;
             serde_json::from_slice(&plain).map_err(|e| Error::InternalError {
                 bucket: bucket.to_owned(),
                 key: String::new(),
@@ -515,12 +514,13 @@ pub(crate) async fn set_bucket_config_impl(
         message: format!("encode config: {e}"),
     })?;
     let object_id = encode_bucket_dir(path_key, bucket);
-    let ciphertext = encrypt_meta(config_key, &json, &object_id).map_err(|e| Error::InternalError {
-        bucket: bucket.to_owned(),
-        key: String::new(),
-        operation: "set_bucket_config".to_owned(),
-        message: format!("encrypt config: {e}"),
-    })?;
+    let ciphertext =
+        encrypt_meta(config_key, &json, &object_id).map_err(|e| Error::InternalError {
+            bucket: bucket.to_owned(),
+            key: String::new(),
+            operation: "set_bucket_config".to_owned(),
+            message: format!("encrypt config: {e}"),
+        })?;
     let path = dir.join(BUCKET_CONFIG_FILE);
     let tmp = dir.join(".y2q-bucket.json.tmp");
     tokio::fs::write(&tmp, &ciphertext)
@@ -545,12 +545,14 @@ pub(crate) async fn set_bucket_config_impl(
 /// Read the bucket-config key (BCK) from `node_keys`, erroring if the node
 /// key has not been installed (which should never happen post-boot).
 pub(crate) fn require_bucket_config_key(node_keys: &NodeKeySlot) -> Result<[u8; 32], Error> {
-    node_keys.bucket_config_key().ok_or_else(|| Error::InternalError {
-        bucket: String::new(),
-        key: String::new(),
-        operation: "bucket-config".to_owned(),
-        message: "bucket config operation attempted without an installed node key".to_owned(),
-    })
+    node_keys
+        .bucket_config_key()
+        .ok_or_else(|| Error::InternalError {
+            bucket: String::new(),
+            key: String::new(),
+            operation: "bucket-config".to_owned(),
+            message: "bucket config operation attempted without an installed node key".to_owned(),
+        })
 }
 
 pub(crate) async fn bucket_usage_impl(index: &MetadataIndex, bucket: &str) -> Result<u64, Error> {
@@ -906,7 +908,8 @@ impl FilesystemStorage {
 
         let (is_overwrite, prior_created) = match tokio::fs::metadata(&obj_path).await {
             Ok(_) => {
-                let created = read_obj_created(&obj_path, self.mek.object_metadata_key().as_ref()).await;
+                let created =
+                    read_obj_created(&obj_path, self.mek.object_metadata_key().as_ref()).await;
                 (true, created)
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => (false, None),
@@ -1139,7 +1142,8 @@ impl Storage for FilesystemStorage {
 
             let (is_overwrite, prior_created) = match tokio::fs::metadata(&obj_path).await {
                 Ok(_) => {
-                    let created = read_obj_created(&obj_path, self.mek.object_metadata_key().as_ref()).await;
+                    let created =
+                        read_obj_created(&obj_path, self.mek.object_metadata_key().as_ref()).await;
                     (true, created)
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => (false, None),
@@ -1223,7 +1227,8 @@ impl Storage for FilesystemStorage {
                         bucket: bucket.to_owned(),
                         key: key.to_owned(),
                         operation: "put".to_owned(),
-                        message: "metadata write attempted without an installed node key".to_owned(),
+                        message: "metadata write attempted without an installed node key"
+                            .to_owned(),
                     });
                 }
             };
@@ -2355,9 +2360,15 @@ mod tests {
         let base = dir.path().join("data");
         let path_key = test_path_key();
         let config_key = crate::crypto::derive_bucket_config_key(&TEST_NODE_KEY);
-        set_bucket_config_impl(&base, &path_key, &config_key, "b", &crate::BucketConfig::default())
-            .await
-            .unwrap();
+        set_bucket_config_impl(
+            &base,
+            &path_key,
+            &config_key,
+            "b",
+            &crate::BucketConfig::default(),
+        )
+        .await
+        .unwrap();
 
         // Same path key (so the sidecar is found at the same on-disk
         // location), a different config key: the AEAD no longer verifies.

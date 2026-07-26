@@ -191,7 +191,10 @@ pub async fn authorize_bucket(
         // otherwise) — so a Write against a not-yet-existing bucket still
         // reports `ClaimOwnership` regardless of the flag.
         return if matches!(required, BucketPermission::Write)
-            && !storage.bucket_exists(bucket).await.map_err(AppError::from)?
+            && !storage
+                .bucket_exists(bucket)
+                .await
+                .map_err(AppError::from)?
         {
             Ok(Decision::ClaimOwnership)
         } else {
@@ -215,7 +218,10 @@ pub async fn authorize_bucket(
         // an object nobody — not even the admin who wrote it — can decrypt.
         if cfg.owner.is_none()
             && matches!(required, BucketPermission::Write)
-            && !storage.bucket_exists(bucket).await.map_err(AppError::from)?
+            && !storage
+                .bucket_exists(bucket)
+                .await
+                .map_err(AppError::from)?
         {
             return Ok(Decision::ClaimOwnership);
         }
@@ -288,13 +294,17 @@ pub async fn claim_ownership(
     // `false` (bucket already existed) never generates key material at all,
     // narrowing — though not eliminating, see above — the window where two
     // racing writers each mint their own epoch-0 keypair.
-    let created = storage.create_bucket(bucket).await.map_err(AppError::from)?;
+    let created = storage
+        .create_bucket(bucket)
+        .await
+        .map_err(AppError::from)?;
     let mut cfg = storage
         .get_bucket_config(bucket)
         .await
         .map_err(AppError::from)?;
     if created && cfg.owner.is_none() {
-        let key = crate::bucket_keys::new_owner_key(user_store, bucket, session).map_err(AppError)?;
+        let key =
+            crate::bucket_keys::new_owner_key(user_store, bucket, session).map_err(AppError)?;
         cfg.owner = Some(session.username.clone());
         cfg.keys.push(key);
         storage

@@ -49,7 +49,10 @@ pub fn load_new_node_key(new_node_key_file: &str) -> Result<Zeroizing<[u8; 32]>,
     load_node_key_via(NEW_NODE_KEY_ENV_VAR, new_node_key_file)
 }
 
-fn load_node_key_via(env_var: &str, node_key_file: &str) -> Result<Zeroizing<[u8; 32]>, CryptoError> {
+fn load_node_key_via(
+    env_var: &str,
+    node_key_file: &str,
+) -> Result<Zeroizing<[u8; 32]>, CryptoError> {
     if let Ok(env_val) = std::env::var(env_var) {
         let raw = decode_node_key(&env_val)?;
         return Ok(Zeroizing::new(*extract_node_key(&raw)));
@@ -57,9 +60,8 @@ fn load_node_key_via(env_var: &str, node_key_file: &str) -> Result<Zeroizing<[u8
     if node_key_file.trim().is_empty() {
         return Err(CryptoError::NodeKeyMissing);
     }
-    let bytes = std::fs::read(node_key_file).map_err(|e| {
-        CryptoError::NodeKeyMalformed(format!("read {node_key_file}: {e}"))
-    })?;
+    let bytes = std::fs::read(node_key_file)
+        .map_err(|e| CryptoError::NodeKeyMalformed(format!("read {node_key_file}: {e}")))?;
     let raw = match std::str::from_utf8(&bytes) {
         Ok(text) => decode_node_key(text.trim())?,
         Err(_) => bytes,
@@ -115,7 +117,10 @@ pub fn decode_node_key(text: &str) -> Result<Vec<u8>, CryptoError> {
 }
 
 fn decode_hex(text: &str) -> Option<Vec<u8>> {
-    if text.is_empty() || text.len() % 2 != 0 || !text.bytes().all(|b| b.is_ascii_hexdigit()) {
+    if text.is_empty()
+        || !text.len().is_multiple_of(2)
+        || !text.bytes().all(|b| b.is_ascii_hexdigit())
+    {
         return None;
     }
     let mut out = Vec::with_capacity(text.len() / 2);
@@ -214,7 +219,7 @@ mod tests {
             Err(CryptoError::NodeKeyMalformed(_))
         ));
         // 31 raw bytes, hex-encoded (62 hex chars) -> decodes to 31 bytes, too short.
-        let short_hex: String = std::iter::repeat("ab").take(31).collect();
+        let short_hex: String = "ab".repeat(31);
         assert!(matches!(
             decode_node_key(&short_hex),
             Err(CryptoError::NodeKeyMalformed(_))
@@ -271,8 +276,7 @@ mod tests {
         std::fs::create_dir_all(outside.parent().unwrap()).unwrap();
         std::fs::write(&outside, b"x").unwrap();
         assert!(
-            check_node_key_location(outside.to_str().unwrap(), &storage_dir, &keystore_dir)
-                .is_ok()
+            check_node_key_location(outside.to_str().unwrap(), &storage_dir, &keystore_dir).is_ok()
         );
     }
 }

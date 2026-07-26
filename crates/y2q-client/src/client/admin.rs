@@ -1,6 +1,8 @@
 use crate::client::Y2qClient;
 use crate::error::ClientError;
-use crate::model::{ClearStaleLocksResponse, RebuildStatus, RekeyStatus, RotateKeyResponse, StaleLockEntry};
+use crate::model::{
+    ClearStaleLocksResponse, RebuildStatus, RekeyStatus, RotateKeyResponse, StaleLockEntry,
+};
 
 impl Y2qClient {
     pub async fn rebuild_start(&self) -> Result<(), ClientError> {

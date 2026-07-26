@@ -1,7 +1,10 @@
 //! Admin operations shared by the CLI and the TUI: index rebuild, stale-lock
 //! management, user administration, and metrics.
 
-use y2q_client::{AclBody, ClientError, RebuildStatus, RekeyStatus, ResetIdentityResponse, RotateKeyResponse, StaleLockEntry, UserView, Y2qClient};
+use y2q_client::{
+    AclBody, ClientError, RebuildStatus, RekeyStatus, ResetIdentityResponse, RotateKeyResponse,
+    StaleLockEntry, UserView, Y2qClient,
+};
 
 /// Start a metadata index rebuild.
 pub async fn rebuild_start(client: &Y2qClient) -> Result<(), ClientError> {
@@ -42,7 +45,11 @@ pub async fn list_users(client: &Y2qClient) -> Result<Vec<UserView>, ClientError
 }
 
 /// Delete a user. `force` bypasses the guard against stranding an owned bucket.
-pub async fn delete_user(client: &Y2qClient, username: &str, force: bool) -> Result<(), ClientError> {
+pub async fn delete_user(
+    client: &Y2qClient,
+    username: &str,
+    force: bool,
+) -> Result<(), ClientError> {
     client.delete_user(username, force).await
 }
 
@@ -100,7 +107,10 @@ pub async fn prometheus_metrics(client: &Y2qClient) -> Result<String, ClientErro
 }
 
 /// Create a new bucket key epoch.
-pub async fn rotate_bucket_key(client: &Y2qClient, bucket: &str) -> Result<RotateKeyResponse, ClientError> {
+pub async fn rotate_bucket_key(
+    client: &Y2qClient,
+    bucket: &str,
+) -> Result<RotateKeyResponse, ClientError> {
     client.rotate_bucket_key(bucket).await
 }
 

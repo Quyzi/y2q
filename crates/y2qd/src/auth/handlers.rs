@@ -11,7 +11,9 @@ use actix_web::{HttpResponse, web};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
-use y2q_core::crypto::{CREDENTIAL_SLOTS, CredentialSlot, Role, SlotPayload, UserRecord, UserSummary, kdf};
+use y2q_core::crypto::{
+    CREDENTIAL_SLOTS, CredentialSlot, Role, SlotPayload, UserRecord, UserSummary, kdf,
+};
 use y2q_core::{AnyStorage, BucketConfig, Listing};
 use zeroize::Zeroizing;
 
@@ -456,7 +458,14 @@ pub async fn add_user(
     let params = state.new_argon2_params();
     let username_for_slots = username.clone();
     let (slots, params) = tokio::task::spawn_blocking(move || {
-        let slot0 = kdf::new_slot(&username_for_slots, 0, password.as_bytes(), &params, role, false)?;
+        let slot0 = kdf::new_slot(
+            &username_for_slots,
+            0,
+            password.as_bytes(),
+            &params,
+            role,
+            false,
+        )?;
         let decoys = kdf::decoy_slots_from(&username_for_slots, 1, &params)?;
         let mut slots = vec![slot0];
         slots.extend(decoys);
@@ -807,7 +816,13 @@ pub async fn reset_identity(
     }
 
     let mut rec = match cluster.as_ref() {
-        Some(rt) => rt.controller.control_state().await.users.get(&username).cloned(),
+        Some(rt) => rt
+            .controller
+            .control_state()
+            .await
+            .users
+            .get(&username)
+            .cloned(),
         None => state
             .user_store
             .get(&username)
@@ -822,7 +837,14 @@ pub async fn reset_identity(
     let role = rec.role;
     let params = rec.kdf.clone();
     let slots = tokio::task::spawn_blocking(move || {
-        let slot0 = kdf::new_slot(&username_for_slots, 0, password.as_bytes(), &params, role, false)?;
+        let slot0 = kdf::new_slot(
+            &username_for_slots,
+            0,
+            password.as_bytes(),
+            &params,
+            role,
+            false,
+        )?;
         let decoys = kdf::decoy_slots_from(&username_for_slots, 1, &params)?;
         let mut slots = vec![slot0];
         slots.extend(decoys);
@@ -844,7 +866,12 @@ pub async fn reset_identity(
     // Every live session carries the old (now-replaced) identity secret key.
     state.sessions.revoke_user(&username);
 
-    let orphaned = scrub_user_grants(storage.get_ref(), cluster.as_ref().map(|d| d.get_ref()), &username).await?;
+    let orphaned = scrub_user_grants(
+        storage.get_ref(),
+        cluster.as_ref().map(|d| d.get_ref()),
+        &username,
+    )
+    .await?;
 
     Ok(HttpResponse::Ok().json(ResetIdentityResponse {
         orphaned_buckets: orphaned,
@@ -1077,7 +1104,14 @@ pub async fn create_persona(
             if collides {
                 return Ok(None);
             }
-            let fresh = kdf::new_slot(&username, slot, password.as_bytes(), &params, role, revoke_other_sessions)?;
+            let fresh = kdf::new_slot(
+                &username,
+                slot,
+                password.as_bytes(),
+                &params,
+                role,
+                revoke_other_sessions,
+            )?;
             Ok(Some(fresh))
         },
     )
@@ -1146,7 +1180,9 @@ pub async fn delete_persona(
         .upsert(&updated)
         .map_err(|e| AuthError::Backend(e.to_string()))?;
 
-    state.sessions.revoke_user_persona(&auth.username, slot as u8);
+    state
+        .sessions
+        .revoke_user_persona(&auth.username, slot as u8);
     Ok(HttpResponse::NoContent().finish())
 }
 

@@ -69,7 +69,8 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         web::resource("/api/v1/personas/me").route(web::get().to(auth_handlers::whoami_persona)),
     );
     cfg.service(
-        web::resource("/api/v1/personas/{slot}").route(web::delete().to(auth_handlers::delete_persona)),
+        web::resource("/api/v1/personas/{slot}")
+            .route(web::delete().to(auth_handlers::delete_persona)),
     );
     cfg.service(
         web::resource("/api/v1/personas/{slot}/grant")
@@ -108,7 +109,8 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             .route(web::put().to(acl::set_acl)),
     );
     cfg.service(
-        web::resource("/api/v1/buckets/{bucket}/rotate-key").route(web::post().to(keys::rotate_key)),
+        web::resource("/api/v1/buckets/{bucket}/rotate-key")
+            .route(web::post().to(keys::rotate_key)),
     );
     cfg.service(
         web::resource("/api/v1/buckets/{bucket}/rekey")

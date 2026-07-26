@@ -132,8 +132,18 @@ pub async fn set_acl(
     // fields it hadn't caught up to yet — most dangerously `keys`, wiping
     // out a bucket's just-claimed key material.
     let mut cfg = match cluster.as_ref() {
-        Some(rt) => rt.controller.control_state().await.buckets.get(&bucket).cloned().unwrap_or_default(),
-        None => storage.get_bucket_config(&bucket).await.map_err(AppError::from)?,
+        Some(rt) => rt
+            .controller
+            .control_state()
+            .await
+            .buckets
+            .get(&bucket)
+            .cloned()
+            .unwrap_or_default(),
+        None => storage
+            .get_bucket_config(&bucket)
+            .await
+            .map_err(AppError::from)?,
     };
 
     // Ownership transfer / assignment: only the current owner or a global admin
@@ -279,7 +289,11 @@ fn reseal_grantee(
     else {
         return Ok(());
     };
-    let identity_pks_b64: Vec<String> = rec.slots.iter().map(|s| s.identity_pk_b64.clone()).collect();
+    let identity_pks_b64: Vec<String> = rec
+        .slots
+        .iter()
+        .map(|s| s.identity_pk_b64.clone())
+        .collect();
     let mut slots_authorized = vec![false; CREDENTIAL_SLOTS];
     if authorized {
         slots_authorized[0] = true;
