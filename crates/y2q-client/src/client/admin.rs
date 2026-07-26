@@ -1,6 +1,6 @@
 use crate::client::Y2qClient;
 use crate::error::ClientError;
-use crate::model::{ClearStaleLocksResponse, RebuildStatus, StaleLockEntry};
+use crate::model::{ClearStaleLocksResponse, RebuildStatus, RekeyStatus, RotateKeyResponse, StaleLockEntry};
 
 impl Y2qClient {
     pub async fn rebuild_start(&self) -> Result<(), ClientError> {
@@ -38,6 +38,30 @@ impl Y2qClient {
         let resp = Self::check_status(resp).await?;
         let body = resp.json::<ClearStaleLocksResponse>().await?;
         Ok(body.removed)
+    }
+
+    /// Create a new bucket key epoch (`POST /api/v1/buckets/{bucket}/rotate-key`).
+    pub async fn rotate_bucket_key(&self, bucket: &str) -> Result<RotateKeyResponse, ClientError> {
+        let url = self.url(&format!("api/v1/buckets/{bucket}/rotate-key"));
+        let resp = self.authed(self.inner.post(url)).send().await?;
+        let resp = Self::check_status(resp).await?;
+        Ok(resp.json::<RotateKeyResponse>().await?)
+    }
+
+    /// Start a bucket rekey (`POST /api/v1/buckets/{bucket}/rekey`).
+    pub async fn rekey_start(&self, bucket: &str) -> Result<(), ClientError> {
+        let url = self.url(&format!("api/v1/buckets/{bucket}/rekey"));
+        let resp = self.authed(self.inner.post(url)).send().await?;
+        Self::check_status(resp).await?;
+        Ok(())
+    }
+
+    /// Query a bucket's rekey status (`GET /api/v1/buckets/{bucket}/rekey`).
+    pub async fn rekey_status(&self, bucket: &str) -> Result<RekeyStatus, ClientError> {
+        let url = self.url(&format!("api/v1/buckets/{bucket}/rekey"));
+        let resp = self.authed(self.inner.get(url)).send().await?;
+        let resp = Self::check_status(resp).await?;
+        Ok(resp.json::<RekeyStatus>().await?)
     }
 
     /// Fetch the raw Prometheus scrape body from `/metrics/prometheus`.

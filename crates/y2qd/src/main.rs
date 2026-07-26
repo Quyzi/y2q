@@ -73,7 +73,7 @@ use crate::config::LogFormat;
 use crate::span::Y2qRootSpanBuilder;
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
-use y2q_core::crypto::{Argon2Params, keystore as keystore_mod};
+use y2q_core::crypto::{Argon2Params, keystore as keystore_mod, node_key};
 use y2q_core::{AnyStorage, FilesystemStorage, StorageExt};
 
 #[cfg(target_os = "linux")]
@@ -81,12 +81,14 @@ use y2q_core::{UringStorage, storage::uring::UringConfig};
 
 mod auth;
 mod authz;
+mod bucket_keys;
 mod cipher;
 mod cli;
 mod cluster;
 mod config;
 mod error;
 mod handlers;
+mod node_key_rotation;
 pub(crate) mod observability;
 mod rate_limit;
 mod request_id;
@@ -136,6 +138,9 @@ impl<W: std::io::Write> std::io::Write for IgnoreBrokenPipe<W> {
         handlers::buckets::set_config,
         handlers::acl::get_acl,
         handlers::acl::set_acl,
+        handlers::keys::rotate_key,
+        handlers::keys::start_rekey,
+        handlers::keys::rekey_status,
         handlers::tags::handle,
         handlers::rebuild::start,
         handlers::rebuild::status,
@@ -145,10 +150,16 @@ impl<W: std::io::Write> std::io::Write for IgnoreBrokenPipe<W> {
         auth::handlers::refresh,
         auth::handlers::logout,
         auth::handlers::change_password,
+        auth::handlers::delete_user,
+        auth::handlers::reset_identity,
         auth::handlers::add_user,
         auth::handlers::list_users,
-        auth::handlers::delete_user,
         auth::handlers::set_role,
+        auth::handlers::create_persona,
+        auth::handlers::delete_persona,
+        auth::handlers::whoami_persona,
+        handlers::personas::grant_persona,
+        handlers::personas::revoke_persona_grant,
     ),
     components(schemas(
         error::ErrorBody,
@@ -157,6 +168,9 @@ impl<W: std::io::Write> std::io::Write for IgnoreBrokenPipe<W> {
         handlers::buckets::DeleteBucketResponse,
         handlers::buckets::BucketConfigBody,
         handlers::acl::AclBody,
+        handlers::keys::RotateKeyResponse,
+        handlers::keys::RekeyStartResponse,
+        handlers::keys::RekeyStatusResponse,
         handlers::tags::SetTagsResponse,
         handlers::list_objects::ListObjectsResponse,
         handlers::list_objects::MetadataView,
@@ -166,11 +180,17 @@ impl<W: std::io::Write> std::io::Write for IgnoreBrokenPipe<W> {
         handlers::locks::ClearStaleLocksResponse,
         auth::handlers::LoginRequest,
         auth::handlers::TokenResponse,
+        auth::handlers::ListUsersResponse,
+        auth::handlers::UserView,
+        auth::handlers::ResetIdentityRequest,
+        auth::handlers::ResetIdentityResponse,
         auth::handlers::ChangePasswordRequest,
         auth::handlers::AddUserRequest,
         auth::handlers::SetRoleRequest,
-        auth::handlers::ListUsersResponse,
-        auth::handlers::UserView,
+        auth::handlers::PersonaCreateRequest,
+        auth::handlers::PersonaCreateResponse,
+        auth::handlers::PersonaView,
+        handlers::personas::PersonaGrantBody,
     )),
     modifiers(&SecurityAddon),
     tags(
@@ -181,6 +201,7 @@ impl<W: std::io::Write> std::io::Write for IgnoreBrokenPipe<W> {
         (name = "admin", description = "Administrative operations — secondary-index rebuild, stale-lock cleanup"),
         (name = "auth", description = "Session login/refresh/logout and password change"),
         (name = "users", description = "Add, list, and delete users authorized to log in"),
+        (name = "personas", description = "Multiple passwords per user (duress personas) and self-service bucket sharing between them"),
     ),
 )]
 struct ApiDoc;
@@ -236,6 +257,17 @@ async fn main() -> std::io::Result<()> {
 
     tracing::info!(host = %cfg.server.host, port = cfg.server.port, "starting y2qd");
 
+    // Offline node-key rotation short-circuits the entire normal boot
+    // sequence: it acquires its own flock, walks the storage tree, and exits.
+    if cli.rotate_node_key {
+        let new_node_key_file = cli
+            .new_node_key_file
+            .as_deref()
+            .and_then(|p| p.to_str())
+            .unwrap_or("");
+        return node_key_rotation::run(&cfg, new_node_key_file).await;
+    }
+
     #[cfg(feature = "pyroscope")]
     let _pyroscope_agent = {
         let pcfg = &cfg.observability.pyroscope;
@@ -277,8 +309,26 @@ async fn main() -> std::io::Result<()> {
     // anything else — prevents two y2qd processes from racing over the
     // same keystore.
     let keystore_dir = PathBuf::from(&cfg.crypto.keystore_dir);
+    if keystore_mod::rotation_journal_exists(&keystore_dir) {
+        return Err(std::io::Error::other(node_key_rotation::INTERRUPTED_MESSAGE));
+    }
     let _flock = keystore_mod::acquire_lock(&keystore_dir)
         .map_err(|e| std::io::Error::other(format!("acquire keystore lock: {e}")))?;
+
+    // Resolve the operator-supplied node key. Never auto-generated — refuses
+    // to start without one. Also refuse a node_key_file that resolves inside
+    // storage.base_path or keystore_dir, so a copy of the data can't carry
+    // the key that protects it.
+    node_key::check_node_key_location(
+        &cfg.crypto.node_key_file,
+        std::path::Path::new(&cfg.storage.base_path),
+        &keystore_dir,
+    )
+    .map_err(std::io::Error::other)?;
+    let nk = node_key::load_node_key(&cfg.crypto.node_key_file)
+        .map_err(|e| std::io::Error::other(format!("node key: {e}")))?;
+    let node_key_verifier = y2q_core::crypto::derive_node_key_verifier(&nk);
+    let node_key_fingerprint = to_hex(&node_key_verifier);
 
     // Load or first-run the keystore.
     let argon2_for_first_run = Argon2Params::with_random_salt(
@@ -286,21 +336,19 @@ async fn main() -> std::io::Result<()> {
         cfg.crypto.argon2.t_cost,
         cfg.crypto.argon2.p_cost,
     );
-    let (public_keystore, user_store) = match keystore_mod::load(&keystore_dir) {
-        Ok(pair) => pair,
+    let user_store = match keystore_mod::load(&keystore_dir, &nk) {
+        Ok(store) => store,
         Err(y2q_core::crypto::CryptoError::KeystoreMissing(_)) => {
             tracing::info!(
                 dir = %keystore_dir.display(),
                 "no keystore found; running first-run setup"
             );
-            let outcome = keystore_mod::first_run(&keystore_dir, "root", argon2_for_first_run)
-                .map_err(|e| std::io::Error::other(format!("first-run setup: {e}")))?;
+            let outcome =
+                keystore_mod::first_run(&keystore_dir, "root", argon2_for_first_run, &nk)
+                    .map_err(|e| std::io::Error::other(format!("first-run setup: {e}")))?;
             print_first_run_password(&outcome.root_username, &outcome.root_password);
-            tracing::info!(
-                fingerprint = %outcome.keystore.fingerprint,
-                "keystore initialized"
-            );
-            (outcome.keystore, outcome.user_store)
+            tracing::info!(dir = %keystore_dir.display(), "keystore initialized");
+            outcome.user_store
         }
         Err(e) => {
             return Err(std::io::Error::other(format!("load keystore: {e}")));
@@ -312,16 +360,7 @@ async fn main() -> std::io::Result<()> {
     // of the admin endpoints — so ensure at least one administrator exists.
     reconcile_admin(&user_store)?;
 
-    tracing::info!(
-        fingerprint = %public_keystore.fingerprint,
-        "deployment public-key fingerprint"
-    );
-
-    // The Metadata Encryption Key is derived from the deployment secret key,
-    // which only becomes available after a login. The storage backend exposes a
-    // shared slot that the login path fills; `mek_ready` is fired on the first
-    // install so the deferred startup index rebuild can run with a MEK present.
-    let mek_ready = Arc::new(tokio::sync::Notify::new());
+    tracing::info!(node_key_fingerprint = %node_key_fingerprint[..16], "node key loaded");
 
     let index_path = cfg
         .storage
@@ -369,25 +408,46 @@ async fn main() -> std::io::Result<()> {
     });
     let storage_data = web::Data::new(storage);
 
-    // Build auth state after storage so it can share the MEK slot: a successful
-    // login derives the MEK from the unwrapped secret key and installs it here.
+    // Install the node key on the active backend — the daemon's own keys
+    // (index, paths, object metadata) now come from the operator, not from
+    // whoever logs in first. Drop the raw key immediately afterward; every
+    // holder from here on is a derived, domain-separated sub-key. Cluster
+    // builds also need the Control Store Key (CSK) to encrypt the Raft
+    // control redb; derive it now, before the raw node key is dropped.
+    let control_store_key = y2q_core::crypto::derive_control_store_key(&nk);
+    storage_data.install_node_key(*nk);
+    drop(nk);
+
+    // Startup auto-rebuild: repair index consistency after any unclean
+    // shutdown. Runs immediately — the node key is already installed, so
+    // there is no session to wait for.
+    {
+        let storage_clone = Arc::clone(storage_data.as_ref());
+        tokio::spawn(async move {
+            if let Err(e) = storage_clone.rebuild_cache().await {
+                tracing::warn!(error = %e, "startup cache rebuild failed to initiate");
+            } else {
+                tracing::info!("startup cache rebuild initiated");
+            }
+        });
+    }
+
     let auth_state = web::Data::new(AuthState::new(
-        public_keystore,
         user_store,
         cfg.auth.clone(),
         cfg.crypto.argon2.clone(),
-        Arc::clone(storage_data.as_ref()),
-        mek_ready.clone(),
     ));
 
-    // Build the cluster runtime (control plane) when clustering is enabled. This
-    // provisions the MEK at boot from the configured unlock user so the node can
-    // serve peer-forwarded writes without an interactive login.
+    // Build the cluster runtime (control plane) when clustering is enabled.
+    // Cluster admission is fingerprinted by the node-key verifier — every
+    // node already has its own node key, so there is no unlock secret to
+    // provision here.
     let cluster_runtime: Option<web::Data<cluster::ClusterRuntime>> = if cfg.cluster.enabled {
         let rt = cluster::build_runtime(
             &cfg,
-            auth_state.get_ref(),
             Arc::clone(storage_data.as_ref()),
+            &node_key_fingerprint,
+            control_store_key,
         )
         .await
         .map_err(|e| std::io::Error::other(format!("cluster startup: {e}")))?;
@@ -405,9 +465,8 @@ async fn main() -> std::io::Result<()> {
     } else {
         None
     };
-    let cluster_enabled = cfg.cluster.enabled;
 
-    // Background sweeper for expired sessions + idle-keystore drop.
+    // Background sweeper for expired sessions.
     {
         let auth_state = auth_state.clone();
         let interval = Duration::from_secs(cfg.auth.session_sweep_interval_seconds.max(1));
@@ -417,16 +476,6 @@ async fn main() -> std::io::Result<()> {
                 let removed = auth_state.sessions.sweep();
                 if removed > 0 {
                     tracing::debug!(removed, "swept expired sessions");
-                }
-                // When the idle keystore drop fires, zeroize the MEK too so no
-                // metadata key lingers in memory while no session is active. In
-                // cluster mode the MEK is provisioned for the process lifetime,
-                // so an idle session SK may still be dropped but the MEK must NOT
-                // be cleared — peer-forwarded writes depend on it.
-                let dropped = auth_state.keystore.reconcile(&auth_state.sessions);
-                if dropped && !cluster_enabled {
-                    auth_state.storage.clear_mek();
-                    tracing::debug!("idle: dropped secret key and zeroized MEK");
                 }
             }
         });
@@ -438,6 +487,7 @@ async fn main() -> std::io::Result<()> {
         chunk_size_bytes: cfg.crypto.envelope_chunk_size_bytes,
         max_body_bytes: cfg.server.max_body_bytes as u64,
     });
+    let rekey_registry = web::Data::new(handlers::keys::RekeyRegistry::new());
 
     // Background dirty flusher: drains best-effort PUT paths and fsyncs them.
     {
@@ -464,22 +514,6 @@ async fn main() -> std::io::Result<()> {
                         let _ = d.sync_all().await;
                     }
                 }
-            }
-        });
-    }
-
-    // Startup auto-rebuild: repair index consistency after any unclean shutdown.
-    // Deferred until the first login installs the MEK, since the rebuild reads
-    // and re-indexes encrypted on-disk metadata and would otherwise have no key.
-    {
-        let storage_clone = Arc::clone(storage_data.as_ref());
-        let mek_ready = mek_ready.clone();
-        tokio::spawn(async move {
-            mek_ready.notified().await;
-            if let Err(e) = storage_clone.rebuild_cache().await {
-                tracing::warn!(error = %e, "startup cache rebuild failed to initiate");
-            } else {
-                tracing::info!("startup cache rebuild initiated");
             }
         });
     }
@@ -555,6 +589,7 @@ async fn main() -> std::io::Result<()> {
             .app_data(label_limits.clone())
             .app_data(default_sync.clone())
             .app_data(encryption_params.clone())
+            .app_data(rekey_registry.clone())
             .app_data(auth_state.clone())
             .app_data(web::PayloadConfig::new(max_body_bytes));
         // Register cluster routes before handlers::configure so the specific
@@ -701,4 +736,14 @@ fn print_first_run_password(username: &str, password: &str) {
     println!("    password: {password}");
     println!("===========================================================");
     println!();
+}
+
+/// Lowercase-hex encode `bytes`.
+fn to_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
 }

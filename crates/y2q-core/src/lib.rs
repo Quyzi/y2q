@@ -155,6 +155,13 @@ pub struct Metadata {
     /// query. `None` outside of cluster writes.
     #[serde(default)]
     pub committed_at: Option<u64>,
+    /// Which bucket key epoch this object's envelope was encrypted under
+    /// (envelope v3's `key_epoch` header field, mirrored here so the rekey
+    /// job can enumerate stale objects straight from the index without
+    /// opening files). `None` for objects written before per-bucket keys
+    /// existed.
+    #[serde(default)]
+    pub key_epoch: Option<u32>,
 }
 
 /// Durability guarantee a PUT should provide before returning success.
@@ -237,6 +244,11 @@ pub struct CipherMetadata {
     pub aead_alg: String,
     /// Envelope format version number.
     pub envelope_version: u16,
+    /// Which bucket key epoch this envelope's `kem_ct` was encapsulated
+    /// against — mirrors [`crate::crypto::envelope::EnvelopeInfo::key_epoch`],
+    /// carried here so the caller can persist it directly into
+    /// [`Metadata::key_epoch`].
+    pub key_epoch: u32,
 }
 
 /// Default page size when [`ListOptions::limit`] is `None` or `Some(0)`.
@@ -421,6 +433,15 @@ pub enum Error {
         reason: String,
     },
 
+    /// A persona-management request was rejected: an out-of-range slot, or
+    /// (for `POST /api/v1/personas`) a caller's own record vanished
+    /// mid-request. Produced by the daemon's persona endpoints.
+    #[error("invalid persona request: {reason}")]
+    InvalidPersonaRequest {
+        /// Human-readable reason the request was rejected.
+        reason: String,
+    },
+
     /// `pubkey.json` is missing — the daemon cannot serve traffic until
     /// first-run setup completes.
     #[error("keystore not found at {path}")]
@@ -491,6 +512,31 @@ pub enum Error {
     Query {
         /// Human-readable parse or regex-compilation error.
         message: String,
+    },
+
+    /// A bucket-key rotation was refused because the bucket already holds the
+    /// maximum number of retained key epochs; a rekey must prune old epochs
+    /// (see [`crate::Error::RekeyAlreadyRunning`]'s sibling endpoint) before
+    /// another rotation is allowed.
+    #[error("bucket `{bucket}` has {count} retained key epochs (max {max}); run rekey to prune before rotating again")]
+    TooManyBucketKeyEpochs {
+        /// Bucket the rotation was refused on.
+        bucket: String,
+        /// Current number of retained epochs.
+        count: usize,
+        /// The configured maximum ([`crate::Error`] doesn't own this constant;
+        /// the caller — `y2qd`'s `bucket_keys` module — supplies it).
+        max: usize,
+    },
+
+    /// A bucket rekey was requested while one is already running for that
+    /// bucket. Mirrors [`Error::RebuildAlreadyRunning`] but scoped per
+    /// bucket, since rekey walks one bucket's objects rather than the whole
+    /// deployment's index.
+    #[error("rekey already in progress for bucket `{bucket}`")]
+    RekeyAlreadyRunning {
+        /// Bucket a rekey is already running against.
+        bucket: String,
     },
 }
 
@@ -598,6 +644,34 @@ pub struct BucketConfig {
     /// they have implicit full access. Absent/empty for legacy configs.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub acl: BTreeMap<String, BucketPermission>,
+    /// Bucket key versions, ascending by epoch. Writes always use the last
+    /// entry; reads select by the epoch in the object's envelope header.
+    /// Empty only for a bucket whose directory exists but was never created
+    /// through the API.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub keys: Vec<BucketKeyVersion>,
+}
+
+/// One epoch of a bucket's ML-KEM-768 keypair, plus who can currently open
+/// its secret half.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BucketKeyVersion {
+    /// Monotonic, starts at 0.
+    pub epoch: u32,
+    /// ML-KEM-768 public key, standard-base64. Cleartext — writes need only
+    /// this.
+    pub public_key_b64: String,
+    /// `AES-256-GCM(BWK, bucket_sk)`: this epoch's ML-KEM secret key under
+    /// its 32-byte bucket wrap key. One copy per epoch, not one per grantee.
+    pub sk_blob: crate::crypto::WrappedSk,
+    /// `username` → exactly `CREDENTIAL_SLOTS` sealed blobs, indexed by the
+    /// grantee's credential slot. Entry `i` carries the real BWK when that
+    /// user's persona `i` may read the bucket, and 32 random bytes when it
+    /// may not. Both are AEAD ciphertext of identical length, so the stored
+    /// value never reveals which of a user's personas hold access — nor how
+    /// many personas are real.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub grants: BTreeMap<String, Vec<crate::crypto::SealedKey>>,
 }
 
 /// Enumerate buckets and the objects within them.

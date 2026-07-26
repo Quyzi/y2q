@@ -12,7 +12,7 @@ use crate::{
     CacheRebuildStatus, CipherMetadata, DEFAULT_LIST_LIMIT, Error, ListOptions, ListPage, Listing,
     MAX_LIST_LIMIT, Metadata, MetadataIndex, Object, PlaintextMetrics, PutOptions, StaleLock,
     Storage, StorageExt, SyncLevel,
-    crypto::{decrypt_meta, encrypt_meta, metadata_key::MekSlot, prf},
+    crypto::{decrypt_meta, encrypt_meta, node_keys::NodeKeySlot, prf},
     storage::{
         format::{self, HEADER_SIZE, Header},
         locks::LockRegistry,
@@ -44,10 +44,9 @@ pub struct FilesystemStorage {
     base_path: PathBuf,
     index: Arc<MetadataIndex>,
     rebuild_state: Arc<tokio::sync::Mutex<CacheRebuildStatus>>,
-    /// Shared MEK slot, also held by `index`. Empty until a login installs the
-    /// key derived from the deployment secret key; zeroized on idle; never read
-    /// from disk.
-    mek: Arc<MekSlot>,
+    /// Shared node-key slot, also held by `index`. Installed once at boot;
+    /// never cleared — the daemon cannot serve anything without it.
+    mek: Arc<NodeKeySlot>,
     dirty_tx: Option<flume::Sender<crate::DirtyEntry>>,
     flush_notify: Option<Arc<tokio::sync::Notify>>,
     flush_limit: usize,
@@ -81,7 +80,7 @@ impl FilesystemStorage {
             })?;
         }
         let index = MetadataIndex::new(index_path);
-        let mek = index.mek_slot();
+        let mek = index.node_key_slot();
         Ok(Self {
             base_path,
             index: Arc::new(index),
@@ -99,25 +98,17 @@ impl FilesystemStorage {
         &self.index
     }
 
-    /// Install the Metadata Encryption Key (derived from the deployment secret
-    /// key when a login unwraps it). Object sidecar metadata is encrypted under
-    /// the MEK, and the whole-file-encrypted metadata index is opened (its file
-    /// key is derived from the MEK). Idempotent across re-logins.
-    pub fn install_mek(&self, mek: [u8; 32]) {
-        self.index.set_mek(mek);
+    /// Install the node key (supplied by the operator at boot). Object
+    /// sidecar metadata is encrypted under the derived Object Metadata Key,
+    /// and the whole-file-encrypted metadata index is opened (its file key
+    /// is derived from the node key too). Idempotent, though only ever
+    /// called once in practice.
+    pub fn install_node_key(&self, nk: [u8; 32]) {
+        self.index.set_node_key(nk);
     }
 
-    /// Clear the MEK and close the metadata index, leaving only ciphertext on
-    /// disk. Returns whether a key was present. Called on idle drop.
-    pub fn clear_mek(&self) -> bool {
-        let had = self.mek.clear();
-        self.index.close();
-        had
-    }
-
-    /// Shared handle to the MEK slot, so the daemon can install or clear the key
-    /// in step with login / idle-drop.
-    pub fn mek_slot(&self) -> Arc<MekSlot> {
+    /// Shared handle to the node-key slot.
+    pub fn node_key_slot(&self) -> Arc<NodeKeySlot> {
         Arc::clone(&self.mek)
     }
 
@@ -141,9 +132,9 @@ impl FilesystemStorage {
     /// `bucket_dir` and `id` are keyed HMACs under the login-gated path key.
     ///
     /// Matches the path scheme used by [`crate::UringStorage`] so both
-    /// backends can read each other's files when sharing a `base_path` and the
-    /// same deployment secret key. Errors if no login has installed the MEK
-    /// (and hence the path key) yet.
+    /// backends can read each other's files when sharing a `base_path` and
+    /// the same node key. Errors if the node key (and hence the path key)
+    /// is not installed — which should never happen post-boot.
     pub fn key_path(&self, bucket: &str, key: &str) -> Result<PathBuf, Error> {
         let path_key = require_path_key(&self.mek)?;
         Ok(obj_path_for(&self.base_path, &path_key, bucket, key))
@@ -160,17 +151,17 @@ fn to_hex(bytes: &[u8]) -> String {
     s
 }
 
-/// Read the path key from `mek`, erroring if no session has installed it.
+/// Read the path key from `node_keys`, erroring if the node key has not been
+/// installed (which should never happen post-boot).
 ///
-/// Object and bucket on-disk locations are keyed by the login-gated path key,
-/// so every path-building operation requires an active session — mirroring the
-/// MEK requirement for metadata encryption.
-pub(crate) fn require_path_key(mek: &MekSlot) -> Result<[u8; 32], Error> {
-    mek.path_key().ok_or_else(|| Error::InternalError {
+/// Object and bucket on-disk locations are keyed by the path key, so every
+/// path-building operation requires the node key to be installed.
+pub(crate) fn require_path_key(node_keys: &NodeKeySlot) -> Result<[u8; 32], Error> {
+    node_keys.path_key().ok_or_else(|| Error::InternalError {
         bucket: String::new(),
         key: String::new(),
         operation: "path".to_owned(),
-        message: "path operation attempted without an installed MEK".to_owned(),
+        message: "path operation attempted without an installed node key".to_owned(),
     })
 }
 
@@ -207,7 +198,7 @@ pub(crate) fn bucket_dir_path(base_path: &Path, path_key: &[u8; 32], bucket: &st
 /// [`encode_object_id`]) from a path built by [`obj_path_for`].
 ///
 /// Used to bind encrypted metadata to its physical storage location (see
-/// [`crate::crypto::metadata_key`]) without needing to already know the
+/// `crate::crypto::node_keys`) without needing to already know the
 /// object's bucket/key — the index-rebuild scan discovers those only by
 /// decrypting the metadata itself, so the id must be derivable from the path
 /// alone.
@@ -417,13 +408,13 @@ pub(crate) async fn set_labels_impl(
 
     let new_json =
         serde_json::to_vec(&metadata).map_err(|e| internal(format!("encode meta: {e}")))?;
-    // Writes require an installed MEK; refuse rather than persisting plaintext.
+    // Writes require an installed node key; refuse rather than persisting plaintext.
     let new_meta = match mek {
         Some(k) => encrypt_meta(k, &new_json, object_id)
             .map_err(|e| internal(format!("encrypt meta: {e}")))?,
         None => {
             return Err(internal(
-                "metadata write attempted without an installed MEK".to_owned(),
+                "metadata write attempted without an installed node key".to_owned(),
             ));
         }
     };
@@ -466,17 +457,30 @@ const BUCKET_CONFIG_FILE: &str = ".y2q-bucket.json";
 pub(crate) async fn get_bucket_config_impl(
     base_path: &Path,
     path_key: &[u8; 32],
+    config_key: &[u8; 32],
     bucket: &str,
 ) -> Result<crate::BucketConfig, Error> {
     validate_bucket(bucket)?;
-    let path = bucket_dir_path(base_path, path_key, bucket).join(BUCKET_CONFIG_FILE);
+    let dir = bucket_dir_path(base_path, path_key, bucket);
+    let path = dir.join(BUCKET_CONFIG_FILE);
     match tokio::fs::read(&path).await {
-        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| Error::InternalError {
-            bucket: bucket.to_owned(),
-            key: String::new(),
-            operation: "get_bucket_config".to_owned(),
-            message: format!("parse config: {e}"),
-        }),
+        Ok(bytes) => {
+            let object_id = encode_bucket_dir(path_key, bucket);
+            let plain = decrypt_meta(config_key, &bytes, &object_id).map_err(|e| {
+                Error::InternalError {
+                    bucket: bucket.to_owned(),
+                    key: String::new(),
+                    operation: "get_bucket_config".to_owned(),
+                    message: format!("decrypt config: {e}"),
+                }
+            })?;
+            serde_json::from_slice(&plain).map_err(|e| Error::InternalError {
+                bucket: bucket.to_owned(),
+                key: String::new(),
+                operation: "get_bucket_config".to_owned(),
+                message: format!("parse config: {e}"),
+            })
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(crate::BucketConfig::default()),
         Err(e) => Err(Error::InternalError {
             bucket: bucket.to_owned(),
@@ -490,6 +494,7 @@ pub(crate) async fn get_bucket_config_impl(
 pub(crate) async fn set_bucket_config_impl(
     base_path: &Path,
     path_key: &[u8; 32],
+    config_key: &[u8; 32],
     bucket: &str,
     config: &crate::BucketConfig,
 ) -> Result<(), Error> {
@@ -503,15 +508,22 @@ pub(crate) async fn set_bucket_config_impl(
             operation: "set_bucket_config".to_owned(),
             message: format!("create bucket dir: {e}"),
         })?;
-    let json = serde_json::to_vec_pretty(config).map_err(|e| Error::InternalError {
+    let json = serde_json::to_vec(config).map_err(|e| Error::InternalError {
         bucket: bucket.to_owned(),
         key: String::new(),
         operation: "set_bucket_config".to_owned(),
         message: format!("encode config: {e}"),
     })?;
+    let object_id = encode_bucket_dir(path_key, bucket);
+    let ciphertext = encrypt_meta(config_key, &json, &object_id).map_err(|e| Error::InternalError {
+        bucket: bucket.to_owned(),
+        key: String::new(),
+        operation: "set_bucket_config".to_owned(),
+        message: format!("encrypt config: {e}"),
+    })?;
     let path = dir.join(BUCKET_CONFIG_FILE);
     let tmp = dir.join(".y2q-bucket.json.tmp");
-    tokio::fs::write(&tmp, &json)
+    tokio::fs::write(&tmp, &ciphertext)
         .await
         .map_err(|e| Error::InternalError {
             bucket: bucket.to_owned(),
@@ -528,6 +540,17 @@ pub(crate) async fn set_bucket_config_impl(
             message: format!("rename config: {e}"),
         })?;
     Ok(())
+}
+
+/// Read the bucket-config key (BCK) from `node_keys`, erroring if the node
+/// key has not been installed (which should never happen post-boot).
+pub(crate) fn require_bucket_config_key(node_keys: &NodeKeySlot) -> Result<[u8; 32], Error> {
+    node_keys.bucket_config_key().ok_or_else(|| Error::InternalError {
+        bucket: String::new(),
+        key: String::new(),
+        operation: "bucket-config".to_owned(),
+        message: "bucket config operation attempted without an installed node key".to_owned(),
+    })
 }
 
 pub(crate) async fn bucket_usage_impl(index: &MetadataIndex, bucket: &str) -> Result<u64, Error> {
@@ -634,7 +657,7 @@ pub struct StreamingPutGuard {
     is_overwrite: bool,
     prior_created: Option<u64>,
     index: Arc<MetadataIndex>,
-    mek: Arc<MekSlot>,
+    mek: Arc<NodeKeySlot>,
     dirty_tx: Option<flume::Sender<crate::DirtyEntry>>,
     flush_notify: Option<Arc<tokio::sync::Notify>>,
     flush_limit: usize,
@@ -675,6 +698,7 @@ impl StreamingPutGuard {
             envelope_version: Some(cipher_metadata.envelope_version),
             version: options.version,
             committed_at: options.version.map(|_| now),
+            key_epoch: Some(cipher_metadata.key_epoch),
         };
 
         let meta_json = serde_json::to_vec(&metadata).map_err(|e| Error::InternalError {
@@ -683,7 +707,7 @@ impl StreamingPutGuard {
             operation: "put".to_owned(),
             message: format!("encode meta: {e}"),
         })?;
-        let meta_bytes = match self.mek.mek() {
+        let meta_bytes = match self.mek.object_metadata_key() {
             Some(mek) => {
                 let object_id =
                     object_id_from_path(&self.obj_path).ok_or_else(|| Error::InternalError {
@@ -704,7 +728,7 @@ impl StreamingPutGuard {
                     bucket: bucket.to_owned(),
                     key: key.to_owned(),
                     operation: "put".to_owned(),
-                    message: "metadata write attempted without an installed MEK".to_owned(),
+                    message: "metadata write attempted without an installed node key".to_owned(),
                 });
             }
         };
@@ -882,7 +906,7 @@ impl FilesystemStorage {
 
         let (is_overwrite, prior_created) = match tokio::fs::metadata(&obj_path).await {
             Ok(_) => {
-                let created = read_obj_created(&obj_path, self.mek.mek().as_ref()).await;
+                let created = read_obj_created(&obj_path, self.mek.object_metadata_key().as_ref()).await;
                 (true, created)
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => (false, None),
@@ -1115,7 +1139,7 @@ impl Storage for FilesystemStorage {
 
             let (is_overwrite, prior_created) = match tokio::fs::metadata(&obj_path).await {
                 Ok(_) => {
-                    let created = read_obj_created(&obj_path, self.mek.mek().as_ref()).await;
+                    let created = read_obj_created(&obj_path, self.mek.object_metadata_key().as_ref()).await;
                     (true, created)
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => (false, None),
@@ -1137,7 +1161,7 @@ impl Storage for FilesystemStorage {
                 Some(p) => (p.size, p.checksum_gxhash_b64.clone()),
                 None => (data.len() as u64, compute_checksum(data)),
             };
-            let (cipher_size, cipher_checksum, kem_alg, aead_alg, envelope_version) =
+            let (cipher_size, cipher_checksum, kem_alg, aead_alg, envelope_version, key_epoch) =
                 match &options.cipher_metadata {
                     Some(c) => (
                         Some(c.cipher_size),
@@ -1145,8 +1169,9 @@ impl Storage for FilesystemStorage {
                         Some(c.kem_alg.clone()),
                         Some(c.aead_alg.clone()),
                         Some(c.envelope_version),
+                        Some(c.key_epoch),
                     ),
-                    None => (None, None, None, None, None),
+                    None => (None, None, None, None, None, None),
                 };
 
             let metadata = Metadata {
@@ -1168,6 +1193,7 @@ impl Storage for FilesystemStorage {
                 // assigned only on the streaming commit path.
                 version: None,
                 committed_at: None,
+                key_epoch,
             };
 
             let meta_json = serde_json::to_vec(&metadata).map_err(|e| Error::InternalError {
@@ -1176,7 +1202,7 @@ impl Storage for FilesystemStorage {
                 operation: "put".to_owned(),
                 message: e.to_string(),
             })?;
-            let meta_bytes = match self.mek.mek() {
+            let meta_bytes = match self.mek.object_metadata_key() {
                 Some(mek) => {
                     let object_id =
                         object_id_from_path(&obj_path).ok_or_else(|| Error::InternalError {
@@ -1197,7 +1223,7 @@ impl Storage for FilesystemStorage {
                         bucket: bucket.to_owned(),
                         key: key.to_owned(),
                         operation: "put".to_owned(),
-                        message: "metadata write attempted without an installed MEK".to_owned(),
+                        message: "metadata write attempted without an installed node key".to_owned(),
                     });
                 }
             };
@@ -1417,7 +1443,7 @@ impl Storage for FilesystemStorage {
             set_labels_impl(
                 &self.base_path,
                 &self.index,
-                self.mek.mek().as_ref(),
+                self.mek.object_metadata_key().as_ref(),
                 &path_key,
                 bucket,
                 key,
@@ -1450,7 +1476,7 @@ impl Storage for FilesystemStorage {
                 });
             }
 
-            read_obj_metadata(&obj_path, self.mek.mek().as_ref())
+            read_obj_metadata(&obj_path, self.mek.object_metadata_key().as_ref())
                 .await
                 .map_err(|e| Error::InternalError {
                     bucket: bucket.to_owned(),
@@ -1490,7 +1516,8 @@ impl Listing for FilesystemStorage {
 
     async fn get_bucket_config(&self, bucket: &str) -> Result<crate::BucketConfig, Error> {
         let path_key = require_path_key(&self.mek)?;
-        get_bucket_config_impl(&self.base_path, &path_key, bucket).await
+        let config_key = require_bucket_config_key(&self.mek)?;
+        get_bucket_config_impl(&self.base_path, &path_key, &config_key, bucket).await
     }
 
     async fn set_bucket_config(
@@ -1499,7 +1526,8 @@ impl Listing for FilesystemStorage {
         config: &crate::BucketConfig,
     ) -> Result<(), Error> {
         let path_key = require_path_key(&self.mek)?;
-        set_bucket_config_impl(&self.base_path, &path_key, bucket, config).await
+        let config_key = require_bucket_config_key(&self.mek)?;
+        set_bucket_config_impl(&self.base_path, &path_key, &config_key, bucket, config).await
     }
 
     async fn bucket_usage(&self, bucket: &str) -> Result<u64, Error> {
@@ -1562,7 +1590,7 @@ impl StorageExt for FilesystemStorage {
         let base_path = self.base_path.clone();
         let index = self.index.clone();
         let state = self.rebuild_state.clone();
-        let mek = self.mek.mek();
+        let mek = self.mek.object_metadata_key();
         tokio::spawn(async move {
             let result = run_rebuild(base_path, index, state.clone(), mek).await;
             let mut s = state.lock().await;
@@ -1765,13 +1793,13 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    /// Stand-in for the login-derived MEK; metadata writes require one.
-    const TEST_MEK: [u8; 32] = [7u8; 32];
+    /// The node key; metadata writes require one installed.
+    const TEST_NODE_KEY: [u8; 32] = [7u8; 32];
 
-    /// The path key derived from [`TEST_MEK`] — used to recompute expected
+    /// The path key derived from [`TEST_NODE_KEY`] — used to recompute expected
     /// opaque on-disk names in tests.
     fn test_path_key() -> [u8; 32] {
-        crate::crypto::derive_path_key(&TEST_MEK)
+        crate::crypto::derive_path_key(&TEST_NODE_KEY)
     }
 
     fn make_storage() -> (FilesystemStorage, TempDir) {
@@ -1779,7 +1807,7 @@ mod tests {
         let base = dir.path().join("data");
         let index = dir.path().join("index.redb");
         let storage = FilesystemStorage::new(base, index).unwrap();
-        storage.install_mek(TEST_MEK);
+        storage.install_node_key(TEST_NODE_KEY);
         (storage, dir)
     }
 
@@ -1872,7 +1900,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let s2 =
             FilesystemStorage::new(dir.path().join("data"), dir.path().join("i.redb")).unwrap();
-        s2.install_mek([9u8; 32]);
+        s2.install_node_key([9u8; 32]);
         let p2 = s2.key_path("b", "k").unwrap();
 
         // Same (bucket, key) under a different deployment key yields a different
@@ -1888,7 +1916,7 @@ mod tests {
     async fn path_ops_error_without_an_installed_mek() {
         let dir = TempDir::new().unwrap();
         let s = FilesystemStorage::new(dir.path().join("data"), dir.path().join("i.redb")).unwrap();
-        // No install_mek: the path key is unavailable, so path-building errors.
+        // No install_node_key: the path key is unavailable, so path-building errors.
         assert!(s.key_path("b", "k").is_err());
     }
 
@@ -2159,13 +2187,13 @@ mod tests {
         let index = dir.path().join("index.redb");
         {
             let s = FilesystemStorage::new(&base, &index).unwrap();
-            s.install_mek(TEST_MEK);
+            s.install_node_key(TEST_NODE_KEY);
             s.put("b", "k", make_object(b"v"), opts(&[("env", "prod")]))
                 .await
                 .unwrap();
         }
         let s2 = FilesystemStorage::new(&base, &index).unwrap();
-        s2.install_mek(TEST_MEK);
+        s2.install_node_key(TEST_NODE_KEY);
         let hits = s2.index().lookup_by_label("env", "prod").await.unwrap();
         assert_eq!(hits, vec![("b".to_owned(), "k".to_owned())]);
     }
@@ -2300,6 +2328,54 @@ mod tests {
         };
         s.set_bucket_config("b", &want).await.unwrap();
         assert_eq!(s.get_bucket_config("b").await.unwrap(), want);
+    }
+
+    #[tokio::test]
+    async fn bucket_config_sidecar_is_encrypted_on_disk() {
+        let (s, dir) = make_storage();
+        let want = crate::BucketConfig {
+            quota_bytes: Some(4096),
+            ..Default::default()
+        };
+        s.set_bucket_config("secret-bucket", &want).await.unwrap();
+
+        // The plaintext quota value must not appear anywhere in the on-disk
+        // sidecar bytes — only ciphertext is written.
+        let path_key = test_path_key();
+        let sidecar = bucket_dir_path(&dir.path().join("data"), &path_key, "secret-bucket")
+            .join(BUCKET_CONFIG_FILE);
+        let raw = tokio::fs::read(&sidecar).await.unwrap();
+        assert!(!raw.windows(4).any(|w| w == b"4096"));
+        assert!(!raw.windows(11).any(|w| w == b"quota_bytes"));
+    }
+
+    #[tokio::test]
+    async fn bucket_config_sidecar_fails_hard_under_the_wrong_config_key() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path().join("data");
+        let path_key = test_path_key();
+        let config_key = crate::crypto::derive_bucket_config_key(&TEST_NODE_KEY);
+        set_bucket_config_impl(&base, &path_key, &config_key, "b", &crate::BucketConfig::default())
+            .await
+            .unwrap();
+
+        // Same path key (so the sidecar is found at the same on-disk
+        // location), a different config key: the AEAD no longer verifies.
+        // This must be a hard error, never a silent default — a default
+        // would fail the bucket open to the next writer.
+        let wrong_config_key = [0xEEu8; 32];
+        let err = get_bucket_config_impl(&base, &path_key, &wrong_config_key, "b")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InternalError { .. }));
+
+        // The genuine key still opens it.
+        assert_eq!(
+            get_bucket_config_impl(&base, &path_key, &config_key, "b")
+                .await
+                .unwrap(),
+            crate::BucketConfig::default()
+        );
     }
 
     #[tokio::test]
@@ -2461,7 +2537,7 @@ mod tests {
 
         {
             let s = FilesystemStorage::new(&base, &index_a).unwrap();
-            s.install_mek(TEST_MEK);
+            s.install_node_key(TEST_NODE_KEY);
             s.put("b1", "k1", make_object(b"v1"), opts(&[("env", "prod")]))
                 .await
                 .unwrap();
@@ -2474,7 +2550,7 @@ mod tests {
         }
 
         let s2 = FilesystemStorage::new(&base, &index_b).unwrap();
-        s2.install_mek(TEST_MEK);
+        s2.install_node_key(TEST_NODE_KEY);
         // The fresh index is empty; the label index proves it. list_buckets now
         // unions on-disk bucket directories, so it already reflects b1/b2 here
         // even before the rebuild repopulates the object/label index.
@@ -2626,6 +2702,7 @@ mod tests {
             kem_alg: "ml-kem-768".to_owned(),
             aead_alg: "aes-256-gcm".to_owned(),
             envelope_version: 1,
+            key_epoch: 0,
         }
     }
 

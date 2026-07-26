@@ -62,6 +62,16 @@ pub enum AuthError {
     #[error("cannot delete the last remaining administrator")]
     CannotDeleteLastAdmin,
 
+    /// `DELETE /api/v1/users/{user}` for a user who is the sole grantee
+    /// (real or decoy — any username present as a key at all) of one or
+    /// more buckets' newest key epoch: deleting them would strand those
+    /// buckets — their identity (and any real bucket-key grant sealed to
+    /// it) becomes unrecoverable, so nobody could ever grant new access
+    /// again, even though existing objects stay readable to whoever
+    /// already holds a live grant. Pass `?force=true` to delete anyway.
+    #[error("user is the only key holder for bucket(s): {}", buckets.join(", "))]
+    CannotDeleteSoleGrantee { buckets: Vec<String> },
+
     /// A role change would demote the only administrator, locking everyone out
     /// of admin endpoints.
     #[error("cannot demote the last remaining administrator")]
@@ -71,11 +81,6 @@ pub enum AuthError {
     #[error("invalid role: {role}")]
     InvalidRole { role: String },
 
-    /// Caller hit a protected endpoint before any user has logged in
-    /// since the daemon started, so the SK isn't available in memory.
-    #[error("keystore unavailable: no active session has unlocked it")]
-    KeystoreUnavailable,
-
     /// Username failed validation (empty, too long, illegal chars).
     #[error("invalid username: {reason}")]
     InvalidUsername { reason: &'static str },
@@ -83,6 +88,21 @@ pub enum AuthError {
     /// Body could not be parsed as JSON or fields missing.
     #[error("invalid request body: {reason}")]
     InvalidBody { reason: String },
+
+    /// `POST /api/v1/personas` for a slot outside `1..=3`, or
+    /// `DELETE /api/v1/personas/{slot}` for slot 0.
+    #[error("invalid persona slot: {reason}")]
+    InvalidPersonaSlot { reason: &'static str },
+
+    /// `POST /api/v1/personas` with a role exceeding the account's own
+    /// global role.
+    #[error("persona role must not exceed the account's global role")]
+    RoleExceedsAccount,
+
+    /// `POST /api/v1/personas` with a password that already opens one of
+    /// the caller's four credential slots.
+    #[error("that password already opens one of your credential slots")]
+    PasswordReused,
 
     /// Wrapped y2q-core error from the underlying user store / crypto.
     #[error("auth backend error: {0}")]
@@ -105,13 +125,16 @@ impl ResponseError for AuthError {
             AuthError::TtlOutOfRange { .. }
             | AuthError::InvalidUsername { .. }
             | AuthError::InvalidRole { .. }
+            | AuthError::InvalidPersonaSlot { .. }
+            | AuthError::RoleExceedsAccount
             | AuthError::InvalidBody { .. } => StatusCode::BAD_REQUEST,
             AuthError::UserExists { .. }
             | AuthError::CannotDeleteLastUser
             | AuthError::CannotDeleteLastAdmin
-            | AuthError::CannotDemoteLastAdmin => StatusCode::CONFLICT,
+            | AuthError::CannotDemoteLastAdmin
+            | AuthError::CannotDeleteSoleGrantee { .. }
+            | AuthError::PasswordReused => StatusCode::CONFLICT,
             AuthError::UserNotFound { .. } => StatusCode::NOT_FOUND,
-            AuthError::KeystoreUnavailable => StatusCode::SERVICE_UNAVAILABLE,
             AuthError::Backend(_) | AuthError::InternalState => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -180,14 +203,25 @@ mod tests {
             (AuthError::CannotDeleteLastUser, S::CONFLICT),
             (AuthError::CannotDeleteLastAdmin, S::CONFLICT),
             (
+                AuthError::CannotDeleteSoleGrantee {
+                    buckets: vec!["b".into()],
+                },
+                S::CONFLICT,
+            ),
+            (
                 AuthError::UserNotFound {
                     username: "u".into(),
                 },
                 S::NOT_FOUND,
             ),
-            (AuthError::KeystoreUnavailable, S::SERVICE_UNAVAILABLE),
             (AuthError::Backend("e".into()), S::INTERNAL_SERVER_ERROR),
             (AuthError::InternalState, S::INTERNAL_SERVER_ERROR),
+            (
+                AuthError::InvalidPersonaSlot { reason: "bad" },
+                S::BAD_REQUEST,
+            ),
+            (AuthError::RoleExceedsAccount, S::BAD_REQUEST),
+            (AuthError::PasswordReused, S::CONFLICT),
         ];
         for (err, code) in cases {
             assert_eq!(err.status_code(), code, "{err:?}");

@@ -4,7 +4,7 @@ This document describes how `y2qd` is put together: the components, the encrypti
 
 ## Overview
 
-`y2qd` is an HTTP daemon that exposes an object store. Every object is encrypted at rest using ML-KEM-768 key encapsulation feeding AES-256-GCM (via the pure-Rust [aes-gcm](https://github.com/RustCrypto/AEADs) crate). The deployment's private key is never written to disk in plaintext - it is wrapped under each authorized user's password with Argon2id, unwrapped into process memory on successful login, and dropped when no sessions remain (subject to an optional idle timeout).
+`y2qd` is an HTTP daemon that exposes an object store. Every object is encrypted at rest using ML-KEM-768 key encapsulation feeding AES-256-GCM (via the pure-Rust [aes-gcm](https://github.com/RustCrypto/AEADs) crate). There is no single deployment-wide secret key: an operator-supplied node key drives server-structural encryption (index, paths, metadata), a per-persona identity keypair is wrapped under each password with Argon2id and unwrapped into that session's memory on login, and each bucket has its own keypair whose secret is sealed individually to every authorized grantee. See [Key hierarchy and identity protection at rest](#key-hierarchy-and-identity-protection-at-rest) below.
 
 Two storage backends ship in tree:
 
@@ -93,16 +93,17 @@ On GET the daemon does the reverse: parse the header, decapsulate with the in-me
 
 The shared secret is *not* the content key directly. HKDF binds the content key to `ss`, `kem_ct`, and the object's address, which means two encapsulations against the same public key can never collide on content key even if `ss` did, and - more importantly - an envelope decrypted under any address other than the one it was written for derives the wrong key and fails the tag check. The `bucket`/`key` binding costs nothing (HKDF's `info` parameter is never transmitted or stored, only supplied by the caller at both ends) and closes a real gap: without it, the ciphertext carries no identity of its own, so a filesystem-write attacker could copy one object's on-disk envelope onto a different object's storage location and have it decrypt successfully there, handing that object's plaintext to anyone with ordinary read access to the *target* address - no access to the source object required.
 
-### Secret-key protection at rest
+### Key hierarchy and identity protection at rest
 
-The ML-KEM-768 secret key is 2400 bytes. It is never written to disk in plaintext.
+There is no longer a single deployment-wide secret key wrapped per user. Three tiers exist:
 
-- On first run, a 32-byte random root password is generated, encoded as URL-safe base64 (no padding), printed once to stdout, and used to derive a 32-byte KEK via Argon2id.
-- The KEK wraps the secret key under AES-256-GCM (AAD = `b"y2q/v1/sk-wrap"`).
-- The wrapped secret, together with the user's Argon2id parameters and salt, is stored as a `UserRecord` in `users.redb`.
-- On login, the password is run through Argon2id (using that user's stored salt and parameters), the KEK is recomputed, and the secret key is unwrapped into a `Zeroizing<Vec<u8>>` that clears on drop.
+- **Tier 0 — node key.** Operator-supplied (`Y2QD_NODE_KEY` env var or `[crypto] node_key_file`), never auto-generated and never persisted anywhere inside `storage.base_path` or `crypto.keystore_dir` (the daemon refuses to start if it resolves there — a `cp -r` of the data must not carry its own key). It derives every server-structural key via HMAC-SHA256 (`prf`): the metadata-index file key, the path-blinding key, the object-metadata key, the bucket-config sidecar key, the Raft control-store key, and a verifier stored in `keystore.json`. See [`crates/y2q-core/src/crypto/node_keys.rs`](../crates/y2q-core/src/crypto/node_keys.rs).
+- **Tier 1 — per-persona identity keypair.** Every `UserRecord` carries exactly four credential slots, occupied or not (`CREDENTIAL_SLOTS`). A slot is one password's worth of identity: its own 2400-byte ML-KEM-768 secret key, wrapped under an Argon2id-derived KEK from that slot's password. All four slots of a record share one Argon2id salt; a per-slot AAD binding to `(username, slot_index)` is what stops a wrapped blob being relocated to a different slot or user. Unused slots hold a *real* keypair wrapped under discarded random bytes — byte-shape identical to a live slot — so nothing on disk reveals how many of a user's passwords are actually in use (see [Duress personas](#duress-personas)).
+- **Tier 2 — per-bucket-per-epoch keypair.** Each bucket has its own ML-KEM-768 keypair per retained key epoch (`BucketKeyVersion`, ascending, newest used for new writes). Its secret is wrapped under a 32-byte bucket-wrap key (BWK) generated fresh per epoch and never itself persisted — instead the BWK is sealed once per credential slot of every grantee, so recovering it requires that grantee's own identity secret key.
 
-Adding a new user is just "wrap the in-memory SK under the new user's password" - there is one canonical secret key shared across all users; each user just has their own wrapped copy.
+On login, one Argon2id derivation (against the record's shared salt) yields a KEK; the daemon tries all four slots' unwrap *without short-circuiting*, so response timing never reveals which slot — real or decoy — actually opened, nor how many of the four are live. The recovered identity secret key lives only inside that session's `SessionInfo` (`crates/y2qd/src/auth/session.rs`), zeroized when the session is dropped — there is no process-wide keystore slot analogous to the old shared MEK, and nothing to idle-drop.
+
+Content keys (tier 3, one per PUT — see [Per-object key derivation](#per-object-key-derivation) below) are now encapsulated to the bucket's *current-epoch* public key rather than one deployment-wide key, so a leaked object envelope names only a `key_epoch`, never anything that identifies a specific user.
 
 ### Argon2id parameters
 
@@ -121,18 +122,20 @@ Each user's `UserRecord` records the parameters used at the time of password wri
 
 ```
 <keystore_dir>/
-  pubkey.json    plaintext public key, algorithm, fingerprint
-  users.redb     one row per user (wrapped SK + Argon2 params + metadata)
+  keystore.json  node-key verifier (never the key itself)
+  users.redb     one row per user (four credential slots + Argon2 params + metadata)
   .lock          POSIX advisory exclusive flock, held while daemon runs
 ```
 
-`pubkey.json` schema:
+A directory still holding a pre-hierarchy `pubkey.json` is refused outright (`CryptoError::LegacyKeystore`) — there is no conversion path; re-initialize the deployment.
+
+`keystore.json` schema:
 
 ```json
 {
-  "kem_alg": "ml-kem-768",
-  "public_key_b64": "<base64 of 1184-byte public key>",
-  "fingerprint_sha256": "<lowercase hex SHA-256 of raw PK bytes>"
+  "format_version": 1,
+  "node_key_verifier_b64": "<base64 of HMAC-SHA256(node_key, \"y2q/v3/node-key-verifier\")>",
+  "created_at": 1715000000000000000
 }
 ```
 
@@ -143,13 +146,19 @@ Each user's `UserRecord` records the parameters used at the time of password wri
   "username": "alice",
   "created_at": 1715000000000000000,
   "last_login": 1715000123000000000,
-  "role": "admin",
+  "role": "user",
   "kdf": { "m_cost_kib": 65536, "t_cost": 3, "p_cost": 4, "salt": "<b64>" },
-  "wrapped_sk": { "nonce": "<b64>", "ciphertext": "<b64+tag>" }
+  "slots": [
+    { "identity_pk_b64": "<b64>", "wrapped": { "nonce": "<b64>", "ciphertext": "<b64+tag>" } },
+    { "identity_pk_b64": "<b64>", "wrapped": { "nonce": "<b64>", "ciphertext": "<b64+tag>" } },
+    { "identity_pk_b64": "<b64>", "wrapped": { "nonce": "<b64>", "ciphertext": "<b64+tag>" } },
+    { "identity_pk_b64": "<b64>", "wrapped": { "nonce": "<b64>", "ciphertext": "<b64+tag>" } }
+  ]
 }
 ```
 
-`role` is the user's global role (`admin` | `user` | `readonly` | `writeonly` | `auditor` | `disabled`); see [Authorization](#authorization-roles-ownership-acls). In cluster mode, user records and bucket ownership/ACLs are replicated through the Raft control plane so a joined node inherits them.
+`slots` always has exactly four entries — real and decoy personas are byte-shape identical (same-length wrapped ciphertext), so the record itself never reveals how many passwords are actually live. `role` is the user's global role (`admin` | `user` | `readonly` | `writeonly` | `auditor` | `disabled`); see [Authorization](#authorization-roles-ownership-acls). In cluster mode, user records and bucket ownership/ACLs are replicated through the Raft control plane so a joined node inherits them.
+
 
 ## Storage
 
@@ -193,11 +202,11 @@ Each object is a single `.obj` file whose on-disk directory and filename are **k
   object_id  = hex(HMAC-SHA256(path_key, "y2q-object\0" || len(bucket)||bucket || len(key)||key))
 ```
 
-The `path_key` is derived from the login-gated MEK (deterministic from the deployment secret key), so the mapping is stable across restarts and backends but **the storage tree leaks neither bucket names nor object keys** to anyone who can read the directory - the names are irreversible without the key. This is why listing reads names from the encrypted index, not from the directory.
+The `path_key` is derived from the node key (tier 0, operator-supplied — see [Key hierarchy](#key-hierarchy-and-identity-protection-at-rest) above), so the mapping is stable across restarts and backends but **the storage tree leaks neither bucket names nor object keys** to anyone who can read the directory - the names are irreversible without the node key. This is why listing reads names from the encrypted index, not from the directory.
 
 Bucket names: ASCII alphanumeric plus `-` and `_`; case-insensitive `"api"` is reserved (collides with `/api/v1/*`). Keys: up to 1024 bytes, no null bytes.
 
-The metadata blob embedded in each `.obj` is **encrypted at rest** under the MEK (`encrypt_meta`, AES-256-GCM; `MEK = SHA-256(sk || "y2q-metadata-encryption-key-v2")`), so labels, timestamps, checksums, and the cleartext key are not readable from the file without the deployment key. Unlike the content key, the MEK is one fixed key for the whole deployment rather than per-object, so `encrypt_meta`/`decrypt_meta` bind the AEAD to the object's opaque on-disk id (the `.obj` filename stem, itself a keyed HMAC of `bucket`/`key`) via AAD - the same identity-binding principle as the envelope above, closing the same copy-attack: a metadata blob relocated to a different object's storage location fails the tag check instead of decrypting into a spoofed size/labels/checksums for the target object. Decrypted, it has this logical shape:
+The metadata blob embedded in each `.obj` is **encrypted at rest** under the tier-0 Object Metadata Key (OMK, derived from the node key via `prf`), so labels, timestamps, checksums, and the cleartext key are not readable from the file without the node key. Like the old MEK it derives, it is one fixed key for the whole deployment rather than per-object, so `encrypt_meta`/`decrypt_meta` bind the AEAD to the object's opaque on-disk id (the `.obj` filename stem, itself a keyed HMAC of `bucket`/`key`) via AAD - the same identity-binding principle as the envelope above, closing the same copy-attack: a metadata blob relocated to a different object's storage location fails the tag check instead of decrypting into a spoofed size/labels/checksum. **Metadata stays at this tier deliberately** - `run_rebuild` discovers `(bucket, key)` pairs by decrypting metadata across the whole tree, so a node-key holder without any bucket grant can see object sizes, labels, and keys, but never object plaintext (that needs the per-bucket key from tier 2).
 
 ```json
 {
@@ -214,7 +223,7 @@ The metadata blob embedded in each `.obj` is **encrypted at rest** under the MEK
   "cipher_checksum": "<b64 8-byte XXH3-64, 12 chars>",
   "kem_alg":         "ml-kem-768",
   "aead_alg":        "aes-256-gcm",
-  "envelope_version": 2,
+  "envelope_version": 3,
   "version":         null,
   "committed_at":    null
 }
@@ -305,7 +314,7 @@ All composite keys use a 4-byte big-endian length prefix per field, which makes 
 
 The entire `_y2q_index.redb` file is encrypted at rest. redb runs on top of a custom `StorageBackend` (`EncryptedFileBackend`) that transparently encrypts every 4 KiB block with AES-256-GCM (fresh per-block nonce, block index bound as AAD) and translates redb's logical offsets to physical ones. A small authenticated header records the logical file length. Inside the database, table keys and values are stored in the clear - the whole-file layer is the sole protection, so nothing about the schema, sizes, or contents leaks on disk.
 
-The file key is derived from the login-gated MEK (`FK = HMAC-SHA256(MEK, "y2q-index-file-key-v1")`), which is only available while a session is active. Consequently the database is **opened on first login** and **closed on idle keystore drop** - while idle, only ciphertext remains and every index operation returns a "metadata index locked" error. The MEK (hence the file key) is deterministic from the deployment secret key, so the existing encrypted file reopens unchanged on the next login with no rewrapping.
+The file key is derived from the node key (`IFK = prf(node_key, "index-file-key")`), which is resident in memory for the daemon's whole lifetime once boot completes - there is no idle-drop for it (see [Session-scoped identity keys](#session-scoped-identity-keys) below). Because the node key never changes without an explicit offline rotation (`y2qd --rotate-node-key`), the existing encrypted file reopens unchanged across restarts with no rewrapping.
 
 Listing operations are implemented as bounded range scans:
 
@@ -348,11 +357,9 @@ Per-username failed login attempts are tracked in memory. Once `auth.max_failed_
 
 A floor of `auth.min_login_response_ms` (default 250 ms) is applied to both success and failure responses on login to smooth out timing differences between "user not found" and "wrong password".
 
-### Idle keystore drop
+### Session-scoped identity keys
 
-The decrypted secret key lives in an `Arc<DecryptedKeystore>` held by the daemon's `KeystoreSlot`. While at least one active session exists, the slot holds the SK. When the last session expires the sweeper marks the slot's `empty_since`. Once `now - empty_since >= auth.keystore_idle_drop_seconds`, the SK is dropped and zeroized. The next login re-unwraps it from the user's password.
-
-Default `keystore_idle_drop_seconds = 0` drops the SK immediately on the first sweep after the last session expires. Operators who want gap-tolerant uptime can extend it.
+There is no process-wide keystore slot to idle-drop anymore. Tier 0 (node key) is resident for the daemon's whole lifetime once boot completes - the daemon cannot serve anything without it. Tier 1 (a persona's identity secret key) lives only inside that login's `SessionInfo`, bounded by `[auth] max_ttl_seconds`/`default_ttl_seconds` and zeroized on session drop; a compromised request handler observes exactly one session's key material, never every user's. Operators who want a shorter exposure window for identity keys should shorten the session TTL rather than looking for an idle-drop knob - there isn't one.
 
 ### Daemon-wide flock
 
@@ -360,33 +367,42 @@ On startup the daemon acquires a POSIX exclusive `flock` on `<keystore_dir>/.loc
 
 ### Authorization (roles, ownership, ACLs)
 
-Authentication answers *who*; authorization answers *what they may do*, when `auth.enforce_authorization = true` (default). Two layers intersect:
+Authentication answers *who*; authorization answers *what they may do*, when `auth.enforce_authorization = true` (default). Two layers intersect, plus a third crypto-layer gate that global roles do **not** bypass:
 
 - **Global role** - an account-wide capability ceiling stored on the `UserRecord`: `admin` (everything), `user` (governed by bucket grants), `readonly`/`writeonly` (read-or-write only on owned/granted buckets), `auditor` (read every bucket + read-only admin), `disabled` (nothing).
 - **Per-bucket ownership + ACL** - each bucket has an owner (full control) and an optional grant map (`read`/`write`/`writeonly`/`admin`). New buckets are private to their creator. A bucket the caller has no relationship to is hidden: it is omitted from listings and any direct operation returns 404 (never 403), so existence cannot be probed; 403 appears only on a bucket you can already see but lack the verb for.
+- **Cryptographic bucket-key grant** - *strict admin exclusion*. A global `admin`/`auditor` role satisfies the first two layers for every bucket (so `GET /` lists every bucket name), but reading an object additionally requires the caller's *persona* to hold a real, sealed bucket-key grant (`bucket_keys::resolve_read_key`) - a role ceiling alone confers none. A compromised admin account with no bucket grant of its own can therefore see bucket/object *names*, sizes, and labels (tier-0 metadata, see above) but not decrypt a single byte of plaintext it wasn't explicitly granted. There is no admin group key, no escrow, and no break-glass path - this is enforced identically whether or not the request even reaches `authorize_bucket`'s ACL check.
 
-The effective capability for an action is the intersection of the role ceiling and the bucket relationship. With `enforce_authorization = false`, both layers are skipped and every authenticated user has full access (single-user / migration mode). Full model and status codes: [api.md](api.md#authorization).
+The effective capability for an action is the intersection of the role ceiling and the bucket relationship, further gated by the cryptographic grant for reads. With `enforce_authorization = false`, the ACL/role layers are skipped (single-user / migration mode) - the crypto-layer grant still applies regardless, since it isn't an authorization *policy*, it's what the object is physically encrypted under. Full model and status codes: [api.md](api.md#authorization).
+
+### Duress personas
+
+Every `UserRecord` carries four credential slots (see [Key hierarchy](#key-hierarchy-and-identity-protection-at-rest)); slot 0 is the primary persona, slots 1-3 are self-service alternates a user can populate via `POST /api/v1/personas` (`y2q persona add`). Each persona is a fully separate identity with its own bucket grants - there is no shared-access, silent-alarm design. A persona created with `revoke_other_sessions: true` kills every other live session of the account on login, which is the only observable side effect of a duress login: no alert, no log line, and no metric distinguishes it from an ordinary one (`y2q_auth_logins_total{result}` never gains a duress label). A bucket the duress persona wasn't granted is 404, not 403, to it - identical to any other bucket the caller has no relationship to, so a 403 can never be used to confirm a real bucket's existence and betray the primary password. Granting reaches only the grantee's *primary* persona (slot 0) from a third party; sharing access with one of your own alternate personas is self-service (`POST /api/v1/personas/{slot}/grant`), because a third party granting a *named* alternate persona would first have to know it exists.
 
 ## Distributed mode
 
 > **Experimental.** Functional and covered by multi-node integration tests, but young and not yet recommended for production data. The single-node path (`cluster.enabled = false`, default) is unaffected.
 
-`y2qd` optionally runs as a cluster. The **data plane** is CRAQ (chain replication with apportioned reads); the **control plane** is an embedded Raft controller (`y2q-cluster`) that replicates only topology plus low-volume user/bucket metadata - object data and per-object metadata never enter the Raft log. Every node loads the **same deployment keystore**, so the derived key hierarchy (and therefore the on-disk path for any `(bucket, key)`) is identical on every node and ciphertext is portable verbatim - replication and migration never re-encrypt. The integration seam is at the handler layer: the daemon routes through `DistributedStorage` (in `y2q-cluster`, wrapping a local `AnyStorage`) when `cluster.enabled = true`, and is byte-for-byte single-node when it is `false`. Full design: [clustering.md](clustering.md).
+`y2qd` optionally runs as a cluster. The **data plane** is CRAQ (chain replication with apportioned reads); the **control plane** is an embedded Raft controller (`y2q-cluster`) that replicates only topology plus low-volume user/bucket metadata - object data and per-object metadata never enter the Raft log. Every node is started with the same operator-supplied node key and loads the same `keystore.json` + `users.redb`, so the derived tier-0 key hierarchy (and therefore the on-disk path for any `(bucket, key)`) is identical on every node and ciphertext is portable verbatim - replication and migration never re-encrypt. Cluster admission is fingerprinted by `NKV` (the node-key verifier), not a separate unlock credential - there is none. The integration seam is at the handler layer: the daemon routes through `DistributedStorage` (in `y2q-cluster`, wrapping a local `AnyStorage`) when `cluster.enabled = true`, and is byte-for-byte single-node when it…
 
 ## Threat model (brief)
 
 What the design defends against:
 
-- **Disk theft** - an adversary with full read access to the storage tree learns object sizes, keys, labels, timestamps, and ciphertext, but cannot recover plaintext without the secret key.
-- **Server-stored-credentials theft** - the user-store database contains only Argon2id-wrapped copies of the secret key; brute-forcing requires the configured Argon2 work per guess.
-- **Quantum adversary** - ML-KEM-768 is a NIST-selected post-quantum KEM. The AES-256-GCM content key derivation is symmetric and unaffected by Shor.
+- **Disk theft** - an adversary with full read access to the storage tree learns object sizes, keys, labels, timestamps, and ciphertext, but cannot recover any object's plaintext without both the node key (tier 0, to find and decrypt metadata) and the specific bucket's key (tier 2, sealed to individual grantees) - the node key alone is not enough.
+- **A compromised administrator account** - this is the central property the per-bucket key hierarchy exists for. `admin`/`auditor` are cryptographically excluded from object plaintext: their role satisfies authorization but never confers a bucket-key grant, so `GET`ing an object they weren't explicitly granted fails at the crypto layer (403) regardless of role. There is no admin group key, no escrow secret, and no break-glass self-grant - an admin can only read what they hold a real grant for, exactly like any other user.
+- **A compromised, less-privileged account** - a `readonly`/`writeonly`/`user` account's blast radius is bounded to exactly the buckets that account was granted, not the whole deployment. Revoking a grant (`set_acl`), rotating the bucket's key (`rotate-key`), and rekeying its objects (`rekey`) closes even a leaked *old* bucket key without requiring a redeploy - see [operations.md](operations.md#key-rotation).
+- **Coercion to reveal a password** - a user who set up a duress persona (see [Duress personas](#duress-personas)) can hand over an alternate password that unlocks a separate, deniable identity holding only decoy buckets; a coercer cannot distinguish a duress persona's login, session, or 404s from an ordinary account with no access, and cannot tell from a `UserRecord`/`BucketKeyVersion`'s byte shape how many of a user's four slots are actually live.
+- **Server-stored-credentials theft** - the user-store database contains only Argon2id-wrapped copies of each persona's identity secret key; brute-forcing requires the configured Argon2 work per guess, once per slot tried.
+- **Quantum adversary** - ML-KEM-768 is a NIST-selected post-quantum KEM, used at every tier (node-key-derived encryption is symmetric HMAC/AES-GCM and likewise unaffected by Shor). The AES-256-GCM content-key derivation is symmetric throughout.
 
 What it doesn't defend against:
 
-- **Compromised running daemon** - once the SK is unwrapped into memory, anything that can read process memory can read objects. The `keystore_idle_drop_seconds` shortens but doesn't eliminate this window.
+- **Compromised running daemon** - once a persona's identity secret key is unwrapped into memory (on login), anything that can read that request's process memory can read whatever that persona holds a grant for. Session TTL (`[auth] max_ttl_seconds`) bounds this window; there is no idle-drop knob to shorten it further (see [Session-scoped identity keys](#session-scoped-identity-keys)).
+- **The node key holder** - metadata (object sizes, labels, cleartext keys, bucket names) is encrypted at tier 0, not per-bucket, so a node-key-holding operator or attacker sees the *shape* of the deployment - which buckets exist, how many objects, their labels and sizes - without ever seeing content. This is an accepted, deliberate consequence of keeping the metadata index reconstructible without every bucket's key (see the Filesystem backend section above).
 - **Compromised client** - Bearer tokens are bearer credentials. A client that leaks one gives the holder full access until expiry or revocation.
 - **Plaintext on the wire** - mitigated by the native TLS listener (`[server.tls]`), which can be restricted to the X25519MLKEM768 post-quantum hybrid key exchange and can enforce mutual TLS. When TLS is disabled the daemon serves plaintext HTTP and should sit behind a TLS-terminating reverse proxy.
-- **Replay of encrypted payloads under a different key** - the daemon trusts whatever public key is in `pubkey.json` at process start. Key rotation is not yet implemented.
+- **A stolen node key by itself** - it unlocks metadata and paths, but not object plaintext; combined with disk access it still requires each bucket's own key material (sealed to specific personas) to decrypt anything.
 
 ## Observability
 
@@ -431,17 +447,22 @@ y2q targets any architecture the Rust toolchain supports. The two formerly arch-
 ## Source map
 
 - [crates/y2q-core/src/crypto/envelope.rs](../crates/y2q-core/src/crypto/envelope.rs) - envelope format, encrypt/decrypt
-- [crates/y2q-core/src/crypto/kdf.rs](../crates/y2q-core/src/crypto/kdf.rs) - Argon2id wrap/unwrap
-- [crates/y2q-core/src/crypto/keystore.rs](../crates/y2q-core/src/crypto/keystore.rs) - pubkey.json, first-run, daemon flock
-- [crates/y2q-core/src/crypto/user_store.rs](../crates/y2q-core/src/crypto/user_store.rs) - users.redb schema
+- [crates/y2q-core/src/crypto/kdf.rs](../crates/y2q-core/src/crypto/kdf.rs) - Argon2id wrap/unwrap, credential-slot wrap/unwrap
+- [crates/y2q-core/src/crypto/keystore.rs](../crates/y2q-core/src/crypto/keystore.rs) - keystore.json, first-run, daemon flock, node-key rotation journal
+- [crates/y2q-core/src/crypto/node_keys.rs](../crates/y2q-core/src/crypto/node_keys.rs) - tier-0 node-key derivation (IFK/IK/PATHK/OMK/BCK/CSK/NKV)
+- [crates/y2q-core/src/crypto/seal.rs](../crates/y2q-core/src/crypto/seal.rs) - seal/open a value to an ML-KEM-768 public key (identity + bucket-grant sealing)
+- [crates/y2q-core/src/crypto/user_store.rs](../crates/y2q-core/src/crypto/user_store.rs) - users.redb schema, credential slots
 - [crates/y2q-core/src/storage/filesystem.rs](../crates/y2q-core/src/storage/filesystem.rs) - filesystem backend, hex sharding, .obj writes
 - [crates/y2q-core/src/storage/format.rs](../crates/y2q-core/src/storage/format.rs) - shared .obj header/trailer format (both backends)
 - [crates/y2q-core/src/storage/locks.rs](../crates/y2q-core/src/storage/locks.rs) - in-memory LockRegistry
 - [crates/y2q-core/src/storage/index.rs](../crates/y2q-core/src/storage/index.rs) - redb metadata index
-- [crates/y2qd/src/auth/session.rs](../crates/y2qd/src/auth/session.rs) - session store, token hashing
-- [crates/y2qd/src/auth/keystore.rs](../crates/y2qd/src/auth/keystore.rs) - in-memory keystore slot, idle drop
+- [crates/y2q-core/src/storage/rotation.rs](../crates/y2q-core/src/storage/rotation.rs) - offline node-key rotation, whole-tree walk
+- [crates/y2qd/src/bucket_keys.rs](../crates/y2qd/src/bucket_keys.rs) - per-bucket key epochs, grant sealing/resolution, strict-admin crypto gate
+- [crates/y2qd/src/node_key_rotation.rs](../crates/y2qd/src/node_key_rotation.rs) - `y2qd --rotate-node-key` orchestration
+- [crates/y2qd/src/auth/session.rs](../crates/y2qd/src/auth/session.rs) - session store, token hashing, per-persona `SessionInfo`
+- [crates/y2qd/src/auth/handlers.rs](../crates/y2qd/src/auth/handlers.rs) - login/users/persona HTTP handlers
 - [crates/y2qd/src/observability.rs](../crates/y2qd/src/observability.rs) - metrics setup, log format
 - [crates/y2qd/src/tls.rs](../crates/y2qd/src/tls.rs) - rustls listener, PQ-hybrid kex, mutual TLS
-- [crates/y2qd/src/authz.rs](../crates/y2qd/src/authz.rs) - bucket ownership / ACL / role enforcement
+- [crates/y2qd/src/authz.rs](../crates/y2qd/src/authz.rs) - bucket ownership / ACL / role enforcement, strict-admin visibility gate
 - [crates/y2q-cluster/](../crates/y2q-cluster/) - CRAQ data plane + embedded Raft control plane (see [clustering.md](clustering.md))
 - [crates/y2qd/src/main.rs](../crates/y2qd/src/main.rs) - startup, lifecycle, route wiring

@@ -7,16 +7,18 @@
 //! `Admin` (owner) or global-admin check. Transferring ownership additionally
 //! requires being the current owner or a global admin.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use actix_web::{HttpResponse, web};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
+use y2q_core::crypto::CREDENTIAL_SLOTS;
 use y2q_core::{AnyStorage, BucketPermission, Listing};
 
 use crate::auth::{AuthState, Authenticated};
 use crate::authz::authorize_bucket;
+use crate::bucket_keys::{self, GranteeSlots};
 use crate::cluster::{self, ClusterRuntime};
 use crate::error::{AppError, ErrorBody};
 
@@ -32,6 +34,9 @@ pub struct AclBody {
     #[serde(default)]
     #[schema(value_type = std::collections::HashMap<String, String>)]
     pub grants: BTreeMap<String, BucketPermission>,
+    /// Retained bucket key epochs, ascending. Read-only: ignored on `PUT`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub key_epochs: Vec<u32>,
 }
 
 /// Read a bucket's owner and ACL. Requires bucket `Admin` (owner) or global admin.
@@ -75,6 +80,7 @@ pub async fn get_acl(
     Ok(HttpResponse::Ok().json(AclBody {
         owner: cfg.owner,
         grants: cfg.acl,
+        key_epochs: cfg.keys.iter().map(|k| k.epoch).collect(),
     }))
 }
 
@@ -117,10 +123,18 @@ pub async fn set_acl(
     }
 
     let body = body.into_inner();
-    let mut cfg = storage
-        .get_bucket_config(&bucket)
-        .await
-        .map_err(AppError::from)?;
+    // Read-modify-write the bucket config. Clustered: read the raft
+    // *authoritative* in-memory state, not the local filesystem projection
+    // — the projector that mirrors raft-committed changes onto disk runs
+    // asynchronously, so a local read can lag behind a claim/config change
+    // another node just committed. Proposing a full-replace `SetBucketConfig`
+    // built from a stale local read would silently roll back whatever
+    // fields it hadn't caught up to yet — most dangerously `keys`, wiping
+    // out a bucket's just-claimed key material.
+    let mut cfg = match cluster.as_ref() {
+        Some(rt) => rt.controller.control_state().await.buckets.get(&bucket).cloned().unwrap_or_default(),
+        None => storage.get_bucket_config(&bucket).await.map_err(AppError::from)?,
+    };
 
     // Ownership transfer / assignment: only the current owner or a global admin
     // may change the owner (a mere bucket-`Admin` grantee may not).
@@ -151,7 +165,67 @@ pub async fn set_acl(
             )));
         }
     }
+
+    // Grants that imply *read* (Read/Write/Admin, not WriteOnly) additionally
+    // carry a cryptographic bucket-key grant on top of the authz-layer ACL
+    // entry — writing alone never needs one (WriteOnly grantees stay
+    // decoy-only forever), but reading needs the real secret key. Diff the
+    // old and new read-implying grantee sets so we only touch slots that
+    // actually changed.
+    let old_read_grantees = read_implying_grantees(&cfg.acl);
+    let new_read_grantees = read_implying_grantees(&body.grants);
     cfg.acl = body.grants;
+
+    if old_read_grantees != new_read_grantees
+        && let Some(kv) = bucket_keys::current_key(&cfg).cloned()
+    {
+        // Sealing a *new* grant requires the bucket wrap key, which only an
+        // existing real grantee's own persona can recover — the caller must
+        // already hold real crypto access (owner, or a bucket-admin grantee
+        // sealed earlier). A global admin with no grant on this bucket
+        // cannot conjure one here either: that would make the "global admin"
+        // role a de facto escrow key, exactly what strict admin exclusion
+        // rules out. Their ACL edit still applies below for write-only
+        // grants; a read-implying change from such a caller is rejected
+        // outright rather than silently landing as crypto-inert.
+        let bwk = bucket_keys::open_bwk(
+            &cfg,
+            &bucket,
+            kv.epoch,
+            &auth.username,
+            auth.session.persona as usize,
+            &auth.session.identity_sk,
+        )
+        .map_err(|_| {
+            AppError(y2q_core::Error::Forbidden {
+                bucket: bucket.clone(),
+            })
+        })?;
+
+        let mut new_kv = kv;
+        for user in new_read_grantees.difference(&old_read_grantees) {
+            reseal_grantee(&state, &bucket, &mut new_kv, user, &bwk, true)?;
+        }
+        for user in old_read_grantees.difference(&new_read_grantees) {
+            // Revoked: reseal every slot as decoy, and drop this user's live
+            // sessions so a token minted under the old grant can't keep
+            // reading from an in-memory cache after the grant is gone.
+            reseal_grantee(&state, &bucket, &mut new_kv, user, &bwk, false)?;
+            state.sessions.revoke_user(user);
+        }
+        if let Some(slot) = cfg.keys.iter_mut().find(|k| k.epoch == new_kv.epoch) {
+            *slot = new_kv;
+        }
+    } else if old_read_grantees != new_read_grantees {
+        // No key material exists yet (bucket registered but never claimed/
+        // written to) — nothing to seal a grant against. The ACL-only
+        // change still applies; the entries just stay crypto-inert until a
+        // write creates key material and a crypto-capable caller re-grants.
+        tracing::warn!(
+            bucket = %bucket,
+            "set_acl: read-implying grant changed on a bucket with no key material yet; ACL updated, no grant sealed"
+        );
+    }
 
     // Clustered: replicate owner+ACL through raft so every node enforces one view.
     if let Some(rt) = cluster.as_ref() {
@@ -162,10 +236,59 @@ pub async fn set_acl(
             .await
             .map_err(AppError::from)?;
     }
+    let key_epochs = cfg.keys.iter().map(|k| k.epoch).collect();
     Ok(HttpResponse::Ok().json(AclBody {
         owner: cfg.owner,
         grants: cfg.acl,
+        key_epochs,
     }))
+}
+
+/// Users whose grant level implies read access (`Read`, `Write`, `Admin`) —
+/// the ones that need a real cryptographic bucket-key grant, as opposed to
+/// `WriteOnly` which never opens the secret key.
+pub(crate) fn read_implying_grantees(acl: &BTreeMap<String, BucketPermission>) -> BTreeSet<String> {
+    acl.iter()
+        .filter(|(_, perm)| !matches!(perm, BucketPermission::WriteOnly))
+        .map(|(user, _)| user.clone())
+        .collect()
+}
+
+/// Re-seal `user`'s full grant row on `kv`: real BWK to their primary
+/// persona (credential slot 0) when `authorized`, decoys to every slot
+/// otherwise. Slot 0 is the only slot a third party can grant directly —
+/// granting to someone else's *alternate* persona would require knowing it
+/// exists, which defeats the point of it being a duress persona (phase 5's
+/// persona-to-persona sharing is self-service for exactly this reason).
+/// Unknown usernames are silently skipped: the caller already validated
+/// grantee existence is deliberately not enforced (see `set_acl`'s comment),
+/// so an ACL entry for a nonexistent user simply never gets crypto material.
+fn reseal_grantee(
+    state: &AuthState,
+    bucket: &str,
+    kv: &mut y2q_core::BucketKeyVersion,
+    user: &str,
+    bwk: &[u8; 32],
+    authorized: bool,
+) -> Result<(), AppError> {
+    let Some(rec) = state.user_store.get(user).map_err(|e| {
+        AppError(y2q_core::Error::Index {
+            message: e.to_string(),
+        })
+    })?
+    else {
+        return Ok(());
+    };
+    let identity_pks_b64: Vec<String> = rec.slots.iter().map(|s| s.identity_pk_b64.clone()).collect();
+    let mut slots_authorized = vec![false; CREDENTIAL_SLOTS];
+    if authorized {
+        slots_authorized[0] = true;
+    }
+    let slots = GranteeSlots {
+        identity_pks_b64,
+        authorized: slots_authorized,
+    };
+    bucket_keys::put_grant_slot(kv, bucket, user, &slots, bwk).map_err(AppError)
 }
 
 /// Reject the request if `username` is not a known user.

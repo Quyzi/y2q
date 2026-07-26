@@ -33,6 +33,7 @@ pub struct ErrorBody {
 /// | `RebuildAlreadyRunning`       | 409         |
 /// | `Forbidden`                   | 403         |
 /// | `InvalidAcl`                  | 400         |
+/// | `InvalidPersonaRequest`       | 400         |
 /// | `Index`                       | 500 (generic body) |
 /// | `InternalError`               | 500 (generic body) |
 /// | `KdfFailed`                   | 500 (generic body) |
@@ -44,6 +45,8 @@ pub struct ErrorBody {
 /// | `KeystoreCorrupt`             | 500 (generic body) |
 /// | `Query`                       | 400         |
 /// | `BodyTooLarge`                | 413         |
+/// | `TooManyBucketKeyEpochs`      | 409         |
+/// | `RekeyAlreadyRunning`         | 409         |
 #[derive(Debug)]
 pub struct AppError(pub CoreError);
 
@@ -87,8 +90,12 @@ impl ResponseError for AppError {
             | CoreError::TooManyLabels { .. }
             | CoreError::Query { .. }
             | CoreError::InvalidAcl { .. }
+            | CoreError::InvalidPersonaRequest { .. }
             | CoreError::InvalidStaleLockThreshold { .. } => StatusCode::BAD_REQUEST,
-            CoreError::Locked { .. } | CoreError::RebuildAlreadyRunning => StatusCode::CONFLICT,
+            CoreError::Locked { .. }
+            | CoreError::RebuildAlreadyRunning
+            | CoreError::TooManyBucketKeyEpochs { .. }
+            | CoreError::RekeyAlreadyRunning { .. } => StatusCode::CONFLICT,
             CoreError::Forbidden { .. } => StatusCode::FORBIDDEN,
             CoreError::QuotaExceeded { .. } | CoreError::BodyTooLarge { .. } => {
                 StatusCode::PAYLOAD_TOO_LARGE

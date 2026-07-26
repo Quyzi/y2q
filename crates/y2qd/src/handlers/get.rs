@@ -1,6 +1,6 @@
 //! `GET /{bucket}/{key}` — retrieve a stored object.
 //!
-//! Range requests are served from the chunk-addressable v2 envelope: only the
+//! Range requests are served from the chunk-addressable v3 envelope: only the
 //! ciphertext chunks covering the requested plaintext bytes are read from
 //! storage and decrypted (206 Partial Content). Every object is always
 //! encrypted; there is no unauthenticated plaintext passthrough.
@@ -11,16 +11,17 @@ use actix_web::http::header;
 use actix_web::{HttpRequest, HttpResponse, web};
 use bytes::{Bytes, BytesMut};
 use y2q_core::crypto::envelope;
-use y2q_core::{AnyStorage, BucketPermission, Storage};
+use y2q_core::{AnyStorage, BucketPermission, Listing, Storage};
 
-use crate::auth::Authenticated;
+use crate::auth::{Authenticated, AuthState};
 use crate::authz::authorize_bucket;
+use crate::bucket_keys;
 use crate::cipher;
 use crate::cluster::{self, ClusterRuntime};
 use crate::error::{AppError, ErrorBody};
 use crate::observability;
 
-/// AES-256-GCM authentication tag length appended to each v2 chunk on disk.
+/// AES-256-GCM authentication tag length appended to each v3 chunk on disk.
 const TAG_LEN: u64 = 16;
 
 /// Retrieve a stored object.
@@ -56,6 +57,7 @@ pub async fn handle(
     path: web::Path<(String, String)>,
     req: HttpRequest,
     storage: web::Data<Arc<AnyStorage>>,
+    _state: web::Data<AuthState>,
     cluster: Option<web::Data<ClusterRuntime>>,
     auth: Authenticated,
 ) -> Result<HttpResponse, AppError> {
@@ -67,14 +69,17 @@ pub async fn handle(
         .and_then(|h| h.to_str().ok())
         .and_then(parse_byte_range);
 
+    let cfg = storage.get_bucket_config(&bucket).await.map_err(AppError::from)?;
+
     // Clustered: an apportioned read either serves this node's local committed
     // copy (fall through) or fetches the committed envelope from the chain TAIL,
-    // which is then decrypted here with the user keystore.
+    // decrypted here after peeking its key epoch straight from the envelope
+    // header (there is no local `Metadata` for a copy this node doesn't hold).
     if let Some(rt) = cluster.as_ref() {
         match cluster::plan_read(rt, &bucket, &key).await? {
             y2q_cluster::ReadPlan::Remote { envelope, size } => {
                 metrics::counter!(observability::CLUSTER_READS, "kind" => "remote").increment(1);
-                return serve_remote_envelope(envelope, size, range_header, &auth, &bucket, &key);
+                return serve_remote_envelope(envelope, size, range_header, &auth, &cfg, &bucket, &key);
             }
             y2q_cluster::ReadPlan::Local => {
                 metrics::counter!(observability::CLUSTER_READS, "kind" => "local").increment(1);
@@ -82,6 +87,20 @@ pub async fn handle(
             }
         }
     }
+
+    // Consult metadata (index lookup, no whole-file read) up front: every path
+    // below needs the plaintext size and the bucket key epoch this object was
+    // encrypted under before it can resolve the right secret key.
+    let md = storage.describe(&bucket, &key).await.map_err(AppError::from)?;
+    let epoch = md.key_epoch.ok_or_else(|| {
+        AppError(y2q_core::Error::EnvelopeMalformed {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            reason: "object metadata has no key_epoch".to_owned(),
+        })
+    })?;
+    let bucket_sk =
+        bucket_keys::resolve_read_key(&auth.session, &cfg, &bucket, epoch).map_err(AppError)?;
 
     // No Range header: return the full object, decrypted in place.
     let Some((start, end)) = range_header else {
@@ -92,15 +111,11 @@ pub async fn handle(
         let buf = stored
             .try_into_mut()
             .unwrap_or_else(|b| BytesMut::from(b.as_ref()));
-        let plaintext = cipher::decrypt_after_get(&auth.keystore, &bucket, &key, buf)?;
-        // v2 envelopes are zero-padded to a Padmé boundary to hide the exact
+        let plaintext = cipher::decrypt_after_get(&bucket_sk, &bucket, &key, buf)?;
+        // v3 envelopes are zero-padded to a Padmé boundary to hide the exact
         // object size, so the decrypted plaintext may carry trailing pad
         // bytes. Trim to the true size recorded in the (encrypted) metadata.
-        let size = storage
-            .describe(&bucket, &key)
-            .await
-            .map_err(AppError::from)?
-            .size as usize;
+        let size = md.size as usize;
         let plaintext = if plaintext.len() > size {
             plaintext.slice(0..size)
         } else {
@@ -111,12 +126,6 @@ pub async fn handle(
             .body(plaintext));
     };
 
-    // Range request: consult metadata (index lookup, no whole-file read) to learn
-    // the plaintext size and envelope version before deciding how to serve it.
-    let md = storage
-        .describe(&bucket, &key)
-        .await
-        .map_err(AppError::from)?;
     let size = md.size;
 
     // A range must be well-formed and lie entirely within the object.
@@ -125,19 +134,19 @@ pub async fn handle(
     }
 
     match md.envelope_version {
-        // v2 chunked (the only supported format): read only the covering
+        // v3 chunked (the only supported format): read only the covering
         // ciphertext chunks and decrypt them.
-        Some(2) => {
-            let preamble_len = envelope::v2_preamble_len() as u64;
+        Some(3) => {
+            let preamble_len = envelope::v3_preamble_len() as u64;
             let preamble = storage
                 .get_range(&bucket, &key, (0..=preamble_len - 1).into())
                 .await
                 .map_err(AppError::from)?;
-            let (chunk_size_u32, _) = envelope::parse_v2_geometry(&preamble).map_err(|_| {
+            let (_epoch, chunk_size_u32, _) = envelope::parse_v3_geometry(&preamble).map_err(|_| {
                 AppError(y2q_core::Error::EnvelopeMalformed {
                     bucket: bucket.clone(),
                     key: key.clone(),
-                    reason: "bad v2 header".to_owned(),
+                    reason: "bad v3 header".to_owned(),
                 })
             })?;
             let chunk_size = chunk_size_u32 as u64;
@@ -156,8 +165,8 @@ pub async fn handle(
                 .await
                 .map_err(AppError::from)?;
 
-            let chunks_pt = cipher::decrypt_v2_chunks(
-                &auth.keystore,
+            let chunks_pt = cipher::decrypt_v3_chunks(
+                &bucket_sk,
                 &bucket,
                 &key,
                 &preamble,
@@ -170,7 +179,7 @@ pub async fn handle(
             let body = Bytes::from(chunks_pt).slice(trim_front..trim_front + take);
             Ok(partial_content(start, end, size, body))
         }
-        // Any other (unknown, or pre-v2/legacy) envelope version is rejected —
+        // Any other (unknown, or pre-v3/legacy) envelope version is rejected —
         // there is no unauthenticated plaintext passthrough to fall back to.
         other => Err(AppError(y2q_core::Error::UnsupportedEnvelopeVersion {
             version: other.unwrap_or(0),
@@ -179,20 +188,40 @@ pub async fn handle(
 }
 
 /// Serve a committed ciphertext `envelope` fetched from a peer (the chain TAIL)
-/// for an apportioned read: decrypt it with the user keystore, trim Padmé
-/// padding to the true plaintext `size`, then answer the full body or the
-/// requested byte range. Range requests decrypt the whole envelope and slice the
-/// plaintext (the chunk-addressable fast path is local-only).
+/// for an apportioned read: resolve the bucket secret key for the epoch
+/// recorded in the envelope's own header (no local `Metadata` exists for a
+/// copy this node doesn't hold), decrypt, trim Padmé padding to the true
+/// plaintext `size`, then answer the full body or the requested byte range.
+/// Range requests decrypt the whole envelope and slice the plaintext (the
+/// chunk-addressable fast path is local-only).
 fn serve_remote_envelope(
-    envelope: Bytes,
+    envelope_bytes: Bytes,
     size: u64,
     range: Option<(u64, u64)>,
     auth: &Authenticated,
+    cfg: &y2q_core::BucketConfig,
     bucket: &str,
     key: &str,
 ) -> Result<HttpResponse, AppError> {
-    let buf = BytesMut::from(envelope.as_ref());
-    let plaintext = cipher::decrypt_after_get(&auth.keystore, bucket, key, buf)?;
+    if envelope_bytes.len() < envelope::ENVELOPE_V3_HEADER_FIXED_LEN {
+        return Err(AppError(y2q_core::Error::EnvelopeMalformed {
+            bucket: bucket.to_owned(),
+            key: key.to_owned(),
+            reason: "truncated v3 header".to_owned(),
+        }));
+    }
+    let (epoch, _chunk_size, _plaintext_len) =
+        envelope::parse_v3_geometry(&envelope_bytes[..envelope::ENVELOPE_V3_HEADER_FIXED_LEN]).map_err(|_| {
+            AppError(y2q_core::Error::EnvelopeMalformed {
+                bucket: bucket.to_owned(),
+                key: key.to_owned(),
+                reason: "bad v3 header".to_owned(),
+            })
+        })?;
+    let bucket_sk = bucket_keys::resolve_read_key(&auth.session, cfg, bucket, epoch).map_err(AppError)?;
+
+    let buf = BytesMut::from(envelope_bytes.as_ref());
+    let plaintext = cipher::decrypt_after_get(&bucket_sk, bucket, key, buf)?;
     let plaintext: Bytes = if plaintext.len() as u64 > size {
         plaintext.slice(0..size as usize)
     } else {

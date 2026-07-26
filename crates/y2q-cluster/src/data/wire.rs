@@ -32,7 +32,7 @@ pub struct PrepareMeta {
     /// copies of a version agree; the TAIL's committed value is what a version
     /// query returns.
     pub version: u64,
-    /// The v2 header `plaintext_len` (padded length) the HEAD patched locally.
+    /// The v3 header `plaintext_len` (padded length) the HEAD patched locally.
     /// The Tee does not forward the patch, so the receiver backfills it from
     /// here to keep its envelope byte-identical to the HEAD's.
     pub plaintext_len: u64,
@@ -52,6 +52,8 @@ pub struct PrepareMeta {
     pub aead_alg: String,
     /// Envelope format version.
     pub envelope_version: u16,
+    /// Bucket key epoch this object's envelope was encrypted under.
+    pub key_epoch: u32,
     /// Whether the write must be durable (`fdatasync`) before acking.
     pub sync_durable: bool,
     /// User labels to persist with the object.
@@ -96,6 +98,7 @@ impl PrepareMeta {
             kem_alg: self.kem_alg.clone(),
             aead_alg: self.aead_alg.clone(),
             envelope_version: self.envelope_version,
+            key_epoch: self.key_epoch,
         }
     }
 }
@@ -187,7 +190,7 @@ pub struct BackfillManifest {
 pub struct BackfillObjectMeta {
     /// CRAQ version to stamp into the replica.
     pub version: u64,
-    /// The v2 header `plaintext_len` (padded length) at envelope offset 20.
+    /// The v3 header `plaintext_len` (padded length) at envelope offset 24.
     pub plaintext_len: u64,
     /// True plaintext size.
     pub plaintext_size: u64,
@@ -204,6 +207,8 @@ pub struct BackfillObjectMeta {
     pub aead_alg: String,
     /// Envelope format version.
     pub envelope_version: u16,
+    /// Bucket key epoch this object's envelope was encrypted under.
+    pub key_epoch: u32,
     /// User labels to persist with the object.
     pub labels: Vec<(String, String)>,
 }
@@ -227,6 +232,7 @@ impl BackfillObjectMeta {
             kem_alg: self.kem_alg.clone(),
             aead_alg: self.aead_alg.clone(),
             envelope_version: self.envelope_version,
+            key_epoch: self.key_epoch,
             sync_durable: true,
             labels: self.labels.clone(),
         }
@@ -332,6 +338,7 @@ mod tests {
             kem_alg: "ml-kem-768".into(),
             aead_alg: "aes-256-gcm".into(),
             envelope_version: 2,
+            key_epoch: 0,
             sync_durable: true,
             labels: vec![("env".into(), "prod".into())],
         }

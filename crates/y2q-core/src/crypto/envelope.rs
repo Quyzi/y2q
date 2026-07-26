@@ -1,4 +1,4 @@
-//! AEAD envelope format (v2, chunked).
+//! AEAD envelope format (v3, chunked).
 //!
 //! Each PUT runs a fresh ML-KEM-768 encapsulation (once per object) and
 //! derives an AES-256-GCM key via HKDF-SHA256, bound to the object's
@@ -14,24 +14,37 @@
 //!
 //! ## on-disk layout
 //! ```text
-//! magic         [u8; 4]    = b"Y2Q2"
-//! format_ver    u16 BE     = 2
+//! magic         [u8; 4]    = b"Y2Q3"
+//! format_ver    u16 BE     = 3
 //! kem_alg       u8         = 1 (ML-KEM-768)
 //! aead_alg      u8         = 1 (AES-256-GCM)
+//! key_epoch     u32 BE     (which bucket key epoch's public key sealed kem_ct)
 //! nonce_base    [u8; 12]
 //! plaintext_len u64 BE     (patched after streaming completes)
 //! chunk_size    u32 BE     (plaintext chunk size; default 4 MiB)
 //! kem_ct        [u8; 1088]
 //! [ aead_ct     [u8; chunk_plaintext_len + 16] ] × N chunks
 //! ```
-//! Fixed header = 32 bytes.  Preamble (header + KEM CT) = 1120 bytes.
+//! Fixed header = 36 bytes. Preamble (header + KEM CT) = 1124 bytes.
 //! Chunk nonce_i = nonce_base XOR (i as u64 BE in bytes [4..12]).
-//! AAD for each chunk = magic/format_ver/kem_alg/aead_alg/nonce_base +
-//! chunk_size (see [`build_v2_aad`]) — everything in the fixed header except
+//! AAD for each chunk = magic/format_ver/kem_alg/aead_alg/key_epoch/nonce_base
+//! + chunk_size (see [`build_v3_aad`]) — everything in the fixed header except
 //! `plaintext_len`, which is only known after all chunks are written.
+//! `key_epoch` is therefore authenticated the same way as every other
+//! structural field: a caller who supplies the wrong bucket-epoch secret key
+//! derives the wrong content key and every chunk fails to open, but an
+//! on-path tamperer flipping `key_epoch` to point at a *different*, correct
+//! secret key is caught by the AAD mismatch instead of silently succeeding.
+//!
+//! `key_epoch` records which epoch of the *bucket's* ML-KEM-768 keypair
+//! `kem_ct` was encapsulated against — callers resolve the matching secret
+//! key (via the bucket's key-version list) before calling [`decrypt`] et al.;
+//! this module has no notion of buckets or grants, only that the same epoch
+//! used to encrypt must be used to decrypt.
 //!
 //! Envelopes without the recognized magic (including the retired v1
-//! whole-object format) are rejected outright — there is no unauthenticated
+//! whole-object format and the retired v2 chunked format, which lacked
+//! `key_epoch`) are rejected outright — there is no unauthenticated
 //! passthrough for unrecognized or legacy data.
 
 use aes_gcm::{Aes256Gcm, KeyInit, aead::AeadInOut};
@@ -50,25 +63,26 @@ use zeroize::Zeroize;
 
 use super::CryptoError;
 
-// ── v2 constants ─────────────────────────────────────────────────────────────
+// ── v3 constants ─────────────────────────────────────────────────────────────
 
-/// Fixed-header length for a v2 envelope (includes the 4-byte chunk_size field).
-pub const ENVELOPE_V2_HEADER_FIXED_LEN: usize = 4 + 2 + 1 + 1 + 12 + 8 + 4; // = 32
+/// Fixed-header length for a v3 envelope (includes the 4-byte `key_epoch`
+/// field and the 4-byte `chunk_size` field).
+pub const ENVELOPE_V3_HEADER_FIXED_LEN: usize = 4 + 2 + 1 + 1 + 4 + 12 + 8 + 4; // = 36
 
-const MAGIC_V2: &[u8; 4] = b"Y2Q2";
-const FORMAT_VER_V2: u16 = 2;
-/// Default v2 plaintext chunk size (4 MiB) when no config override is given.
+const MAGIC_V3: &[u8; 4] = b"Y2Q3";
+const FORMAT_VER_V3: u16 = 3;
+/// Default v3 plaintext chunk size (4 MiB) when no config override is given.
 /// The actual size used per object is recorded in the envelope header, so
 /// decryption never depends on this constant.
 pub const DEFAULT_CHUNK_SIZE_BYTES: usize = 4 << 20;
-/// Byte offset of `plaintext_len` inside the v2 fixed header.
+/// Byte offset of `plaintext_len` inside the v3 fixed header.
 ///
 /// Public so cluster replicas can backfill this field verbatim: the CRAQ HEAD
 /// patches it locally at `finish()` but does not forward the patch down-chain
 /// (the [`Tee`](crate::storage::streaming_sink::StreamingSink::Tee) only mirrors
 /// appends), so a downstream node applies the same patch from a PREPARE header
 /// to keep its on-disk envelope byte-identical.
-pub const V2_PLAINTEXT_LEN_OFFSET: u64 = 20;
+pub const V3_PLAINTEXT_LEN_OFFSET: u64 = 24;
 
 // ── shared constants ─────────────────────────────────────────────────────────
 
@@ -131,9 +145,21 @@ pub struct EnvelopeInfo {
     /// detecting accidental corruption/divergence between replicas, not
     /// tamper detection (that's what the per-chunk AEAD tag is for).
     pub cipher_checksum_b64: String,
+    /// The bucket key epoch this envelope's `kem_ct` was encapsulated
+    /// against, mirrored here so the caller can persist it in
+    /// [`crate::Metadata::key_epoch`] without a separate header parse.
+    pub key_epoch: u32,
 }
 
 /// Decrypt a complete envelope under `sk`, addressed to `bucket`/`key`.
+///
+/// `sk` must be the secret key for the epoch the envelope was encrypted
+/// under (its `key_epoch` header field, itself authenticated via the AAD —
+/// see the module docs). Callers resolve the matching epoch's secret key
+/// (typically from [`crate::Metadata::key_epoch`], populated at encrypt time
+/// from [`EnvelopeInfo::key_epoch`]) before calling this function; supplying
+/// the wrong epoch's key derives the wrong content key and every chunk fails
+/// to authenticate.
 ///
 /// `bucket`/`key` must be the address the caller actually requested — they're
 /// folded into the content-key derivation (see [`derive_content_key`]), so
@@ -145,35 +171,25 @@ pub struct EnvelopeInfo {
 /// another's and have it decrypt successfully under the wrong address.
 ///
 /// Returns the recovered plaintext on success, or an error if the magic bytes
-/// are unrecognized (including any pre-v2 or otherwise legacy data — there is
+/// are unrecognized (including any pre-v3 or otherwise legacy data — there is
 /// no unauthenticated passthrough).
-pub fn decrypt(
-    sk_bytes: &[u8],
-    envelope: &[u8],
-    bucket: &str,
-    key: &str,
-) -> Result<Vec<u8>, CryptoError> {
+pub fn decrypt(sk_bytes: &[u8], envelope: &[u8], bucket: &str, key: &str) -> Result<Vec<u8>, CryptoError> {
     if envelope.len() < 4 {
         return Err(CryptoError::Envelope("truncated header"));
     }
     match &envelope[..4] {
-        m if m == MAGIC_V2 => decrypt_v2(sk_bytes, envelope, bucket, key),
+        m if m == MAGIC_V3 => decrypt_v3(sk_bytes, envelope, bucket, key),
         _ => Err(CryptoError::Envelope("bad magic")),
     }
 }
 
-fn decrypt_v2(
-    sk_bytes: &[u8],
-    envelope: &[u8],
-    bucket: &str,
-    key: &str,
-) -> Result<Vec<u8>, CryptoError> {
-    let preamble_len = ENVELOPE_V2_HEADER_FIXED_LEN + mlkem768::ciphertext_bytes();
+fn decrypt_v3(sk_bytes: &[u8], envelope: &[u8], bucket: &str, key: &str) -> Result<Vec<u8>, CryptoError> {
+    let preamble_len = ENVELOPE_V3_HEADER_FIXED_LEN + mlkem768::ciphertext_bytes();
     if envelope.len() < preamble_len {
-        return Err(CryptoError::Envelope("truncated v2 envelope"));
+        return Err(CryptoError::Envelope("truncated v3 envelope"));
     }
     let ver = u16::from_be_bytes([envelope[4], envelope[5]]);
-    if ver != FORMAT_VER_V2 {
+    if ver != FORMAT_VER_V3 {
         return Err(CryptoError::UnsupportedVersion(ver));
     }
     if envelope[6] != KEM_ALG_MLKEM768 {
@@ -183,20 +199,19 @@ fn decrypt_v2(
         return Err(CryptoError::Envelope("unknown aead_alg"));
     }
     let mut nonce_base = [0u8; 12];
-    nonce_base.copy_from_slice(&envelope[8..20]);
-    let plaintext_len = u64::from_be_bytes(envelope[20..28].try_into().unwrap());
-    let chunk_size = u32::from_be_bytes(envelope[28..32].try_into().unwrap()) as usize;
+    nonce_base.copy_from_slice(&envelope[12..24]);
+    let plaintext_len = u64::from_be_bytes(envelope[24..32].try_into().unwrap());
+    let chunk_size = u32::from_be_bytes(envelope[32..36].try_into().unwrap()) as usize;
     if chunk_size == 0 {
         return Err(CryptoError::Envelope("zero chunk_size"));
     }
 
-    let kem_ct_bytes = &envelope[ENVELOPE_V2_HEADER_FIXED_LEN..preamble_len];
-    let aad = build_v2_aad(&envelope[..ENVELOPE_V2_HEADER_FIXED_LEN]);
+    let kem_ct_bytes = &envelope[ENVELOPE_V3_HEADER_FIXED_LEN..preamble_len];
+    let aad = build_v3_aad(&envelope[..ENVELOPE_V3_HEADER_FIXED_LEN]);
 
-    let sk = mlkem768::SecretKey::from_bytes(sk_bytes)
-        .map_err(|_| CryptoError::KemDecode("secret key"))?;
-    let kem_ct = mlkem768::Ciphertext::from_bytes(kem_ct_bytes)
-        .map_err(|_| CryptoError::KemDecode("kem ciphertext"))?;
+    let sk = mlkem768::SecretKey::from_bytes(sk_bytes).map_err(|_| CryptoError::KemDecode("secret key"))?;
+    let kem_ct =
+        mlkem768::Ciphertext::from_bytes(kem_ct_bytes).map_err(|_| CryptoError::KemDecode("kem ciphertext"))?;
     let ss = mlkem768::decapsulate(&kem_ct, &sk);
 
     let mut key_bytes = derive_content_key(ss.as_bytes(), kem_ct_bytes, bucket, key)?;
@@ -236,37 +251,33 @@ fn decrypt_v2(
 /// Decrypt a complete envelope, consuming an owned `BytesMut` buffer.
 ///
 /// Identical semantics to [`decrypt`] (including the `bucket`/`key` identity
-/// binding — see its doc comment), but reuses the input allocation for the
-/// in-place AEAD open instead of allocating a fresh ciphertext buffer per
-/// call. Returns the recovered plaintext as `Bytes` (zero-copy of the freed
-/// underlying allocation).
-pub fn decrypt_owned(
-    sk_bytes: &[u8],
-    envelope: BytesMut,
-    bucket: &str,
-    key: &str,
-) -> Result<Bytes, CryptoError> {
+/// binding and the epoch-selection contract on `sk_bytes` — see its doc
+/// comment), but reuses the input allocation for the in-place AEAD open
+/// instead of allocating a fresh ciphertext buffer per call. Returns the
+/// recovered plaintext as `Bytes` (zero-copy of the freed underlying
+/// allocation).
+pub fn decrypt_owned(sk_bytes: &[u8], envelope: BytesMut, bucket: &str, key: &str) -> Result<Bytes, CryptoError> {
     if envelope.len() < 4 {
         return Err(CryptoError::Envelope("truncated header"));
     }
     match &envelope[..4] {
-        m if m == MAGIC_V2 => decrypt_v2_owned(sk_bytes, envelope, bucket, key),
+        m if m == MAGIC_V3 => decrypt_v3_owned(sk_bytes, envelope, bucket, key),
         _ => Err(CryptoError::Envelope("bad magic")),
     }
 }
 
-fn decrypt_v2_owned(
+fn decrypt_v3_owned(
     sk_bytes: &[u8],
     mut envelope: BytesMut,
     bucket: &str,
     key: &str,
 ) -> Result<Bytes, CryptoError> {
-    let preamble_len = ENVELOPE_V2_HEADER_FIXED_LEN + mlkem768::ciphertext_bytes();
+    let preamble_len = ENVELOPE_V3_HEADER_FIXED_LEN + mlkem768::ciphertext_bytes();
     if envelope.len() < preamble_len {
-        return Err(CryptoError::Envelope("truncated v2 envelope"));
+        return Err(CryptoError::Envelope("truncated v3 envelope"));
     }
     let ver = u16::from_be_bytes([envelope[4], envelope[5]]);
-    if ver != FORMAT_VER_V2 {
+    if ver != FORMAT_VER_V3 {
         return Err(CryptoError::UnsupportedVersion(ver));
     }
     if envelope[6] != KEM_ALG_MLKEM768 {
@@ -276,19 +287,18 @@ fn decrypt_v2_owned(
         return Err(CryptoError::Envelope("unknown aead_alg"));
     }
     let mut nonce_base = [0u8; 12];
-    nonce_base.copy_from_slice(&envelope[8..20]);
-    let plaintext_len = u64::from_be_bytes(envelope[20..28].try_into().unwrap());
-    let chunk_size = u32::from_be_bytes(envelope[28..32].try_into().unwrap()) as usize;
+    nonce_base.copy_from_slice(&envelope[12..24]);
+    let plaintext_len = u64::from_be_bytes(envelope[24..32].try_into().unwrap());
+    let chunk_size = u32::from_be_bytes(envelope[32..36].try_into().unwrap()) as usize;
     if chunk_size == 0 {
         return Err(CryptoError::Envelope("zero chunk_size"));
     }
-    let aad = build_v2_aad(&envelope[..ENVELOPE_V2_HEADER_FIXED_LEN]);
-    let kem_ct_owned: Vec<u8> = envelope[ENVELOPE_V2_HEADER_FIXED_LEN..preamble_len].to_vec();
+    let aad = build_v3_aad(&envelope[..ENVELOPE_V3_HEADER_FIXED_LEN]);
+    let kem_ct_owned: Vec<u8> = envelope[ENVELOPE_V3_HEADER_FIXED_LEN..preamble_len].to_vec();
 
-    let sk = mlkem768::SecretKey::from_bytes(sk_bytes)
-        .map_err(|_| CryptoError::KemDecode("secret key"))?;
-    let kem_ct = mlkem768::Ciphertext::from_bytes(&kem_ct_owned)
-        .map_err(|_| CryptoError::KemDecode("kem ciphertext"))?;
+    let sk = mlkem768::SecretKey::from_bytes(sk_bytes).map_err(|_| CryptoError::KemDecode("secret key"))?;
+    let kem_ct =
+        mlkem768::Ciphertext::from_bytes(&kem_ct_owned).map_err(|_| CryptoError::KemDecode("kem ciphertext"))?;
     let ss = mlkem768::decapsulate(&kem_ct, &sk);
 
     let mut key_bytes = derive_content_key(ss.as_bytes(), &kem_ct_owned, bucket, key)?;
@@ -299,7 +309,7 @@ fn decrypt_v2_owned(
     let mut body = envelope.split_off(preamble_len);
     drop(envelope);
 
-    // See the matching comment in `decrypt_v2` — `plaintext_len` isn't
+    // See the matching comment in `decrypt_v3` — `plaintext_len` isn't
     // trustworthy until the chunks are verified, so the pre-allocation is
     // capped by the received body length instead of the raw header value.
     let cap = plaintext_len.min(body.len() as u64) as usize;
@@ -328,26 +338,30 @@ fn decrypt_v2_owned(
     Ok(plaintext.freeze())
 }
 
-/// Number of bytes before the first chunk in a v2 envelope: the 32-byte fixed
+/// Number of bytes before the first chunk in a v3 envelope: the 36-byte fixed
 /// header plus the 1088-byte ML-KEM-768 ciphertext. A ranged read must fetch at
 /// least this prefix to recover the content key and chunk geometry.
-pub fn v2_preamble_len() -> usize {
-    ENVELOPE_V2_HEADER_FIXED_LEN + mlkem768::ciphertext_bytes()
+pub fn v3_preamble_len() -> usize {
+    ENVELOPE_V3_HEADER_FIXED_LEN + mlkem768::ciphertext_bytes()
 }
 
-/// Parse `(chunk_size, plaintext_len)` from the fixed portion of a v2 header.
+/// Parse `(key_epoch, chunk_size, plaintext_len)` from the fixed portion of a
+/// v3 header.
 ///
-/// `header` must be at least [`ENVELOPE_V2_HEADER_FIXED_LEN`] bytes. Validates
-/// the v2 magic, version, and algorithm IDs.
-pub fn parse_v2_geometry(header: &[u8]) -> Result<(u32, u64), CryptoError> {
-    if header.len() < ENVELOPE_V2_HEADER_FIXED_LEN {
-        return Err(CryptoError::Envelope("truncated v2 header"));
+/// `header` must be at least [`ENVELOPE_V3_HEADER_FIXED_LEN`] bytes. Validates
+/// the v3 magic, version, and algorithm IDs. `key_epoch` is cleartext (it must
+/// be, since it's needed to select the secret key before anything can be
+/// decrypted) but is still authenticated as part of the AAD on every chunk —
+/// see the module docs.
+pub fn parse_v3_geometry(header: &[u8]) -> Result<(u32, u32, u64), CryptoError> {
+    if header.len() < ENVELOPE_V3_HEADER_FIXED_LEN {
+        return Err(CryptoError::Envelope("truncated v3 header"));
     }
-    if &header[0..4] != MAGIC_V2 {
+    if &header[0..4] != MAGIC_V3 {
         return Err(CryptoError::Envelope("bad magic"));
     }
     let ver = u16::from_be_bytes([header[4], header[5]]);
-    if ver != FORMAT_VER_V2 {
+    if ver != FORMAT_VER_V3 {
         return Err(CryptoError::UnsupportedVersion(ver));
     }
     if header[6] != KEM_ALG_MLKEM768 {
@@ -356,26 +370,28 @@ pub fn parse_v2_geometry(header: &[u8]) -> Result<(u32, u64), CryptoError> {
     if header[7] != AEAD_ALG_AES256GCM {
         return Err(CryptoError::Envelope("unknown aead_alg"));
     }
-    let plaintext_len = u64::from_be_bytes(header[20..28].try_into().unwrap());
-    let chunk_size = u32::from_be_bytes(header[28..32].try_into().unwrap());
+    let key_epoch = u32::from_be_bytes(header[8..12].try_into().unwrap());
+    let plaintext_len = u64::from_be_bytes(header[24..32].try_into().unwrap());
+    let chunk_size = u32::from_be_bytes(header[32..36].try_into().unwrap());
     if chunk_size == 0 {
         return Err(CryptoError::Envelope("zero chunk_size"));
     }
-    Ok((chunk_size, plaintext_len))
+    Ok((key_epoch, chunk_size, plaintext_len))
 }
 
-/// Decrypt a contiguous run of whole v2 chunks beginning at `first_chunk_idx`.
+/// Decrypt a contiguous run of whole v3 chunks beginning at `first_chunk_idx`.
 ///
-/// `preamble` must be the first [`v2_preamble_len`] bytes of the envelope (used
+/// `preamble` must be the first [`v3_preamble_len`] bytes of the envelope (used
 /// to recover the content key, chunk geometry, and AAD). `chunks_ct` holds the
 /// ciphertext for chunks `[first_chunk_idx ..]`, aligned to a chunk boundary
 /// (i.e. it must start exactly at the on-disk offset of `first_chunk_idx`).
 ///
 /// Returns the concatenated plaintext of the decrypted whole chunks; the caller
 /// trims to the exact requested byte range. Used by ranged GET; the per-chunk
-/// AEAD nonce and AAD match [`decrypt_v2`]. `bucket`/`key` must be the address
-/// the caller requested — see the identity-binding note on [`decrypt`].
-pub fn decrypt_v2_chunks(
+/// AEAD nonce and AAD match [`decrypt_v3`]. `bucket`/`key` must be the address
+/// the caller requested, and `sk_bytes` the epoch-matching secret key — see
+/// the identity/epoch-binding notes on [`decrypt`].
+pub fn decrypt_v3_chunks(
     sk_bytes: &[u8],
     preamble: &[u8],
     chunks_ct: &[u8],
@@ -383,24 +399,22 @@ pub fn decrypt_v2_chunks(
     bucket: &str,
     key: &str,
 ) -> Result<Vec<u8>, CryptoError> {
-    let preamble_len = v2_preamble_len();
+    let preamble_len = v3_preamble_len();
     if preamble.len() < preamble_len {
-        return Err(CryptoError::Envelope("truncated v2 preamble"));
+        return Err(CryptoError::Envelope("truncated v3 preamble"));
     }
-    let (chunk_size_u32, _plaintext_len) =
-        parse_v2_geometry(&preamble[..ENVELOPE_V2_HEADER_FIXED_LEN])?;
+    let (_key_epoch, chunk_size_u32, _plaintext_len) = parse_v3_geometry(&preamble[..ENVELOPE_V3_HEADER_FIXED_LEN])?;
     let chunk_size = chunk_size_u32 as usize;
 
     let mut nonce_base = [0u8; 12];
-    nonce_base.copy_from_slice(&preamble[8..20]);
-    let aad = build_v2_aad(&preamble[..ENVELOPE_V2_HEADER_FIXED_LEN]);
+    nonce_base.copy_from_slice(&preamble[12..24]);
+    let aad = build_v3_aad(&preamble[..ENVELOPE_V3_HEADER_FIXED_LEN]);
 
-    let kem_ct_bytes = &preamble[ENVELOPE_V2_HEADER_FIXED_LEN..preamble_len];
+    let kem_ct_bytes = &preamble[ENVELOPE_V3_HEADER_FIXED_LEN..preamble_len];
 
-    let sk = mlkem768::SecretKey::from_bytes(sk_bytes)
-        .map_err(|_| CryptoError::KemDecode("secret key"))?;
-    let kem_ct = mlkem768::Ciphertext::from_bytes(kem_ct_bytes)
-        .map_err(|_| CryptoError::KemDecode("kem ciphertext"))?;
+    let sk = mlkem768::SecretKey::from_bytes(sk_bytes).map_err(|_| CryptoError::KemDecode("secret key"))?;
+    let kem_ct =
+        mlkem768::Ciphertext::from_bytes(kem_ct_bytes).map_err(|_| CryptoError::KemDecode("kem ciphertext"))?;
     let ss = mlkem768::decapsulate(&kem_ct, &sk);
 
     let mut key_bytes = derive_content_key(ss.as_bytes(), kem_ct_bytes, bucket, key)?;
@@ -428,35 +442,35 @@ pub fn decrypt_v2_chunks(
 }
 
 /// Length of the header prefix (magic + format_ver + kem_alg + aead_alg +
-/// nonce_base) that forms the first part of the v2 per-chunk AAD.
-const V2_AAD_PREFIX_LEN: usize = 20; // up to and including nonce_base
+/// key_epoch + nonce_base) that forms the first part of the v3 per-chunk AAD.
+const V3_AAD_PREFIX_LEN: usize = 24; // up to and including nonce_base
 
-/// Total length of the v2 per-chunk AAD: the header prefix plus `chunk_size`
-/// (bytes 28-31). `plaintext_len` (bytes 20-27) is the only fixed-header
+/// Total length of the v3 per-chunk AAD: the header prefix plus `chunk_size`
+/// (bytes 32-35). `plaintext_len` (bytes 24-31) is the only fixed-header
 /// field excluded — it's only known after all chunks are written (patched in
 /// via a seek in [`EncryptSession::finish`]), so a placeholder value bound at
 /// encrypt time would never match what's read back at decrypt time.
 /// `chunk_size` has no such excuse: it's fixed before the first byte is
 /// written, so it's authenticated like every other header field.
-const V2_AAD_LEN: usize = V2_AAD_PREFIX_LEN + 4;
+const V3_AAD_LEN: usize = V3_AAD_PREFIX_LEN + 4;
 
-/// Build the v2 per-chunk AAD from a (at least) 32-byte fixed header: the
-/// magic/version/alg/nonce_base prefix concatenated with `chunk_size`,
-/// skipping the not-yet-known `plaintext_len` bytes in between.
-fn build_v2_aad(header: &[u8]) -> [u8; V2_AAD_LEN] {
-    let mut aad = [0u8; V2_AAD_LEN];
-    aad[..V2_AAD_PREFIX_LEN].copy_from_slice(&header[..V2_AAD_PREFIX_LEN]);
-    aad[V2_AAD_PREFIX_LEN..].copy_from_slice(&header[28..32]);
+/// Build the v3 per-chunk AAD from a (at least) 36-byte fixed header: the
+/// magic/version/alg/key_epoch/nonce_base prefix concatenated with
+/// `chunk_size`, skipping the not-yet-known `plaintext_len` bytes in between.
+fn build_v3_aad(header: &[u8]) -> [u8; V3_AAD_LEN] {
+    let mut aad = [0u8; V3_AAD_LEN];
+    aad[..V3_AAD_PREFIX_LEN].copy_from_slice(&header[..V3_AAD_PREFIX_LEN]);
+    aad[V3_AAD_PREFIX_LEN..].copy_from_slice(&header[32..36]);
     aad
 }
 
-/// Streaming AES-256-GCM v2 encryptor that writes directly to a file.
+/// Streaming AES-256-GCM v3 encryptor that writes directly to a file.
 ///
 /// Feed plaintext in arbitrary-sized chunks via [`feed`]; call [`finish`] when
 /// done to flush the last chunk and patch the `plaintext_len` field in the
 /// header. The file is returned so the caller can close or rename it.
 ///
-/// `write_offset` is the byte offset within the file at which the v2 envelope
+/// `write_offset` is the byte offset within the file at which the v3 envelope
 /// starts. Pass `0` when the envelope occupies the whole file (filesystem
 /// backend). Pass `64` when a 64-byte container header precedes the envelope
 /// (uring backend — the caller pre-writes a placeholder header before creating
@@ -469,13 +483,16 @@ pub struct EncryptSession {
     buf: Vec<u8>,
     plaintext_total: u64,
     /// This session's AAD: the header prefix concatenated with `chunk_size`
-    /// (see [`build_v2_aad`]).
-    aad: [u8; V2_AAD_LEN],
+    /// (see [`build_v3_aad`]).
+    aad: [u8; V3_AAD_LEN],
     bytes_written: u64,
-    /// Byte offset within the file at which the v2 envelope begins.
+    /// Byte offset within the file at which the v3 envelope begins.
     write_offset: u64,
     /// Plaintext chunk size used for this session (recorded in the header).
     chunk_size: usize,
+    /// Bucket key epoch this session encapsulated `pk_bytes` from, mirrored
+    /// into [`EnvelopeInfo::key_epoch`] on [`finish`](Self::finish).
+    key_epoch: u32,
     /// Running checksum of every byte written (header, KEM ciphertext, and
     /// each chunk's ciphertext+tag), fed incrementally as it's written so no
     /// read-back is needed. See [`EnvelopeInfo::cipher_checksum_b64`].
@@ -483,21 +500,27 @@ pub struct EncryptSession {
 }
 
 impl EncryptSession {
-    /// Create a new encrypt session for a v2 envelope.
+    /// Create a new encrypt session for a v3 envelope.
     ///
-    /// Writes the 32-byte fixed header (with `plaintext_len = 0`) and the
+    /// Writes the 36-byte fixed header (with `plaintext_len = 0`) and the
     /// 1088-byte KEM ciphertext to `sink`, starting at the sink's current
     /// cursor (which must equal `write_offset`). Pass `write_offset = 0`
     /// when the envelope is the entire file; pass a non-zero value when a
     /// container header precedes it.
     ///
-    /// `bucket`/`key` are the address this object is being written to. They're
-    /// folded into the content-key derivation so the resulting envelope only
-    /// decrypts when later read back under this same address — see the
-    /// identity-binding note on [`decrypt`].
+    /// `pk_bytes` is the public key of the bucket key epoch `key_epoch`
+    /// identifies; the two must correspond to the same epoch, since
+    /// `key_epoch` is written into the header (and folded into every
+    /// chunk's AAD) so a future reader knows which secret key decrypts this
+    /// envelope. `bucket`/`key` are the address this object is being
+    /// written to. They're folded into the content-key derivation so the
+    /// resulting envelope only decrypts when later read back under this same
+    /// address — see the identity-binding note on [`decrypt`].
+    #[allow(clippy::too_many_arguments)]
     pub async fn new(
         mut sink: crate::storage::streaming_sink::StreamingSink,
         pk_bytes: &[u8],
+        key_epoch: u32,
         bucket: &str,
         key: &str,
         write_offset: u64,
@@ -506,30 +529,26 @@ impl EncryptSession {
         if chunk_size == 0 || chunk_size > u32::MAX as usize {
             return Err(CryptoError::Envelope("invalid chunk_size"));
         }
-        let pk = mlkem768::PublicKey::from_bytes(pk_bytes)
-            .map_err(|_| CryptoError::KemDecode("public key"))?;
+        let pk = mlkem768::PublicKey::from_bytes(pk_bytes).map_err(|_| CryptoError::KemDecode("public key"))?;
         let (ss, kem_ct) = mlkem768::encapsulate(&pk);
         let kem_ct_bytes = kem_ct.as_bytes();
 
         let mut nonce_base = [0u8; 12];
         rand::rng().fill_bytes(&mut nonce_base);
 
-        // Build the 32-byte v2 fixed header (plaintext_len = 0 placeholder).
-        let mut header = Vec::with_capacity(ENVELOPE_V2_HEADER_FIXED_LEN);
-        header.extend_from_slice(MAGIC_V2);
-        header.extend_from_slice(&FORMAT_VER_V2.to_be_bytes());
+        // Build the 36-byte v3 fixed header (plaintext_len = 0 placeholder).
+        let mut header = Vec::with_capacity(ENVELOPE_V3_HEADER_FIXED_LEN);
+        header.extend_from_slice(MAGIC_V3);
+        header.extend_from_slice(&FORMAT_VER_V3.to_be_bytes());
         header.push(KEM_ALG_MLKEM768);
         header.push(AEAD_ALG_AES256GCM);
+        header.extend_from_slice(&key_epoch.to_be_bytes());
         header.extend_from_slice(&nonce_base);
         header.extend_from_slice(&0u64.to_be_bytes()); // plaintext_len placeholder
         header.extend_from_slice(&(chunk_size as u32).to_be_bytes());
 
-        sink.write_all(&header)
-            .await
-            .map_err(|_| CryptoError::Aead("write header"))?;
-        sink.write_all(kem_ct_bytes)
-            .await
-            .map_err(|_| CryptoError::Aead("write kem ct"))?;
+        sink.write_all(&header).await.map_err(|_| CryptoError::Aead("write header"))?;
+        sink.write_all(kem_ct_bytes).await.map_err(|_| CryptoError::Aead("write kem ct"))?;
 
         let mut key_bytes = derive_content_key(ss.as_bytes(), kem_ct_bytes, bucket, key)?;
         let cipher = aes_key(&key_bytes);
@@ -537,7 +556,7 @@ impl EncryptSession {
 
         let bytes_written = (header.len() + kem_ct_bytes.len()) as u64;
 
-        let aad = build_v2_aad(&header);
+        let aad = build_v3_aad(&header);
 
         let mut cipher_hasher = crate::checksum::StreamChecksum::new();
         cipher_hasher.update(&header);
@@ -554,6 +573,7 @@ impl EncryptSession {
             bytes_written,
             write_offset,
             chunk_size,
+            key_epoch,
             cipher_hasher,
         })
     }
@@ -573,7 +593,7 @@ impl EncryptSession {
         Ok(())
     }
 
-    /// Flush remaining buffered data, patch `plaintext_len` at its v2 header
+    /// Flush remaining buffered data, patch `plaintext_len` at its v3 header
     /// position, and return the sink (now positioned at end-of-data) plus
     /// [`EnvelopeInfo`].
     pub async fn finish(
@@ -605,28 +625,23 @@ impl EncryptSession {
 
         let cipher_size = self.bytes_written;
 
-        // Patch plaintext_len at its position within the v2 envelope.
+        // Patch plaintext_len at its position within the v3 envelope.
         self.sink
-            .write_all_at(
-                &self.plaintext_total.to_be_bytes(),
-                self.write_offset + V2_PLAINTEXT_LEN_OFFSET,
-            )
+            .write_all_at(&self.plaintext_total.to_be_bytes(), self.write_offset + V3_PLAINTEXT_LEN_OFFSET)
             .await
             .map_err(|_| CryptoError::Aead("write plaintext_len"))?;
         // Return to end so callers can do further writes / flush / close.
-        self.sink
-            .seek_to_end()
-            .await
-            .map_err(|_| CryptoError::Aead("seek end"))?;
+        self.sink.seek_to_end().await.map_err(|_| CryptoError::Aead("seek end"))?;
 
         Ok((
             self.sink,
             EnvelopeInfo {
-                envelope_version: FORMAT_VER_V2,
+                envelope_version: FORMAT_VER_V3,
                 kem_alg: KEM_ALG_NAME,
                 aead_alg: AEAD_ALG_NAME,
                 cipher_size,
                 cipher_checksum_b64: self.cipher_hasher.finish_b64(),
+                key_epoch: self.key_epoch,
             },
         ))
     }
@@ -644,10 +659,7 @@ impl EncryptSession {
         self.plaintext_total += plaintext_len as u64;
         self.bytes_written += self.buf.len() as u64;
         self.cipher_hasher.update(&self.buf);
-        self.sink
-            .write_all(&self.buf)
-            .await
-            .map_err(|_| CryptoError::Aead("write chunk"))?;
+        self.sink.write_all(&self.buf).await.map_err(|_| CryptoError::Aead("write chunk"))?;
         self.buf.clear();
         self.chunk_idx += 1;
         Ok(())
@@ -688,12 +700,7 @@ fn aes_nonce(bytes: &[u8; 12]) -> Nonce {
 /// longer grants access to it. Length-prefixed (matching
 /// `filesystem::encode_object_id`'s scheme) so there's no ambiguity between
 /// different bucket/key splits of the same concatenated bytes.
-fn derive_content_key(
-    ss: &[u8],
-    kem_ct: &[u8],
-    bucket: &str,
-    key: &str,
-) -> Result<[u8; 32], CryptoError> {
+fn derive_content_key(ss: &[u8], kem_ct: &[u8], bucket: &str, key: &str) -> Result<[u8; 32], CryptoError> {
     let hk = Hkdf::<Sha256>::new(Some(kem_ct), ss);
     let mut info = Vec::with_capacity(HKDF_INFO.len() + 8 + bucket.len() + key.len());
     info.extend_from_slice(HKDF_INFO);
@@ -702,8 +709,7 @@ fn derive_content_key(
         info.extend_from_slice(part);
     }
     let mut out = [0u8; 32];
-    hk.expand(&info, &mut out)
-        .map_err(|_| CryptoError::Aead("hkdf expand"))?;
+    hk.expand(&info, &mut out).map_err(|_| CryptoError::Aead("hkdf expand"))?;
     Ok(out)
 }
 
@@ -711,21 +717,18 @@ fn derive_content_key(
 mod tests {
     use super::*;
 
+    const EPOCH: u32 = 0;
+
     #[test]
     fn bad_magic_rejected() {
-        let env = vec![0u8; ENVELOPE_V2_HEADER_FIXED_LEN + 2000];
+        let env = vec![0u8; ENVELOPE_V3_HEADER_FIXED_LEN + 2000];
         let (_, sk) = mlkem768::keypair();
         assert!(matches!(
             decrypt(sk.as_bytes(), &env, "bucket", "key"),
             Err(CryptoError::Envelope("bad magic"))
         ));
         assert!(matches!(
-            decrypt_owned(
-                sk.as_bytes(),
-                BytesMut::from(env.as_slice()),
-                "bucket",
-                "key"
-            ),
+            decrypt_owned(sk.as_bytes(), BytesMut::from(env.as_slice()), "bucket", "key"),
             Err(CryptoError::Envelope("bad magic"))
         ));
     }
@@ -733,17 +736,11 @@ mod tests {
     #[tokio::test]
     async fn unsupported_version_rejected() {
         let (pk, sk) = mlkem768::keypair();
-        let file = tempfile_v2().await;
-        let session = EncryptSession::new(
-            file,
-            pk.as_bytes(),
-            "bucket",
-            "key",
-            0,
-            DEFAULT_CHUNK_SIZE_BYTES,
-        )
-        .await
-        .unwrap();
+        let file = tempfile_v3().await;
+        let session =
+            EncryptSession::new(file, pk.as_bytes(), EPOCH, "bucket", "key", 0, DEFAULT_CHUNK_SIZE_BYTES)
+                .await
+                .unwrap();
         let (file, _) = session.finish().await.unwrap();
         let mut env = read_file(file).await;
         env[4] = 0xff;
@@ -755,20 +752,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v2_wrong_key_breaks_decrypt() {
+    async fn v3_wrong_key_breaks_decrypt() {
         let (pk1, _) = mlkem768::keypair();
         let (_, sk2) = mlkem768::keypair();
-        let file = tempfile_v2().await;
-        let mut session = EncryptSession::new(
-            file,
-            pk1.as_bytes(),
-            "bucket",
-            "key",
-            0,
-            DEFAULT_CHUNK_SIZE_BYTES,
-        )
-        .await
-        .unwrap();
+        let file = tempfile_v3().await;
+        let mut session =
+            EncryptSession::new(file, pk1.as_bytes(), EPOCH, "bucket", "key", 0, DEFAULT_CHUNK_SIZE_BYTES)
+                .await
+                .unwrap();
         session.feed(b"hi").await.unwrap();
         let (file, _) = session.finish().await.unwrap();
         let env = read_file(file).await;
@@ -776,51 +767,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v2_fresh_kem_per_call() {
+    async fn v3_fresh_kem_per_call() {
         let (pk, _sk) = mlkem768::keypair();
         let mut envs = Vec::new();
         for _ in 0..2 {
-            let file = tempfile_v2().await;
-            let mut session = EncryptSession::new(
-                file,
-                pk.as_bytes(),
-                "bucket",
-                "key",
-                0,
-                DEFAULT_CHUNK_SIZE_BYTES,
-            )
-            .await
-            .unwrap();
+            let file = tempfile_v3().await;
+            let mut session =
+                EncryptSession::new(file, pk.as_bytes(), EPOCH, "bucket", "key", 0, DEFAULT_CHUNK_SIZE_BYTES)
+                    .await
+                    .unwrap();
             session.feed(b"x").await.unwrap();
             let (file, _) = session.finish().await.unwrap();
             envs.push(read_file(file).await);
         }
-        assert_ne!(
-            envs[0], envs[1],
-            "two encrypts of same plaintext must differ"
-        );
+        assert_ne!(envs[0], envs[1], "two encrypts of same plaintext must differ");
     }
 
-    // ── v2 EncryptSession tests ───────────────────────────────────────────
+    // ── v3 EncryptSession tests ───────────────────────────────────────────
 
     #[tokio::test]
-    async fn v2_roundtrip_small() {
+    async fn v3_roundtrip_small() {
         let (pk, sk) = mlkem768::keypair();
         let pt = b"hello chunked world";
-        let file = tempfile_v2().await;
-        let mut session = EncryptSession::new(
-            file,
-            pk.as_bytes(),
-            "bucket",
-            "key",
-            0,
-            DEFAULT_CHUNK_SIZE_BYTES,
-        )
-        .await
-        .unwrap();
+        let file = tempfile_v3().await;
+        let mut session =
+            EncryptSession::new(file, pk.as_bytes(), EPOCH, "bucket", "key", 0, DEFAULT_CHUNK_SIZE_BYTES)
+                .await
+                .unwrap();
         session.feed(pt).await.unwrap();
         let (file, info) = session.finish().await.unwrap();
-        assert_eq!(info.envelope_version, 2);
+        assert_eq!(info.envelope_version, 3);
+        assert_eq!(info.key_epoch, EPOCH);
         let env = read_file(file).await;
         let recovered = decrypt(sk.as_bytes(), &env, "bucket", "key").unwrap();
         // The envelope zero-pads to a Padmé boundary to hide the exact size; the
@@ -838,10 +815,7 @@ mod tests {
             assert!(p >= l, "padme({l}) = {p} shrank");
             // Padmé overhead is bounded well under ~12%.
             if l > 0 {
-                assert!(
-                    p <= l + l / 8 + 1,
-                    "padme({l}) = {p} exceeds the ~12% overhead bound"
-                );
+                assert!(p <= l + l / 8 + 1, "padme({l}) = {p} exceeds the ~12% overhead bound");
             }
         }
         // Powers of two and their multiples by the bucket size are unchanged.
@@ -851,7 +825,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v2_quantizes_size_and_trims_back() {
+    async fn v3_quantizes_size_and_trims_back() {
         let (pk, sk) = mlkem768::keypair();
         // Two plaintexts of slightly different size that share a Padmé bucket.
         let a = vec![0x11u8; 1000];
@@ -864,17 +838,11 @@ mod tests {
 
         let mut sizes = Vec::new();
         for pt in [&a, &b] {
-            let file = tempfile_v2().await;
-            let mut session = EncryptSession::new(
-                file,
-                pk.as_bytes(),
-                "bucket",
-                "key",
-                0,
-                DEFAULT_CHUNK_SIZE_BYTES,
-            )
-            .await
-            .unwrap();
+            let file = tempfile_v3().await;
+            let mut session =
+                EncryptSession::new(file, pk.as_bytes(), EPOCH, "bucket", "key", 0, DEFAULT_CHUNK_SIZE_BYTES)
+                    .await
+                    .unwrap();
             session.feed(pt).await.unwrap();
             let (file, info) = session.finish().await.unwrap();
             sizes.push(info.cipher_size);
@@ -890,19 +858,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v2_roundtrip_empty() {
+    async fn v3_roundtrip_empty() {
         let (pk, sk) = mlkem768::keypair();
-        let file = tempfile_v2().await;
-        let session = EncryptSession::new(
-            file,
-            pk.as_bytes(),
-            "bucket",
-            "key",
-            0,
-            DEFAULT_CHUNK_SIZE_BYTES,
-        )
-        .await
-        .unwrap();
+        let file = tempfile_v3().await;
+        let session =
+            EncryptSession::new(file, pk.as_bytes(), EPOCH, "bucket", "key", 0, DEFAULT_CHUNK_SIZE_BYTES)
+                .await
+                .unwrap();
         let (file, _) = session.finish().await.unwrap();
         let env = read_file(file).await;
         let recovered = decrypt(sk.as_bytes(), &env, "bucket", "key").unwrap();
@@ -910,21 +872,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v2_roundtrip_multi_chunk() {
+    async fn v3_roundtrip_multi_chunk() {
         let (pk, sk) = mlkem768::keypair();
         // 2.5 chunks — spans three chunks (last is partial)
         let pt = vec![0xAB_u8; 5 * DEFAULT_CHUNK_SIZE_BYTES / 2];
-        let file = tempfile_v2().await;
-        let mut session = EncryptSession::new(
-            file,
-            pk.as_bytes(),
-            "bucket",
-            "key",
-            0,
-            DEFAULT_CHUNK_SIZE_BYTES,
-        )
-        .await
-        .unwrap();
+        let file = tempfile_v3().await;
+        let mut session =
+            EncryptSession::new(file, pk.as_bytes(), EPOCH, "bucket", "key", 0, DEFAULT_CHUNK_SIZE_BYTES)
+                .await
+                .unwrap();
         // Feed in small slices to exercise partial-chunk buffering.
         for chunk in pt.chunks(65536) {
             session.feed(chunk).await.unwrap();
@@ -940,43 +896,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn decrypt_owned_v2_multi_chunk() {
+    async fn decrypt_owned_v3_multi_chunk() {
         let (pk, sk) = mlkem768::keypair();
         let pt = vec![0x37_u8; 5 * DEFAULT_CHUNK_SIZE_BYTES / 2];
-        let file = tempfile_v2().await;
-        let mut session = EncryptSession::new(
-            file,
-            pk.as_bytes(),
-            "bucket",
-            "key",
-            0,
-            DEFAULT_CHUNK_SIZE_BYTES,
-        )
-        .await
-        .unwrap();
+        let file = tempfile_v3().await;
+        let mut session =
+            EncryptSession::new(file, pk.as_bytes(), EPOCH, "bucket", "key", 0, DEFAULT_CHUNK_SIZE_BYTES)
+                .await
+                .unwrap();
         for chunk in pt.chunks(65536) {
             session.feed(chunk).await.unwrap();
         }
         let (file, _) = session.finish().await.unwrap();
         let env = read_file(file).await;
-        let rec = decrypt_owned(
-            sk.as_bytes(),
-            BytesMut::from(env.as_slice()),
-            "bucket",
-            "key",
-        )
-        .unwrap();
+        let rec = decrypt_owned(sk.as_bytes(), BytesMut::from(env.as_slice()), "bucket", "key").unwrap();
         assert_eq!(rec.as_ref(), pt.as_slice());
     }
 
     #[tokio::test]
-    async fn v2_ranged_decrypt_matches_full() {
+    async fn v3_ranged_decrypt_matches_full() {
         let (pk, sk) = mlkem768::keypair();
         // Use a small chunk size so the test stays cheap but still multi-chunk.
         let chunk_size = 4096usize;
         let pt: Vec<u8> = (0..(chunk_size * 5 / 2)).map(|i| (i % 251) as u8).collect();
-        let file = tempfile_v2().await;
-        let mut session = EncryptSession::new(file, pk.as_bytes(), "bucket", "key", 0, chunk_size)
+        let file = tempfile_v3().await;
+        let mut session = EncryptSession::new(file, pk.as_bytes(), EPOCH, "bucket", "key", 0, chunk_size)
             .await
             .unwrap();
         for c in pt.chunks(777) {
@@ -985,7 +929,7 @@ mod tests {
         let (file, info) = session.finish().await.unwrap();
         let env = read_file(file).await;
         let cipher_size = info.cipher_size;
-        let preamble_len = v2_preamble_len();
+        let preamble_len = v3_preamble_len();
         let stride = chunk_size + TAG_LEN;
 
         // Exercise several ranges: within one chunk, across a boundary, into the
@@ -1002,37 +946,26 @@ mod tests {
             let first = start / chunk_size as u64;
             let last = end / chunk_size as u64;
             let cipher_start = preamble_len as u64 + first * stride as u64;
-            let cipher_end =
-                (preamble_len as u64 + (last + 1) * stride as u64 - 1).min(cipher_size - 1);
+            let cipher_end = (preamble_len as u64 + (last + 1) * stride as u64 - 1).min(cipher_size - 1);
             let preamble = &env[..preamble_len];
             let window = &env[cipher_start as usize..=cipher_end as usize];
             let chunks_pt =
-                decrypt_v2_chunks(sk.as_bytes(), preamble, window, first, "bucket", "key").unwrap();
+                decrypt_v3_chunks(sk.as_bytes(), preamble, window, first, "bucket", "key").unwrap();
             let trim_front = (start - first * chunk_size as u64) as usize;
             let take = (end - start + 1) as usize;
             let got = &chunks_pt[trim_front..trim_front + take];
-            assert_eq!(
-                got,
-                &pt[start as usize..=end as usize],
-                "range {start}-{end}"
-            );
+            assert_eq!(got, &pt[start as usize..=end as usize], "range {start}-{end}");
         }
     }
 
     #[tokio::test]
-    async fn v2_tamper_breaks_decrypt() {
+    async fn v3_tamper_breaks_decrypt() {
         let (pk, sk) = mlkem768::keypair();
-        let file = tempfile_v2().await;
-        let mut session = EncryptSession::new(
-            file,
-            pk.as_bytes(),
-            "bucket",
-            "key",
-            0,
-            DEFAULT_CHUNK_SIZE_BYTES,
-        )
-        .await
-        .unwrap();
+        let file = tempfile_v3().await;
+        let mut session =
+            EncryptSession::new(file, pk.as_bytes(), EPOCH, "bucket", "key", 0, DEFAULT_CHUNK_SIZE_BYTES)
+                .await
+                .unwrap();
         session.feed(b"some payload").await.unwrap();
         let (file, _) = session.finish().await.unwrap();
         let mut env = read_file(file).await;
@@ -1042,7 +975,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v2_chunk_size_tampering_is_authenticated() {
+    async fn v3_chunk_size_tampering_is_authenticated() {
         // Before chunk_size was included in the AAD, substituting a different
         // (still-oversized-relative-to-the-ciphertext) chunk_size value went
         // completely undetected on a single-chunk object: any value large
@@ -1050,24 +983,18 @@ mod tests {
         // exact same ciphertext window and AAD, so the tag check couldn't
         // tell the difference. It's now part of the AAD, so this must fail.
         let (pk, sk) = mlkem768::keypair();
-        let file = tempfile_v2().await;
-        let mut session = EncryptSession::new(
-            file,
-            pk.as_bytes(),
-            "bucket",
-            "key",
-            0,
-            DEFAULT_CHUNK_SIZE_BYTES,
-        )
-        .await
-        .unwrap();
+        let file = tempfile_v3().await;
+        let mut session =
+            EncryptSession::new(file, pk.as_bytes(), EPOCH, "bucket", "key", 0, DEFAULT_CHUNK_SIZE_BYTES)
+                .await
+                .unwrap();
         session.feed(b"some payload").await.unwrap();
         let (file, _) = session.finish().await.unwrap();
         let mut env = read_file(file).await;
 
-        // chunk_size lives at header bytes [28..32].
+        // chunk_size lives at header bytes [32..36].
         let tampered = (DEFAULT_CHUNK_SIZE_BYTES as u32) / 2;
-        env[28..32].copy_from_slice(&tampered.to_be_bytes());
+        env[32..36].copy_from_slice(&tampered.to_be_bytes());
 
         assert!(matches!(
             decrypt(sk.as_bytes(), &env, "bucket", "key"),
@@ -1076,17 +1003,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v2_envelope_cannot_be_relocated_to_a_different_object() {
+    async fn v3_key_epoch_tampering_is_authenticated() {
+        // key_epoch must be cleartext (a reader needs it before it can pick a
+        // secret key), but flipping it to point at a *different, still-valid*
+        // epoch must not silently decrypt as if nothing changed — it's part
+        // of the AAD, so tampering with it invalidates every chunk's tag.
+        let (pk, sk) = mlkem768::keypair();
+        let file = tempfile_v3().await;
+        let mut session =
+            EncryptSession::new(file, pk.as_bytes(), EPOCH, "bucket", "key", 0, DEFAULT_CHUNK_SIZE_BYTES)
+                .await
+                .unwrap();
+        session.feed(b"some payload").await.unwrap();
+        let (file, _) = session.finish().await.unwrap();
+        let mut env = read_file(file).await;
+
+        // key_epoch lives at header bytes [8..12].
+        env[8..12].copy_from_slice(&99u32.to_be_bytes());
+
+        assert!(matches!(
+            decrypt(sk.as_bytes(), &env, "bucket", "key"),
+            Err(CryptoError::AuthFailed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn v3_envelope_cannot_be_relocated_to_a_different_object() {
         // The ciphertext itself carries no identity — a filesystem-write
         // attacker who copies object A's on-disk envelope onto object B's
         // storage location must not be able to have it decrypt successfully
         // "as B". The content key is bound to (bucket, key), so the exact
         // same bytes, decrypted under a different address, must fail.
         let (pk, sk) = mlkem768::keypair();
-        let file = tempfile_v2().await;
+        let file = tempfile_v3().await;
         let mut session = EncryptSession::new(
             file,
             pk.as_bytes(),
+            EPOCH,
             "bucket-a",
             "secret-object",
             0,
@@ -1094,10 +1047,7 @@ mod tests {
         )
         .await
         .unwrap();
-        session
-            .feed(b"object A's confidential payload")
-            .await
-            .unwrap();
+        session.feed(b"object A's confidential payload").await.unwrap();
         let (file, _) = session.finish().await.unwrap();
         let env = read_file(file).await;
 
@@ -1127,30 +1077,18 @@ mod tests {
         // The owned and chunked decrypt paths derive the key the same way —
         // relocation must fail there too.
         assert!(matches!(
-            decrypt_owned(
-                sk.as_bytes(),
-                BytesMut::from(env.as_slice()),
-                "bucket-b",
-                "other-object"
-            ),
+            decrypt_owned(sk.as_bytes(), BytesMut::from(env.as_slice()), "bucket-b", "other-object"),
             Err(CryptoError::AuthFailed)
         ));
-        let preamble_len = v2_preamble_len();
+        let preamble_len = v3_preamble_len();
         assert!(matches!(
-            decrypt_v2_chunks(
-                sk.as_bytes(),
-                &env[..preamble_len],
-                &env[preamble_len..],
-                0,
-                "bucket-b",
-                "other-object",
-            ),
+            decrypt_v3_chunks(sk.as_bytes(), &env[..preamble_len], &env[preamble_len..], 0, "bucket-b", "other-object",),
             Err(CryptoError::AuthFailed)
         ));
     }
 
     #[tokio::test]
-    async fn v2_lying_plaintext_len_does_not_drive_unbounded_allocation() {
+    async fn v3_lying_plaintext_len_does_not_drive_unbounded_allocation() {
         // plaintext_len isn't authenticated (it's patched in after all chunks
         // are written, so it can't be bound at encrypt time). Before the fix
         // its raw value was trusted directly as a Vec/BytesMut pre-allocation
@@ -1159,40 +1097,29 @@ mod tests {
         // still decrypt fine, and the lie is caught by the trailing
         // length-consistency check instead of an AEAD failure.
         let (pk, sk) = mlkem768::keypair();
-        let file = tempfile_v2().await;
-        let mut session = EncryptSession::new(
-            file,
-            pk.as_bytes(),
-            "bucket",
-            "key",
-            0,
-            DEFAULT_CHUNK_SIZE_BYTES,
-        )
-        .await
-        .unwrap();
+        let file = tempfile_v3().await;
+        let mut session =
+            EncryptSession::new(file, pk.as_bytes(), EPOCH, "bucket", "key", 0, DEFAULT_CHUNK_SIZE_BYTES)
+                .await
+                .unwrap();
         session.feed(b"tiny").await.unwrap();
         let (file, _) = session.finish().await.unwrap();
         let mut env = read_file(file).await;
 
-        // plaintext_len lives at header bytes [20..28].
-        env[20..28].copy_from_slice(&u64::MAX.to_be_bytes());
+        // plaintext_len lives at header bytes [24..32].
+        env[24..32].copy_from_slice(&u64::MAX.to_be_bytes());
 
         assert!(matches!(
             decrypt(sk.as_bytes(), &env, "bucket", "key"),
             Err(CryptoError::Envelope("plaintext length mismatch"))
         ));
         assert!(matches!(
-            decrypt_owned(
-                sk.as_bytes(),
-                BytesMut::from(env.as_slice()),
-                "bucket",
-                "key"
-            ),
+            decrypt_owned(sk.as_bytes(), BytesMut::from(env.as_slice()), "bucket", "key"),
             Err(CryptoError::Envelope("plaintext length mismatch"))
         ));
     }
 
-    async fn tempfile_v2() -> crate::storage::streaming_sink::StreamingSink {
+    async fn tempfile_v3() -> crate::storage::streaming_sink::StreamingSink {
         let path = std::env::temp_dir().join(format!("y2q_test_{}.env", rand_u64()));
         let file = tokio::fs::OpenOptions::new()
             .write(true)
@@ -1238,9 +1165,6 @@ mod tests {
 
     fn rand_u64() -> u64 {
         use std::time::{SystemTime, UNIX_EPOCH};
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .subsec_nanos() as u64
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().subsec_nanos() as u64
     }
 }

@@ -84,6 +84,16 @@ pub(crate) fn role_is_global(role: Role) -> bool {
     matches!(role, Role::Admin | Role::Auditor)
 }
 
+/// Whether `candidate`'s verb ceiling is fully covered by `ceiling`'s — i.e.
+/// `candidate` grants nothing `ceiling` doesn't already grant. Used to stop
+/// a persona (phase 5, `POST /api/v1/personas`) from being minted with more
+/// power than the account's own global role.
+pub(crate) fn role_permits(candidate: Role, ceiling: Role) -> bool {
+    let c = role_caps(candidate);
+    let m = role_caps(ceiling);
+    (!c.read || m.read) && (!c.write || m.write) && (!c.admin || m.admin)
+}
+
 /// Verb capabilities a bucket grants `username` by ownership or ACL. `None`
 /// means no relationship at all (not the owner, not in the ACL).
 pub(crate) fn bucket_grant_caps(cfg: &BucketConfig, username: &str) -> Option<Caps> {
@@ -128,13 +138,28 @@ pub enum Decision {
 /// Effective capabilities for `auth` on `cfg` (role ceiling ∩ bucket
 /// relationship). The bool is whether the caller can *see* the bucket at all
 /// (owner, ACL grant, or a globally-scoped role) — used to choose 403 vs 404.
-fn effective_caps(auth: &Authenticated, cfg: &BucketConfig) -> (Caps, bool) {
+///
+/// `read` is additionally gated on `auth`'s *persona* actually holding a
+/// working cryptographic bucket-key grant (see [`crate::bucket_keys::is_visible`]):
+/// the ACL/ownership fields are username-keyed and persona-agnostic, but the
+/// sealed bucket-key grants are per-persona, so a duress persona whose slot
+/// was sealed with a decoy must not read here even when the ACL says the
+/// *user* can. `write`/`admin` are unaffected by this gate — writing only
+/// needs the bucket's public key, never a persona-specific secret-key grant,
+/// so a `WriteOnly` drop-box grantee (who never gets a real grant row at
+/// all) keeps working.
+fn effective_caps(auth: &Authenticated, cfg: &BucketConfig, bucket: &str) -> (Caps, bool) {
     let rc = role_caps(auth.role);
     if role_is_global(auth.role) {
         return (rc.intersect(Caps::FULL), true);
     }
     match bucket_grant_caps(cfg, &auth.username) {
-        Some(bc) => (rc.intersect(bc), true),
+        Some(mut bc) => {
+            if bc.read && !crate::bucket_keys::is_visible(&auth.session, cfg, bucket) {
+                bc.read = false;
+            }
+            (rc.intersect(bc), true)
+        }
         None => (Caps::NONE, false),
     }
 }
@@ -146,7 +171,11 @@ fn effective_caps(auth: &Authenticated, cfg: &BucketConfig) -> (Caps, bool) {
 /// ([`Decision::ClaimOwnership`]). On denial returns an [`AppError`] carrying
 /// the correct status:
 /// - **404** when the caller has no relationship to the bucket and cannot see
-///   it — never reveal that such a bucket exists.
+///   it — never reveal that such a bucket exists. This also covers a Read
+///   request denied *purely* because this persona's cryptographic bucket-key
+///   grant doesn't cover it while the username-keyed ACL says it should: that
+///   case is indistinguishable from the bucket not existing (the duress
+///   deniability property — see [`effective_caps`]).
 /// - **403** when the caller can see the bucket but lacks the verb (because of
 ///   their role ceiling, their grant level, or both).
 pub async fn authorize_bucket(
@@ -155,9 +184,19 @@ pub async fn authorize_bucket(
     bucket: &str,
     required: BucketPermission,
 ) -> Result<Decision, AppError> {
-    // Authorization disabled → full access.
     if !auth.authz_enforced {
-        return Ok(Decision::Allowed);
+        // Authorization disabled -> no ACL/ownership gate on an *existing*
+        // bucket, but a brand-new one still needs its owner/key material
+        // seeded (there is no group/escrow key to encrypt against
+        // otherwise) — so a Write against a not-yet-existing bucket still
+        // reports `ClaimOwnership` regardless of the flag.
+        return if matches!(required, BucketPermission::Write)
+            && !storage.bucket_exists(bucket).await.map_err(AppError::from)?
+        {
+            Ok(Decision::ClaimOwnership)
+        } else {
+            Ok(Decision::Allowed)
+        };
     }
 
     let cfg = storage
@@ -165,11 +204,28 @@ pub async fn authorize_bucket(
         .await
         .map_err(AppError::from)?;
 
-    let (eff, visible) = effective_caps(auth, &cfg);
+    let (eff, visible) = effective_caps(auth, &cfg, bucket);
     if eff.allows(required) {
+        // A globally-scoped role (Admin/Auditor) "sees" every bucket via its
+        // role ceiling, including one that doesn't exist yet — that
+        // ceiling is about visibility into *other* users' buckets, not an
+        // exemption from becoming the actual crypto owner of a bucket it
+        // creates itself. Without this, an admin's first write to a new
+        // bucket would never seed key material for anyone at all, leaving
+        // an object nobody — not even the admin who wrote it — can decrypt.
+        if cfg.owner.is_none()
+            && matches!(required, BucketPermission::Write)
+            && !storage.bucket_exists(bucket).await.map_err(AppError::from)?
+        {
+            return Ok(Decision::ClaimOwnership);
+        }
         return Ok(Decision::Allowed);
     }
-    if visible {
+
+    let denied_only_by_missing_crypto_grant = required == BucketPermission::Read
+        && !role_is_global(auth.role)
+        && bucket_grant_caps(&cfg, &auth.username).is_some_and(|bc| bc.read);
+    if visible && !denied_only_by_missing_crypto_grant {
         // Caller can see the bucket but lacks the verb.
         return Err(AppError(CoreError::Forbidden {
             bucket: bucket.to_owned(),
@@ -196,27 +252,69 @@ pub async fn authorize_bucket(
     }
 }
 
-/// Record `owner` as the bucket's owner if it has none yet. Idempotent and
-/// race-safe: if another writer claimed the bucket first, the existing owner is
-/// left untouched. Called by write handlers after a [`Decision::ClaimOwnership`]
-/// PUT/create succeeds.
+/// Record `auth`'s persona as the bucket's owner if it has none yet, seeding
+/// its epoch-0 key material at the same time (real access for this persona,
+/// decoy access for the claiming user's other personas — see
+/// [`crate::bucket_keys::new_owner_key`]). Idempotent: if another writer
+/// already claimed the bucket, the existing owner and key material are left
+/// untouched and this returns the config *they* wrote, not a
+/// caller-generated one — a caller must never encrypt against key material
+/// it generated but lost the race to persist. Called by write handlers
+/// after a [`Decision::ClaimOwnership`] PUT/create.
+///
+/// Race-narrowing, not race-*proof*: [`Listing::create_bucket`]'s
+/// create-if-absent is itself a check-then-act on the filesystem/uring
+/// backends (no bucket-level lock exists below this layer), so this can
+/// only shrink the window two concurrent first-writers race through, not
+/// close it — the same limitation the pre-existing plain `create_bucket`
+/// path already has. A closed race needs a real per-bucket lock in the
+/// storage layer, out of scope here.
+///
+/// Returns the resulting (possibly pre-existing) [`BucketConfig`] plus
+/// whether *this call* physically created the bucket directory (from
+/// [`Listing::create_bucket`]'s own return), so callers that need that
+/// signal (the explicit create endpoint's `created` response field) don't
+/// have to call `create_bucket` a second time themselves — doing so would
+/// always observe `false` (the directory now exists) and silently skip
+/// seeding owner/key material entirely.
 pub async fn claim_ownership(
     storage: &AnyStorage,
+    user_store: &y2q_core::crypto::UserStore,
     bucket: &str,
-    owner: &str,
-) -> Result<(), AppError> {
+    session: &crate::auth::session::SessionInfo,
+) -> Result<(BucketConfig, bool), AppError> {
+    // `create_bucket` reports `true` only to whichever caller's directory
+    // creation the filesystem actually observed first; a caller that gets
+    // `false` (bucket already existed) never generates key material at all,
+    // narrowing — though not eliminating, see above — the window where two
+    // racing writers each mint their own epoch-0 keypair.
+    let created = storage.create_bucket(bucket).await.map_err(AppError::from)?;
     let mut cfg = storage
         .get_bucket_config(bucket)
         .await
         .map_err(AppError::from)?;
-    if cfg.owner.is_none() {
-        cfg.owner = Some(owner.to_owned());
+    if created && cfg.owner.is_none() {
+        let key = crate::bucket_keys::new_owner_key(user_store, bucket, session).map_err(AppError)?;
+        cfg.owner = Some(session.username.clone());
+        cfg.keys.push(key);
         storage
             .set_bucket_config(bucket, &cfg)
             .await
             .map_err(AppError::from)?;
+        // Read back rather than trusting our own locally-mutated `cfg`: if
+        // another caller also observed `created` (the underlying
+        // create-if-absent isn't a true CAS — see above) and its
+        // `set_bucket_config` physically landed after ours, our own key
+        // material is already orphaned and encrypting against it here would
+        // silently produce an object nothing can ever decrypt. Trusting
+        // whatever is on disk *now* means every racing caller converges on
+        // the same (whoever-landed-last) owner and key material.
+        cfg = storage
+            .get_bucket_config(bucket)
+            .await
+            .map_err(AppError::from)?;
     }
-    Ok(())
+    Ok((cfg, created))
 }
 
 /// Whether `auth` may at least read `bucket`. Used to filter listings and
@@ -238,7 +336,7 @@ pub async fn bucket_readable(
         .get_bucket_config(bucket)
         .await
         .map_err(AppError::from)?;
-    let (eff, _) = effective_caps(auth, &cfg);
+    let (eff, _) = effective_caps(auth, &cfg, bucket);
     Ok(eff.read)
 }
 
@@ -319,5 +417,23 @@ mod tests {
         // WriteOnly account.
         let eff = role_caps(Role::WriteOnly).intersect(grant_caps(BucketPermission::Read));
         assert!(!eff.read && !eff.write);
+    }
+
+    #[test]
+    fn role_permits_rejects_a_persona_role_exceeding_the_account_ceiling() {
+        // A ReadOnly account may not mint an Admin (or User, which has full
+        // caps) persona - the persona would grant write/admin the account
+        // itself doesn't have.
+        assert!(!role_permits(Role::Admin, Role::ReadOnly));
+        assert!(!role_permits(Role::User, Role::ReadOnly));
+        // Same-or-narrower is fine.
+        assert!(role_permits(Role::ReadOnly, Role::ReadOnly));
+        assert!(role_permits(Role::User, Role::Admin));
+        // WriteOnly and ReadOnly are incomparable (disjoint caps) - neither
+        // permits the other.
+        assert!(!role_permits(Role::WriteOnly, Role::ReadOnly));
+        assert!(!role_permits(Role::ReadOnly, Role::WriteOnly));
+        // Disabled permits nothing but is itself permitted by anything.
+        assert!(role_permits(Role::Disabled, Role::ReadOnly));
     }
 }

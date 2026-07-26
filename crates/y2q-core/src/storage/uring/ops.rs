@@ -580,7 +580,7 @@ async fn do_put(
             crate::checksum::checksum_b64(&payload),
         ),
     };
-    let (cipher_size, cipher_checksum, kem_alg, aead_alg, envelope_version) = match cipher_metadata
+    let (cipher_size, cipher_checksum, kem_alg, aead_alg, envelope_version, key_epoch) = match cipher_metadata
     {
         Some(c) => (
             Some(c.cipher_size),
@@ -588,8 +588,9 @@ async fn do_put(
             Some(c.kem_alg),
             Some(c.aead_alg),
             Some(c.envelope_version),
+            Some(c.key_epoch),
         ),
-        None => (None, None, None, None, None),
+        None => (None, None, None, None, None, None),
     };
 
     let now = now_nanos();
@@ -613,11 +614,12 @@ async fn do_put(
         // only on the streaming commit path.
         version: None,
         committed_at: None,
+        key_epoch,
     };
 
     let meta_json = serde_json::to_vec(&metadata)
         .map_err(|e| internal(&bucket, &key, "put", format!("encode meta: {e}")))?;
-    // Writes require an installed MEK; refuse rather than persisting plaintext.
+    // Writes require an installed node key; refuse rather than persisting plaintext.
     let meta_bytes = match mek {
         Some(ref mek) => {
             let object_id = object_id_from_path(&obj_path).ok_or_else(|| {
@@ -636,7 +638,7 @@ async fn do_put(
                 &bucket,
                 &key,
                 "put",
-                "metadata write attempted without an installed MEK".to_owned(),
+                "metadata write attempted without an installed node key".to_owned(),
             ));
         }
     };

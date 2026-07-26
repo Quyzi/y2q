@@ -219,12 +219,13 @@ Equivalent HTTP: `PUT /api/v1/users/{user}/role`, `GET`/`PUT /api/v1/buckets/{bu
 
 | Path | What it is | Priority |
 |---|---|---|
-| `<crypto.keystore_dir>/pubkey.json` | Deployment public key + fingerprint | **Critical** |
-| `<crypto.keystore_dir>/users.redb` | Every user's wrapped SK and Argon2 params | **Critical** |
+| The node key (`crypto.node_key_file`, or wherever `Y2QD_NODE_KEY` sources it from) | Operator-supplied structural key deriving the index, path-blinding, metadata and bucket-config keys | **Critical** - never auto-generated, never persisted anywhere in `keystore_dir` or `base_path` |
+| `<crypto.keystore_dir>/keystore.json` | Node-key verifier | **Critical** |
+| `<crypto.keystore_dir>/users.redb` | Every user's credential slots (wrapped identity keypairs) | **Critical** |
 | `<storage.base_path>/` | All objects - each is a single `.obj` file containing ciphertext and embedded metadata | **Critical** |
 | `<storage.base_path>/_y2q_index.redb` | redb metadata index | Optional - rebuildable |
 
-Lose `pubkey.json` or `users.redb` and your ciphertext is unrecoverable. Back them up to a different host (or at least a different volume) than `base_path`.
+Lose the node key, `keystore.json`, or `users.redb` and your ciphertext is unrecoverable. Back up the node key itself out of band from everything else (it must never live inside `storage.base_path` or `crypto.keystore_dir` - the daemon refuses to start if it does), and back up `keystore_dir`/`users.redb` to a different host (or at least a different volume) than `base_path`.
 
 Recommended: keep `keystore_dir` and `base_path` on different mount points. A `cp -r` of the storage tree by an operator should not accidentally exfiltrate authentication state, and a failure of one volume should not necessarily destroy both halves.
 
@@ -240,7 +241,7 @@ Write locks are in-memory and vanish on process exit - there are no lock files i
 
 1. Stop `y2qd`.
 2. Restore `keystore_dir` and `base_path` from backup to the original paths (or fix up `config.toml` to point at the new paths).
-3. Start `y2qd`. It should find `pubkey.json` and skip first-run.
+3. Start `y2qd`. It should find `keystore.json` and skip first-run.
 4. Inspect: log in as any restored user, `GET /` to list buckets, do a few HEAD/GET round trips on objects you expect to exist.
 5. If listing looks wrong but objects are readable by direct GET, the index is out of sync. Kick off a rebuild:
    ```sh
@@ -253,14 +254,58 @@ Write locks are in-memory and vanish on process exit - there are no lock files i
 
 ## Key rotation
 
-**Not currently implemented.** The deployment's ML-KEM-768 keypair is generated on first run and lives forever. There is no in-place rotation today.
+Two independent things can be rotated: a bucket's content-encryption key (online, per-bucket) and the node key (offline, whole-deployment). They solve different problems and are operated differently.
 
-Workarounds:
+### Revoking a user's access to a bucket
 
-- **Password rotation per user** - `POST /api/v1/auth/password` works fine and re-wraps that user's copy of the SK under fresh Argon2 parameters. Do this routinely.
-- **Migrating to a new keypair** - currently requires standing up a fresh deployment, copying objects through (re-encrypting on the new keypair), and switching consumers over.
+Removing someone from a bucket's ACL does not, by itself, make old ciphertext unreadable to them if they already exfiltrated the bucket's current key. Do all three steps, in order, to actually revoke:
 
-If your threat model requires periodic SK rotation, file an issue or plan for a migration. Don't pretend the existing pubkey is rotatable.
+1. **Remove the grant.**
+   ```sh
+   curl -X PUT https://y2qd.example/api/v1/buckets/mybucket/acl \
+     -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+     -d '{"grants": {"alice": null}}'
+   ```
+   This also kills every live session the removed user holds - their existing bearer tokens stop working immediately.
+
+2. **Rotate the bucket key.**
+   ```sh
+   curl -X POST https://y2qd.example/api/v1/buckets/mybucket/rotate-key -H "Authorization: Bearer $TOKEN"
+   ```
+   New writes immediately move to a fresh key epoch the revoked user never held; existing objects keep decrypting fine under their original epoch, so nothing is unavailable in between. Refuses with 409 once a bucket has 8 retained epochs (`MAX_RETAINED_EPOCHS`) - `rekey` (next step) prunes old ones back down.
+
+3. **Rekey existing objects.**
+   ```sh
+   curl -X POST https://y2qd.example/api/v1/buckets/mybucket/rekey -H "Authorization: Bearer $TOKEN"
+   curl https://y2qd.example/api/v1/buckets/mybucket/rekey -H "Authorization: Bearer $TOKEN"
+   # {"state": "running", "percent": 60}
+   ```
+   Walks every object still on an old epoch, re-encrypts it under the newest key, and once every object is current prunes every retained key below the newest. **Until this completes**, a revoked user who already exfiltrated the old bucket key can still decrypt any old ciphertext they also exfiltrated - rotation only protects new writes; rekey is what closes the old ones.
+
+`GET /api/v1/buckets/mybucket/acl` reports `key_epochs` (ascending) so you can confirm a rekey actually pruned down to one epoch.
+
+### Node key rotation (offline)
+
+The node key (`[crypto] node_key_file` / `Y2QD_NODE_KEY`) derives every server-structural key - the metadata index, object metadata sidecars, bucket-config sidecars, path blinding, the control store. Password changes and the bucket rotate/rekey above never touch it; those only re-key user- and bucket-scoped material. Rotating the node key touches every object's on-disk path and metadata sidecar, so it is an **offline** tool, not an API call - the same keystore flock the daemon holds for its whole lifetime means a rotation refuses to start against a live daemon, and the daemon refuses to start while a rotation is in progress or interrupted.
+
+```sh
+# Stop the daemon first.
+export Y2QD_NODE_KEY=<current key>
+export Y2QD_NEW_NODE_KEY=$(y2q admin gen-node-key)
+y2qd --config config.toml --rotate-node-key
+# Then restart with the new key:
+export Y2QD_NODE_KEY=$Y2QD_NEW_NODE_KEY
+y2qd --config config.toml
+```
+(`--new-node-key-file` is the file-based equivalent of `Y2QD_NEW_NODE_KEY`, mirroring `node_key_file`/`Y2QD_NODE_KEY`'s precedence rule.)
+
+It walks the whole storage tree once - re-encrypting every object's metadata sidecar and renaming it to its new path-key-derived name, re-encrypting every bucket's `.y2q-bucket.json` and renaming its directory - then deletes and rebuilds `_y2q_index.redb` fresh under the new key, then rewrites the keystore verifier. Object bodies are never touched or re-encrypted: they stay sealed under per-object content keys the node key never sees.
+
+**Crash safety.** The tool writes a journal (`<keystore_dir>/node-key-rotation.json`) before touching anything, and deletes it only once the verifier rewrite completes. While that journal exists, `y2qd`'s normal boot path refuses to start (`node key rotation was interrupted; re-run y2qd --rotate-node-key to finish it`) rather than serving against a half-migrated tree. Re-running `--rotate-node-key` with the same old/new key pair resumes exactly where it left off - every step is idempotent, so already-migrated objects and buckets are skipped, not redone.
+
+`users.redb` and all bucket key material need no rotation here - they are wrapped under user passwords and sealed to identity keypairs, neither of which involves the node key.
+
+**Clustering.** Rotation is per-node and offline-only - there is no rolling rotation. `NKV` (a fingerprint of the node key) is the cluster admission check, so a node on the new key is refused by peers still on the old one. Stop **every** node in the cluster, rotate each one's tree independently (paths are node-local; CRAQ addresses objects by `(bucket, key)`, not by on-disk path), then restart the whole cluster with the new key everywhere.
 
 ## Write locks
 
@@ -434,8 +479,8 @@ location / {
 
 `y2qd` can run as a distributed store (off by default). Operational essentials; full reference in [clustering.md](clustering.md):
 
-- **Shared keystore is mandatory.** Every node must load the *same* deployment keystore (`pubkey.json` + `users.redb`) before joining - the key hierarchy is derived from it and the leader refuses to admit a node whose deployment-key fingerprint differs. Back it up exactly as in single-node mode.
-- **Boot unlock.** Cluster nodes unwrap the secret key at startup from a provisioned secret (`Y2QD_CLUSTER__UNLOCK_SECRET` or `cluster.unlock_secret_file`) so peer-forwarded writes commit unattended; idle-drop is disabled while clustered.
+- **Shared node key is mandatory.** Every node must be started with the same operator-supplied node key and load the *same* deployment keystore (`keystore.json` + `users.redb`) before joining - the key hierarchy is derived from the node key, and the leader refuses to admit a node whose node-key fingerprint (`NKV`) differs. Back the keystore up exactly as in single-node mode; distribute the node key to every node's `Y2QD_NODE_KEY` (or `node_key_file`) out of band, same as single-node boot.
+- **No separate cluster unlock credential.** There is no provisioned "cluster unlock secret" distinct from the node key - every node supplies its own copy of the same node key at boot exactly like single-node mode, and it stays resident in memory for the daemon's whole lifetime (no idle-drop).
 - **Bring-up.** Exactly one node sets `cluster.raft.bootstrap = true` on first boot; the rest join and are admitted as voters (if in `voter_seeds`) or learners. Check `GET /api/v1/cluster/status` for membership, leader, and committed epoch.
 - **Migration.** `POST /api/v1/cluster/migrate` moves objects online in either direction (distribute into the cluster / collect back to one node); it is idempotent and resumable.
 - **Local demo.** `make cluster-up` starts a 5-node cluster via podman-compose ([deploy/cluster/](../deploy/cluster/)); `make cluster-down` tears it down and wipes volumes. The demo's `init` service generates the shared keystore and captures the root password to `/seed/unlock_secret.txt`.
@@ -446,14 +491,14 @@ location / {
 | Symptom | Likely cause | What to do |
 |---|---|---|
 | Daemon refuses to start: `acquire keystore lock` | Another `y2qd` is already running against the same `keystore_dir` | Check `ps` / systemd. If stale, the flock is released by the OS - investigate why the daemon didn't exit cleanly. |
-| `503` on any object op | `KeystoreUnavailable` - SK not in memory (idle-dropped, no active sessions) | Log in (any user). The SK is reinstalled on the first successful login. |
+| `503` on any object op | `KeystoreNotFound` - `keystore.json`/`users.redb` missing at the configured `keystore_dir` (misconfiguration, or a copy that left the keystore behind) | Confirm `[crypto] keystore_dir` and the node key are correct. On a genuine first boot this doesn't happen - first-run setup runs automatically and prints the root password. |
 | `409 Conflict` on PUT | Active in-flight write lock for that key (same key PUT in two concurrent requests) | Normally self-resolves; if stuck, use `GET /api/v1/locks` to check and `DELETE /api/v1/locks` to force-release. |
-| `500` on any op against an old object | The object or its metadata predates the v2 chunked envelope (v1 whole-object or unencrypted legacy data). There is no unauthenticated passthrough or v1 decode - such objects are unreadable | If you have an out-of-band copy of the original plaintext, re-PUT it so it is stored as v2. Otherwise the object is unrecoverable through the API. |
+| `500` on any op against an old object | The object or its metadata predates the current v3 per-bucket envelope (magic bytes aren't `Y2Q3` - e.g. leftover v1/v2 data from before this deployment adopted per-bucket keys). There is no unauthenticated passthrough or legacy decode - such objects are unreadable | If you have an out-of-band copy of the original plaintext, re-PUT it so it is stored as v3. Otherwise the object is unrecoverable through the API. |
 | `429 Too Many Requests` on login | Either the per-source-IP rate limit (bursty requests from one client, checked before credentials) or the per-username lockout after repeated failures | For the lockout, wait `lockout_seconds` or use another user - `Retry-After` tells you exactly how long. The IP rate limit clears itself after a few seconds; no body/header details are returned for it. |
 | Listing shows missing or stale objects after restore | Index drift after bulk restore | Run `POST /api/v1/rebuild` (or restart the daemon - startup auto-rebuild handles it). |
 | Data-loss `tracing::error!` messages at startup | `.obj` files referenced in index are gone | Indicates actual data loss (e.g. from a partial restore). Startup rebuild logs the affected keys. |
 | `503` cluster writes stall; reads still work | Raft quorum lost (voter-majority partition) - correct CP behavior | Restore connectivity / a voter majority. Reads keep serving; writes resume once quorum returns. See [clustering.md](clustering.md). |
-| Joined node 404s or `STALE_EPOCH` on peer ops | Wrong keystore (fingerprint mismatch) or stale topology after a re-splice | Verify every node shares the deployment keystore; check `GET /api/v1/cluster/status` for the committed epoch and member states. |
+| Joined node 404s or `STALE_EPOCH` on peer ops | Wrong node key (`NKV` fingerprint mismatch) or stale topology after a re-splice | Verify every node was started with the same node key; check `GET /api/v1/cluster/status` for the committed epoch and member states. |
 
 ## Source
 

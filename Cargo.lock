@@ -6176,6 +6176,7 @@ dependencies = [
 name = "y2q-cli"
 version = "0.2.0"
 dependencies = [
+ "base64 0.22.1",
  "bytes",
  "chrono",
  "clap",
@@ -6187,6 +6188,7 @@ dependencies = [
  "glob",
  "humantime",
  "indexmap",
+ "rand 0.10.2",
  "ratatui",
  "rpassword",
  "serde",
@@ -6366,6 +6368,7 @@ dependencies = [
  "metrics-exporter-prometheus",
  "metrics-rs-dashboard-actix",
  "openraft",
+ "parking_lot",
  "pqcrypto",
  "pqcrypto-traits",
  "pyroscope",

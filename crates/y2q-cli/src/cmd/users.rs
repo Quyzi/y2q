@@ -59,9 +59,13 @@ pub async fn run(cmd: UserCmd, mode: OutputMode) -> Result<(), CliError> {
             }
         }
 
-        UserCmd::Remove { alias, username } => {
+        UserCmd::Remove {
+            alias,
+            username,
+            force,
+        } => {
             let client = make_client(&alias).await?;
-            crate::ops::admin::delete_user(&client, &username).await?;
+            crate::ops::admin::delete_user(&client, &username, force).await?;
             if mode == OutputMode::Json {
                 print_json(&serde_json::json!({ "deleted": username }));
             } else {

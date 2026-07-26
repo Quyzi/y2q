@@ -208,6 +208,7 @@ fn bench_envelope_v2_encrypt(c: &mut Criterion) {
                 let mut session = EncryptSession::new(
                     sink,
                     black_box(&pk_bytes),
+                    0,
                     "bucket",
                     "key",
                     0,
@@ -244,6 +245,7 @@ fn bench_envelope_v2_decrypt(c: &mut Criterion) {
             let mut session = EncryptSession::new(
                 sink,
                 &pk_bytes,
+                0,
                 "bucket",
                 "key",
                 0,

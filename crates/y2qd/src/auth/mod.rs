@@ -1,18 +1,18 @@
 //! User authentication, session storage, and the `Authenticated` extractor.
 //!
 //! Sessions live entirely in memory ([`SessionStore`]) and are forgotten on
-//! restart. The deployment secret key is held in a process-wide
-//! [`KeystoreSlot`] that the first successful login populates and that empties
-//! again when the last session expires (with an optional grace period).
+//! restart. Each session carries the unwrapped identity secret key of the
+//! persona (credential slot) that logged in — there is no process-wide
+//! keystore slot; a compromised request handler sees exactly one session's
+//! key material, never every user's.
 //!
 //! Every protected handler takes an [`Authenticated`] extractor parameter;
 //! the extractor parses the `Authorization: Bearer <token>` header, looks up
 //! the token's SHA-256 hash in the session store, validates expiry, and
-//! attaches the user identity + decrypted keystore to the request.
+//! attaches the user identity + session to the request.
 
 pub mod error;
 pub mod handlers;
-pub mod keystore;
 pub mod session;
 pub mod state;
 pub mod users;
@@ -24,7 +24,9 @@ use actix_web::{FromRequest, HttpRequest, dev::Payload, http::header};
 use std::future::{Ready, ready};
 use std::sync::Arc;
 
-use y2q_core::crypto::{DecryptedKeystore, Role};
+use y2q_core::crypto::Role;
+
+use self::session::SessionInfo;
 
 /// Identity attached to a successfully-authenticated request.
 ///
@@ -42,8 +44,10 @@ pub struct Authenticated {
     pub role: Role,
     /// Hashed token id (used to look up / revoke this session).
     pub token_hash: [u8; 32],
-    /// Decrypted keypair held in process memory. Cheap to clone — `Arc`.
-    pub keystore: Arc<DecryptedKeystore>,
+    /// The session this request authenticated against: carries the
+    /// persona's identity secret key and its bucket-key cache. Cheap to
+    /// clone — `Arc`.
+    pub session: Arc<SessionInfo>,
     /// Whether bucket ownership/ACL and the admin role are enforced
     /// (`[auth] enforce_authorization`). When `false`, [`crate::authz`] and
     /// [`AdminAuthenticated`] short-circuit to allow.
@@ -129,15 +133,11 @@ fn extract_authenticated(req: &HttpRequest) -> Result<Authenticated, AuthError> 
     if state.config.enforce_authorization && session.role == Role::Disabled {
         return Err(AuthError::AccountDisabled);
     }
-    let keystore = state
-        .keystore
-        .current()
-        .ok_or(AuthError::KeystoreUnavailable)?;
     Ok(Authenticated {
         username: session.username.clone(),
         role: session.role,
         token_hash,
-        keystore,
+        session,
         authz_enforced: state.config.enforce_authorization,
     })
 }

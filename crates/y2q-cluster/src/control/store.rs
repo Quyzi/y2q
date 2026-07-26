@@ -27,6 +27,7 @@ use openraft::{
 use redb::{Builder, Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, watch};
+use y2q_core::storage::EncryptedFileBackend;
 
 use crate::control::raft_impl::TypeConfig;
 use crate::control::types::{ControlResp, ControlState};
@@ -55,11 +56,24 @@ fn sto_w<E: std::error::Error + 'static>(e: E) -> StorageError<NodeId> {
     StorageIOError::write(&e).into()
 }
 
-/// Open (creating if needed) the control-plane raft store at `path`, returning a
-/// log store and a state-machine store that share one database. The state
-/// machine is loaded from disk so a restart resumes the last applied state.
-pub fn open(path: &Path) -> Result<(LogStore, StateMachineStore), StorageError<NodeId>> {
-    let db = Builder::new().create(path).map_err(sto_w)?;
+/// Open (creating if needed) the control-plane raft store at `path`, whole-
+/// file-encrypted under `file_key` (the Control Store Key, derived from the
+/// operator-supplied node key — see
+/// [`y2q_core::crypto::derive_control_store_key`]). Returns a log store and a
+/// state-machine store that share one database. The state machine is loaded
+/// from disk so a restart resumes the last applied state.
+///
+/// An existing plaintext control store (from before this encryption landed)
+/// fails to open under the encrypted backend — expected and unhandled here:
+/// the daemon's `LegacyKeystore` boot guard already refuses to start against
+/// a pre-existing deployment, and a freshly-joined node rebuilds this store
+/// from the raft log rather than needing to read an old one.
+pub fn open(
+    path: &Path,
+    file_key: [u8; 32],
+) -> Result<(LogStore, StateMachineStore), StorageError<NodeId>> {
+    let backend = EncryptedFileBackend::open(path, file_key).map_err(sto_w)?;
+    let db = Builder::new().create_with_backend(backend).map_err(sto_w)?;
     let db = Arc::new(db);
 
     // Ensure both tables exist so later read transactions don't fail on a fresh
@@ -449,7 +463,7 @@ mod tests {
             &self,
         ) -> Result<(TempDir, LogStore, StateMachineStore), StorageError<NodeId>> {
             let dir = tempfile::tempdir().unwrap();
-            let (log, sm) = open(&dir.path().join("raft.redb"))?;
+            let (log, sm) = open(&dir.path().join("raft.redb"), [7u8; 32])?;
             Ok((dir, log, sm))
         }
     }
