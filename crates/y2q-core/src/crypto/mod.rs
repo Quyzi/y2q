@@ -75,11 +75,11 @@ pub enum CryptoError {
     #[error("keystore io: {0}")]
     KeystoreIo(String),
 
-    /// `pubkey.json` is missing — caller should run first-run setup.
+    /// `keystore.json` is missing - caller should run first-run setup.
     #[error("keystore not found at {0}")]
     KeystoreMissing(String),
 
-    /// `pubkey.json` exists but could not be parsed.
+    /// `keystore.json` exists but could not be parsed.
     #[error("keystore corrupt at {path}: {reason}")]
     KeystoreCorrupt {
         /// Filesystem path of the corrupt keystore.

@@ -25,11 +25,14 @@
 //!
 //! # First-run setup
 //!
-//! On first start (no `pubkey.json` in `[crypto] keystore_dir`), the daemon
-//! generates an ML-KEM-768 keypair, wraps the secret key under a
-//! randomly-generated root password, prints the password to stdout exactly
-//! once, and persists the public key + wrapped secret. RECORD THIS PASSWORD —
-//! losing it requires resetting everything.
+//! The daemon refuses to start without an operator-supplied node key
+//! (`Y2QD_NODE_KEY` env var or `[crypto] node_key_file`; never
+//! auto-generated). Given a valid node key and no `keystore.json` in
+//! `[crypto] keystore_dir`, it treats this as first-run: generates a
+//! `root` identity keypair, wraps its secret key under a
+//! randomly-generated password, prints the password to stdout exactly
+//! once, and persists the keystore verifier + user record. RECORD THIS
+//! PASSWORD — losing it requires resetting everything.
 //!
 //! # Authentication
 //!

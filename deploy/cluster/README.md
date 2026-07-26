@@ -11,11 +11,13 @@ cd deploy/cluster
 docker compose up --build        # or: podman compose up --build
 ```
 
-The `init` service runs once: it generates a single shared deployment keystore
-(so every node derives the identical MEK/Path Key - the shared-key invariant) and
-captures the random root password, which doubles as the provisioned MEK unlock
-secret. Each node then copies that keystore into its own volume (the `users.redb`
-file is held open per process, so it cannot be shared) and starts.
+The `init` service runs once: it generates a single shared node key
+(`/seed/node.key`) and, using it, a shared keystore.json + users.redb (so
+every node derives identical tier-0 keys - the shared-key invariant) and
+captures the random root password. Each node then copies the keystore into
+its own volume (the `users.redb` file is held open per process, so it
+cannot be shared) and reads the node key directly from the read-only
+`/seed` mount, and starts.
 
 Set your own cluster peer secret instead of the default:
 
@@ -37,13 +39,13 @@ docker compose up --build
 ## Get the root password
 
 ```sh
-docker compose exec node1 cat /seed/unlock_secret.txt
+docker compose exec node1 cat /seed/root_password.txt
 ```
 
 ## Try it
 
 ```sh
-PW=$(docker compose exec -T node1 cat /seed/unlock_secret.txt)
+PW=$(docker compose exec -T node1 cat /seed/root_password.txt)
 
 # Log in on any node (user records are shared); grab a token.
 TOK=$(curl -s localhost:8080/api/v1/auth/login \
@@ -67,7 +69,7 @@ cluster (bucket/user state via raft; object data via CRAQ chain replication).
   `cluster.auth = "mtls"` (see `docs/clustering.md`).
 - Tear down and wipe state: `docker compose down -v`.
 - This uses a shell-bearing image (`deploy/cluster/Dockerfile`, Wolfi base) so one
-  image can both generate the keystore and run a node. The plain production image
-  (`./Dockerfile`) is distroless.
+  image can both generate the node key + keystore and run a node. The plain
+  production image (`./Dockerfile`) is distroless.
 - Argon2 cost is lowered at keystore generation for fast bring-up; raise it for a
   real deployment.

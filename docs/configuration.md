@@ -96,7 +96,7 @@ When clustering with `cluster.auth = "mtls"`, `client_ca_path` is also what peer
 |---|---|---|---|
 | `backend` | enum | `"filesystem"` | Either `"filesystem"` or `"uring"`. `uring` requires Linux ≥ 5.6 and is always compiled in on Linux (no cargo feature); on non-Linux targets it is unavailable and selecting it returns a runtime error. Both backends use the same on-disk `.obj` format and files are cross-compatible. |
 | `base_path` | string | *required* | Root directory for the object tree. Created on first write if absent. |
-| `index_path` | string | `<base_path>/_y2q_index.redb` | Path to the redb metadata index file. The whole file is encrypted at rest under a key derived from the login-gated MEK; it is opened on first login and closed on idle. Override to put the index on a faster disk. |
+| `index_path` | string | `<base_path>/_y2q_index.redb` | Path to the redb metadata index file. The whole file is encrypted at rest under a key derived from the operator-supplied node key; it is resident for the daemon's whole lifetime (no idle-drop). Override to put the index on a faster disk. |
 | `max_labels` | usize | `32` | Maximum `X-Y2Q-<label>` headers accepted per PUT. |
 | `max_label_name_bytes` | usize | `64` | Maximum byte length of a label name (after stripping `X-Y2Q-` and lowercasing). |
 | `max_label_value_bytes` | usize | `1024` | Maximum byte length of a label value. |
@@ -110,9 +110,10 @@ The reserved bucket name `"api"` (case-insensitive) is rejected - it would colli
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
-| `keystore_dir` | string | *required* | Directory holding `pubkey.json`, `users.redb`, and the daemon's `.lock`. Should be on a path you back up; should *not* live under `storage.base_path` so a `cp -r` of the storage tree can't accidentally copy authentication state. |
-| `envelope_chunk_size_bytes` | usize | `4194304` (4 MiB) | Plaintext chunk size for v2 streaming encryption. Bounds: `65536` (64 KiB) .. `268435456` (256 MiB); out-of-range values are rejected at startup. Smaller chunks make ranged GETs finer-grained but add per-chunk AEAD overhead. **Recorded per-object in the envelope header** - see note below. |
-| `argon2` | table | *(see below)* | Argon2id parameters used when writing *new* user records (existing users keep their stored parameters). |
+| `keystore_dir` | string | *required* | Directory holding `keystore.json`, `users.redb`, and the daemon's `.lock`. Should be on a path you back up; should *not* live under `storage.base_path` so a `cp -r` of the storage tree can't accidentally copy authentication state. |
+| `node_key_file` | string | *(none)* | Path to a file holding the operator-supplied node key (raw binary, hex, or base64; at least 32 bytes). Alternatively set `Y2QD_NODE_KEY`. One of the two is required - the daemon refuses to start without it and never auto-generates one. Must not live inside `storage.base_path` or `crypto.keystore_dir` (enforced at startup). |
+| `envelope_chunk_size_bytes` | usize | `4194304` (4 MiB) | Plaintext chunk size for v3 streaming encryption. Bounds: `65536` (64 KiB) .. `268435456` (256 MiB); out-of-range values are rejected at startup. Smaller chunks make ranged GETs finer-grained but add per-chunk AEAD overhead. **Recorded per-object in the envelope header** - see note below. |
+| `argon2` | table | *(see below)* | Argon2id parameters used when writing *new* credential slots (existing slots keep their stored parameters). |
 
 The chunk size is stored in each object's envelope header, and decryption always
 reads it from there. Changing `envelope_chunk_size_bytes` therefore only affects
@@ -139,11 +140,10 @@ Changing these only affects newly written records. Existing user records carry t
 |---|---|---|---|
 | `default_ttl_seconds` | u64 | `3600` (1 hour) | Session lifetime when `ttl_seconds` is omitted on login. |
 | `max_ttl_seconds` | u64 | `86400` (24 hours) | Hard ceiling - logins requesting `ttl_seconds > max_ttl_seconds` get a 400. |
-| `session_sweep_interval_seconds` | u64 | `300` (5 min) | How often the background sweeper purges expired sessions and runs idle-keystore reconciliation. |
+| `session_sweep_interval_seconds` | u64 | `300` (5 min) | How often the background sweeper purges expired sessions from memory. |
 | `min_login_response_ms` | u64 | `250` | Floor on login response latency, success or failure. Smooths timing differences between "user not found" and "wrong password". |
 | `max_failed_logins` | u32 | `10` | Consecutive failed logins per username before lockout. Set to `0` to disable lockout. |
 | `lockout_seconds` | u64 | `900` (15 min) | Lockout duration once `max_failed_logins` is hit. |
-| `keystore_idle_drop_seconds` | u64 | `0` | Drop the in-memory decrypted SK this many seconds after the last session expires. `0` = drop immediately on the next sweep. Raise to forgive brief gaps between sessions; lower to bound how long the SK lives in memory. |
 | `enforce_authorization` | bool | `true` | Enforce per-bucket ownership/ACLs and the global admin role. New buckets are private to their creator; admin endpoints (user management, rebuild, locks, trace) require an admin account. Set `false` for a single-user or migration deployment where every authenticated user should have full access. See the [API authorization model](api.md#authorization). |
 
 ### `[observability]`
@@ -171,7 +171,7 @@ The agent runs a background OS thread using SIGPROF; it does not interact with t
 
 ### `[cluster]` and `[cluster.raft]`
 
-Distributed mode (**experimental** - functional and tested, but young and not yet recommended for production data). **Disabled by default** (`enabled = false`) - the whole section is optional and every key is defaulted; with it off the daemon is byte-for-byte single-node. Enabling clustering requires the **same deployment keystore on every node** (the key hierarchy is derived deterministically from it). This table is a quick reference; the full design, bootstrap/join procedure, voter/learner split, and migration live in [clustering.md](clustering.md).
+Distributed mode (**experimental** - functional and tested, but young and not yet recommended for production data). **Disabled by default** (`enabled = false`) - the whole section is optional and every key is defaulted; with it off the daemon is byte-for-byte single-node. Enabling clustering requires the **same operator-supplied node key on every node** (the tier-0 key hierarchy is derived deterministically from it; the leader refuses to admit a node whose node-key fingerprint differs). This table is a quick reference; the full design, bootstrap/join procedure, voter/learner split, and migration live in [clustering.md](clustering.md).
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
@@ -188,8 +188,6 @@ Distributed mode (**experimental** - functional and tested, but young and not ye
 | `shared_secret` | string | *(none)* | Peer-auth secret when `auth = "shared-secret"`; prefer `Y2QD_CLUSTER__SHARED_SECRET`. |
 | `health_probe_interval_ms` | u64 | `1000` | Inter-node health probe cadence. |
 | `health_fail_threshold` | u32 | `3` | Consecutive failed probes before a node is marked down. |
-| `unlock` | enum | `"provisioned"` | Boot unlock mode so peer writes commit unattended. |
-| `unlock_secret_file` | string | *(none)* | File holding the provisioned unlock secret; or set `Y2QD_CLUSTER__UNLOCK_SECRET`. |
 | `raft.heartbeat_interval_ms` | u64 | `250` | Raft heartbeat cadence. |
 | `raft.election_timeout_min_ms` | u64 | `1000` | Election timeout lower bound. |
 | `raft.election_timeout_max_ms` | u64 | `1500` | Election timeout upper bound. |
@@ -229,6 +227,7 @@ sync_flush_limit = 128
 
 [crypto]
 keystore_dir = "/var/lib/y2qd/keystore"
+node_key_file = "/etc/y2qd/node.key"  # or set Y2QD_NODE_KEY
 envelope_chunk_size_bytes = 4194304   # 4 MiB plaintext chunks
 
 [crypto.argon2]
@@ -239,11 +238,10 @@ p_cost = 4
 [auth]
 default_ttl_seconds = 3600
 max_ttl_seconds = 28800                # 8 hours
-session_sweep_interval_seconds = 60    # sweep every minute for tighter idle drop
+session_sweep_interval_seconds = 60    # sweep every minute for tighter expiry cleanup
 min_login_response_ms = 500
 max_failed_logins = 5
 lockout_seconds = 1800                 # 30 min
-keystore_idle_drop_seconds = 300       # forget SK 5 min after last logout
 enforce_authorization = true           # bucket ownership/ACLs + admin role
 
 [observability]

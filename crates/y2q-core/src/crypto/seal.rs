@@ -5,8 +5,8 @@
 //! module wraps a secret under a *public key*: any holder of the recipient's
 //! public key can seal a value for them with no interaction, and only the
 //! matching secret key can open it. Used to grant a symmetric key (a bucket
-//! wrap key, or — transitionally — the deployment secret key) to a specific
-//! ML-KEM-768 identity without ever needing that identity's password.
+//! wrap key) to a specific ML-KEM-768 identity without ever needing that
+//! identity's password.
 //!
 //! Derivation mirrors [`super::envelope::derive_content_key`]: the KEM shared
 //! secret and ciphertext feed HKDF-SHA256 (`salt = kem_ct`, `info =

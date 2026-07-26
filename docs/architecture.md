@@ -57,29 +57,30 @@ AES-256-GCM is implemented via the pure-Rust [aes-gcm](https://github.com/RustCr
 
 ### Envelope format
 
-There is a single on-disk envelope format (v2, chunked), identified by its magic bytes. It wraps one ML-KEM-768 ciphertext and a sequence of AES-256-GCM-sealed chunks behind a fixed header, most of which doubles as additional authenticated data (AAD) so tampering with it invalidates the tag - see [AAD coverage](#aad-coverage) below for the one field that's deliberately excluded. An envelope with an unrecognized magic - including the retired v1 whole-object format used by builds before chunked streaming existed - is rejected outright; there is no unauthenticated passthrough for unrecognized or legacy data.
+There is a single on-disk envelope format (v3, chunked), identified by its magic bytes. It wraps one ML-KEM-768 ciphertext and a sequence of AES-256-GCM-sealed chunks behind a fixed header, most of which doubles as additional authenticated data (AAD) so tampering with it invalidates the tag - see [AAD coverage](#aad-coverage) below for the one field that's deliberately excluded. An envelope with an unrecognized magic - including the retired v1 whole-object format and the retired v2 single-deployment-key format - is rejected outright; there is no unauthenticated passthrough for unrecognized or legacy data.
 
-#### v2 - chunked
+#### v3 - chunked, per-bucket-epoch
 
 ```mermaid
 %%{init: {"packet": {"showBits": false}}}%%
 packet-beta
-0-3: "magic b'Y2Q2' (4 B)"
-4-5: "format_ver = 2 (2 B)"
+0-3: "magic b'Y2Q3' (4 B)"
+4-5: "format_ver = 3 (2 B)"
 6-6: "kem_alg (1)"
 7-7: "aead_alg (1)"
-8-19: "nonce_base - 12 B"
-20-27: "plaintext_len (8 B, BE; patched after streaming)"
-28-31: "chunk_size (4 B, BE)"
-32-1119: "kem_ct - ML-KEM-768 ciphertext (1088 B)"
-1120-1199: "aead_ct chunks - [chunk_pt + 16 tag] × N"
+8-11: "key_epoch (4 B, BE)"
+12-23: "nonce_base - 12 B"
+24-31: "plaintext_len (8 B, BE; patched after streaming)"
+32-35: "chunk_size (4 B, BE)"
+36-1123: "kem_ct - ML-KEM-768 ciphertext (1088 B)"
+1124-1203: "aead_ct chunks - [chunk_pt + 16 tag] × N"
 ```
 
-The 32-byte fixed header plus the 1088-byte KEM ciphertext form a 1120-byte **preamble**, followed by `N` independently sealed chunks of `chunk_size` plaintext each (default 4 MiB, `crypto.envelope_chunk_size_bytes`). Chunk `i` uses `nonce_i = nonce_base XOR (i as u64 BE)`. Because each chunk is its own frame at a deterministic offset, a `Range` GET reads and decrypts only the covering chunks (206), and a multi-GiB PUT streams chunk-by-chunk without buffering the whole object. `chunk_size` is recorded per object, so changing the config knob only affects future writes.
+The 36-byte fixed header plus the 1088-byte KEM ciphertext form a 1124-byte **preamble**, followed by `N` independently sealed chunks of `chunk_size` plaintext each (default 4 MiB, `crypto.envelope_chunk_size_bytes`). Chunk `i` uses `nonce_i = nonce_base XOR (i as u64 BE)`. Because each chunk is its own frame at a deterministic offset, a `Range` GET reads and decrypts only the covering chunks (206), and a multi-GiB PUT streams chunk-by-chunk without buffering the whole object. `chunk_size` is recorded per object, so changing the config knob only affects future writes. `key_epoch` names which of the bucket's retained [`BucketKeyVersion`](#key-hierarchy-and-identity-protection-at-rest)s the `kem_ct` was encapsulated to, so a decryptor knows which epoch's bucket secret key to unwrap before decapsulating.
 
 #### AAD coverage
 
-The AAD for every chunk is `magic || format_ver || kem_alg || aead_alg || nonce_base || chunk_size` (24 of the header's 32 bytes) - every fixed-header field *except* `plaintext_len`. `plaintext_len` is the one field genuinely unknown until streaming finishes (it's patched in via a seek after the last chunk is written), so a placeholder bound into the AAD at encrypt time could never match what's read back at decrypt time. `chunk_size`, by contrast, is fixed before the first byte is written and has no such excuse, so it *is* authenticated.
+The AAD for every chunk is `magic || format_ver || kem_alg || aead_alg || key_epoch || nonce_base || chunk_size` (28 of the header's 36 bytes) - every fixed-header field *except* `plaintext_len`. `plaintext_len` is the one field genuinely unknown until streaming finishes (it's patched in via a seek after the last chunk is written), so a placeholder bound into the AAD at encrypt time could never match what's read back at decrypt time. `chunk_size` and `key_epoch`, by contrast, are fixed before the first byte is written and have no such excuse, so they *are* authenticated.
 
 ### Per-object key derivation
 
@@ -206,7 +207,7 @@ The `path_key` is derived from the node key (tier 0, operator-supplied — see [
 
 Bucket names: ASCII alphanumeric plus `-` and `_`; case-insensitive `"api"` is reserved (collides with `/api/v1/*`). Keys: up to 1024 bytes, no null bytes.
 
-The metadata blob embedded in each `.obj` is **encrypted at rest** under the tier-0 Object Metadata Key (OMK, derived from the node key via `prf`), so labels, timestamps, checksums, and the cleartext key are not readable from the file without the node key. Like the old MEK it derives, it is one fixed key for the whole deployment rather than per-object, so `encrypt_meta`/`decrypt_meta` bind the AEAD to the object's opaque on-disk id (the `.obj` filename stem, itself a keyed HMAC of `bucket`/`key`) via AAD - the same identity-binding principle as the envelope above, closing the same copy-attack: a metadata blob relocated to a different object's storage location fails the tag check instead of decrypting into a spoofed size/labels/checksum. **Metadata stays at this tier deliberately** - `run_rebuild` discovers `(bucket, key)` pairs by decrypting metadata across the whole tree, so a node-key holder without any bucket grant can see object sizes, labels, and keys, but never object plaintext (that needs the per-bucket key from tier 2).
+The metadata blob embedded in each `.obj` is **encrypted at rest** under the tier-0 Object Metadata Key (OMK, derived from the node key via `prf`), so labels, timestamps, checksums, and the cleartext key are not readable from the file without the node key. It is one fixed key for the whole deployment rather than per-object, so `encrypt_meta`/`decrypt_meta` bind the AEAD to the object's opaque on-disk id (the `.obj` filename stem, itself a keyed HMAC of `bucket`/`key`) via AAD - the same identity-binding principle as the envelope above, closing the same copy-attack: a metadata blob relocated to a different object's storage location fails the tag check instead of decrypting into a spoofed size/labels/checksum. **Metadata stays at tier 0, not per-bucket** - see [Key hierarchy](#key-hierarchy-and-identity-protection-at-rest) above for the accepted tradeoff this implies.
 
 ```json
 {
@@ -344,12 +345,11 @@ Authorization: Bearer <43-char base64url>
 
 ### Session store
 
-In-memory `DashMap<[u8; 32], Arc<SessionInfo>>`. Each `SessionInfo` carries `(username, created_at, expires_at)`. There is no persistence: a daemon restart invalidates every session.
+In-memory `DashMap<[u8; 32], Arc<SessionInfo>>`. Each `SessionInfo` carries the username, global role, timestamps, this persona's slot index, its unwrapped identity secret key (zeroized on drop), and a bounded per-session bucket-key cache. There is no persistence: a daemon restart invalidates every session.
 
 A background sweeper runs every `auth.session_sweep_interval_seconds` (default 300). On each pass it:
 
 1. Iterates the session map and removes entries past `expires_at`.
-2. Calls `keystore.reconcile(&sessions)` to drive idle-keystore drop.
 
 ### Lockout
 

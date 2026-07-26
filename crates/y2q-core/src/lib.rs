@@ -442,7 +442,7 @@ pub enum Error {
         reason: String,
     },
 
-    /// `pubkey.json` is missing — the daemon cannot serve traffic until
+    /// `keystore.json` is missing - the daemon cannot serve traffic until
     /// first-run setup completes.
     #[error("keystore not found at {path}")]
     KeystoreNotFound {
@@ -450,7 +450,7 @@ pub enum Error {
         path: String,
     },
 
-    /// `pubkey.json` exists but is unparseable, has a wrong-size key, or
+    /// `keystore.json` exists but is unparseable, has a wrong-size key, or
     /// fingerprint mismatches.
     #[error("keystore corrupt at {path}: {reason}")]
     KeystoreCorrupt {
