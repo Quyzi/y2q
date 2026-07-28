@@ -259,6 +259,8 @@ curl -X DELETE https://y2qd.example/api/v1/personas/2/grant \
 
 `GET /api/v1/personas/me` reports the calling session's own slot, role, and duress flag - the only introspection offered, and useless to a coercer since it only ever describes the session you are already in. `DELETE /api/v1/personas/{slot}` overwrites that slot with a fresh decoy.
 
+A share made with `POST /api/v1/personas/{slot}/grant` does not survive a bucket key rotation performed by someone else - see the warning under [Key rotation](#key-rotation).
+
 ## Backup and recovery
 
 ### What to back up
@@ -329,6 +331,8 @@ Removing someone from a bucket's ACL does not, by itself, make old ciphertext un
    Walks every object still on an old epoch, re-encrypts it under the newest key, and once every object is current prunes every retained key below the newest. **Until this completes**, a revoked user who already exfiltrated the old bucket key can still decrypt any old ciphertext they also exfiltrated - rotation only protects new writes; rekey is what closes the old ones.
 
 `GET /api/v1/buckets/mybucket/acl` reports `key_epochs` (ascending) so you can confirm a rekey actually pruned down to one epoch.
+
+**Warning: rotating a bucket's key can silently drop persona-to-persona shares.** `rotate-key` reconstructs the new epoch's grantee list from the bucket's cleartext ACL/owner fields plus whichever persona the *caller* is currently authenticated as - it has no way to read who else holds a real (non-decoy) grant on the current epoch, since that is exactly the information sealed grants are designed to hide (see [Duress personas](#duress-personas)). A grant made via self-service persona sharing (`POST /api/v1/personas/{slot}/grant`) is invisible to `rotate-key` unless that same persona happens to be the one running the rotation. If any bucket grantee has shared access with one of their own alternate personas, that persona must re-run its own `grant` call after every `rotate-key`/`rekey` - otherwise it silently loses access with no error or warning at rotation time.
 
 ### Node key rotation (offline)
 

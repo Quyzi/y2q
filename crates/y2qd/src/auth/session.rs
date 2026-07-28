@@ -271,8 +271,7 @@ impl SessionStore {
         n
     }
 
-    /// Total number of (possibly expired) entries — used to decide when to
-    /// drop the in-memory SK.
+    /// Total number of (possibly expired) entries currently in the store.
     pub fn len(&self) -> usize {
         self.inner.len()
     }
