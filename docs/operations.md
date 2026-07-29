@@ -241,7 +241,7 @@ curl -X POST https://y2qd.example/api/v1/personas \
   -d '{"slot":1,"password":"a-different-password","role":"readonly","revoke_other_sessions":true}'
 ```
 
-`role` is capped at the account's own global role - a persona can never grant itself more power than the account already has. `revoke_other_sessions: true` is what makes a persona usable under duress: logging in through it immediately kills every other live session on the account, so a coerced login can't be quietly used to also keep the "real" session alive.
+`role` is capped at the account's own global role - a persona can never grant itself more power than the account already has. `revoke_other_sessions: true` is what makes a persona usable under duress: logging in through it silently switches every other live session on the account over to this persona's identity, in place - same tokens, same expiry, nothing visibly interrupted. A coercer who checks that some other session is still "logged in" sees exactly that; it just now carries the duress persona's own (usually far more limited) access instead of the real one's, with no revocation, error, or log line distinguishing it from an ordinary login.
 
 Share (or revoke) some of your *current* session's bucket access with one of your own other personas - self-service only, there is no admin route to grant someone else's persona, since such a route would be the first thing a coercer with an admin account would reach for:
 

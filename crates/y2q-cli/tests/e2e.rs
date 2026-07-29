@@ -1538,7 +1538,7 @@ async fn e2e_duress_persona_deniability() {
         .expect("put plausible.txt");
 
     // 2. Create a duress persona at slot 1, password B, revoke_other_sessions
-    // baked in from the start (exercised by the later revocation check).
+    // baked in from the start (exercised by the later silent-switch check).
     let resp = alice_a
         .create_persona(1, "password-B", Some("user"), true)
         .await
@@ -1556,7 +1556,8 @@ async fn e2e_duress_persona_deniability() {
         .expect("grant decoy-bucket to slot 1");
 
     // A held live A-session (separate from `alice_a`, minted before B's
-    // duress login below) to prove it dies when password B logs in.
+    // duress login below) to prove it silently becomes B's session rather
+    // than dying when password B logs in.
     let mut held_a = mk();
     let held_tok = held_a
         .login("alice", "password-A", None)
@@ -1604,16 +1605,38 @@ async fn e2e_duress_persona_deniability() {
         "expected 404 (not 403 - a 403 would confirm the bucket exists), got: {err:?}"
     );
 
-    // Duress session revocation: the held A session, live since before B's
-    // login, is now dead; B's own session keeps working.
-    let err = held_a
+    // Duress silent switch: the held A session, live since before B's
+    // login, keeps authenticating with the *same* token - no revocation,
+    // no 401 - but it now silently carries B's (duress) identity: whoami
+    // reports slot 1, and its bucket access is now B's, not the real A's.
+    let held_view = held_a
         .whoami_persona()
         .await
-        .expect_err("held A session must die on duress login");
-    assert!(
-        matches!(err, y2q_client::ClientError::Unauthenticated),
-        "expected 401, got: {err:?}"
+        .expect("held A session must keep working - switched in place, not revoked");
+    assert_eq!(
+        held_view.slot, 1,
+        "held session must now report the duress persona's slot"
     );
+    assert_eq!(held_view.role, "user");
+
+    let held_buckets = held_a
+        .list_buckets()
+        .await
+        .expect("held session still lists buckets");
+    assert_eq!(
+        held_buckets,
+        vec!["decoy-bucket".to_owned()],
+        "held session must now see only the decoy bucket, like B"
+    );
+    let err = held_a
+        .get_to_writer("real-bucket", "secret.txt", &mut Vec::new())
+        .await
+        .expect_err("held session must no longer read real-bucket after the silent switch");
+    assert!(
+        matches!(err, y2q_client::ClientError::NotFound { .. }),
+        "expected 404, got: {err:?}"
+    );
+
     alice_b
         .whoami_persona()
         .await
