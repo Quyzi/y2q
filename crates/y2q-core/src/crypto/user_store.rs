@@ -183,6 +183,19 @@ pub struct UserRecord {
     /// Always exactly [`CREDENTIAL_SLOTS`] entries. Unused slots are
     /// present and byte-shaped identically to live ones — never trim this.
     pub slots: Vec<CredentialSlot>,
+    /// Which slot holds the identity a third party grants (`set_acl`,
+    /// `rotate-key`) resolve to for this account — chosen uniformly at
+    /// random on creation ([`kdf::new_slots_random`](super::kdf::new_slots_random)),
+    /// never a fixed position. This is internal server bookkeeping only:
+    /// it is never serialized into any API response (not `UserSummary`,
+    /// not `PersonaView`), because a coercer who can read it off a live
+    /// session would trivially learn "this exact slot is the real one"
+    /// with no cracking required. A disk-holding attacker learns nothing
+    /// beyond what a fixed slot-0 convention already gave away for free —
+    /// the field only closes the *API-only* leak (a technical coercer
+    /// probing `GET /api/v1/personas/me` themselves and reading off a
+    /// suspiciously-privileged slot number).
+    pub primary_slot: u8,
     /// Global role. Defaults to [`Role::User`] so records written before this
     /// field existed deserialize as ordinary users (no migration pass needed).
     #[serde(default)]
@@ -382,6 +395,7 @@ mod tests {
             last_login: None,
             kdf: params,
             slots,
+            primary_slot: 0,
             role: Role::User,
         }
     }

@@ -89,8 +89,9 @@ pub enum AuthError {
     #[error("invalid request body: {reason}")]
     InvalidBody { reason: String },
 
-    /// `POST /api/v1/personas` for a slot outside `1..=3`, or
-    /// `DELETE /api/v1/personas/{slot}` for slot 0.
+    /// `POST`/`DELETE /api/v1/personas/{slot}` for a slot outside
+    /// `0..CREDENTIAL_SLOTS`, or one that targets the caller's own
+    /// currently-authenticated slot.
     #[error("invalid persona slot: {reason}")]
     InvalidPersonaSlot { reason: &'static str },
 

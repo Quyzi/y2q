@@ -21,7 +21,7 @@ use argon2::{Algorithm, Argon2, Params, Version};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use pqcrypto::kem::mlkem768;
 use pqcrypto_traits::kem::{PublicKey as KemPublicKeyTrait, SecretKey as KemSecretKeyTrait};
-use rand::Rng;
+use rand::{Rng, RngExt};
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -207,6 +207,42 @@ pub fn decoy_slots_from(
     (start..CREDENTIAL_SLOTS)
         .map(|i| decoy_slot(username, i, params))
         .collect()
+}
+
+/// Build a fresh `CREDENTIAL_SLOTS`-length slot array for a brand-new
+/// identity, with the real (password-opened) slot placed at a position
+/// chosen uniformly at random rather than a fixed index. Returns the slots
+/// plus which index won, so the caller can record it in
+/// [`UserRecord::primary_slot`](super::user_store::UserRecord::primary_slot)
+/// for later grant routing.
+///
+/// This is what stops "the real login is always slot N" from ever being a
+/// usable heuristic: previously slot 0 was hardcoded, so a technical
+/// coercer who queried `GET /api/v1/personas/me` directly (bypassing
+/// whatever a victim's CLI told them) could read the slot number straight
+/// off the response and know with certainty whether they'd been handed the
+/// real password or an alternate/duress one. With placement randomized per
+/// account and never returned by any API, that shortcut is gone — the only
+/// route left to distinguish slots is cracking each one's password
+/// independently, exactly as hard as it already is for a genuine decoy.
+pub fn new_slots_random(
+    username: &str,
+    password: &[u8],
+    params: &Argon2Params,
+    role: Role,
+    revoke_other_sessions: bool,
+) -> Result<(Vec<CredentialSlot>, usize), CryptoError> {
+    let real_slot = rand::rng().random_range(0..CREDENTIAL_SLOTS);
+    let slots = (0..CREDENTIAL_SLOTS)
+        .map(|i| {
+            if i == real_slot {
+                new_slot(username, i, password, params, role, revoke_other_sessions)
+            } else {
+                decoy_slot(username, i, params)
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((slots, real_slot))
 }
 
 /// Wrap `payload` directly under `key` (no password derivation) — used for
@@ -421,5 +457,47 @@ mod tests {
         let b = new_slot("alice", 0, b"pw", &params, Role::User, false).unwrap();
         assert_ne!(a.wrapped.nonce, b.wrapped.nonce);
         assert_ne!(a.wrapped.ciphertext, b.wrapped.ciphertext);
+    }
+
+    #[test]
+    fn new_slots_random_places_the_real_slot_correctly_and_pads_the_rest() {
+        let params = fast_params();
+        let (slots, real_slot) =
+            new_slots_random("alice", b"pw", &params, Role::Admin, true).unwrap();
+        assert_eq!(slots.len(), CREDENTIAL_SLOTS);
+        assert!(real_slot < CREDENTIAL_SLOTS);
+
+        let kek = params.derive_kek(b"pw").unwrap();
+        let opened: Vec<usize> = slots
+            .iter()
+            .enumerate()
+            .filter(|(i, s)| unwrap_slot(&s.wrapped, &kek, &slot_wrap_aad("alice", *i)).is_ok())
+            .map(|(i, _)| i)
+            .collect();
+        // The password opens exactly the reported real slot, and nothing else.
+        assert_eq!(opened, vec![real_slot]);
+
+        // Byte shape stays uniform across the real slot and every decoy.
+        let lens: Vec<usize> = slots.iter().map(|s| s.wrapped.ciphertext.len()).collect();
+        assert!(lens.iter().all(|&l| l == lens[0]));
+    }
+
+    #[test]
+    fn new_slots_random_does_not_always_pick_the_same_slot() {
+        // Statistical, not a correctness proof: with CREDENTIAL_SLOTS = 4 and
+        // 200 draws, the odds every single one lands on slot 0 are
+        // (1/4)^200 - if this ever fails, `real_slot` stopped being random.
+        let params = fast_params();
+        let seen: std::collections::HashSet<usize> = (0..200)
+            .map(|_| {
+                new_slots_random("alice", b"pw", &params, Role::User, false)
+                    .unwrap()
+                    .1
+            })
+            .collect();
+        assert!(
+            seen.len() > 1,
+            "expected multiple distinct real-slot positions across 200 draws, got {seen:?}"
+        );
     }
 }

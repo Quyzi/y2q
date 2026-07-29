@@ -206,7 +206,7 @@ curl -X POST https://y2qd.example/api/v1/users/bob/reset-identity \
   -d '{"password":"new-correct-horse-battery"}'
 ```
 
-This rebuilds bob's whole record with a fresh identity keypair (slot 0, under the new password) and fresh decoy slots 1..3, and revokes every live session bob holds. It restores *login*, not *access*: the new identity holds no bucket keys, because the old ones were sealed to the identity keypair that just got replaced - an admin never touches bucket-key material during a reset, so this cannot be used to escalate. The response's `orphaned_buckets` lists any bucket left with zero grantees on its newest key epoch as a result - re-grant those before the data they held becomes permanently unreachable. This also destroys every duress persona bob had; there is no partial reset.
+This rebuilds bob's whole record with a fresh identity keypair (at a slot chosen randomly on creation, under the new password) and fresh decoys in the other three slots, and revokes every live session bob holds. It restores *login*, not *access*: the new identity holds no bucket keys, because the old ones were sealed to the identity keypair that just got replaced - an admin never touches bucket-key material during a reset, so this cannot be used to escalate. The response's `orphaned_buckets` lists any bucket left with zero grantees on its newest key epoch as a result - re-grant those before the data they held becomes permanently unreachable. This also destroys every duress persona bob had; there is no partial reset.
 
 ### Roles and access control
 
@@ -231,14 +231,14 @@ Equivalent HTTP: `PUT /api/v1/users/{user}/role`, `GET`/`PUT /api/v1/buckets/{bu
 
 ### Duress personas
 
-A user can hold up to three additional passwords (slots 1..3, on top of the primary slot 0), each unlocking a completely separate identity with its own bucket grants. Logging in with a different slot's password behaves exactly like logging in as a different account - there is no shared state, and every `UserRecord` always carries exactly four byte-shape-identical slots, so nothing distinguishes a real persona from an unused decoy from the outside.
+A user can hold up to three additional passwords, each unlocking a completely separate identity with its own bucket grants. There is no "primary slot" a caller can rely on by number: each account's real identity is placed at a slot chosen uniformly at random on creation, so slot position alone reveals nothing about which credential is the real one. Logging in with a different slot's password behaves exactly like logging in as a different account - there is no shared state, and every `UserRecord` always carries exactly four byte-shape-identical slots, so nothing distinguishes a real persona from an unused decoy from the outside.
 
-Create a persona at slot 1..3 (self-service only - the CLI always prompts for the password interactively, never accepts it as an argument):
+Create a persona at any credential slot other than the one your current session is authenticated through (self-service only - the CLI always prompts for the password interactively, never accepts it as an argument):
 
 ```sh
 curl -X POST https://y2qd.example/api/v1/personas \
   -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
-  -d '{"slot":1,"password":"a-different-password","role":"readonly","revoke_other_sessions":true}'
+  -d '{"slot":2,"password":"a-different-password","role":"readonly","revoke_other_sessions":true}'
 ```
 
 `role` is capped at the account's own global role - a persona can never grant itself more power than the account already has. `revoke_other_sessions: true` is what makes a persona usable under duress: logging in through it silently switches every other live session on the account over to this persona's identity, in place - same tokens, same expiry, nothing visibly interrupted. A coercer who checks that some other session is still "logged in" sees exactly that; it just now carries the duress persona's own (usually far more limited) access instead of the real one's, with no revocation, error, or log line distinguishing it from an ordinary login.
@@ -257,7 +257,7 @@ curl -X DELETE https://y2qd.example/api/v1/personas/2/grant \
   -d '{"buckets":["prod"]}'
 ```
 
-`GET /api/v1/personas/me` reports the calling session's own slot, role, and duress flag - the only introspection offered, and useless to a coercer since it only ever describes the session you are already in. `DELETE /api/v1/personas/{slot}` overwrites that slot with a fresh decoy.
+`GET /api/v1/personas/me` reports the calling session's own slot and role - never the duress flag, even for the caller's own session, so a technical coercer who queries this endpoint directly can't read it off. This is the only introspection offered. `DELETE /api/v1/personas/{slot}` overwrites that slot (any slot other than the caller's own active one) with a fresh decoy.
 
 A share made with `POST /api/v1/personas/{slot}/grant` does not survive a bucket key rotation performed by someone else - see the warning under [Key rotation](#key-rotation).
 

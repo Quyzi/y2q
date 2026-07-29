@@ -47,10 +47,7 @@ pub async fn run(cmd: PersonaCmd, mode: OutputMode) -> Result<(), CliError> {
             if mode == OutputMode::Json {
                 print_json(&view);
             } else {
-                println!(
-                    "slot: {}\nrole: {}\nrevoke_other_sessions: {}",
-                    view.slot, view.role, view.revoke_other_sessions
-                );
+                println!("slot: {}\nrole: {}", view.slot, view.role);
             }
         }
 

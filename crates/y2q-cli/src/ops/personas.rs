@@ -4,10 +4,11 @@
 
 use y2q_client::{ClientError, PersonaCreateResponse, PersonaView, Y2qClient};
 
-/// Write a new persona into credential slot `1..=3`. `role` is `"admin"`,
-/// `"user"`, `"readonly"`, `"writeonly"`, `"auditor"`, `"disabled"`, or
-/// `None` for the server default (`user`). Always overwrites whatever was
-/// in `slot`, real or decoy.
+/// Write a new persona into a credential slot (`0..CREDENTIAL_SLOTS`).
+/// `role` is `"admin"`, `"user"`, `"readonly"`, `"writeonly"`, `"auditor"`,
+/// `"disabled"`, or `None` for the server default (`user`). Always
+/// overwrites whatever was in `slot`, real or decoy - except the slot the
+/// caller is currently authenticated through, which the server refuses.
 pub async fn add(
     client: &Y2qClient,
     slot: u8,
@@ -20,13 +21,15 @@ pub async fn add(
         .await
 }
 
-/// Overwrite `slot` (`1..=3`) with a fresh decoy and revoke any live
-/// session opened through it.
+/// Overwrite `slot` (excluding the one the caller is currently
+/// authenticated through) with a fresh decoy and revoke any live session
+/// opened through it.
 pub async fn remove(client: &Y2qClient, slot: u8) -> Result<(), ClientError> {
     client.delete_persona(slot).await
 }
 
-/// The calling session's own persona slot, role, and duress flag.
+/// The calling session's own persona slot and role. The server never
+/// reports the duress flag, even for the caller's own session.
 pub async fn whoami(client: &Y2qClient) -> Result<PersonaView, ClientError> {
     client.whoami_persona().await
 }

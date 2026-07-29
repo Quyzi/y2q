@@ -408,10 +408,11 @@ pub async fn change_password(
 }
 
 /// `PUT /api/v1/users/add` — admin-only: create a user with a brand-new,
-/// independent identity keypair (slot 0) wrapped under the given password,
-/// plus decoy slots 1..3. Unrelated to the caller's own identity: this does
-/// not require the caller's session to hold any bucket access, only the
-/// `admin` role.
+/// independent identity keypair wrapped under the given password, at a
+/// slot position chosen uniformly at random (never a fixed index — see
+/// `UserRecord::primary_slot`), plus decoys in the other three. Unrelated
+/// to the caller's own identity: this does not require the caller's
+/// session to hold any bucket access, only the `admin` role.
 #[utoipa::path(
     put,
     path = "/api/v1/users/add",
@@ -466,19 +467,15 @@ pub async fn add_user(
 
     let params = state.new_argon2_params();
     let username_for_slots = username.clone();
-    let (slots, params) = tokio::task::spawn_blocking(move || {
-        let slot0 = kdf::new_slot(
+    let (slots, params, primary_slot) = tokio::task::spawn_blocking(move || {
+        let (slots, primary_slot) = kdf::new_slots_random(
             &username_for_slots,
-            0,
             password.as_bytes(),
             &params,
             role,
             false,
         )?;
-        let decoys = kdf::decoy_slots_from(&username_for_slots, 1, &params)?;
-        let mut slots = vec![slot0];
-        slots.extend(decoys);
-        Ok::<_, y2q_core::crypto::CryptoError>((slots, params))
+        Ok::<_, y2q_core::crypto::CryptoError>((slots, params, primary_slot))
     })
     .await
     .map_err(|e| AuthError::Backend(format!("kdf join: {e}")))?
@@ -490,6 +487,7 @@ pub async fn add_user(
         last_login: None,
         kdf: params,
         slots,
+        primary_slot: primary_slot as u8,
         role,
     };
     if let Some(rt) = cluster.as_ref() {
@@ -783,11 +781,12 @@ pub struct ResetIdentityResponse {
 
 /// `POST /api/v1/users/{user}/reset-identity` — the honest replacement for an
 /// admin password reset. Rebuilds the target's record with a fresh identity
-/// keypair (slot 0) under the supplied password and fresh decoys in slots
-/// 1..4, revokes their live sessions, and scrubs every bucket-key grant they
-/// held across every bucket — those grants were sealed to the identity
-/// public key that just got replaced, so they are unrecoverable garbage the
-/// moment this runs, whether or not this endpoint bothers to delete them.
+/// keypair under the supplied password, at a slot position chosen
+/// uniformly at random, plus fresh decoys everywhere else, revokes their
+/// live sessions, and scrubs every bucket-key grant they held across every
+/// bucket — those grants were sealed to the identity public key that just
+/// got replaced, so they are unrecoverable garbage the moment this runs,
+/// whether or not this endpoint bothers to delete them.
 ///
 /// This restores login. It does not restore access: the target holds no
 /// bucket key until someone re-grants their new identity, and the caller
@@ -845,24 +844,20 @@ pub async fn reset_identity(
     let username_for_slots = username.clone();
     let role = rec.role;
     let params = rec.kdf.clone();
-    let slots = tokio::task::spawn_blocking(move || {
-        let slot0 = kdf::new_slot(
+    let (slots, primary_slot) = tokio::task::spawn_blocking(move || {
+        kdf::new_slots_random(
             &username_for_slots,
-            0,
             password.as_bytes(),
             &params,
             role,
             false,
-        )?;
-        let decoys = kdf::decoy_slots_from(&username_for_slots, 1, &params)?;
-        let mut slots = vec![slot0];
-        slots.extend(decoys);
-        Ok::<_, y2q_core::crypto::CryptoError>(slots)
+        )
     })
     .await
     .map_err(|e| AuthError::Backend(format!("kdf join: {e}")))?
     .map_err(|e| AuthError::Backend(e.to_string()))?;
     rec.slots = slots;
+    rec.primary_slot = primary_slot as u8;
 
     if let Some(rt) = cluster.as_ref() {
         cluster::cluster_upsert_user(rt, state.get_ref(), &rec).await?;
@@ -1009,8 +1004,11 @@ fn now_ns() -> u64 {
 /// `POST /api/v1/personas` request body.
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct PersonaCreateRequest {
-    /// Credential slot to write: must be `1..=3`. Slot 0 is the primary
-    /// persona, changed only via `POST /api/v1/auth/password`.
+    /// Credential slot to write, `0..CREDENTIAL_SLOTS`. No slot is
+    /// privileged from this endpoint's point of view — the account's own
+    /// randomly-placed primary slot is protected only because it's always
+    /// the slot the caller is currently authenticated through, not because
+    /// of its numeric value; see [`create_persona`].
     pub slot: u8,
     pub password: String,
     /// Effective role for sessions opened through this persona. Must not
@@ -1036,19 +1034,32 @@ pub struct PersonaCreateResponse {
     pub warning: String,
 }
 
-/// `GET /api/v1/personas/me` response body.
+/// `GET /api/v1/personas/me` response body. Deliberately omits the
+/// account's `revoke_other_sessions` duress flag: reporting it, even only
+/// for the caller's own session, would let a technical coercer who queries
+/// this endpoint themselves (rather than trusting whatever a victim's CLI
+/// told them) read the flag straight off the JSON and know with certainty
+/// they'd been handed a duress persona rather than the real one — closing
+/// that hole matters more than the minor convenience of a user being able
+/// to double-check their own setting via the API.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct PersonaView {
     pub slot: u8,
     #[schema(value_type = String, example = "user")]
     pub role: Role,
-    pub revoke_other_sessions: bool,
 }
 
 /// `POST /api/v1/personas` — write a new persona into the caller's own
-/// record at `slot` (`1..=3`), unconditionally overwriting whatever was
-/// there. Acts only on the caller's own record: there is no admin route to
-/// add a persona for someone else, because such a route would be the first
+/// record at `slot` (`0..CREDENTIAL_SLOTS`), unconditionally overwriting
+/// whatever was there — except the slot the caller is *currently*
+/// authenticated through, which is refused to prevent a session from
+/// silently invalidating its own login credential. No slot number carries
+/// any special meaning to this endpoint: each account's real/primary
+/// identity lives at a slot chosen uniformly at random on creation
+/// (`UserRecord::primary_slot`, never a fixed index and never returned by
+/// any API), so there is nothing to hardcode-protect by position. Acts
+/// only on the caller's own record: there is no admin route to add a
+/// persona for someone else, because such a route would be the first
 /// thing a coercer with an admin account would reach for.
 #[utoipa::path(
     post,
@@ -1056,7 +1067,7 @@ pub struct PersonaView {
     request_body = PersonaCreateRequest,
     responses(
         (status = 201, description = "Persona written", body = PersonaCreateResponse, content_type = "application/json"),
-        (status = 400, description = "Slot out of range, role exceeds the account's global role, or empty password"),
+        (status = 400, description = "Slot out of range, targets the caller's own active slot, role exceeds the account's global role, or empty password"),
         (status = 401, description = "Token missing/invalid"),
         (status = 409, description = "Password already opens one of the caller's credential slots"),
     ),
@@ -1070,9 +1081,14 @@ pub async fn create_persona(
     body: web::Json<PersonaCreateRequest>,
 ) -> Result<HttpResponse, AuthError> {
     let slot = body.slot as usize;
-    if !(1..CREDENTIAL_SLOTS).contains(&slot) {
+    if !(0..CREDENTIAL_SLOTS).contains(&slot) {
         return Err(AuthError::InvalidPersonaSlot {
-            reason: "slot must be 1..=3 (slot 0 is the primary persona)",
+            reason: "slot must be in range 0..CREDENTIAL_SLOTS",
+        });
+    }
+    if slot == auth.session.persona as usize {
+        return Err(AuthError::InvalidPersonaSlot {
+            reason: "cannot overwrite the slot this session is currently authenticated through",
         });
     }
     if body.password.is_empty() {
@@ -1142,14 +1158,15 @@ pub async fn create_persona(
     }))
 }
 
-/// `DELETE /api/v1/personas/{slot}` — overwrite `slot` (`1..=3`) with a
-/// fresh decoy and revoke any live session opened through it. Idempotent:
-/// deleting an already-decoy slot is a no-op that still returns 204, and
-/// must not reveal which it was.
+/// `DELETE /api/v1/personas/{slot}` — overwrite `slot`
+/// (`0..CREDENTIAL_SLOTS`, except the caller's own currently-authenticated
+/// slot) with a fresh decoy and revoke any live session opened through it.
+/// Idempotent: deleting an already-decoy slot is a no-op that still
+/// returns 204, and must not reveal which it was.
 #[utoipa::path(
     delete,
     path = "/api/v1/personas/{slot}",
-    params(("slot" = u8, Path, description = "Credential slot, 1..=3")),
+    params(("slot" = u8, Path, description = "Credential slot, 0..CREDENTIAL_SLOTS, excluding the caller's own active slot")),
     responses(
         (status = 204, description = "Slot overwritten with a decoy"),
         (status = 400, description = "Slot out of range"),
@@ -1165,9 +1182,14 @@ pub async fn delete_persona(
     path: web::Path<u8>,
 ) -> Result<HttpResponse, AuthError> {
     let slot = path.into_inner() as usize;
-    if !(1..CREDENTIAL_SLOTS).contains(&slot) {
+    if !(0..CREDENTIAL_SLOTS).contains(&slot) {
         return Err(AuthError::InvalidPersonaSlot {
-            reason: "slot must be 1..=3 (slot 0 is the primary persona)",
+            reason: "slot must be in range 0..CREDENTIAL_SLOTS",
+        });
+    }
+    if slot == auth.session.persona as usize {
+        return Err(AuthError::InvalidPersonaSlot {
+            reason: "cannot overwrite the slot this session is currently authenticated through",
         });
     }
     let rec = state
@@ -1196,9 +1218,11 @@ pub async fn delete_persona(
     Ok(HttpResponse::NoContent().finish())
 }
 
-/// `GET /api/v1/personas/me` — the calling session's own persona slot,
-/// role, and duress flag. Never lists any other slot: this is the only
-/// introspection offered, and it is deliberately useless to a coercer.
+/// `GET /api/v1/personas/me` — the calling session's own persona slot and
+/// role. Never lists any other slot, and never reports the
+/// `revoke_other_sessions` duress flag (see [`PersonaView`]'s doc comment
+/// for why) — this is the only introspection offered, and what remains of
+/// it is deliberately useless to a coercer.
 #[utoipa::path(
     get,
     path = "/api/v1/personas/me",
@@ -1214,6 +1238,5 @@ pub async fn whoami_persona(auth: Authenticated) -> Result<HttpResponse, AuthErr
     Ok(HttpResponse::Ok().json(PersonaView {
         slot: auth.session.persona,
         role: auth.session.role,
-        revoke_other_sessions: auth.session.revoke_other_sessions,
     }))
 }

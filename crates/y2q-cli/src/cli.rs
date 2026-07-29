@@ -535,8 +535,11 @@ pub enum LocksCmd {
 
 #[derive(Subcommand, Debug)]
 pub enum PersonaCmd {
-    /// Write (or overwrite) a persona into credential slot `1..=3`. Slot 0
-    /// is the primary persona, changed via `y2q passwd`.
+    /// Write (or overwrite) a persona into a credential slot
+    /// (`0..CREDENTIAL_SLOTS`). No slot is privileged - each account's real
+    /// identity lives at a slot chosen randomly on creation, changed via
+    /// `y2q passwd`. The server refuses to overwrite whichever slot the
+    /// current session is authenticated through.
     Add {
         alias: String,
         #[arg(long)]
@@ -551,15 +554,17 @@ pub enum PersonaCmd {
         #[arg(long)]
         duress: bool,
     },
-    /// Overwrite a persona slot (`1..=3`) with a fresh decoy and revoke any
-    /// live session opened through it.
+    /// Overwrite a persona slot (excluding the one the current session is
+    /// authenticated through) with a fresh decoy and revoke any live
+    /// session opened through it.
     #[command(alias = "remove")]
     Rm {
         alias: String,
         #[arg(long)]
         slot: u8,
     },
-    /// Show the current session's persona slot, role, and duress flag.
+    /// Show the current session's persona slot and role. The server never
+    /// reports the duress flag, even for your own session.
     Whoami { alias: String },
     /// Share buckets your current persona holds with one of your own
     /// other personas.

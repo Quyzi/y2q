@@ -3,10 +3,12 @@ use crate::error::ClientError;
 use crate::model::{PersonaCreateRequest, PersonaCreateResponse, PersonaGrantBody, PersonaView};
 
 impl Y2qClient {
-    /// Write a new persona (credential slot `1..=3`) into the caller's own
-    /// record. `role` is `"admin"`/`"user"`/`"readonly"`/`"writeonly"`/
-    /// `"auditor"`/`"disabled"`, or `None` to let the server default to
-    /// `user`. Always overwrites whatever was in `slot`, real or decoy.
+    /// Write a new persona (credential slot `0..CREDENTIAL_SLOTS`) into the
+    /// caller's own record. `role` is
+    /// `"admin"`/`"user"`/`"readonly"`/`"writeonly"`/`"auditor"`/`"disabled"`,
+    /// or `None` to let the server default to `user`. Always overwrites
+    /// whatever was in `slot`, real or decoy — except the slot the caller
+    /// is currently authenticated through, which the server refuses.
     pub async fn create_persona(
         &self,
         slot: u8,
@@ -26,8 +28,9 @@ impl Y2qClient {
         Ok(resp.json::<PersonaCreateResponse>().await?)
     }
 
-    /// Overwrite `slot` (`1..=3`) with a fresh decoy and revoke any live
-    /// session opened through it.
+    /// Overwrite `slot` (`0..CREDENTIAL_SLOTS`, excluding the caller's own
+    /// active slot) with a fresh decoy and revoke any live session opened
+    /// through it.
     pub async fn delete_persona(&self, slot: u8) -> Result<(), ClientError> {
         let url = self.url(&format!("api/v1/personas/{slot}"));
         let resp = self.authed(self.inner.delete(url)).send().await?;
@@ -35,7 +38,8 @@ impl Y2qClient {
         Ok(())
     }
 
-    /// The calling session's own persona slot, role, and duress flag.
+    /// The calling session's own persona slot and role. The server never
+    /// reports the duress flag, even for the caller's own session.
     pub async fn whoami_persona(&self) -> Result<PersonaView, ClientError> {
         let url = self.url("api/v1/personas/me");
         let resp = self.authed(self.inner.get(url)).send().await?;

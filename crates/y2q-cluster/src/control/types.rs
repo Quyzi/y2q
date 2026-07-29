@@ -120,11 +120,11 @@ pub enum ControlCmd {
         bucket: String,
     },
     /// Insert or replace a user's durable record cluster-wide (create, a
-    /// password change which re-wraps slot 0, or a persona/reset-identity
-    /// change which replaces the whole slot array). The wrapped secret
-    /// key material in the record is the same ciphertext-at-rest already
-    /// stored on disk; the daemon projects the record into each node's
-    /// local user store on apply.
+    /// password change which re-wraps whichever slot that password opened,
+    /// or a persona/reset-identity change which replaces the whole slot
+    /// array). The wrapped secret key material in the record is the same
+    /// ciphertext-at-rest already stored on disk; the daemon projects the
+    /// record into each node's local user store on apply.
     UpsertUser {
         /// The complete user record to store (keyed by its username).
         record: UserRecord,
@@ -442,6 +442,7 @@ mod tests {
             last_login: None,
             kdf: params,
             slots,
+            primary_slot: 0,
             role,
         }
     }

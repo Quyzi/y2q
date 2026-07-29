@@ -38,25 +38,23 @@ pub struct PersonaGrantBody {
 }
 
 fn validate_slot(slot: usize) -> Result<(), AppError> {
-    if (1..CREDENTIAL_SLOTS).contains(&slot) {
+    if (0..CREDENTIAL_SLOTS).contains(&slot) {
         Ok(())
     } else {
         Err(AppError(CoreError::InvalidPersonaRequest {
-            reason: format!(
-                "invalid persona slot {slot}: must be 1..={}",
-                CREDENTIAL_SLOTS - 1
-            ),
+            reason: format!("invalid persona slot {slot}: must be 0..{CREDENTIAL_SLOTS}"),
         }))
     }
 }
 
 /// `POST /api/v1/personas/{slot}/grant` — share every bucket in the body
 /// that the caller's *current* persona really holds with `slot`, one of
-/// the caller's own other personas.
+/// the caller's own other personas. `slot` may be any credential slot
+/// except the caller's own currently-authenticated one.
 #[utoipa::path(
     post,
     path = "/api/v1/personas/{slot}/grant",
-    params(("slot" = u8, Path, description = "Credential slot, 1..=3, to grant")),
+    params(("slot" = u8, Path, description = "Credential slot, 0..CREDENTIAL_SLOTS, excluding the caller's own active slot, to grant")),
     request_body = PersonaGrantBody,
     responses(
         (status = 204, description = "Buckets shared with the target persona"),
@@ -94,7 +92,7 @@ pub async fn grant_persona(
 #[utoipa::path(
     delete,
     path = "/api/v1/personas/{slot}/grant",
-    params(("slot" = u8, Path, description = "Credential slot, 1..=3, to revoke")),
+    params(("slot" = u8, Path, description = "Credential slot, 0..CREDENTIAL_SLOTS, excluding the caller's own active slot, to revoke")),
     request_body = PersonaGrantBody,
     responses(
         (status = 204, description = "Buckets unshared from the target persona"),
@@ -137,6 +135,11 @@ async fn share_or_revoke(
 ) -> Result<(), AppError> {
     let target_slot = slot as usize;
     validate_slot(target_slot)?;
+    if target_slot == auth.session.persona as usize {
+        return Err(AppError(CoreError::InvalidPersonaRequest {
+            reason: "cannot target the caller's own currently-authenticated slot".to_owned(),
+        }));
+    }
 
     let rec = state
         .user_store

@@ -88,12 +88,13 @@ pub fn new_bucket_key_version(
 /// `caller_username` at `caller_persona` (whatever slot they're actually
 /// authenticated as — this is the only way to guarantee the *caller's own*
 /// access survives the rotation, since a bucket owner's real persona is
-/// whichever slot originally claimed it, not necessarily slot 0), plus real
-/// access at credential slot 0 for the bucket owner (if different from the
-/// caller) and every other username with a read-implying ACL grant —
-/// matching the slot-0 convention `set_acl`'s `reseal_grantee` already uses
-/// for third-party grants. Unknown usernames (a stale ACL entry for a
-/// deleted user) are silently skipped, same as `reseal_grantee`.
+/// whichever slot originally claimed it, not necessarily their
+/// `primary_slot`), plus real access at each other username's own
+/// `UserRecord::primary_slot` (the bucket owner, if different from the
+/// caller, and every other username with a read-implying ACL grant) —
+/// matching the primary-slot convention `set_acl`'s `reseal_grantee`
+/// already uses for third-party grants. Unknown usernames (a stale ACL
+/// entry for a deleted user) are silently skipped, same as `reseal_grantee`.
 ///
 /// This is necessarily a *reconstruction* from the cleartext ACL/owner
 /// fields, not a read of who currently holds real access on the bucket's
@@ -132,7 +133,7 @@ pub fn current_grantees(
         if username == caller_username {
             authorized[caller_persona as usize] = true;
         } else {
-            authorized[0] = true;
+            authorized[rec.primary_slot as usize] = true;
         }
         grantees.push((
             username,
