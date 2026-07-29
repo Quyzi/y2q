@@ -53,7 +53,7 @@ pub enum Commands {
         alias: String,
         #[arg(long, short)]
         user: Option<String>,
-        #[arg(long, short)]
+        #[arg(long, short, allow_hyphen_values = true)]
         password: Option<String>,
         #[arg(long, value_name = "SECONDS")]
         ttl: Option<u64>,
@@ -63,9 +63,9 @@ pub enum Commands {
     /// Change password for an alias.
     Passwd {
         alias: String,
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         current: Option<String>,
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         new: Option<String>,
     },
     /// Copy files between local and remote storage.
@@ -433,7 +433,7 @@ pub enum AdminCmd {
     ResetIdentity {
         alias: String,
         username: String,
-        #[arg(long, short)]
+        #[arg(long, short, allow_hyphen_values = true)]
         password: Option<String>,
     },
 }
@@ -444,7 +444,7 @@ pub enum UserCmd {
     Add {
         alias: String,
         username: String,
-        #[arg(long, short)]
+        #[arg(long, short, allow_hyphen_values = true)]
         password: Option<String>,
         /// Global role for the new user: `admin` or `user` (default).
         #[arg(long, default_value = "user")]
