@@ -1678,3 +1678,107 @@ async fn e2e_duress_persona_deniability() {
         "expected 409 conflict, got: {err:?}"
     );
 }
+
+/// Regression: a duress persona must not be able to destroy the account's
+/// real identity through `create_persona`/`delete_persona`, and the two
+/// endpoints' responses must be indistinguishable whether or not the
+/// targeted slot happened to be the real one — otherwise a coercer holding
+/// only a duress password could enumerate the other three slots and read
+/// off which one is real from whichever refuses to change.
+#[tokio::test]
+async fn e2e_duress_persona_cannot_destroy_primary() {
+    let Some(server) = start_server() else {
+        return;
+    };
+    let url = server.url();
+    let mk = || y2q_client::Y2qClient::new(y2q_client::ClientConfig::new(url.clone())).unwrap();
+
+    // Login budget: the `/auth/login` rate limiter allows a burst of 5
+    // requests per source IP before throttling (see `rate_limit.rs`), so
+    // this test is deliberately structured to use exactly 5: root, real,
+    // duress, then one final "real still works" check and one "attacker
+    // password fails" check — both attacks below reuse the already
+    // logged-in `duress` session rather than minting fresh ones.
+    let mut root = mk();
+    let root_tok = root
+        .login("root", &server.password, None)
+        .await
+        .expect("root login");
+    root.set_token(root_tok.token);
+    root.add_user("mallory", "password-real", Some("user"))
+        .await
+        .expect("add mallory");
+
+    let mut real = mk();
+    let real_tok = real
+        .login("mallory", "password-real", None)
+        .await
+        .expect("real login");
+    real.set_token(real_tok.token);
+    let real_slot = real.whoami_persona().await.expect("whoami real").slot;
+
+    // Duress persona at any other slot.
+    let duress_slot = (0..4u8).find(|&s| s != real_slot).unwrap();
+    real.create_persona(duress_slot, "password-duress", Some("user"), false)
+        .await
+        .expect("create duress persona");
+
+    let mut duress = mk();
+    let duress_tok = duress
+        .login("mallory", "password-duress", None)
+        .await
+        .expect("duress login");
+    duress.set_token(duress_tok.token);
+    assert_eq!(
+        duress.whoami_persona().await.expect("whoami duress").slot,
+        duress_slot
+    );
+
+    // The duress persona attempts to overwrite the real slot with an
+    // attacker-controlled password.
+    let resp_on_real = duress
+        .create_persona(real_slot, "attacker-password", Some("user"), false)
+        .await
+        .expect("create_persona on the real slot must still return success");
+
+    // Same call against a genuinely untouched (non-real) slot, for
+    // response-shape comparison.
+    let untouched_slot = (0..4u8)
+        .find(|&s| s != real_slot && s != duress_slot)
+        .unwrap();
+    let resp_on_untouched = duress
+        .create_persona(untouched_slot, "another-password", Some("user"), false)
+        .await
+        .expect("create_persona on an untouched slot");
+
+    // The warning always echoes the caller's own requested slot number
+    // (which the caller already knows - not a leak), so compare the
+    // message *shape*, not literal text: both must say "overwritten",
+    // neither may say anything distinguishing real from decoy.
+    for w in [&resp_on_real.warning, &resp_on_untouched.warning] {
+        assert!(
+            w.contains("overwritten") && w.contains("grants sealed to it are gone"),
+            "response must not reveal whether the target was the real slot: {w}"
+        );
+    }
+
+    // Now the same attack via delete_persona: targeting the real slot must
+    // also silently no-op, with an identical 204 either way.
+    duress
+        .delete_persona(real_slot)
+        .await
+        .expect("delete_persona on the real slot must still return success");
+
+    // The real password still works after both attacks; the attacker's
+    // injected password does not open any persona.
+    let real2 = mk();
+    real2
+        .login("mallory", "password-real", None)
+        .await
+        .expect("real password must still work - the primary slot was never touched");
+    let attacker_login = mk();
+    attacker_login
+        .login("mallory", "attacker-password", None)
+        .await
+        .expect_err("the attacker's injected password must not open any persona");
+}
