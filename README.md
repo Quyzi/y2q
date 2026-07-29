@@ -487,7 +487,7 @@ All authenticated routes require `Authorization: Bearer <token>`. Authorization 
 | `POST` | `/api/v1/users/{user}/reset-identity` | Admin | Reset a forgotten password (restores login, not bucket access) |
 | `POST` | `/api/v1/personas` | Yes | Add a duress persona (extra password, own credential slot) |
 | `DELETE` | `/api/v1/personas/{slot}` | Yes | Overwrite a persona slot with a fresh decoy |
-| `GET` | `/api/v1/personas/me` | Yes | The calling session's own slot/role/duress flag |
+| `GET` | `/api/v1/personas/me` | Yes | The calling session's own slot/role (never the duress flag) |
 | `POST`/`DELETE` | `/api/v1/personas/{slot}/grant` | Yes | Share/revoke your current bucket access with your own other persona |
 
 ### Objects and buckets

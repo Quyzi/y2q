@@ -985,7 +985,8 @@ fn e2e_bucket_acl_grant_and_revoke() {
     assert!(!ok(&server.y2q(&["stat", "bob/shared/secret.txt"])));
 
     // Owner grants bob read access; this seals a real bucket-key grant to
-    // bob's primary persona (slot 0), not just an authz-layer ACL entry.
+    // bob's real (randomly-placed) identity slot, not just an authz-layer
+    // ACL entry.
     server.ok(&["admin", "acl", "grant", "test", "shared", "bob", "read"]);
 
     // Bob can now list and decrypt the object using his existing session —
@@ -1495,7 +1496,8 @@ async fn e2e_duress_persona_deniability() {
         .await
         .expect("add alice");
 
-    // 1. As alice (password A / slot 0): create real-bucket+secret.txt and
+    // 1. As alice (password A, whichever slot the server randomly chose as
+    // her real identity): create real-bucket+secret.txt and
     // decoy-bucket+plausible.txt.
     let mut alice_a = mk();
     let tok_a = alice_a
@@ -1503,6 +1505,7 @@ async fn e2e_duress_persona_deniability() {
         .await
         .expect("alice login A");
     alice_a.set_token(tok_a.token.clone());
+    let alice_a_slot = alice_a.whoami_persona().await.expect("whoami as A").slot;
 
     alice_a
         .create_bucket("real-bucket")
@@ -1537,23 +1540,27 @@ async fn e2e_duress_persona_deniability() {
         .await
         .expect("put plausible.txt");
 
-    // 2. Create a duress persona at slot 1, password B, revoke_other_sessions
-    // baked in from the start (exercised by the later silent-switch check).
+    // 2. Create a duress persona at any slot other than alice's own real
+    // one (primary placement is randomized, so it could be any of the
+    // four - the server refuses only the caller's currently-active slot),
+    // password B, revoke_other_sessions baked in from the start (exercised
+    // by the later silent-switch check).
+    let duress_slot = (0..4u8).find(|&s| s != alice_a_slot).unwrap();
     let resp = alice_a
-        .create_persona(1, "password-B", Some("user"), true)
+        .create_persona(duress_slot, "password-B", Some("user"), true)
         .await
-        .expect("create persona slot 1");
+        .expect("create duress persona");
     assert!(
         resp.warning.contains("overwritten"),
         "expected the unconditional overwrite warning, got: {}",
         resp.warning
     );
 
-    // 3. Share only decoy-bucket with slot 1.
+    // 3. Share only decoy-bucket with the duress slot.
     alice_a
-        .grant_persona(1, &["decoy-bucket".to_owned()])
+        .grant_persona(duress_slot, &["decoy-bucket".to_owned()])
         .await
-        .expect("grant decoy-bucket to slot 1");
+        .expect("grant decoy-bucket to duress slot");
 
     // A held live A-session (separate from `alice_a`, minted before B's
     // duress login below) to prove it silently becomes B's session rather
@@ -1578,9 +1585,8 @@ async fn e2e_duress_persona_deniability() {
     alice_b.set_token(tok_b.token.clone());
 
     let view = alice_b.whoami_persona().await.expect("whoami as B");
-    assert_eq!(view.slot, 1);
+    assert_eq!(view.slot, duress_slot);
     assert_eq!(view.role, "user");
-    assert!(view.revoke_other_sessions);
 
     let buckets = alice_b.list_buckets().await.expect("list buckets as B");
     assert_eq!(
@@ -1608,13 +1614,14 @@ async fn e2e_duress_persona_deniability() {
     // Duress silent switch: the held A session, live since before B's
     // login, keeps authenticating with the *same* token - no revocation,
     // no 401 - but it now silently carries B's (duress) identity: whoami
-    // reports slot 1, and its bucket access is now B's, not the real A's.
+    // reports the duress slot, and its bucket access is now B's, not the
+    // real A's.
     let held_view = held_a
         .whoami_persona()
         .await
         .expect("held A session must keep working - switched in place, not revoked");
     assert_eq!(
-        held_view.slot, 1,
+        held_view.slot, duress_slot,
         "held session must now report the duress persona's slot"
     );
     assert_eq!(held_view.role, "user");
@@ -1657,9 +1664,13 @@ async fn e2e_duress_persona_deniability() {
         .expect("A still reads real-bucket");
     assert_eq!(got2, b"the real secret");
 
-    // 6. Reusing password A for a different slot is refused outright.
+    // 6. Reusing password A for a different (untouched) slot is refused
+    // outright.
+    let untouched_slot = (0..4u8)
+        .find(|&s| s != alice_a_slot && s != duress_slot)
+        .unwrap();
     let err = alice_a2
-        .create_persona(2, "password-A", Some("user"), false)
+        .create_persona(untouched_slot, "password-A", Some("user"), false)
         .await
         .expect_err("password reuse across slots must be refused");
     assert!(

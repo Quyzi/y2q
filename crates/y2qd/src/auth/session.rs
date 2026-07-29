@@ -96,10 +96,11 @@ pub struct SessionInfo {
     /// itself, and so bucket grants (phase 3) resolve per persona rather
     /// than per username.
     pub persona: u8,
-    /// This persona's duress flag, captured at login. Reported verbatim by
-    /// `GET /api/v1/personas/me` — there is no other way to recover it
-    /// post-login, since it lives only in the encrypted `SlotPayload`, not
-    /// on the user record's cleartext fields.
+    /// This persona's duress flag, captured at login. Server-internal only:
+    /// never returned by any API response (including `GET
+    /// /api/v1/personas/me`) — exposing it, even just for the caller's own
+    /// session, would hand a technical coercer who queries the endpoint
+    /// directly a definitive signal that this is a duress persona.
     pub revoke_other_sessions: bool,
     /// The unwrapped identity secret key of the persona this session logged
     /// in as. Lives exactly as long as the session; zeroized when the entry

@@ -62,6 +62,8 @@ impl AuthState {
             last_login: None,
             kdf: params,
             slots,
+            // All-decoy record; no slot is real, so the value is arbitrary.
+            primary_slot: 0,
             role: y2q_core::crypto::Role::User,
         }
     }

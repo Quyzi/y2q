@@ -177,17 +177,13 @@ pub fn first_run(
     }
 
     let root_password = generate_root_password();
-    let slot0 = kdf::new_slot(
+    let (slots, primary_slot) = kdf::new_slots_random(
         root_username,
-        0,
         root_password.as_bytes(),
         &params,
         Role::Admin,
         false,
     )?;
-    let decoys = kdf::decoy_slots_from(root_username, 1, &params)?;
-    let mut slots = vec![slot0];
-    slots.extend(decoys);
 
     let manifest = KeystoreManifest {
         format_version: KEYSTORE_FORMAT_VERSION,
@@ -203,6 +199,7 @@ pub fn first_run(
         last_login: None,
         kdf: params,
         slots,
+        primary_slot: primary_slot as u8,
         // The bootstrap user is the daemon's first administrator.
         role: Role::Admin,
     };
@@ -427,12 +424,14 @@ mod tests {
 
         let users = load(dir.path(), &k).unwrap();
 
-        // Root's primary persona (slot 0) opens with the printed password.
+        // Root's persona lives at a randomly-chosen slot; recover it via
+        // primary_slot rather than assuming a fixed index.
         let rec = users.get("root").unwrap().unwrap();
         assert_eq!(rec.slots.len(), CREDENTIAL_SLOTS);
+        let slot = rec.primary_slot as usize;
         let kek = rec.kdf.derive_kek(root_password.as_bytes()).unwrap();
-        let aad = kdf::slot_wrap_aad("root", 0);
-        let payload_bytes = kdf::unwrap_slot(&rec.slots[0].wrapped, &kek, &aad).unwrap();
+        let aad = kdf::slot_wrap_aad("root", slot);
+        let payload_bytes = kdf::unwrap_slot(&rec.slots[slot].wrapped, &kek, &aad).unwrap();
         let payload = super::super::user_store::SlotPayload::from_bytes(&payload_bytes).unwrap();
         assert_eq!(payload.role, Role::Admin);
     }

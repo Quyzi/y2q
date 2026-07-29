@@ -265,11 +265,12 @@ pub(crate) fn read_implying_grantees(acl: &BTreeMap<String, BucketPermission>) -
 }
 
 /// Re-seal `user`'s full grant row on `kv`: real BWK to their primary
-/// persona (credential slot 0) when `authorized`, decoys to every slot
-/// otherwise. Slot 0 is the only slot a third party can grant directly —
+/// persona (`UserRecord::primary_slot` — chosen at random per account, not
+/// a fixed index) when `authorized`, decoys to every slot otherwise. The
+/// primary slot is the only slot a third party can grant directly —
 /// granting to someone else's *alternate* persona would require knowing it
-/// exists, which defeats the point of it being a duress persona (phase 5's
-/// persona-to-persona sharing is self-service for exactly this reason).
+/// exists, which defeats the point of it being a duress persona
+/// (persona-to-persona sharing is self-service for exactly this reason).
 /// Unknown usernames are silently skipped: the caller already validated
 /// grantee existence is deliberately not enforced (see `set_acl`'s comment),
 /// so an ACL entry for a nonexistent user simply never gets crypto material.
@@ -296,7 +297,7 @@ fn reseal_grantee(
         .collect();
     let mut slots_authorized = vec![false; CREDENTIAL_SLOTS];
     if authorized {
-        slots_authorized[0] = true;
+        slots_authorized[rec.primary_slot as usize] = true;
     }
     let slots = GranteeSlots {
         identity_pks_b64,

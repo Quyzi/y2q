@@ -212,6 +212,11 @@ pub struct ClearStaleLocksResponse {
 /// Request body for `POST /api/v1/personas`.
 #[derive(Debug, Serialize)]
 pub struct PersonaCreateRequest {
+    /// Credential slot, `0..CREDENTIAL_SLOTS`. No slot number is
+    /// privileged — each account's real identity lives at a slot chosen
+    /// uniformly at random on creation, never a fixed index. The one slot
+    /// the server refuses to overwrite is whichever one the caller is
+    /// currently authenticated through.
     pub slot: u8,
     pub password: String,
     /// Effective role for sessions opened through this persona. Omitted
@@ -228,12 +233,14 @@ pub struct PersonaCreateResponse {
     pub warning: String,
 }
 
-/// Response body for `GET /api/v1/personas/me`.
+/// Response body for `GET /api/v1/personas/me`. Deliberately has no
+/// `revoke_other_sessions` field: the server never reports it, even for the
+/// caller's own session, so a technical coercer probing this endpoint
+/// directly can't read off whether they were handed a duress persona.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersonaView {
     pub slot: u8,
     pub role: String,
-    pub revoke_other_sessions: bool,
 }
 
 /// Request body for `POST`/`DELETE /api/v1/personas/{slot}/grant`.
