@@ -1052,15 +1052,22 @@ pub struct PersonaView {
 /// `POST /api/v1/personas` — write a new persona into the caller's own
 /// record at `slot` (`0..CREDENTIAL_SLOTS`), unconditionally overwriting
 /// whatever was there — except the slot the caller is *currently*
-/// authenticated through, which is refused to prevent a session from
-/// silently invalidating its own login credential. No slot number carries
-/// any special meaning to this endpoint: each account's real/primary
-/// identity lives at a slot chosen uniformly at random on creation
-/// (`UserRecord::primary_slot`, never a fixed index and never returned by
-/// any API), so there is nothing to hardcode-protect by position. Acts
-/// only on the caller's own record: there is no admin route to add a
-/// persona for someone else, because such a route would be the first
-/// thing a coercer with an admin account would reach for.
+/// authenticated through (refused outright, to prevent a session from
+/// silently invalidating its own login credential) and the account's real
+/// `primary_slot` when it differs from the caller's own slot: that write is
+/// silently discarded rather than applied, so a duress persona cannot use
+/// this endpoint to destroy the account's real identity. The discard is
+/// unobservable — same 201, same warning text, same KDF cost paid either
+/// way — because a distinguishable response would let a coercer holding
+/// only a duress password enumerate the other three slots and read off
+/// which one is real from whichever one refuses to change. No slot number
+/// otherwise carries any special meaning to this endpoint: each account's
+/// real/primary identity lives at a slot chosen uniformly at random on
+/// creation (`UserRecord::primary_slot`, never returned by any API), so
+/// there is nothing else to hardcode-protect by position. Acts only on the
+/// caller's own record: there is no admin route to add a persona for
+/// someone else, because such a route would be the first thing a coercer
+/// with an admin account would reach for.
 #[utoipa::path(
     post,
     path = "/api/v1/personas",
@@ -1147,7 +1154,11 @@ pub async fn create_persona(
     .ok_or(AuthError::PasswordReused)?;
 
     let mut updated = rec.clone();
-    updated.slots[slot] = new_slot;
+    // Silently no-op against the real primary slot (see the doc comment
+    // above) — the response is identical either way.
+    if slot != rec.primary_slot as usize {
+        updated.slots[slot] = new_slot;
+    }
     state
         .user_store
         .upsert(&updated)
@@ -1162,7 +1173,12 @@ pub async fn create_persona(
 /// (`0..CREDENTIAL_SLOTS`, except the caller's own currently-authenticated
 /// slot) with a fresh decoy and revoke any live session opened through it.
 /// Idempotent: deleting an already-decoy slot is a no-op that still
-/// returns 204, and must not reveal which it was.
+/// returns 204, and must not reveal which it was. Like [`create_persona`],
+/// silently no-ops (same 204, no session revoked) when `slot` is the
+/// account's real `primary_slot` and differs from the caller's own active
+/// slot — a duress persona cannot use this endpoint to delete the real
+/// identity, and the identical response means it cannot even detect that
+/// its attempt did nothing.
 #[utoipa::path(
     delete,
     path = "/api/v1/personas/{slot}",
@@ -1206,15 +1222,20 @@ pub async fn delete_persona(
         .map_err(|e| AuthError::Backend(e.to_string()))?;
 
     let mut updated = rec.clone();
-    updated.slots[slot] = decoy;
+    let is_primary = slot == rec.primary_slot as usize;
+    if !is_primary {
+        updated.slots[slot] = decoy;
+    }
     state
         .user_store
         .upsert(&updated)
         .map_err(|e| AuthError::Backend(e.to_string()))?;
 
-    state
-        .sessions
-        .revoke_user_persona(&auth.username, slot as u8);
+    if !is_primary {
+        state
+            .sessions
+            .revoke_user_persona(&auth.username, slot as u8);
+    }
     Ok(HttpResponse::NoContent().finish())
 }
 
