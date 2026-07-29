@@ -92,8 +92,9 @@ pub struct SessionInfo {
     pub created_at: SystemTime,
     pub expires_at: SystemTime,
     /// Which credential slot opened this session. Needed so a duress login
-    /// (phase 5) can revoke only *other* personas' sessions, and so bucket
-    /// grants (phase 3) resolve per persona rather than per username.
+    /// (phase 5) can switch only *other* personas' live sessions over to
+    /// itself, and so bucket grants (phase 3) resolve per persona rather
+    /// than per username.
     pub persona: u8,
     /// This persona's duress flag, captured at login. Reported verbatim by
     /// `GET /api/v1/personas/me` — there is no other way to recover it
@@ -231,22 +232,47 @@ impl SessionStore {
         n
     }
 
-    /// Revoke every session belonging to `username` *except* those opened
-    /// through `keep_persona`. Used by a duress-flagged login
-    /// (`revoke_other_sessions`) to drop the real persona's live sessions
-    /// without touching its own. Returns the count removed.
-    pub fn revoke_user_except(&self, username: &str, keep_persona: u8) -> usize {
+    /// Silently convert every OTHER live session belonging to `username` to
+    /// `new_persona`'s identity, in place — same token, same expiry, no
+    /// re-issued credential, no observable interruption. Used by a
+    /// duress-flagged login (`revoke_other_sessions`): rather than revoking
+    /// a coerced session (a visible logout is itself a tell that something
+    /// happened), any other live session for this account is transparently
+    /// downgraded to the duress persona's access on its very next request.
+    /// Whoever holds one of those tokens keeps working exactly as before,
+    /// just scoped to whatever the duress persona was granted. Returns the
+    /// count switched.
+    pub fn switch_user_to_persona(
+        &self,
+        username: &str,
+        new_persona: u8,
+        new_role: Role,
+        new_revoke_other_sessions: bool,
+        identity_sk: &Zeroizing<Vec<u8>>,
+    ) -> usize {
         let victims: Vec<[u8; 32]> = self
             .inner
             .iter()
             .filter_map(|r| {
                 let info = r.value();
-                (info.username == username && info.persona != keep_persona).then_some(*r.key())
+                (info.username == username && info.persona != new_persona).then_some(*r.key())
             })
             .collect();
         let n = victims.len();
         for k in victims {
-            self.inner.remove(&k);
+            let Some(old) = self.inner.get(&k).map(|r| r.value().clone()) else {
+                continue;
+            };
+            let switched = SessionInfo::new(
+                old.username.clone(),
+                new_role,
+                old.created_at,
+                old.expires_at,
+                new_persona,
+                new_revoke_other_sessions,
+                identity_sk.clone(),
+            );
+            self.inner.insert(k, Arc::new(switched));
         }
         n
     }
@@ -365,20 +391,47 @@ mod tests {
     }
 
     #[test]
-    fn revoke_user_except_keeps_only_the_named_persona() {
+    fn duress_login_switches_other_sessions_to_the_duress_persona_in_place() {
         let s = SessionStore::new();
         let future = SystemTime::now() + Duration::from_secs(60);
+        // alice's real-persona session, plus a second live one from another
+        // device — both must switch, not die.
         let tok_a = s.insert(test_session("alice", 0, future));
-        let tok_b = s.insert(test_session("alice", 1, future));
-        let tok_c = s.insert(test_session("bob", 0, future));
+        let tok_a2 = s.insert(test_session("alice", 0, future));
+        // bob must never be touched by alice's duress login.
+        let tok_bob = s.insert(test_session("bob", 0, future));
 
-        assert_eq!(s.revoke_user_except("alice", 1), 1);
-        assert!(matches!(
-            s.get_active(&tok_a.hash()),
-            Err(AuthError::TokenInvalid)
-        ));
-        assert!(s.get_active(&tok_b.hash()).is_ok());
-        assert!(s.get_active(&tok_c.hash()).is_ok());
+        let duress_sk = Zeroizing::new(vec![9u8; 8]);
+        let n = s.switch_user_to_persona("alice", 1, Role::ReadOnly, true, &duress_sk);
+        assert_eq!(n, 2);
+
+        // Same tokens still authenticate - nothing was revoked - but now
+        // carry the duress persona's identity/role.
+        let a = s.get_active(&tok_a.hash()).unwrap();
+        let a2 = s.get_active(&tok_a2.hash()).unwrap();
+        assert_eq!(a.persona, 1);
+        assert_eq!(a2.persona, 1);
+        assert_eq!(a.role, Role::ReadOnly);
+        assert_eq!(&a.identity_sk[..], &duress_sk[..]);
+
+        let bob = s.get_active(&tok_bob.hash()).unwrap();
+        assert_eq!(bob.persona, 0);
+    }
+
+    #[test]
+    fn switch_user_to_persona_leaves_that_persona_s_own_session_untouched() {
+        let s = SessionStore::new();
+        let future = SystemTime::now() + Duration::from_secs(60);
+        let tok_duress = s.insert(test_session("alice", 1, future));
+
+        let duress_sk = Zeroizing::new(vec![9u8; 8]);
+        // Already persona 1 - the just-inserted session that logged in as
+        // the duress persona itself must not be touched by its own login.
+        assert_eq!(
+            s.switch_user_to_persona("alice", 1, Role::ReadOnly, true, &duress_sk),
+            0
+        );
+        assert_eq!(s.get_active(&tok_duress.hash()).unwrap().persona, 1);
     }
 
     #[test]

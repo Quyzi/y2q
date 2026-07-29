@@ -203,6 +203,7 @@ pub async fn login(
             let identity_sk = STANDARD
                 .decode(&payload.identity_sk_b64)
                 .map_err(|e| AuthError::Backend(format!("decode identity sk: {e}")))?;
+            let identity_sk = Zeroizing::new(identity_sk);
 
             let info = SessionInfo::new(
                 rec.username.clone(),
@@ -211,18 +212,26 @@ pub async fn login(
                 expires_at,
                 slot_idx as u8,
                 payload.revoke_other_sessions,
-                Zeroizing::new(identity_sk),
+                identity_sk.clone(),
             );
             let token = state.sessions.insert(info);
             record_login("success", Some(state.sessions.len()));
 
-            // A duress-flagged persona revokes every other persona's live
-            // sessions on login — no alert, no log line distinguishing it
-            // from an ordinary login.
+            // A duress-flagged persona silently takes over every other live
+            // session on this account, in place — no revocation, no alert,
+            // no log line distinguishing it from an ordinary login. Whoever
+            // holds one of those tokens keeps working exactly as before,
+            // just now scoped to the duress persona's own access, rather
+            // than visibly losing their session (a dead session is itself
+            // a tell that something happened).
             if payload.revoke_other_sessions {
-                state
-                    .sessions
-                    .revoke_user_except(&rec.username, slot_idx as u8);
+                state.sessions.switch_user_to_persona(
+                    &rec.username,
+                    slot_idx as u8,
+                    payload.role,
+                    payload.revoke_other_sessions,
+                    &identity_sk,
+                );
             }
 
             // Update last_login + reset failure counter.
@@ -1010,9 +1019,10 @@ pub struct PersonaCreateRequest {
     #[serde(default)]
     #[schema(value_type = String, example = "user")]
     pub role: Role,
-    /// When true, a login through this persona revokes every other live
-    /// session of this account. What makes a persona usable as a duress
-    /// slot.
+    /// When true, a login through this persona silently switches every
+    /// other live session of this account to this persona's identity in
+    /// place, rather than revoking them. What makes a persona usable as a
+    /// duress slot.
     #[serde(default)]
     pub revoke_other_sessions: bool,
 }
