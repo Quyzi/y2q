@@ -255,9 +255,15 @@ pub async fn cluster_set_bucket_config(
 // ---------------------------------------------------------------------------
 
 /// Mirror one replicated user record into the local user store. Preserves the
-/// node-local `last_login` (an observation, not replicated state) and, when the
-/// user's role changed, revokes their local sessions so a demote/disable takes
-/// effect on every node — not only where the admin action ran.
+/// node-local `last_login` (an observation, not replicated state) and, when
+/// the user's role changed *or* their credential slots were rebuilt (e.g.
+/// `reset-identity`), revokes their local sessions — so a demote/disable, or
+/// an admin resetting a compromised account's identity, takes effect on
+/// every node, not only where the admin action ran. A live session's
+/// `identity_sk` is only valid against the slots it was issued under; once
+/// those are replaced, the session is unrecoverable garbage exactly like the
+/// old slot's sealed bucket grants, so it must not be allowed to keep
+/// serving requests until natural expiry.
 fn project_user(state: &AuthState, record: &UserRecord) {
     let prev = state.user_store.get(&record.username).ok().flatten();
     let mut rec = record.clone();
@@ -268,8 +274,24 @@ fn project_user(state: &AuthState, record: &UserRecord) {
         tracing::warn!(user = %rec.username, error = %e, "user projector: upsert failed");
         return;
     }
-    if prev.as_ref().map(|p| p.role) != Some(rec.role) {
+    if sessions_stale(prev.as_ref(), &rec) {
         state.sessions.revoke_user(&rec.username);
+    }
+}
+
+/// Whether a live session opened under `prev` (the last record this node
+/// projected) is no longer valid against `new`: either the global role
+/// changed, or the credential slots were rebuilt (a `reset-identity` or
+/// equivalent full identity replacement) — a session's cached
+/// `identity_sk` is only valid against the slot layout it was issued
+/// under, so once that layout changes underneath it, the session is
+/// unrecoverable garbage exactly like the old slot's sealed bucket grants.
+/// `None` (first time this node has seen the user) never counts as a
+/// change — there is nothing to revoke yet.
+fn sessions_stale(prev: Option<&UserRecord>, new: &UserRecord) -> bool {
+    match prev {
+        None => false,
+        Some(p) => p.role != new.role || p.slots != new.slots || p.primary_slot != new.primary_slot,
     }
 }
 
@@ -1950,5 +1972,70 @@ mod tests {
         assert!(matches!(e, AdmitError::Fingerprint { .. }));
         assert!(e.to_string().contains("expected aaaa"));
         assert!(e.to_string().contains("got bbbb"));
+    }
+
+    fn dummy_record(role: UserRole, primary_slot: u8, slot_marker: u8) -> UserRecord {
+        UserRecord {
+            username: "alice".to_owned(),
+            created_at: 0,
+            last_login: None,
+            kdf: y2q_core::crypto::Argon2Params::with_random_salt(8, 1, 1),
+            slots: vec![
+                y2q_core::crypto::CredentialSlot {
+                    identity_pk_b64: format!("pk-{slot_marker}"),
+                    wrapped: y2q_core::crypto::kdf::WrappedSk::default(),
+                };
+                4
+            ],
+            primary_slot,
+            role,
+        }
+    }
+
+    /// No prior record (first time this node has seen the user) never
+    /// counts as a change — nothing to revoke yet.
+    #[test]
+    fn sessions_stale_false_with_no_prior_record() {
+        let rec = dummy_record(UserRole::User, 0, 1);
+        assert!(!sessions_stale(None, &rec));
+    }
+
+    /// Identical record: nothing changed, no revoke.
+    #[test]
+    fn sessions_stale_false_when_unchanged() {
+        let rec = dummy_record(UserRole::User, 0, 1);
+        assert!(!sessions_stale(Some(&rec), &rec));
+    }
+
+    /// A role change (demote/disable) must revoke, matching the pre-existing
+    /// behavior this helper was extracted from.
+    #[test]
+    fn sessions_stale_true_on_role_change() {
+        let prev = dummy_record(UserRole::User, 0, 1);
+        let new = dummy_record(UserRole::Disabled, 0, 1);
+        assert!(sessions_stale(Some(&prev), &new));
+    }
+
+    /// A `reset-identity`-style slot rebuild (same role, different
+    /// `slots`/`primary_slot`) must also revoke — a live session's cached
+    /// `identity_sk` is only valid against the slot layout it was issued
+    /// under. This is the fix for the reviewer-flagged gap: previously only
+    /// a role change triggered the cross-node revoke, so `reset-identity`'s
+    /// session kill never propagated past the serving node.
+    #[test]
+    fn sessions_stale_true_on_identity_replacement_with_same_role() {
+        let prev = dummy_record(UserRole::User, 2, 1);
+        let new = dummy_record(UserRole::User, 3, 9);
+        assert!(sessions_stale(Some(&prev), &new));
+    }
+
+    /// Only `primary_slot` moving (slots content otherwise identical) must
+    /// also revoke — it alone signals a different real identity, even if by
+    /// some coincidence every slot's ciphertext were unchanged.
+    #[test]
+    fn sessions_stale_true_on_primary_slot_change_alone() {
+        let prev = dummy_record(UserRole::User, 0, 1);
+        let new = dummy_record(UserRole::User, 1, 1);
+        assert!(sessions_stale(Some(&prev), &new));
     }
 }

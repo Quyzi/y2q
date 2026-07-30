@@ -49,12 +49,17 @@ pub async fn rotate_key(alias: &str, bucket: &str, mode: OutputMode) -> Result<(
     let client = make_client(alias).await?;
     let resp = crate::ops::admin::rotate_bucket_key(&client, bucket).await?;
     if mode == OutputMode::Json {
-        print_json(&serde_json::json!({ "epoch": resp.epoch, "key_epochs": resp.key_epochs }));
+        print_json(&serde_json::json!({
+            "epoch": resp.epoch,
+            "key_epochs": resp.key_epochs,
+            "persona_share_warning": resp.persona_share_warning,
+        }));
     } else {
         println!(
             "Rotated `{bucket}` to epoch {} (retained: {:?})",
             resp.epoch, resp.key_epochs
         );
+        println!("warning: {}", resp.persona_share_warning);
     }
     Ok(())
 }

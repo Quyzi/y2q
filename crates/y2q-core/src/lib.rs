@@ -540,6 +540,22 @@ pub enum Error {
         /// Bucket a rekey is already running against.
         bucket: String,
     },
+
+    /// A bucket rekey was refused because cluster mode is enabled.
+    /// `run_rekey` re-encrypts and prunes objects through the node-local
+    /// storage backend only, not the CRAQ-replicated data path — running it
+    /// in a cluster would migrate only the objects that happen to live on
+    /// the serving node, then prune the old epoch's key material
+    /// deployment-wide via raft, permanently orphaning every replica that
+    /// was never independently rekeyed. Refused outright until rekey is
+    /// made cluster-aware.
+    #[error(
+        "bucket `{bucket}`'s rekey is not supported while cluster mode is enabled: it operates on node-local storage only and pruning the old key epoch afterward would strand any replica that was not independently rekeyed; disable clustering to run rekey"
+    )]
+    RekeyUnsupportedInCluster {
+        /// Bucket the rekey was refused on.
+        bucket: String,
+    },
 }
 
 /// Async interface for object storage backends.

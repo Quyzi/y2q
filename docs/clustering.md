@@ -320,10 +320,27 @@ inherits every bucket config and user record.
 
 For users, the projector preserves the node-local `last_login` (an observation,
 not replicated state - login stays a node-local data-plane operation) and revokes
-the user's local sessions when their role changes, so a demote/disable takes
-effect on **every** node, not only where the admin ran it. A credential slot's
-wrapped identity secret key in a `UserRecord` is the same ciphertext-at-rest
-already stored on disk; sessions themselves are never replicated.
+the user's local sessions when their role changes *or* their credential slots are
+rebuilt (e.g. `reset-identity`, which replaces every slot at once), so a
+demote/disable/identity-reset takes effect on **every** node, not only where the
+admin action ran - a session's cached `identity_sk` is only valid against the
+slot layout it was issued under. A credential slot's wrapped identity secret key
+in a `UserRecord` is the same ciphertext-at-rest already stored on disk; sessions
+themselves are never replicated. Self-service persona endpoints
+(`POST /api/v1/personas`, `DELETE /api/v1/personas/{slot}`) are the one exception:
+they write straight to the local `UserStore` rather than through
+`cluster_upsert_user`/Raft, so a persona created or deleted on one node is not
+yet visible - or revoked - on the others (tracked in `TODO.md`).
+
+Bucket key `rekey` (`crates/y2qd/src/handlers/keys.rs`) is refused outright
+(501) while clustering is enabled: it migrates object ciphertext through the
+node-local storage backend, never `ClusterRuntime.distributed` (the
+CRAQ-replicated path other writes use), so a clustered run would migrate only
+the objects on the serving node while still pruning the old epoch's key
+material deployment-wide - permanently stranding any replica that was never
+independently rekeyed. `rotate-key` is unaffected (it only appends to the
+Raft-replicated `BucketConfig`); see docs/operations.md's
+[Key rotation](operations.md#key-rotation) section.
 
 ### LIST / SEARCH scatter-gather
 

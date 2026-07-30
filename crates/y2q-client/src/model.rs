@@ -177,6 +177,11 @@ pub struct RebuildStatus {
 pub struct RotateKeyResponse {
     pub epoch: u32,
     pub key_epochs: Vec<u32>,
+    /// Always present: grants shared with another persona via
+    /// `POST /api/v1/personas/{slot}/grant` are not preserved unless that
+    /// same persona performs this rotation. See `docs/operations.md`'s
+    /// "Key rotation" section.
+    pub persona_share_warning: String,
 }
 
 /// Response body for `GET /api/v1/buckets/{bucket}/rekey`. Mirrors
