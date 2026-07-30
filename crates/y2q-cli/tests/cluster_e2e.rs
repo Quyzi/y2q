@@ -270,6 +270,36 @@ fn set_acl(port: u16, token: &str, bucket: &str, body: &str) -> u16 {
     .unwrap_or(0)
 }
 
+/// Rotate a bucket's key (`POST /api/v1/buckets/{bucket}/rotate-key`)
+/// returning `(status, json_body)`.
+fn rotate_key(port: u16, token: &str, bucket: &str) -> (u16, String) {
+    let bearer = auth_header(token);
+    let (s, b) = http(
+        port,
+        "POST",
+        &format!("/api/v1/buckets/{bucket}/rotate-key"),
+        &[("Authorization", &bearer)],
+        &[],
+    )
+    .unwrap_or((0, Vec::new()));
+    (s, String::from_utf8_lossy(&b).into_owned())
+}
+
+/// Start a bucket rekey job (`POST /api/v1/buckets/{bucket}/rekey`)
+/// returning `(status, json_body)`.
+fn start_rekey(port: u16, token: &str, bucket: &str) -> (u16, String) {
+    let bearer = auth_header(token);
+    let (s, b) = http(
+        port,
+        "POST",
+        &format!("/api/v1/buckets/{bucket}/rekey"),
+        &[("Authorization", &bearer)],
+        &[],
+    )
+    .unwrap_or((0, Vec::new()));
+    (s, String::from_utf8_lossy(&b).into_owned())
+}
+
 /// Read a bucket's owner+ACL (`GET /api/v1/buckets/{bucket}/acl`) returning
 /// `(status, json_body)`. 404 until the bucket exists locally on the node.
 fn get_acl(port: u16, token: &str, bucket: &str) -> (u16, String) {
@@ -863,6 +893,63 @@ fn cluster_user_replication() {
         "disable did not replicate to node {}",
         cluster.nodes[1].id
     );
+}
+
+/// Bucket key rotation in a clustered deployment (PR #61 review finding):
+/// `rotate-key` only appends a new epoch to the raft-replicated `BucketConfig`
+/// (no object data touched), so it stays safe and must keep working. `rekey`
+/// migrates object ciphertext through the node-local storage backend only —
+/// never through `ClusterRuntime.distributed`, the CRAQ-replicated path other
+/// writes use — so running it in a cluster would silently strand any replica
+/// that was never independently rekeyed once the old epoch's key material is
+/// pruned deployment-wide. It must refuse outright (501) rather than risk
+/// that, on every node, not only the leader.
+#[test]
+#[ignore = "multi-node cluster; run with `cargo test --test cluster_e2e -- --ignored`"]
+fn cluster_rotate_key_allowed_rekey_refused() {
+    let Some(cluster) = start_cluster(3, 2) else {
+        return;
+    };
+    let pw = cluster.password.clone();
+    let bucket = "rekeytest";
+
+    // Create the bucket on node 0 (this alone mints epoch 0's key material —
+    // no object write required) and wait for it to project to every node.
+    let tok0 = login(cluster.nodes[0].port, "root", &pw).expect("root login on node 0");
+    let s = create_bucket(cluster.nodes[0].port, &tok0, bucket);
+    assert!(matches!(s, 200 | 201), "create bucket: {s}");
+    for node in &cluster.nodes {
+        let tok = login(node.port, "root", &pw).expect("root login");
+        assert!(
+            wait_until(|| get_acl(node.port, &tok, bucket).0 == 200, 30),
+            "bucket did not replicate to node {}",
+            node.id
+        );
+    }
+
+    // rotate-key must still work cluster-wide — it never touches object data.
+    let (rs, rb) = rotate_key(cluster.nodes[0].port, &tok0, bucket);
+    assert_eq!(rs, 200, "rotate-key should succeed in cluster mode: {rb}");
+    assert!(
+        rb.contains("\"epoch\":1"),
+        "rotate-key should have minted epoch 1: {rb}"
+    );
+
+    // rekey must be refused with 501 on every node — leader and followers
+    // alike, since it is not leader-forwarded and each node must guard itself.
+    for (i, node) in cluster.nodes.iter().enumerate() {
+        let tok = login(node.port, "root", &pw).expect("root login");
+        let (ks, kb) = start_rekey(node.port, &tok, bucket);
+        assert_eq!(
+            ks, 501,
+            "rekey should be refused (501) on node {} (index {i}): {kb}",
+            node.id
+        );
+        assert!(
+            kb.to_lowercase().contains("cluster"),
+            "501 body should explain the cluster-mode refusal: {kb}"
+        );
+    }
 }
 
 /// Bidirectional migration (Phase G): `export` collects every object in the

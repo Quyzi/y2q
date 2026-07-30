@@ -792,7 +792,11 @@ pub struct ResetIdentityResponse {
 /// bucket key until someone re-grants their new identity, and the caller
 /// (an admin) never touches bucket-key material in the process, so this
 /// cannot be used to escalate. It also destroys every persona the user had,
-/// including any duress ones — there is no partial reset.
+/// including any duress ones — there is no partial reset. In a clustered
+/// deployment, sessions on *every* node are revoked, not only the one that
+/// served this request: `cluster_upsert_user` replicates the new record
+/// through raft, and each node's registry projector (`project_user`)
+/// revokes locally as soon as it observes the slots change.
 #[utoipa::path(
     post,
     path = "/api/v1/users/{user}/reset-identity",
@@ -868,6 +872,11 @@ pub async fn reset_identity(
             .map_err(|e| AuthError::Backend(e.to_string()))?;
     }
     // Every live session carries the old (now-replaced) identity secret key.
+    // In cluster mode this is the fast local path — `cluster_upsert_user`
+    // above already replicated the new record, and every *other* node's
+    // registry projector (`project_user`) revokes its own local sessions
+    // once it observes the slots/primary_slot change, so this call only
+    // needs to cover the node that served this request.
     state.sessions.revoke_user(&username);
 
     let orphaned = scrub_user_grants(

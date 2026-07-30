@@ -3,6 +3,10 @@
 //! and the background job that migrates existing objects onto the newest
 //! epoch and prunes retired ones.
 //!
+//! `rekey` refuses outright when cluster mode is enabled — see
+//! [`y2q_core::Error::RekeyUnsupportedInCluster`] and `start_rekey`'s doc
+//! comment for why.
+//!
 //! Revocation only fully takes effect after all three steps run in order:
 //! `set_acl` (drop the ACL entry — kills live sessions, but old epochs the
 //! revoked user already held a real grant on are untouched), `rotate-key`
@@ -70,7 +74,12 @@ impl RekeyRegistry {
 
     /// Claim the right to start a rekey job for `bucket`. Fails if one is
     /// already running — never silently overlaps two runs against the same
-    /// bucket, which could race on which epoch ends up pruned.
+    /// bucket, which could race on which epoch ends up pruned. This
+    /// guarantee is node-local only; it holds cluster-wide today solely
+    /// because `start_rekey` refuses outright whenever cluster mode is
+    /// enabled (see [`y2q_core::Error::RekeyUnsupportedInCluster`]) — if
+    /// that guard is ever lifted, this registry must become cluster-aware
+    /// (e.g. raft-backed) too, or two nodes could still race independently.
     fn try_start(&self, bucket: &str) -> Result<(), AppError> {
         let mut map = self.inner.lock().expect("rekey registry poisoned");
         if matches!(map.get(bucket), Some(RekeyState::Running(_))) {
@@ -90,7 +99,16 @@ pub struct RotateKeyResponse {
     pub epoch: u32,
     /// Every retained epoch, ascending, after the rotation.
     pub key_epochs: Vec<u32>,
+    /// Always present. The server cannot tell a real persona-to-persona
+    /// grant from a decoy on the epoch being replaced, so it can only ever
+    /// preserve the rotating caller's *own* current-persona access — a
+    /// grant shared via `POST /api/v1/personas/{slot}/grant` survives only
+    /// if that same persona performs the rotation. See
+    /// docs/operations.md's "Key rotation" section.
+    pub persona_share_warning: &'static str,
 }
+
+const PERSONA_SHARE_WARNING: &str = "grants made via POST /api/v1/personas/{slot}/grant to a persona other than the one performing this rotation are not preserved; see docs/operations.md#key-rotation";
 
 /// Append a fresh bucket key epoch. Requires bucket `Admin` (owner or an
 /// admin-level ACL grantee) **and** that the caller currently holds a real
@@ -199,6 +217,7 @@ pub async fn rotate_key(
     Ok(HttpResponse::Ok().json(RotateKeyResponse {
         epoch: new_epoch,
         key_epochs,
+        persona_share_warning: PERSONA_SHARE_WARNING,
     }))
 }
 
@@ -216,7 +235,13 @@ pub struct RekeyStartResponse {
 /// failure — including one caused by the caller not actually holding a real
 /// grant on some *older* epoch an object was written under — aborts the
 /// whole run without pruning anything; already-migrated objects stay on
-/// their new epoch (idempotent to re-run).
+/// their new epoch (idempotent to re-run). Refuses with
+/// [`y2q_core::Error::RekeyUnsupportedInCluster`] when cluster mode is
+/// enabled: the migration below reads/writes through the node-local
+/// [`AnyStorage`] only, never `ClusterRuntime.distributed` (the
+/// CRAQ-replicated path other writes use), so a clustered run would migrate
+/// only the objects that happen to live on this node, then still prune the
+/// old epoch's key material deployment-wide.
 #[utoipa::path(
     post,
     operation_id = "start_bucket_rekey",
@@ -229,6 +254,7 @@ pub struct RekeyStartResponse {
         (status = 404, description = "Bucket not found (or not visible to the caller)", body = ErrorBody, content_type = "application/json"),
         (status = 409, description = "A rekey is already running for this bucket", body = ErrorBody, content_type = "application/json"),
         (status = 500, description = "Internal error", body = ErrorBody, content_type = "application/json"),
+        (status = 501, description = "Rekey is not supported while cluster mode is enabled", body = ErrorBody, content_type = "application/json"),
     ),
     security(("bearer" = [])),
     tag = "buckets",
@@ -249,6 +275,22 @@ pub async fn start_rekey(
         .map_err(AppError::from)?
     {
         return Err(not_found(&bucket));
+    }
+
+    // Rekey re-encrypts and prunes objects through the node-local storage
+    // backend only (`storage.get`/`begin_streaming_put`/`.commit()` below,
+    // and `collect_stale_keys`'s `storage.list_objects`) — never through
+    // `ClusterRuntime.distributed`, the CRAQ-replicated data path `head_write`
+    // and friends use. In a clustered deployment that means only the slice
+    // of the bucket's objects that happen to live on *this* node would be
+    // migrated, yet the run still prunes the old epoch's key material
+    // deployment-wide via raft on completion — permanently stranding every
+    // replica that was never independently rekeyed on its own node. Refuse
+    // outright rather than risk that until rekey is made cluster-aware.
+    if cluster.is_some() {
+        return Err(AppError(y2q_core::Error::RekeyUnsupportedInCluster {
+            bucket: bucket.clone(),
+        }));
     }
     let cfg =
         authoritative_config(&storage, cluster.as_ref().map(|d| d.get_ref()), &bucket).await?;
