@@ -97,6 +97,11 @@ jobs:
         run: |
           brew install --cask macfuse
           echo "PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:$PKG_CONFIG_PATH" >> "$GITHUB_ENV"
+          # macFUSE ships a universal (arm64+x86_64) library, but the `pkg-config`
+          # crate treats host-arch != target-arch as cross-compilation and refuses
+          # to probe unless explicitly allowed - needed when building
+          # x86_64-apple-darwin on the arm64 macos-latest runner.
+          echo "PKG_CONFIG_ALLOW_CROSS=1" >> "$GITHUB_ENV"
 
       - name: Build release binaries
         run: cargo build --release --target ${{ matrix.target }} -p y2qd -p y2q-cli -p y2q-warp
