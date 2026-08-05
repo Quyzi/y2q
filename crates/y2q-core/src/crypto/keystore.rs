@@ -63,7 +63,7 @@ struct KeystoreManifest {
     /// Always [`KEYSTORE_FORMAT_VERSION`].
     format_version: u16,
     /// Base64 of `derive_node_key_verifier(NK)`. Detects a wrong node key at
-    /// boot and doubles as the cluster admission fingerprint.
+    /// boot.
     node_key_verifier_b64: String,
     /// Nanoseconds since the Unix epoch.
     created_at: u64,

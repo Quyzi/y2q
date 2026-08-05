@@ -127,10 +127,9 @@ pub struct Metadata {
     pub cipher_size: Option<u64>,
     /// Standard-base64 XXH3-64 checksum of the on-disk envelope bytes,
     /// computed incrementally as it's written (no read-back needed).
-    /// Non-cryptographic — for corruption/replica-divergence detection
-    /// (`rebuild_cache` integrity scans, CRAQ backfill comparisons), not
-    /// tamper detection; the per-chunk AEAD tag is what authenticates the
-    /// envelope.
+    /// Non-cryptographic — for corruption detection (`rebuild_cache`
+    /// integrity scans), not tamper detection; the per-chunk AEAD tag is
+    /// what authenticates the envelope.
     #[serde(default)]
     pub cipher_checksum: Option<String>,
     /// Symbolic KEM algorithm name (e.g. `"ml-kem-768"`).
@@ -142,17 +141,14 @@ pub struct Metadata {
     /// Envelope format version.
     #[serde(default)]
     pub envelope_version: Option<u16>,
-    /// CRAQ object version: a per-object monotonic counter assigned by the
-    /// chain HEAD and persisted identically on every replica. `None` for
-    /// single-node objects and legacy objects written before clustering (read
-    /// as clean v0). Distinct from [`envelope_version`](Self::envelope_version)
-    /// (the on-disk crypto format) and the container format version.
+    /// Reserved for a future per-object version counter. Always `None` in
+    /// this build (read as clean v0). Distinct from
+    /// [`envelope_version`](Self::envelope_version) (the on-disk crypto
+    /// format) and the container format version.
     #[serde(default)]
     pub version: Option<u64>,
-    /// Nanoseconds since the Unix epoch when this replica committed the object's
-    /// current version locally. Used by the `eventual-bounded` read mode to
-    /// decide whether the local copy is fresh enough to serve without a version
-    /// query. `None` outside of cluster writes.
+    /// Reserved for a future per-object commit timestamp. Always `None` in
+    /// this build.
     #[serde(default)]
     pub committed_at: Option<u64>,
     /// Which bucket key epoch this object's envelope was encrypted under
@@ -207,9 +203,8 @@ pub struct PutOptions {
     /// ciphertext-side fields the backend should attach to the metadata
     /// sidecar (cipher_size, kem/aead alg, envelope_version, cipher_checksum).
     pub cipher_metadata: Option<CipherMetadata>,
-    /// CRAQ object version to stamp into [`Metadata::version`]. Set by the chain
-    /// HEAD (and carried verbatim to replicas) so every copy of a version agrees.
-    /// Honored only by the streaming-PUT commit path (the cluster write path);
+    /// Reserved for a future version counter to stamp into
+    /// [`Metadata::version`]. Honored only by the streaming-PUT commit path;
     /// the buffered [`Storage::put`] path ignores it and writes `None`.
     pub version: Option<u64>,
 }
@@ -540,22 +535,6 @@ pub enum Error {
         /// Bucket a rekey is already running against.
         bucket: String,
     },
-
-    /// A bucket rekey was refused because cluster mode is enabled.
-    /// `run_rekey` re-encrypts and prunes objects through the node-local
-    /// storage backend only, not the CRAQ-replicated data path — running it
-    /// in a cluster would migrate only the objects that happen to live on
-    /// the serving node, then prune the old epoch's key material
-    /// deployment-wide via raft, permanently orphaning every replica that
-    /// was never independently rekeyed. Refused outright until rekey is
-    /// made cluster-aware.
-    #[error(
-        "bucket `{bucket}`'s rekey is not supported while cluster mode is enabled: it operates on node-local storage only and pruning the old key epoch afterward would strand any replica that was not independently rekeyed; disable clustering to run rekey"
-    )]
-    RekeyUnsupportedInCluster {
-        /// Bucket the rekey was refused on.
-        bucket: String,
-    },
 }
 
 /// Async interface for object storage backends.
@@ -805,8 +784,8 @@ pub trait StorageExt: Storage {
 mod metadata_tests {
     use super::Metadata;
 
-    /// Metadata written before clustering (no `version`/`committed_at`) still
-    /// deserializes, defaulting both new fields to `None` (clean v0).
+    /// Metadata written without `version`/`committed_at` present still
+    /// deserializes, defaulting both fields to `None` (clean v0).
     #[test]
     fn legacy_metadata_without_version_defaults_to_none() {
         let json = r#"{

@@ -13,7 +13,6 @@ use y2q_core::{AnyStorage, BucketConfig, BucketPermission, Listing};
 
 use crate::auth::{AuthState, Authenticated};
 use crate::authz::{Decision, authorize_bucket, claim_ownership};
-use crate::cluster::{self, ClusterRuntime};
 use crate::error::{AppError, ErrorBody};
 
 /// Response body for `PUT /{bucket}/`.
@@ -51,32 +50,21 @@ pub async fn create(
     path: web::Path<String>,
     storage: web::Data<Arc<AnyStorage>>,
     state: web::Data<AuthState>,
-    cluster: Option<web::Data<ClusterRuntime>>,
     auth: Authenticated,
 ) -> Result<HttpResponse, AppError> {
     let bucket = path.into_inner();
     let decision = authorize_bucket(&auth, &storage, &bucket, BucketPermission::Write).await?;
-    // Clustered: register the bucket and claim ownership through raft so every
-    // node shares one authoritative registry; the projector mirrors it locally.
-    let created = if let Some(rt) = cluster.as_ref() {
-        let created = cluster::cluster_register_bucket(rt, &bucket).await?;
-        if matches!(decision, Decision::ClaimOwnership) {
-            cluster::cluster_claim_owner(rt, &state.user_store, &bucket, &auth.session).await?;
+    let created = match decision {
+        Decision::ClaimOwnership => {
+            let (_cfg, created) =
+                claim_ownership(&storage, &state.user_store, &bucket, &auth.session).await?;
+            created
         }
-        created
-    } else {
-        match decision {
-            Decision::ClaimOwnership => {
-                let (_cfg, created) =
-                    claim_ownership(&storage, &state.user_store, &bucket, &auth.session).await?;
-                created
-            }
-            // `Decision::Allowed` here always means the bucket already
-            // exists (or authorization is disabled and it does) — never
-            // call `create_bucket` a second time; `claim_ownership`'s own
-            // internal call already made that determination.
-            Decision::Allowed => false,
-        }
+        // `Decision::Allowed` here always means the bucket already
+        // exists (or authorization is disabled and it does) — never
+        // call `create_bucket` a second time; `claim_ownership`'s own
+        // internal call already made that determination.
+        Decision::Allowed => false,
     };
     Ok(HttpResponse::Ok().json(CreateBucketResponse { bucket, created }))
 }
@@ -190,7 +178,6 @@ pub async fn set_config(
     path: web::Path<String>,
     body: web::Json<BucketConfigBody>,
     storage: web::Data<Arc<AnyStorage>>,
-    cluster: Option<web::Data<ClusterRuntime>>,
     auth: Authenticated,
 ) -> Result<HttpResponse, AppError> {
     let bucket = path.into_inner();
@@ -199,37 +186,17 @@ pub async fn set_config(
     // Read-modify-write: this endpoint only edits the quota/SSE/CORS fields and
     // must preserve the bucket's owner, ACL, and key material (which are
     // managed separately via the ACL endpoints / claim flow, never through
-    // this public config body). Clustered: read the raft *authoritative*
-    // in-memory state, not the local filesystem projection — the projector
-    // that mirrors raft-committed changes onto disk runs asynchronously, so
-    // a local read can lag behind a claim/config change another node just
-    // committed, and this endpoint's full-replace write would silently roll
-    // that change back (most dangerously the bucket's `keys`).
-    let mut cfg = match cluster.as_ref() {
-        Some(rt) => rt
-            .controller
-            .control_state()
-            .await
-            .buckets
-            .get(&bucket)
-            .cloned()
-            .unwrap_or_default(),
-        None => storage
-            .get_bucket_config(&bucket)
-            .await
-            .map_err(AppError::from)?,
-    };
+    // this public config body).
+    let mut cfg = storage
+        .get_bucket_config(&bucket)
+        .await
+        .map_err(AppError::from)?;
     cfg.quota_bytes = body.quota_bytes;
     cfg.default_sse = body.default_sse;
     cfg.cors_allow_origin = body.cors_allow_origin;
-    // Clustered: replicate the full config through raft (deterministic replace).
-    if let Some(rt) = cluster.as_ref() {
-        cluster::cluster_set_bucket_config(rt, &bucket, &cfg).await?;
-    } else {
-        storage
-            .set_bucket_config(&bucket, &cfg)
-            .await
-            .map_err(AppError::from)?;
-    }
+    storage
+        .set_bucket_config(&bucket, &cfg)
+        .await
+        .map_err(AppError::from)?;
     Ok(HttpResponse::Ok().json(BucketConfigBody::from(cfg)))
 }

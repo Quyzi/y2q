@@ -99,8 +99,7 @@ pub fn decrypt_v3_chunks(
 /// `bucket_pk`/`key_epoch` are the *current* bucket key epoch's public key
 /// and epoch number (resolved by the caller from the bucket's
 /// [`BucketConfig::keys`](y2q_core::BucketKeyVersion) before calling). Only
-/// the public half is needed (ML-KEM encapsulation), so this works both on
-/// the client PUT path and on the cluster HEAD path (which never logs in).
+/// the public half is needed (ML-KEM encapsulation).
 ///
 /// `max_bytes`, when set, aborts the stream as soon as the running plaintext
 /// byte count exceeds it — enforced here (not just via a `Content-Length`

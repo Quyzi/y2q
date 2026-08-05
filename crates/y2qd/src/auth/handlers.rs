@@ -23,7 +23,6 @@ use super::state::AuthState;
 use super::users::validate as validate_username;
 use super::{AdminAuthenticated, AdminReadAuthenticated, Authenticated};
 use crate::bucket_keys;
-use crate::cluster::{self, ClusterRuntime};
 
 /// Parse a role name (case-insensitive) into a [`Role`], with a clean 400 on a
 /// bad value rather than a raw JSON deserialization error.
@@ -348,10 +347,9 @@ pub async fn logout(
     ),
     tag = "auth",
 )]
-#[tracing::instrument(skip(state, cluster, auth, body), fields(username = %auth.username))]
+#[tracing::instrument(skip(state, auth, body), fields(username = %auth.username))]
 pub async fn change_password(
     state: web::Data<AuthState>,
-    cluster: Option<web::Data<ClusterRuntime>>,
     auth: Authenticated,
     body: web::Json<ChangePasswordRequest>,
 ) -> Result<HttpResponse, AuthError> {
@@ -395,15 +393,10 @@ pub async fn change_password(
 
     let mut updated = rec.clone();
     updated.slots[slot_idx] = new_slot;
-    // Clustered: replicate the re-wrapped record through raft; local otherwise.
-    if let Some(rt) = cluster.as_ref() {
-        cluster::cluster_upsert_user(rt, state.get_ref(), &updated).await?;
-    } else {
-        state
-            .user_store
-            .upsert(&updated)
-            .map_err(|e| AuthError::Backend(e.to_string()))?;
-    }
+    state
+        .user_store
+        .upsert(&updated)
+        .map_err(|e| AuthError::Backend(e.to_string()))?;
     Ok(HttpResponse::NoContent().finish())
 }
 
@@ -425,10 +418,9 @@ pub async fn change_password(
     ),
     tag = "users",
 )]
-#[tracing::instrument(skip(state, cluster, auth, body), fields(actor = %auth.0.username, new_user = %body.username))]
+#[tracing::instrument(skip(state, auth, body), fields(actor = %auth.0.username, new_user = %body.username))]
 pub async fn add_user(
     state: web::Data<AuthState>,
-    cluster: Option<web::Data<ClusterRuntime>>,
     auth: AdminAuthenticated,
     body: web::Json<AddUserRequest>,
 ) -> Result<HttpResponse, AuthError> {
@@ -443,24 +435,11 @@ pub async fn add_user(
         });
     }
 
-    // Existence check. Clustered: consult the replicated registry too, so a user
-    // created on another node is not silently clobbered (a residual race remains
-    // for two truly-simultaneous creates of the same name, last write wins).
-    let exists_clustered = match cluster.as_ref() {
-        Some(rt) => rt
-            .controller
-            .control_state()
-            .await
-            .users
-            .contains_key(&username),
-        None => false,
-    };
-    if exists_clustered
-        || state
-            .user_store
-            .get(&username)
-            .map_err(|e| AuthError::Backend(e.to_string()))?
-            .is_some()
+    if state
+        .user_store
+        .get(&username)
+        .map_err(|e| AuthError::Backend(e.to_string()))?
+        .is_some()
     {
         return Err(AuthError::UserExists { username });
     }
@@ -490,14 +469,10 @@ pub async fn add_user(
         primary_slot: primary_slot as u8,
         role,
     };
-    if let Some(rt) = cluster.as_ref() {
-        cluster::cluster_upsert_user(rt, state.get_ref(), &record).await?;
-    } else {
-        state
-            .user_store
-            .upsert(&record)
-            .map_err(|e| AuthError::Backend(e.to_string()))?;
-    }
+    state
+        .user_store
+        .upsert(&record)
+        .map_err(|e| AuthError::Backend(e.to_string()))?;
     Ok(HttpResponse::Created().finish())
 }
 
@@ -538,18 +513,14 @@ pub struct DeleteUserQuery {
 /// since a decoy slot only ever gets added as one of an *existing* real
 /// grantee's four slots, never as a brand-new map key — see
 /// `bucket_keys::seal_grant_slots`) of the newest key epoch: read from the
-/// authoritative bucket registry, the replicated control state in a
-/// cluster (so every node enforces the guard identically regardless of how
-/// far its local filesystem projection has caught up), or the local store
-/// single-node. Used by [`delete_user`] to warn before stranding a bucket:
-/// once its sole grantee's user record is gone, nobody can ever grant
-/// fresh access to it again (existing objects stay readable to whoever
-/// already holds a live grant, but the grant list is now frozen). A bucket
-/// with no key material yet (never claimed/written to) has nothing to
-/// strand and is never included.
+/// authoritative bucket registry. Used by [`delete_user`] to warn before
+/// stranding a bucket: once its sole grantee's user record is gone, nobody
+/// can ever grant fresh access to it again (existing objects stay readable
+/// to whoever already holds a live grant, but the grant list is now
+/// frozen). A bucket with no key material yet (never claimed/written to)
+/// has nothing to strand and is never included.
 async fn sole_grantee_buckets(
     storage: &AnyStorage,
-    cluster: Option<&ClusterRuntime>,
     username: &str,
 ) -> Result<Vec<String>, AuthError> {
     let is_sole_grantee = |cfg: &BucketConfig| -> bool {
@@ -558,15 +529,6 @@ async fn sole_grantee_buckets(
             None => false,
         }
     };
-    if let Some(rt) = cluster {
-        let state = rt.controller.control_state().await;
-        return Ok(state
-            .buckets
-            .into_iter()
-            .filter(|(_, cfg)| is_sole_grantee(cfg))
-            .map(|(bucket, _)| bucket)
-            .collect());
-    }
     let buckets = storage
         .list_buckets()
         .await
@@ -602,11 +564,10 @@ async fn sole_grantee_buckets(
     ),
     tag = "users",
 )]
-#[tracing::instrument(skip(state, storage, cluster, auth), fields(actor = %auth.0.username, target = %path))]
+#[tracing::instrument(skip(state, storage, auth), fields(actor = %auth.0.username, target = %path))]
 pub async fn delete_user(
     state: web::Data<AuthState>,
     storage: web::Data<Arc<AnyStorage>>,
-    cluster: Option<web::Data<ClusterRuntime>>,
     auth: AdminAuthenticated,
     path: web::Path<String>,
     query: web::Query<DeleteUserQuery>,
@@ -615,37 +576,19 @@ pub async fn delete_user(
     let username = path.into_inner();
 
     if !query.force {
-        let sole = sole_grantee_buckets(
-            storage.get_ref(),
-            cluster.as_ref().map(|d| d.get_ref()),
-            &username,
-        )
-        .await?;
+        let sole = sole_grantee_buckets(storage.get_ref(), &username).await?;
         if !sole.is_empty() {
             return Err(AuthError::CannotDeleteSoleGrantee { buckets: sole });
         }
     }
 
-    // (username, role) over the authoritative set: the replicated registry in a
-    // cluster (so a freshly-joined node enforces the guards correctly), or the
-    // local store single-node.
-    let users: Vec<(String, Role)> = match cluster.as_ref() {
-        Some(rt) => rt
-            .controller
-            .control_state()
-            .await
-            .users
-            .values()
-            .map(|u| (u.username.clone(), u.role))
-            .collect(),
-        None => state
-            .user_store
-            .list()
-            .map_err(|e| AuthError::Backend(e.to_string()))?
-            .into_iter()
-            .map(|u| (u.username, u.role))
-            .collect(),
-    };
+    let users: Vec<(String, Role)> = state
+        .user_store
+        .list()
+        .map_err(|e| AuthError::Backend(e.to_string()))?
+        .into_iter()
+        .map(|u| (u.username, u.role))
+        .collect();
 
     if users.len() <= 1 {
         return Err(AuthError::CannotDeleteLastUser);
@@ -659,19 +602,12 @@ pub async fn delete_user(
         return Err(AuthError::CannotDeleteLastAdmin);
     }
 
-    if let Some(rt) = cluster.as_ref() {
-        if !users.iter().any(|(n, _)| n == &username) {
-            return Err(AuthError::UserNotFound { username });
-        }
-        cluster::cluster_delete_user(rt, state.get_ref(), &username).await?;
-    } else {
-        let removed = state
-            .user_store
-            .delete(&username)
-            .map_err(|e| AuthError::Backend(e.to_string()))?;
-        if !removed {
-            return Err(AuthError::UserNotFound { username });
-        }
+    let removed = state
+        .user_store
+        .delete(&username)
+        .map_err(|e| AuthError::Backend(e.to_string()))?;
+    if !removed {
+        return Err(AuthError::UserNotFound { username });
     }
     Ok(HttpResponse::NoContent().finish())
 }
@@ -696,10 +632,9 @@ pub async fn delete_user(
     ),
     tag = "users",
 )]
-#[tracing::instrument(skip(state, cluster, auth, body), fields(actor = %auth.0.username, target = %path))]
+#[tracing::instrument(skip(state, auth, body), fields(actor = %auth.0.username, target = %path))]
 pub async fn set_role(
     state: web::Data<AuthState>,
-    cluster: Option<web::Data<ClusterRuntime>>,
     auth: AdminAuthenticated,
     path: web::Path<String>,
     body: web::Json<SetRoleRequest>,
@@ -708,31 +643,19 @@ pub async fn set_role(
     let username = path.into_inner();
     let new_role = parse_role(&body.role)?;
 
-    // Resolve the target's current role and the admin count from the
-    // authoritative set (replicated registry in a cluster, local otherwise).
-    let (current_role, admin_count) = match cluster.as_ref() {
-        Some(rt) => {
-            let users = rt.controller.control_state().await.users;
-            let cur = users.get(&username).map(|u| u.role);
-            let admins = users.values().filter(|u| u.role == Role::Admin).count();
-            (cur, admins)
-        }
-        None => {
-            let cur = state
-                .user_store
-                .get(&username)
-                .map_err(|e| AuthError::Backend(e.to_string()))?
-                .map(|u| u.role);
-            let admins = state
-                .user_store
-                .list()
-                .map_err(|e| AuthError::Backend(e.to_string()))?
-                .iter()
-                .filter(|u| u.role == Role::Admin)
-                .count();
-            (cur, admins)
-        }
-    };
+    // Resolve the target's current role and the admin count.
+    let current_role = state
+        .user_store
+        .get(&username)
+        .map_err(|e| AuthError::Backend(e.to_string()))?
+        .map(|u| u.role);
+    let admin_count = state
+        .user_store
+        .list()
+        .map_err(|e| AuthError::Backend(e.to_string()))?
+        .iter()
+        .filter(|u| u.role == Role::Admin)
+        .count();
     let current_role = current_role.ok_or_else(|| AuthError::UserNotFound {
         username: username.clone(),
     })?;
@@ -742,26 +665,20 @@ pub async fn set_role(
         return Err(AuthError::CannotDemoteLastAdmin);
     }
 
-    if let Some(rt) = cluster.as_ref() {
-        // Replicate the role change; the helper also revokes local sessions and
-        // every node revokes on projecting the change.
-        cluster::cluster_set_user_role(rt, state.get_ref(), &username, new_role).await?;
-    } else {
-        let mut rec = state
-            .user_store
-            .get(&username)
-            .map_err(|e| AuthError::Backend(e.to_string()))?
-            .ok_or_else(|| AuthError::UserNotFound {
-                username: username.clone(),
-            })?;
-        rec.role = new_role;
-        state
-            .user_store
-            .upsert(&rec)
-            .map_err(|e| AuthError::Backend(e.to_string()))?;
-        // Apply immediately rather than at session expiry.
-        state.sessions.revoke_user(&username);
-    }
+    let mut rec = state
+        .user_store
+        .get(&username)
+        .map_err(|e| AuthError::Backend(e.to_string()))?
+        .ok_or_else(|| AuthError::UserNotFound {
+            username: username.clone(),
+        })?;
+    rec.role = new_role;
+    state
+        .user_store
+        .upsert(&rec)
+        .map_err(|e| AuthError::Backend(e.to_string()))?;
+    // Apply immediately rather than at session expiry.
+    state.sessions.revoke_user(&username);
     Ok(HttpResponse::NoContent().finish())
 }
 
@@ -792,11 +709,7 @@ pub struct ResetIdentityResponse {
 /// bucket key until someone re-grants their new identity, and the caller
 /// (an admin) never touches bucket-key material in the process, so this
 /// cannot be used to escalate. It also destroys every persona the user had,
-/// including any duress ones — there is no partial reset. In a clustered
-/// deployment, sessions on *every* node are revoked, not only the one that
-/// served this request: `cluster_upsert_user` replicates the new record
-/// through raft, and each node's registry projector (`project_user`)
-/// revokes locally as soon as it observes the slots change.
+/// including any duress ones — there is no partial reset.
 #[utoipa::path(
     post,
     path = "/api/v1/users/{user}/reset-identity",
@@ -810,11 +723,10 @@ pub struct ResetIdentityResponse {
     ),
     tag = "users",
 )]
-#[tracing::instrument(skip(state, storage, cluster, auth, body), fields(actor = %auth.0.username, target = %path))]
+#[tracing::instrument(skip(state, storage, auth, body), fields(actor = %auth.0.username, target = %path))]
 pub async fn reset_identity(
     state: web::Data<AuthState>,
     storage: web::Data<Arc<AnyStorage>>,
-    cluster: Option<web::Data<ClusterRuntime>>,
     auth: AdminAuthenticated,
     path: web::Path<String>,
     body: web::Json<ResetIdentityRequest>,
@@ -827,22 +739,13 @@ pub async fn reset_identity(
         });
     }
 
-    let mut rec = match cluster.as_ref() {
-        Some(rt) => rt
-            .controller
-            .control_state()
-            .await
-            .users
-            .get(&username)
-            .cloned(),
-        None => state
-            .user_store
-            .get(&username)
-            .map_err(|e| AuthError::Backend(e.to_string()))?,
-    }
-    .ok_or_else(|| AuthError::UserNotFound {
-        username: username.clone(),
-    })?;
+    let mut rec = state
+        .user_store
+        .get(&username)
+        .map_err(|e| AuthError::Backend(e.to_string()))?
+        .ok_or_else(|| AuthError::UserNotFound {
+            username: username.clone(),
+        })?;
 
     let password = body.password.clone();
     let username_for_slots = username.clone();
@@ -863,28 +766,14 @@ pub async fn reset_identity(
     rec.slots = slots;
     rec.primary_slot = primary_slot as u8;
 
-    if let Some(rt) = cluster.as_ref() {
-        cluster::cluster_upsert_user(rt, state.get_ref(), &rec).await?;
-    } else {
-        state
-            .user_store
-            .upsert(&rec)
-            .map_err(|e| AuthError::Backend(e.to_string()))?;
-    }
+    state
+        .user_store
+        .upsert(&rec)
+        .map_err(|e| AuthError::Backend(e.to_string()))?;
     // Every live session carries the old (now-replaced) identity secret key.
-    // In cluster mode this is the fast local path — `cluster_upsert_user`
-    // above already replicated the new record, and every *other* node's
-    // registry projector (`project_user`) revokes its own local sessions
-    // once it observes the slots/primary_slot change, so this call only
-    // needs to cover the node that served this request.
     state.sessions.revoke_user(&username);
 
-    let orphaned = scrub_user_grants(
-        storage.get_ref(),
-        cluster.as_ref().map(|d| d.get_ref()),
-        &username,
-    )
-    .await?;
+    let orphaned = scrub_user_grants(storage.get_ref(), &username).await?;
 
     Ok(HttpResponse::Ok().json(ResetIdentityResponse {
         orphaned_buckets: orphaned,
@@ -897,42 +786,18 @@ pub async fn reset_identity(
 /// keeps `BucketKeyVersion::grants` from accumulating dead rows and reports
 /// which buckets' *newest* epoch drops to zero grantees as a result (the
 /// caller surfaces that as `orphaned_buckets`).
-async fn scrub_user_grants(
-    storage: &AnyStorage,
-    cluster: Option<&ClusterRuntime>,
-    username: &str,
-) -> Result<Vec<String>, AuthError> {
-    let buckets = match cluster {
-        Some(rt) => rt
-            .controller
-            .control_state()
-            .await
-            .buckets
-            .keys()
-            .cloned()
-            .collect::<Vec<_>>(),
-        None => storage
-            .list_buckets()
-            .await
-            .map_err(|e| AuthError::Backend(e.to_string()))?,
-    };
+async fn scrub_user_grants(storage: &AnyStorage, username: &str) -> Result<Vec<String>, AuthError> {
+    let buckets = storage
+        .list_buckets()
+        .await
+        .map_err(|e| AuthError::Backend(e.to_string()))?;
 
     let mut orphaned = Vec::new();
     for bucket in buckets {
-        let mut cfg = match cluster {
-            Some(rt) => rt
-                .controller
-                .control_state()
-                .await
-                .buckets
-                .get(&bucket)
-                .cloned()
-                .unwrap_or_default(),
-            None => storage
-                .get_bucket_config(&bucket)
-                .await
-                .map_err(|e| AuthError::Backend(e.to_string()))?,
-        };
+        let mut cfg = storage
+            .get_bucket_config(&bucket)
+            .await
+            .map_err(|e| AuthError::Backend(e.to_string()))?;
         let mut changed = false;
         for kv in cfg.keys.iter_mut() {
             if kv.grants.remove(username).is_some() {
@@ -947,16 +812,10 @@ async fn scrub_user_grants(
         {
             orphaned.push(bucket.clone());
         }
-        if let Some(rt) = cluster {
-            cluster::cluster_set_bucket_config(rt, &bucket, &cfg)
-                .await
-                .map_err(|e| AuthError::Backend(e.to_string()))?;
-        } else {
-            storage
-                .set_bucket_config(&bucket, &cfg)
-                .await
-                .map_err(|e| AuthError::Backend(e.to_string()))?;
-        }
+        storage
+            .set_bucket_config(&bucket, &cfg)
+            .await
+            .map_err(|e| AuthError::Backend(e.to_string()))?;
     }
     Ok(orphaned)
 }

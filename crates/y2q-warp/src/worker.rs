@@ -13,7 +13,7 @@ use crate::generator::ObjectPool;
 use crate::metrics::OpRecord;
 use crate::ops::{OpKind, delete, get, list, put, stat};
 
-/// One worker is pinned to one cluster node (round-robin assigned by the caller).
+/// One worker is pinned to one target node (round-robin assigned by the caller).
 /// `node_url` is that node's base URL (used for the raw GET path) and `node_label`
 /// tags each record so per-node latency can be analyzed alongside the aggregate.
 #[allow(clippy::too_many_arguments)]

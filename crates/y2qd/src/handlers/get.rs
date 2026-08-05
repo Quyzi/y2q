@@ -17,9 +17,7 @@ use crate::auth::{AuthState, Authenticated};
 use crate::authz::authorize_bucket;
 use crate::bucket_keys;
 use crate::cipher;
-use crate::cluster::{self, ClusterRuntime};
 use crate::error::{AppError, ErrorBody};
-use crate::observability;
 
 /// AES-256-GCM authentication tag length appended to each v3 chunk on disk.
 const TAG_LEN: u64 = 16;
@@ -58,7 +56,6 @@ pub async fn handle(
     req: HttpRequest,
     storage: web::Data<Arc<AnyStorage>>,
     _state: web::Data<AuthState>,
-    cluster: Option<web::Data<ClusterRuntime>>,
     auth: Authenticated,
 ) -> Result<HttpResponse, AppError> {
     let (bucket, key) = path.into_inner();
@@ -73,31 +70,6 @@ pub async fn handle(
         .get_bucket_config(&bucket)
         .await
         .map_err(AppError::from)?;
-
-    // Clustered: an apportioned read either serves this node's local committed
-    // copy (fall through) or fetches the committed envelope from the chain TAIL,
-    // decrypted here after peeking its key epoch straight from the envelope
-    // header (there is no local `Metadata` for a copy this node doesn't hold).
-    if let Some(rt) = cluster.as_ref() {
-        match cluster::plan_read(rt, &bucket, &key).await? {
-            y2q_cluster::ReadPlan::Remote { envelope, size } => {
-                metrics::counter!(observability::CLUSTER_READS, "kind" => "remote").increment(1);
-                return serve_remote_envelope(
-                    envelope,
-                    size,
-                    range_header,
-                    &auth,
-                    &cfg,
-                    &bucket,
-                    &key,
-                );
-            }
-            y2q_cluster::ReadPlan::Local => {
-                metrics::counter!(observability::CLUSTER_READS, "kind" => "local").increment(1);
-                // Fall through to the local serving path below.
-            }
-        }
-    }
 
     // Consult metadata (index lookup, no whole-file read) up front: every path
     // below needs the plaintext size and the bucket key epoch this object was
@@ -194,63 +166,6 @@ pub async fn handle(
             version: other.unwrap_or(0),
         })),
     }
-}
-
-/// Serve a committed ciphertext `envelope` fetched from a peer (the chain TAIL)
-/// for an apportioned read: resolve the bucket secret key for the epoch
-/// recorded in the envelope's own header (no local `Metadata` exists for a
-/// copy this node doesn't hold), decrypt, trim Padmé padding to the true
-/// plaintext `size`, then answer the full body or the requested byte range.
-/// Range requests decrypt the whole envelope and slice the plaintext (the
-/// chunk-addressable fast path is local-only).
-fn serve_remote_envelope(
-    envelope_bytes: Bytes,
-    size: u64,
-    range: Option<(u64, u64)>,
-    auth: &Authenticated,
-    cfg: &y2q_core::BucketConfig,
-    bucket: &str,
-    key: &str,
-) -> Result<HttpResponse, AppError> {
-    if envelope_bytes.len() < envelope::ENVELOPE_V3_HEADER_FIXED_LEN {
-        return Err(AppError(y2q_core::Error::EnvelopeMalformed {
-            bucket: bucket.to_owned(),
-            key: key.to_owned(),
-            reason: "truncated v3 header".to_owned(),
-        }));
-    }
-    let (epoch, _chunk_size, _plaintext_len) =
-        envelope::parse_v3_geometry(&envelope_bytes[..envelope::ENVELOPE_V3_HEADER_FIXED_LEN])
-            .map_err(|_| {
-                AppError(y2q_core::Error::EnvelopeMalformed {
-                    bucket: bucket.to_owned(),
-                    key: key.to_owned(),
-                    reason: "bad v3 header".to_owned(),
-                })
-            })?;
-    let bucket_sk =
-        bucket_keys::resolve_read_key(&auth.session, cfg, bucket, epoch).map_err(AppError)?;
-
-    let buf = BytesMut::from(envelope_bytes.as_ref());
-    let plaintext = cipher::decrypt_after_get(&bucket_sk, bucket, key, buf)?;
-    let plaintext: Bytes = if plaintext.len() as u64 > size {
-        plaintext.slice(0..size as usize)
-    } else {
-        plaintext
-    };
-
-    let Some((start, end)) = range else {
-        return Ok(HttpResponse::Ok()
-            .content_type("application/octet-stream")
-            .body(plaintext));
-    };
-
-    let total = plaintext.len() as u64;
-    if start > end || start >= total || end >= total {
-        return Ok(range_not_satisfiable(total));
-    }
-    let body = plaintext.slice(start as usize..end as usize + 1);
-    Ok(partial_content(start, end, total, body))
 }
 
 /// Build a 206 Partial Content response for `[start, end]` of a `total`-byte object.
