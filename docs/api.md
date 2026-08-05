@@ -693,18 +693,6 @@ Server-sent-events stream of every request the daemon handles, in real time. **A
 | 401 | Token missing or invalid |
 | 403 | Caller is not an admin or auditor |
 
-## Cluster endpoints
-
-Present only when `[cluster] enabled = true`. Admin-authed operator endpoints:
-
-| Method | Path | Purpose |
-|---|---|---|
-| `GET` | `/api/v1/cluster/status` | Membership, leader, committed epoch, per-node status |
-| `POST` | `/api/v1/cluster/join` | Admit this contact node's caller-specified peer into the cluster |
-| `POST` | `/api/v1/cluster/migrate` | Online migration: distribute (import) or collect (export) objects between a single node and the cluster |
-
-Peer-only, shared-secret/mTLS-authed and epoch-fenced `/internal/v1/*` routes (Raft RPC, CRAQ prepare/read/describe/version, backfill, health) are documented in [clustering.md](clustering.md) and are not for client use.
-
 ## Observability endpoints
 
 | Route | Purpose |

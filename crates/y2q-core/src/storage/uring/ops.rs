@@ -610,8 +610,8 @@ async fn do_put(
         kem_alg,
         aead_alg,
         envelope_version,
-        // Buffered put is not a cluster write path; CRAQ versions are assigned
-        // only on the streaming commit path.
+        // The buffered path never stamps a version; only the streaming commit
+        // path does.
         version: None,
         committed_at: None,
         key_epoch,

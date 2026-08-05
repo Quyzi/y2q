@@ -31,9 +31,8 @@ pub use kdf::{Argon2Params, WrappedSk, default_argon2_params, unwrap_with_key, w
 pub use keystore::KeystoreFiles;
 pub use node_key::load_node_key;
 pub use node_keys::{
-    NodeKeySlot, decrypt_meta, derive_bucket_config_key, derive_control_store_key,
-    derive_index_file_key, derive_index_key, derive_node_key_verifier, derive_object_metadata_key,
-    derive_path_key, encrypt_meta, prf,
+    NodeKeySlot, decrypt_meta, derive_bucket_config_key, derive_index_file_key, derive_index_key,
+    derive_node_key_verifier, derive_object_metadata_key, derive_path_key, encrypt_meta, prf,
 };
 pub use seal::{
     SealedKey, bucket_grant_aad, bucket_sk_wrap_aad, open_sealed, seal_to, seal_to_slots,

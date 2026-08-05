@@ -86,7 +86,6 @@ Both storage backends are compiled into one image; pick the backend at runtime w
 |---|---|---|
 | `y2q:latest` | `make image` | Distroless runtime; filesystem + io_uring both compiled in |
 | `y2q:dev` | `make image-dev` | Same, built with `--features pyroscope` for profiling |
-| `y2q-cluster:latest` | `make image-cluster` | Shell-bearing image used by the multi-node cluster demo (see [Clustering](#clustering)) |
 
 Build locally:
 
@@ -330,15 +329,13 @@ Removing someone from a bucket's ACL does not, by itself, make old ciphertext un
    ```
    Walks every object still on an old epoch, re-encrypts it under the newest key, and once every object is current prunes every retained key below the newest. **Until this completes**, a revoked user who already exfiltrated the old bucket key can still decrypt any old ciphertext they also exfiltrated - rotation only protects new writes; rekey is what closes the old ones.
 
-   **Refused with 501 while `[cluster] enabled = true`.** `rekey` migrates object ciphertext through the node-local storage backend only, never the CRAQ-replicated data path other writes use - running it in a cluster would migrate only the objects that happen to live on the serving node, then still prune the old epoch's key material deployment-wide, permanently stranding every replica that was never independently rekeyed. `rotate-key` (step 2) is unaffected - it only appends to the raft-replicated `BucketConfig` and never touches object data - so revocation via rotation still works in a cluster, but old ciphertext under a prior epoch (and any epoch above `MAX_RETAINED_EPOCHS`) cannot be pruned until cluster-aware rekey ships.
-
 `GET /api/v1/buckets/mybucket/acl` reports `key_epochs` (ascending) so you can confirm a rekey actually pruned down to one epoch.
 
 **Warning: rotating a bucket's key can silently drop persona-to-persona shares.** `rotate-key` reconstructs the new epoch's grantee list from the bucket's cleartext ACL/owner fields plus whichever persona the *caller* is currently authenticated as - it has no way to read who else holds a real (non-decoy) grant on the current epoch, since that is exactly the information sealed grants are designed to hide (see [Duress personas](#duress-personas)). A grant made via self-service persona sharing (`POST /api/v1/personas/{slot}/grant`) is invisible to `rotate-key` unless that same persona happens to be the one running the rotation. If any bucket grantee has shared access with one of their own alternate personas, that persona must re-run its own `grant` call after every rotation performed by someone else. `rotate-key`'s response always carries a `persona_share_warning` field repeating this caveat, so tooling that only reads the API (not this doc) still sees it.
 
 ### Node key rotation (offline)
 
-The node key (`[crypto] node_key_file` / `Y2QD_NODE_KEY`) derives every server-structural key - the metadata index, object metadata sidecars, bucket-config sidecars, path blinding, the control store. Password changes and the bucket rotate/rekey above never touch it; those only re-key user- and bucket-scoped material. Rotating the node key touches every object's on-disk path and metadata sidecar, so it is an **offline** tool, not an API call - the same keystore flock the daemon holds for its whole lifetime means a rotation refuses to start against a live daemon, and the daemon refuses to start while a rotation is in progress or interrupted.
+The node key (`[crypto] node_key_file` / `Y2QD_NODE_KEY`) derives every server-structural key - the metadata index, object metadata sidecars, bucket-config sidecars, path blinding. Password changes and the bucket rotate/rekey above never touch it; those only re-key user- and bucket-scoped material. Rotating the node key touches every object's on-disk path and metadata sidecar, so it is an **offline** tool, not an API call - the same keystore flock the daemon holds for its whole lifetime means a rotation refuses to start against a live daemon, and the daemon refuses to start while a rotation is in progress or interrupted.
 
 ```sh
 # Stop the daemon first.
@@ -356,8 +353,6 @@ It walks the whole storage tree once - re-encrypting every object's metadata sid
 **Crash safety.** The tool writes a journal (`<keystore_dir>/node-key-rotation.json`) before touching anything, and deletes it only once the verifier rewrite completes. While that journal exists, `y2qd`'s normal boot path refuses to start (`node key rotation was interrupted; re-run y2qd --rotate-node-key to finish it`) rather than serving against a half-migrated tree. Re-running `--rotate-node-key` with the same old/new key pair resumes exactly where it left off - every step is idempotent, so already-migrated objects and buckets are skipped, not redone.
 
 `users.redb` and all bucket key material need no rotation here - they are wrapped under user passwords and sealed to identity keypairs, neither of which involves the node key.
-
-**Clustering.** Rotation is per-node and offline-only - there is no rolling rotation. `NKV` (a fingerprint of the node key) is the cluster admission check, so a node on the new key is refused by peers still on the old one. Stop **every** node in the cluster, rotate each one's tree independently (paths are node-local; CRAQ addresses objects by `(bucket, key)`, not by on-disk path), then restart the whole cluster with the new key everywhere.
 
 ## Write locks
 
@@ -499,7 +494,7 @@ require_pq_kex = true                          # offer ONLY X25519MLKEM768; refu
 # client_ca_path = "/etc/y2q/tls/client-ca.pem"  # require mutual TLS
 ```
 
-When `enabled = true` the daemon binds HTTPS at `[server] port` and refuses plaintext HTTP. The private key may be PKCS#8, PKCS#1, or SEC1. `require_pq_kex = true` (default) makes the handshake post-quantum-only; set `false` to also offer classic X25519/ECDH. Set `client_ca_path` to require every client to present a certificate chaining to that CA bundle (mutual TLS) - the same bundle backs `cluster.auth = "mtls"`. To serve HTTP and HTTPS together, run two `y2qd` processes on different ports.
+When `enabled = true` the daemon binds HTTPS at `[server] port` and refuses plaintext HTTP. The private key may be PKCS#8, PKCS#1, or SEC1. `require_pq_kex = true` (default) makes the handshake post-quantum-only; set `false` to also offer classic X25519/ECDH. Set `client_ca_path` to require every client to present a certificate chaining to that CA bundle (mutual TLS). To serve HTTP and HTTPS together, run two `y2qd` processes on different ports.
 
 `y2q` and `y2q-warp` verify the server certificate by default; use `--ca-cert <pem>` to trust a private CA, `--client-cert`/`--client-key` on an alias for mutual TLS, or `--insecure` for self-signed dev endpoints.
 
@@ -525,19 +520,6 @@ location / {
 
 `proxy_request_buffering off` matters for large PUTs - otherwise nginx will buffer the whole body to disk before sending it on, doubling the bandwidth and adding latency.
 
-## Clustering
-
-> **Experimental** - functional and tested, but not yet recommended for production data. The default single-node mode is the supported deployment.
-
-`y2qd` can run as a distributed store (off by default). Operational essentials; full reference in [clustering.md](clustering.md):
-
-- **Shared node key is mandatory.** Every node must be started with the same operator-supplied node key and load the *same* deployment keystore (`keystore.json` + `users.redb`) before joining - the key hierarchy is derived from the node key, and the leader refuses to admit a node whose node-key fingerprint (`NKV`) differs. Back the keystore up exactly as in single-node mode; distribute the node key to every node's `Y2QD_NODE_KEY` (or `node_key_file`) out of band, same as single-node boot.
-- **No separate cluster unlock credential.** There is no provisioned "cluster unlock secret" distinct from the node key - every node supplies its own copy of the same node key at boot exactly like single-node mode, and it stays resident in memory for the daemon's whole lifetime (no idle-drop).
-- **Bring-up.** Exactly one node sets `cluster.raft.bootstrap = true` on first boot; the rest join and are admitted as voters (if in `voter_seeds`) or learners. Check `GET /api/v1/cluster/status` for membership, leader, and committed epoch.
-- **Migration.** `POST /api/v1/cluster/migrate` moves objects online in either direction (distribute into the cluster / collect back to one node); it is idempotent and resumable.
-- **Local demo.** `make cluster-up` starts a 5-node cluster via podman-compose ([deploy/cluster/](../deploy/cluster/)); `make cluster-down` tears it down and wipes volumes. The demo's `init` service generates a shared node key + keystore and captures the root password to `/seed/root_password.txt`.
-- **Keep client and server in lockstep.** After rebuilding the cluster image, run `make install-local` so the `y2q`/`y2q-warp` binaries match the daemon's object-metadata format.
-
 ## Failure modes and how to recognize them
 
 | Symptom | Likely cause | What to do |
@@ -549,8 +531,6 @@ location / {
 | `429 Too Many Requests` on login | Either the per-source-IP rate limit (bursty requests from one client, checked before credentials) or the per-username lockout after repeated failures | For the lockout, wait `lockout_seconds` or use another user - `Retry-After` tells you exactly how long. The IP rate limit clears itself after a few seconds; no body/header details are returned for it. |
 | Listing shows missing or stale objects after restore | Index drift after bulk restore | Run `POST /api/v1/rebuild` (or restart the daemon - startup auto-rebuild handles it). |
 | Data-loss `tracing::error!` messages at startup | `.obj` files referenced in index are gone | Indicates actual data loss (e.g. from a partial restore). Startup rebuild logs the affected keys. |
-| `503` cluster writes stall; reads still work | Raft quorum lost (voter-majority partition) - correct CP behavior | Restore connectivity / a voter majority. Reads keep serving; writes resume once quorum returns. See [clustering.md](clustering.md). |
-| Joined node 404s or `STALE_EPOCH` on peer ops | Wrong node key (`NKV` fingerprint mismatch) or stale topology after a re-splice | Verify every node was started with the same node key; check `GET /api/v1/cluster/status` for the committed epoch and member states. |
 
 ## Source
 
@@ -559,5 +539,3 @@ location / {
 - [crates/y2qd/src/handlers/rebuild.rs](../crates/y2qd/src/handlers/rebuild.rs) - index rebuild endpoints
 - [crates/y2qd/src/tls.rs](../crates/y2qd/src/tls.rs) - native TLS listener
 - [crates/y2q-core/src/crypto/keystore.rs](../crates/y2q-core/src/crypto/keystore.rs) - keystore on-disk layout
-- [docs/clustering.md](clustering.md) - distributed-mode operations and design
-- [deploy/cluster/README.md](../deploy/cluster/README.md) - 5-node docker/podman compose demo

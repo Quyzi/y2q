@@ -47,7 +47,6 @@ pub struct ErrorBody {
 /// | `BodyTooLarge`                | 413         |
 /// | `TooManyBucketKeyEpochs`      | 409         |
 /// | `RekeyAlreadyRunning`         | 409         |
-/// | `RekeyUnsupportedInCluster`   | 501         |
 #[derive(Debug)]
 pub struct AppError(pub CoreError);
 
@@ -97,7 +96,6 @@ impl ResponseError for AppError {
             | CoreError::RebuildAlreadyRunning
             | CoreError::TooManyBucketKeyEpochs { .. }
             | CoreError::RekeyAlreadyRunning { .. } => StatusCode::CONFLICT,
-            CoreError::RekeyUnsupportedInCluster { .. } => StatusCode::NOT_IMPLEMENTED,
             CoreError::Forbidden { .. } => StatusCode::FORBIDDEN,
             CoreError::QuotaExceeded { .. } | CoreError::BodyTooLarge { .. } => {
                 StatusCode::PAYLOAD_TOO_LARGE

@@ -98,7 +98,7 @@ The shared secret is *not* the content key directly. HKDF binds the content key 
 
 There is no longer a single deployment-wide secret key wrapped per user. Three tiers exist:
 
-- **Tier 0 — node key.** Operator-supplied (`Y2QD_NODE_KEY` env var or `[crypto] node_key_file`), never auto-generated and never persisted anywhere inside `storage.base_path` or `crypto.keystore_dir` (the daemon refuses to start if it resolves there — a `cp -r` of the data must not carry its own key). It derives every server-structural key via HMAC-SHA256 (`prf`): the metadata-index file key, the path-blinding key, the object-metadata key, the bucket-config sidecar key, the Raft control-store key, and a verifier stored in `keystore.json`. See [`crates/y2q-core/src/crypto/node_keys.rs`](../crates/y2q-core/src/crypto/node_keys.rs).
+- **Tier 0 — node key.** Operator-supplied (`Y2QD_NODE_KEY` env var or `[crypto] node_key_file`), never auto-generated and never persisted anywhere inside `storage.base_path` or `crypto.keystore_dir` (the daemon refuses to start if it resolves there — a `cp -r` of the data must not carry its own key). It derives every server-structural key via HMAC-SHA256 (`prf`): the metadata-index file key, the path-blinding key, the object-metadata key, the bucket-config sidecar key, and a verifier stored in `keystore.json`. See [`crates/y2q-core/src/crypto/node_keys.rs`](../crates/y2q-core/src/crypto/node_keys.rs).
 - **Tier 1 — per-persona identity keypair.** Every `UserRecord` carries exactly four credential slots, occupied or not (`CREDENTIAL_SLOTS`). A slot is one password's worth of identity: its own 2400-byte ML-KEM-768 secret key, wrapped under an Argon2id-derived KEK from that slot's password. All four slots of a record share one Argon2id salt; a per-slot AAD binding to `(username, slot_index)` is what stops a wrapped blob being relocated to a different slot or user. Unused slots hold a *real* keypair wrapped under discarded random bytes — byte-shape identical to a live slot — so nothing on disk reveals how many of a user's passwords are actually in use (see [Duress personas](#duress-personas)).
 - **Tier 2 — per-bucket-per-epoch keypair.** Each bucket has its own ML-KEM-768 keypair per retained key epoch (`BucketKeyVersion`, ascending, newest used for new writes). Its secret is wrapped under a 32-byte bucket-wrap key (BWK) generated fresh per epoch and never itself persisted — instead the BWK is sealed once per credential slot of every grantee, so recovering it requires that grantee's own identity secret key.
 
@@ -158,7 +158,7 @@ A directory still holding a pre-hierarchy `pubkey.json` is refused outright (`Cr
 }
 ```
 
-`slots` always has exactly four entries — real and decoy personas are byte-shape identical (same-length wrapped ciphertext), so the record itself never reveals how many passwords are actually live. `role` is the user's global role (`admin` | `user` | `readonly` | `writeonly` | `auditor` | `disabled`); see [Authorization](#authorization-roles-ownership-acls). In cluster mode, user records and bucket ownership/ACLs are replicated through the Raft control plane so a joined node inherits them.
+`slots` always has exactly four entries — real and decoy personas are byte-shape identical (same-length wrapped ciphertext), so the record itself never reveals how many passwords are actually live. `role` is the user's global role (`admin` | `user` | `readonly` | `writeonly` | `auditor` | `disabled`); see [Authorization](#authorization-roles-ownership-acls).
 
 
 ## Storage
@@ -230,7 +230,7 @@ The metadata blob embedded in each `.obj` is **encrypted at rest** under the tie
 }
 ```
 
-`size` is the plaintext length. `checksum_gxhash` is a non-cryptographic XXH3-64 digest of the plaintext (corruption detection, not tamper detection). The `cipher_*` fields and algorithm names are always populated in current builds. `version` and `committed_at` are the CRAQ object version and local commit time; they are `null` outside cluster writes (legacy/single-node objects read as clean v0). The list/HEAD API surface (`MetadataView`) exposes the same fields except `disk_path`, `version`, and `committed_at`, which stay server-internal.
+`size` is the plaintext length. `checksum_gxhash` is a non-cryptographic XXH3-64 digest of the plaintext (corruption detection, not tamper detection). The `cipher_*` fields and algorithm names are always populated in current builds. `version` and `committed_at` are reserved fields, always `null` in this build (objects read as clean v0). The list/HEAD API surface (`MetadataView`) exposes the same fields except `disk_path`, `version`, and `committed_at`, which stay server-internal.
 
 ### Write locks (in-memory)
 
@@ -379,12 +379,6 @@ The effective capability for an action is the intersection of the role ceiling a
 
 Every `UserRecord` carries four credential slots (see [Key hierarchy](#key-hierarchy-and-identity-protection-at-rest)); each account's real identity is placed at a slot chosen uniformly at random on creation - there is no privileged slot number a caller or a coercer can rely on - and the other three are self-service alternates a user can populate via `POST /api/v1/personas` (`y2q persona add`). Each persona is a fully separate identity with its own bucket grants - there is no shared-access, silent-alarm design. A persona created with `revoke_other_sessions: true` silently switches every other live session of the account over to itself on login, in place - same tokens, same expiry, no revocation and nothing observably interrupted, just narrower access from that point on. This is the only side effect of a duress login, and it is not observable as one: no alert, no log line, and no metric distinguishes it from an ordinary one (`y2q_auth_logins_total{result}` never gains a duress label; `GET /api/v1/personas/me` never reports the duress flag, even for the caller's own session). A bucket the duress persona wasn't granted is 404, not 403, to it - identical to any bucket that genuinely doesn't exist. So a 403 can never be used to confirm a real bucket's existence and betray the primary password. Granting reaches only the grantee's real identity (`UserRecord::primary_slot`, resolved server-side, never returned by any API) from a third party; sharing access with one of your own alternate personas is self-service (`POST /api/v1/personas/{slot}/grant`), because a third party granting a *named* alternate persona would first have to know it exists.
 
-## Distributed mode
-
-> **Experimental.** Functional and covered by multi-node integration tests, but young and not yet recommended for production data. The single-node path (`cluster.enabled = false`, default) is unaffected.
-
-`y2qd` optionally runs as a cluster. The **data plane** is CRAQ (chain replication with apportioned reads); the **control plane** is an embedded Raft controller (`y2q-cluster`) that replicates only topology plus low-volume user/bucket metadata - object data and per-object metadata never enter the Raft log. Every node is started with the same operator-supplied node key and loads the same `keystore.json` + `users.redb`, so the derived tier-0 key hierarchy (and therefore the on-disk path for any `(bucket, key)`) is identical on every node and ciphertext is portable verbatim - replication and migration never re-encrypt. Cluster admission is fingerprinted by `NKV` (the node-key verifier), not a separate unlock credential - there is none. The integration seam is at the handler layer: the daemon routes through `DistributedStorage` (in `y2q-cluster`, wrapping a local `AnyStorage`) when `cluster.enabled = true`, and is byte-for-byte single-node when it…
-
 ## Threat model (brief)
 
 What the design defends against:
@@ -423,7 +417,7 @@ The `RUST_LOG` environment variable takes precedence over `log_filter`.
 
 ### Metrics
 
-Storage and auth metrics are exposed at `/metrics/prometheus` (Prometheus format) and `/metrics/dashboard` (in-browser) - but only when `server.unauthenticated_metrics = true`; otherwise neither endpoint (nor `/swagger-ui/`) is registered. Cluster builds add `y2qd_cluster_*` series (per-hop and full-chain commit latency, dirty-read version queries, local-vs-proxied read ratio, Raft term/leader/epoch, back-fill volume, stale-epoch rejections). Core series:
+Storage and auth metrics are exposed at `/metrics/prometheus` (Prometheus format) and `/metrics/dashboard` (in-browser) - but only when `server.unauthenticated_metrics = true`; otherwise neither endpoint (nor `/swagger-ui/`) is registered. Core series:
 
 - `y2q_storage_ops_total{op,backend,result}` - operation counters
 - `y2q_storage_duration_seconds{op,backend}` - latency histograms
@@ -442,14 +436,14 @@ y2q targets any architecture the Rust toolchain supports. The two formerly arch-
 
 - A dataset written on one CPU architecture is not guaranteed to read back correctly on another. Don't copy a `storage.base_path` directory between machines of different architectures and expect it to work.
 - Checksums (`checksum_gxhash`, field name kept for wire compatibility with existing deployments) and any future arch-sensitive storage details may differ in their underlying implementation between architectures, even though the algorithm itself is now portable.
-- The only supported way to move data between architectures is a full logical export/import through the API (or the migrate tooling in [clustering.md](clustering.md)), never a raw filesystem copy.
+- The only supported way to move data between architectures is a full logical export/import through the API, never a raw filesystem copy.
 
 ## Source map
 
 - [crates/y2q-core/src/crypto/envelope.rs](../crates/y2q-core/src/crypto/envelope.rs) - envelope format, encrypt/decrypt
 - [crates/y2q-core/src/crypto/kdf.rs](../crates/y2q-core/src/crypto/kdf.rs) - Argon2id wrap/unwrap, credential-slot wrap/unwrap
 - [crates/y2q-core/src/crypto/keystore.rs](../crates/y2q-core/src/crypto/keystore.rs) - keystore.json, first-run, daemon flock, node-key rotation journal
-- [crates/y2q-core/src/crypto/node_keys.rs](../crates/y2q-core/src/crypto/node_keys.rs) - tier-0 node-key derivation (IFK/IK/PATHK/OMK/BCK/CSK/NKV)
+- [crates/y2q-core/src/crypto/node_keys.rs](../crates/y2q-core/src/crypto/node_keys.rs) - tier-0 node-key derivation (IFK/IK/PATHK/OMK/BCK/NKV)
 - [crates/y2q-core/src/crypto/seal.rs](../crates/y2q-core/src/crypto/seal.rs) - seal/open a value to an ML-KEM-768 public key (identity + bucket-grant sealing)
 - [crates/y2q-core/src/crypto/user_store.rs](../crates/y2q-core/src/crypto/user_store.rs) - users.redb schema, credential slots
 - [crates/y2q-core/src/storage/filesystem.rs](../crates/y2q-core/src/storage/filesystem.rs) - filesystem backend, hex sharding, .obj writes
@@ -464,5 +458,4 @@ y2q targets any architecture the Rust toolchain supports. The two formerly arch-
 - [crates/y2qd/src/observability.rs](../crates/y2qd/src/observability.rs) - metrics setup, log format
 - [crates/y2qd/src/tls.rs](../crates/y2qd/src/tls.rs) - rustls listener, PQ-hybrid kex, mutual TLS
 - [crates/y2qd/src/authz.rs](../crates/y2qd/src/authz.rs) - bucket ownership / ACL / role enforcement, strict-admin visibility gate
-- [crates/y2q-cluster/](../crates/y2q-cluster/) - CRAQ data plane + embedded Raft control plane (see [clustering.md](clustering.md))
 - [crates/y2qd/src/main.rs](../crates/y2qd/src/main.rs) - startup, lifecycle, route wiring

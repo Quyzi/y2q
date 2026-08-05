@@ -19,7 +19,6 @@ use y2q_core::{AnyStorage, BucketPermission, Listing};
 use crate::auth::{AuthState, Authenticated};
 use crate::authz::authorize_bucket;
 use crate::bucket_keys::{self, GranteeSlots};
-use crate::cluster::{self, ClusterRuntime};
 use crate::error::{AppError, ErrorBody};
 
 /// Owner + grants view returned by `GET` and accepted by `PUT`.
@@ -109,7 +108,6 @@ pub async fn set_acl(
     body: web::Json<AclBody>,
     storage: web::Data<Arc<AnyStorage>>,
     state: web::Data<AuthState>,
-    cluster: Option<web::Data<ClusterRuntime>>,
     auth: Authenticated,
 ) -> Result<HttpResponse, AppError> {
     let bucket = path.into_inner();
@@ -123,28 +121,11 @@ pub async fn set_acl(
     }
 
     let body = body.into_inner();
-    // Read-modify-write the bucket config. Clustered: read the raft
-    // *authoritative* in-memory state, not the local filesystem projection
-    // — the projector that mirrors raft-committed changes onto disk runs
-    // asynchronously, so a local read can lag behind a claim/config change
-    // another node just committed. Proposing a full-replace `SetBucketConfig`
-    // built from a stale local read would silently roll back whatever
-    // fields it hadn't caught up to yet — most dangerously `keys`, wiping
-    // out a bucket's just-claimed key material.
-    let mut cfg = match cluster.as_ref() {
-        Some(rt) => rt
-            .controller
-            .control_state()
-            .await
-            .buckets
-            .get(&bucket)
-            .cloned()
-            .unwrap_or_default(),
-        None => storage
-            .get_bucket_config(&bucket)
-            .await
-            .map_err(AppError::from)?,
-    };
+    // Read-modify-write the bucket config.
+    let mut cfg = storage
+        .get_bucket_config(&bucket)
+        .await
+        .map_err(AppError::from)?;
 
     // Ownership transfer / assignment: only the current owner or a global admin
     // may change the owner (a mere bucket-`Admin` grantee may not).
@@ -237,15 +218,10 @@ pub async fn set_acl(
         );
     }
 
-    // Clustered: replicate owner+ACL through raft so every node enforces one view.
-    if let Some(rt) = cluster.as_ref() {
-        cluster::cluster_set_bucket_config(rt, &bucket, &cfg).await?;
-    } else {
-        storage
-            .set_bucket_config(&bucket, &cfg)
-            .await
-            .map_err(AppError::from)?;
-    }
+    storage
+        .set_bucket_config(&bucket, &cfg)
+        .await
+        .map_err(AppError::from)?;
     let key_epochs = cfg.keys.iter().map(|k| k.epoch).collect();
     Ok(HttpResponse::Ok().json(AclBody {
         owner: cfg.owner,
