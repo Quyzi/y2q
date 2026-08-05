@@ -69,16 +69,22 @@ jobs:
             exit 0
           fi
 
-          SUBJECTS=$(git log "${LATEST_TAG}..HEAD" --no-merges --format='%s')
-          BODIES=$(git log "${LATEST_TAG}..HEAD" --no-merges --format='%b')
+          # Scan subject + body of every commit in range (not just subjects):
+          # a squash-merged PR collapses to one commit whose subject is the
+          # PR title, but GitHub folds the original squashed commits' full
+          # messages into the squash commit's body (squash_merge_commit_message
+          # = COMMIT_MESSAGES), so a squashed "feat:"/"feat!:" line still shows
+          # up there. Rebase-merge and merge-commit PRs keep each original
+          # commit intact, so this is a superset of the old subject-only scan.
+          COMMITS=$(git log "${LATEST_TAG}..HEAD" --no-merges --format='%s%n%b')
 
           # Conventional Commits: "type(scope)!:" or a "BREAKING CHANGE:" trailer
-          # forces a major bump; any "feat:" commit forces a minor bump;
+          # forces a major bump; any "feat:" line forces a minor bump;
           # everything else (fix, chore, docs, ci, ...) is a patch bump.
           BUMP=patch
-          if echo "$SUBJECTS" | grep -qE '^[a-zA-Z]+(\([^)]*\))?!:' || echo "$BODIES" | grep -q 'BREAKING CHANGE:'; then
+          if echo "$COMMITS" | grep -qE '^[a-zA-Z]+(\([^)]*\))?!:' || echo "$COMMITS" | grep -q 'BREAKING CHANGE:'; then
             BUMP=major
-          elif echo "$SUBJECTS" | grep -qE '^feat(\([^)]*\))?:'; then
+          elif echo "$COMMITS" | grep -qE '^feat(\([^)]*\))?:'; then
             BUMP=minor
           fi
 
