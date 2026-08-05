@@ -43,6 +43,75 @@ jobs:
         # collide on the same port. Serialize to keep this deterministic.
         run: cargo test -- --test-threads=1
 
+  tag-release:
+    name: Tag + trigger release
+    needs: verify
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      actions: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Compute next version
+        id: version
+        run: |
+          LATEST_TAG=$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n1)
+          LATEST_TAG="${LATEST_TAG:-v0.0.0}"
+          echo "Latest tag: $LATEST_TAG"
+
+          COMMIT_COUNT=$(git rev-list "${LATEST_TAG}..HEAD" --count)
+          if [ "$COMMIT_COUNT" -eq 0 ]; then
+            echo "No commits since ${LATEST_TAG}; skipping release."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          SUBJECTS=$(git log "${LATEST_TAG}..HEAD" --no-merges --format='%s')
+          BODIES=$(git log "${LATEST_TAG}..HEAD" --no-merges --format='%b')
+
+          # Conventional Commits: "type(scope)!:" or a "BREAKING CHANGE:" trailer
+          # forces a major bump; any "feat:" commit forces a minor bump;
+          # everything else (fix, chore, docs, ci, ...) is a patch bump.
+          BUMP=patch
+          if echo "$SUBJECTS" | grep -qE '^[a-zA-Z]+(\([^)]*\))?!:' || echo "$BODIES" | grep -q 'BREAKING CHANGE:'; then
+            BUMP=major
+          elif echo "$SUBJECTS" | grep -qE '^feat(\([^)]*\))?:'; then
+            BUMP=minor
+          fi
+
+          VERSION="${LATEST_TAG#v}"
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$VERSION"
+          case "$BUMP" in
+            major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
+            minor) MINOR=$((MINOR + 1)); PATCH=0 ;;
+            patch) PATCH=$((PATCH + 1)) ;;
+          esac
+          NEW_TAG="v${MAJOR}.${MINOR}.${PATCH}"
+
+          echo "Bump: $BUMP -> $NEW_TAG"
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+          echo "tag=$NEW_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Create + push tag
+        if: steps.version.outputs.skip != 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "${{ steps.version.outputs.tag }}" -m "Release ${{ steps.version.outputs.tag }}"
+          git push origin "${{ steps.version.outputs.tag }}"
+
+      # Tags pushed with GITHUB_TOKEN don't trigger other workflows (recursion
+      # guard), so explicitly dispatch release.yml against the new tag instead
+      # of relying on its `push: tags` trigger.
+      - name: Trigger release workflow
+        if: steps.version.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh workflow run release.yml --ref "${{ steps.version.outputs.tag }}"
+
   image:
     name: Build + push images
     needs: verify
