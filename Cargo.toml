@@ -50,6 +50,7 @@ metrics-exporter-prometheus = "0.17"
 openraft                    = { version = "0.9", features = ["serde", "storage-v2"] }
 metrics-rs-dashboard-actix  = "0.1"
 papaya                      = "0.2"
+parking_lot                 = "0.12"
 pest                        = "2"
 pest_derive                 = "2"
 pqcrypto                    = { version = "0.18.1", features = ["serialization"] }

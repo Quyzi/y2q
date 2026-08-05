@@ -38,7 +38,7 @@ Post-quantum secure object storage. `y2qd` is a REST daemon that encrypts every 
 - **Bucket ownership, ACLs, and global roles** - new buckets are private to their creator; per-bucket grants (read/write/writeonly/admin) plus account-wide roles (admin/user/readonly/writeonly/auditor/disabled). Disable with `auth.enforce_authorization = false` for single-user deployments
 - **Distributed mode (experimental, optional)** - run multiple daemons as one store: CRAQ chain replication for object data, an embedded Raft controller for topology + user/bucket metadata, apportioned reads, online migration single-node <-> cluster. Off by default; experimental - not yet recommended for production data. See [docs/clustering.md](docs/clustering.md)
 - **Dual storage backends** - portable filesystem backend (all platforms); optional Linux io_uring fast path (kernel >= 5.6); both use the same on-disk `.obj` format and are fully cross-compatible
-- **Encrypted, fast listing** - embedded [redb](https://github.com/cberner/redb) metadata index, itself encrypted at rest under the login-gated key; auto-rebuilt on startup; can be triggered manually
+- **Encrypted, fast listing** - embedded [redb](https://github.com/cberner/redb) metadata index, itself encrypted at rest under a key derived from the operator-supplied node key; auto-rebuilt on startup; can be triggered manually
 - **Best-effort mode with background flusher** - skip per-PUT fsyncs for throughput; a background task drains the dirty queue on a configurable interval
 - **Custom object labels** - attach arbitrary key/value metadata to objects via `X-Y2Q-<label>` request headers on PUT; query them with the label search language
 - **Prometheus metrics + live trace** - Prometheus scrape and an interactive dashboard (auth-gated by default); a server-sent-events trace stream (`y2q admin trace`) of every request
@@ -418,7 +418,7 @@ Unmount with Ctrl+C, SIGTERM, or manually: `fusermount3 -u /mnt/y2q` on Linux, `
 
 ## Configuration
 
-`config.default.toml` in the repo root documents every knob with inline comments. Required fields (no compiled-in default): `server.host`, `server.port`, `storage.base_path`, `crypto.keystore_dir`. Key sections:
+`config.default.toml` in the repo root documents every knob with inline comments. Required fields (no compiled-in default): `server.host`, `server.port`, `storage.base_path`, `crypto.keystore_dir`, and an operator-supplied node key (`crypto.node_key_file` or `Y2QD_NODE_KEY`; never auto-generated). Key sections:
 
 ```toml
 [server]
@@ -443,7 +443,8 @@ sync_flush_limit = 64
 
 [crypto]
 keystore_dir = "/var/lib/y2q/keys"     # required; keep separate from base_path
-envelope_chunk_size_bytes = 4194304    # 4 MiB plaintext chunks (v2 envelope)
+node_key_file = "/run/secrets/y2q-node-key"  # or set Y2QD_NODE_KEY; required, never auto-generated
+envelope_chunk_size_bytes = 4194304    # 4 MiB plaintext chunks (v3 envelope)
 [crypto.argon2]
 m_cost_kib = 65536   # 64 MiB
 t_cost = 3
@@ -454,7 +455,6 @@ default_ttl_seconds = 3600
 max_ttl_seconds = 86400
 max_failed_logins = 10
 lockout_seconds = 900
-keystore_idle_drop_seconds = 0
 enforce_authorization = true           # bucket ownership/ACLs + global admin role
 
 [observability]
@@ -484,6 +484,11 @@ All authenticated routes require `Authorization: Bearer <token>`. Authorization 
 | `GET` | `/api/v1/users` | Admin/auditor | List users |
 | `PUT` | `/api/v1/users/{user}/role` | Admin | Change a user's global role |
 | `DELETE` | `/api/v1/users/{user}` | Admin | Delete a user |
+| `POST` | `/api/v1/users/{user}/reset-identity` | Admin | Reset a forgotten password (restores login, not bucket access) |
+| `POST` | `/api/v1/personas` | Yes | Add a duress persona (extra password, own credential slot) |
+| `DELETE` | `/api/v1/personas/{slot}` | Yes | Overwrite a persona slot with a fresh decoy |
+| `GET` | `/api/v1/personas/me` | Yes | The calling session's own slot/role (never the duress flag) |
+| `POST`/`DELETE` | `/api/v1/personas/{slot}/grant` | Yes | Share/revoke your current bucket access with your own other persona |
 
 ### Objects and buckets
 
@@ -530,9 +535,9 @@ When clustering is enabled, additional `/api/v1/cluster/{status,join,migrate}` a
 
 > **Experimental.** Distributed mode works and is covered by integration tests, but it is young and not yet recommended for production data. The single-node path (`cluster.enabled = false`, the default) is unaffected and is the supported deployment.
 
-`y2qd` can run as a distributed store. The data plane is **CRAQ** (chain replication with apportioned reads); the control plane is an **embedded Raft** controller that replicates only topology plus low-volume user/bucket metadata - object data never enters the Raft log. Every node shares one deployment keystore, so the derived key hierarchy is identical and ciphertext is portable verbatim (no re-encryption on replication or migration).
+`y2qd` can run as a distributed store. The data plane is **CRAQ** (chain replication with apportioned reads); the control plane is an **embedded Raft** controller that replicates only topology plus low-volume user/bucket metadata - object data never enters the Raft log. Every node is given the same operator-supplied node key, so the derived tier-0 key hierarchy is identical and ciphertext is portable verbatim (no re-encryption on replication or migration).
 
-Enable per node with `[cluster] enabled = true` and a shared keystore; one node bootstraps Raft and admits the others. Online migration moves data either direction between a single node and a cluster. The whole feature is off by default - with `enabled = false`, behavior is byte-for-byte single-node.
+Enable per node with `[cluster] enabled = true` and the same node key on every node; one node bootstraps Raft and admits the others. Online migration moves data either direction between a single node and a cluster. The whole feature is off by default - with `enabled = false`, behavior is byte-for-byte single-node.
 
 A ready-to-run 5-node demo lives in [deploy/cluster/](deploy/cluster/):
 
@@ -549,20 +554,22 @@ Full design, configuration, internal API, failure handling, and migration: [docs
 
 | What is protected | How | Where |
 |---|---|---|
-| **Object contents** | Per-object ML-KEM-768 encapsulation -> HKDF-SHA256 -> AES-256-GCM content key, bound to the object's `(bucket, key)` address. Plaintext is sealed in independent chunks (each its own AEAD frame). The encapsulated key and ciphertext are stored together; nothing is decryptable without the deployment secret key, and a ciphertext valid for one object fails to decrypt under a different object's address - copying one object's on-disk envelope onto another object's storage location does not grant access to it. | [crypto/envelope.rs](crates/y2q-core/src/crypto/envelope.rs) |
+| **Object contents** | Per-object ML-KEM-768 encapsulation -> HKDF-SHA256 -> AES-256-GCM content key, bound to the object's `(bucket, key)` address and its bucket's current key epoch. Plaintext is sealed in independent chunks (each its own AEAD frame). Nothing is decryptable without the target bucket's epoch secret key, itself sealed individually to every authorized grantee's identity; a ciphertext valid for one object fails to decrypt under a different object's address - copying one object's on-disk envelope onto another object's storage location does not grant access to it. | [crypto/envelope.rs](crates/y2q-core/src/crypto/envelope.rs) |
 | **Tamper / integrity** | The AEAD tag authenticates every chunk; almost the entire fixed envelope header is bound as AAD (everything except `plaintext_len`, which is only known after streaming completes), so altering any other header field invalidates the tag. Two non-cryptographic XXH3-64 checksums (of the plaintext, and of the on-disk envelope, both computed incrementally with no read-back) catch accidental corruption and replica divergence - not tamper detection, which is the AEAD tag's job. | envelope.rs |
-| **Secret key at rest** | The ML-KEM private key is never on disk in plaintext - it is Argon2id-wrapped under each user's password, unwrapped into memory only during an active session, zeroized on drop, and idle-dropped after `auth.keystore_idle_drop_seconds`. | [crypto/kdf.rs](crates/y2q-core/src/crypto/kdf.rs), [auth/keystore.rs](crates/y2qd/src/auth/keystore.rs) |
-| **Object metadata at rest** | The per-object metadata blob (labels, timestamps, checksums, the cleartext key) embedded in each `.obj` is itself encrypted with AES-256-GCM under the login-gated master key (MEK) - not stored in the clear. The MEK is one fixed key for the whole deployment, so the AEAD is additionally bound to the object's opaque on-disk id via AAD: a metadata blob copied onto a different object's storage location fails to decrypt there, the same anti-relocation property as the object envelope above. | [crypto/metadata_key.rs](crates/y2q-core/src/crypto/metadata_key.rs) |
-| **Listing index at rest** | The whole redb metadata index is encrypted (per-4 KiB-block AES-256-GCM, block index bound as AAD) under a key derived from the MEK. It is opened on first login and closed on idle - while idle, only ciphertext remains on disk. | [storage/index.rs](crates/y2q-core/src/storage/index.rs) |
-| **File and bucket names** | On-disk directory and file names are irreversible keyed HMAC-SHA256 under the login-gated path key, so the storage tree leaks **neither bucket names nor object keys** to anyone who can read the directory. | [storage/filesystem.rs](crates/y2q-core/src/storage/filesystem.rs) |
+| **Identity secret keys at rest** | Every account carries four fixed credential slots (real or decoy, byte-shape identical). Each slot's ML-KEM-768 identity secret key is Argon2id-wrapped under its own password, unwrapped into memory only for the lifetime of a login session (bounded by `auth.max_ttl_seconds`), and zeroized on session drop - there is no idle-drop knob, because there is no process-wide key left to drop. | [crypto/kdf.rs](crates/y2q-core/src/crypto/kdf.rs), [auth/session.rs](crates/y2qd/src/auth/session.rs) |
+| **Bucket secret keys at rest** | Each bucket has its own ML-KEM-768 keypair per retained key epoch; its secret is wrapped under a bucket wrap key sealed individually to every authorized grantee's identity - not a single deployment-wide key. Global `admin`/`auditor` roles hold no bucket key material at all: visibility follows the crypto grant, not the role. | [crypto/seal.rs](crates/y2q-core/src/crypto/seal.rs) |
+| **Object metadata at rest** | The per-object metadata blob (labels, timestamps, checksums, the cleartext key) embedded in each `.obj` is encrypted with AES-256-GCM under an Object Metadata Key derived from the operator-supplied node key (never a user password) - not stored in the clear. The AEAD is additionally bound to the object's opaque on-disk id via AAD: a metadata blob copied onto a different object's storage location fails to decrypt there, the same anti-relocation property as the object envelope above. | [crypto/node_keys.rs](crates/y2q-core/src/crypto/node_keys.rs) |
+| **Listing index at rest** | The whole redb metadata index is encrypted (per-4 KiB-block AES-256-GCM, block index bound as AAD) under an Index File Key derived from the node key. It is resident for the daemon's whole lifetime - the daemon cannot serve anything without the node key, so there is nothing to idle-drop. | [storage/index.rs](crates/y2q-core/src/storage/index.rs) |
+| **File and bucket names** | On-disk directory and file names are irreversible keyed HMAC-SHA256 under a path key derived from the node key, so the storage tree leaks **neither bucket names nor object keys** to anyone who can read the directory. | [storage/filesystem.rs](crates/y2q-core/src/storage/filesystem.rs) |
 | **Object size** | Plaintext length is rounded up with Padmé padding before encryption, so the on-disk size leaks at most O(log log n) bits about the true size (<~12% overhead). The exact size lives only in the encrypted metadata. | envelope.rs (`padme_len`) |
 | **Data in transit** | Optional native TLS (`[server.tls]`) via rustls, restrictable to the X25519MLKEM768 post-quantum hybrid group (`require_pq_kex`), with optional mutual TLS. | [tls.rs](crates/y2qd/src/tls.rs) |
 | **Access** | Bucket ownership + per-bucket ACLs + global roles (when `auth.enforce_authorization = true`); a bucket you have no relationship to is hidden (404, never 403) so existence cannot be probed. | [authz.rs](crates/y2qd/src/authz.rs) |
 | **Session tokens** | Only `SHA-256(token)` is held in memory - the plaintext token is never persisted, and a daemon restart invalidates every session. Repeated failed logins lock the account behind a response-time floor. | [auth/session.rs](crates/y2qd/src/auth/session.rs) |
+| **Duress passwords** | Up to three additional passwords per account (`POST /api/v1/personas`), each unlocking a fully separate identity with its own bucket grants and an optional flag that silently switches every other live session on the account over to this persona on login, in place - deniable under coercion, no revocation, no silent alarm. | [docs/operations.md#duress-personas](docs/operations.md#duress-personas) |
 
-**What it does not defend against:** a compromised running daemon (the SK is in memory while sessions are active), a leaked Bearer token until it expires or is revoked, and traffic analysis when TLS is disabled. Key rotation is not yet implemented. See the full [threat model](docs/architecture.md#threat-model-brief).
+**What it does not defend against:** a compromised running daemon (a session's identity key is in memory while that session is active), a leaked Bearer token until it expires or is revoked, and traffic analysis when TLS is disabled. See the full [threat model](docs/architecture.md#threat-model-brief).
 
-> In **cluster mode** (experimental) every node shares the deployment keystore, so all of the above holds identically on each node and ciphertext replicates verbatim (never re-encrypted). Inter-node traffic is authenticated by a shared secret or mutual TLS over the same TLS stack.
+> In **cluster mode** (experimental) every node is given the same operator-supplied node key, so all of the above holds identically on each node and ciphertext replicates verbatim (never re-encrypted). Inter-node traffic is authenticated by a shared secret or mutual TLS over the same TLS stack.
 
 ## Development
 

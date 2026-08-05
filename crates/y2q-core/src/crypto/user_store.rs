@@ -1,14 +1,19 @@
 //! redb-backed table of user records.
 //!
-//! Each record carries the user's KDF parameters and a copy of the
-//! deployment secret key wrapped under a key derived from that user's
-//! password. Adding a user requires the SK to currently be in process
-//! memory (so the new user record can be wrapped); deleting a user just
-//! drops their record.
+//! Each record carries the user's Argon2id KDF parameters (shared by all its
+//! credential slots) and exactly [`CREDENTIAL_SLOTS`] credential slots. A
+//! slot is one password's worth of key material: its own ML-KEM-768 identity
+//! keypair and a wrapped payload (role + duress flag). Multiple passwords
+//! per user falls out of this directly: password *N* opens slot *N*, which
+//! is a different identity holding different bucket grants. Unused slots
+//! are filled with real keypairs wrapped under discarded random bytes, so
+//! nothing on disk reveals how many passwords are actually in use.
 
 use std::path::Path;
 use std::sync::Arc;
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+use pqcrypto::kem::mlkem768;
 use redb::{Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
 use serde::{Deserialize, Serialize};
 
@@ -17,6 +22,12 @@ use super::kdf::{Argon2Params, WrappedSk};
 
 /// `username` (UTF-8) → JSON-serialized [`UserRecord`].
 const USERS: TableDefinition<&str, &[u8]> = TableDefinition::new("users");
+
+/// Fixed number of credential slots every user record carries, occupied or
+/// not. Never make this configurable: a deployment running with a different
+/// width would leak its own setting, and a per-user width would leak per
+/// user. Changing it is a format change, not a tunable.
+pub const CREDENTIAL_SLOTS: usize = 4;
 
 /// Global role of a user: an account-wide capability ceiling applied on top of
 /// per-bucket ownership and ACL grants. The daemon interprets each role as a
@@ -42,12 +53,122 @@ pub enum Role {
     /// ACL). A look-but-don't-touch administrator. No mutations.
     Auditor,
     /// Suspended: every request is rejected and login is refused, without
-    /// deleting the account or its wrapped secret-key copy.
+    /// deleting the account or its credential slots.
     Disabled,
 }
 
-/// One user record. The wrapped SK lets this user (and only this user) recover
-/// the deployment secret key after presenting their password.
+/// One credential slot: a password's worth of identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CredentialSlot {
+    /// This persona's ML-KEM-768 identity public key, standard-base64.
+    /// Cleartext — it is what lets a bucket-key holder (phase 3) or the
+    /// deployment-grant sealer (phase 1-2) seal a value to this persona
+    /// without knowing its password.
+    pub identity_pk_b64: String,
+    /// `AES-256-GCM(KEK, SlotPayload)`. Opens only under this slot's
+    /// password (KEK derived via the record's shared [`UserRecord::kdf`]).
+    pub wrapped: WrappedSk,
+}
+
+/// Plaintext of a [`CredentialSlot::wrapped`] blob. Never stored in
+/// cleartext — `role` and `revoke_other_sessions` living outside the wrap
+/// would let an attacker with the disk pick the duress slot out by eye,
+/// defeating the deniability property.
+#[derive(Clone)]
+pub struct SlotPayload {
+    /// Raw ML-KEM-768 secret key bytes for this persona, standard-base64.
+    pub identity_sk_b64: String,
+    /// Effective role for a session opened with this password. Enforced
+    /// `<=` the record's cleartext `role` when the slot is written.
+    pub role: Role,
+    /// When true, a login through this slot revokes every live session of
+    /// this username that belongs to a different slot.
+    pub revoke_other_sessions: bool,
+}
+
+// A derived `Debug` would print the raw secret key; redact it explicitly,
+// matching `DecryptedKeystore`'s and `SessionInfo`'s pattern.
+impl std::fmt::Debug for SlotPayload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SlotPayload")
+            .field("identity_sk_b64", &"<redacted>")
+            .field("role", &self.role)
+            .field("revoke_other_sessions", &self.revoke_other_sessions)
+            .finish()
+    }
+}
+
+impl SlotPayload {
+    /// Fixed-width binary encoding: `[identity_sk | role (1 byte) | revoke
+    /// (1 byte)]`. Deliberately not JSON: a JSON encoding of `role` and
+    /// `revoke_other_sessions` varies in byte length with their value
+    /// (`"admin"` vs `"readonly"`, `true` vs `false`), which would leak
+    /// which role or duress flag a slot carries via its wrapped ciphertext
+    /// length even though the payload itself stays encrypted. This encoding
+    /// is exactly `mlkem768::secret_key_bytes() + 2` bytes for every slot,
+    /// occupied or decoy, real role or not.
+    pub fn to_bytes(&self) -> Result<Vec<u8>, CryptoError> {
+        let sk = STANDARD
+            .decode(&self.identity_sk_b64)
+            .map_err(|e| CryptoError::Kdf(format!("decode identity sk: {e}")))?;
+        if sk.len() != mlkem768::secret_key_bytes() {
+            return Err(CryptoError::Kdf(format!(
+                "identity secret key wrong size: {} (expected {})",
+                sk.len(),
+                mlkem768::secret_key_bytes()
+            )));
+        }
+        let mut out = Vec::with_capacity(sk.len() + 2);
+        out.extend_from_slice(&sk);
+        out.push(role_to_byte(self.role));
+        out.push(self.revoke_other_sessions as u8);
+        Ok(out)
+    }
+
+    /// Inverse of [`Self::to_bytes`].
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, CryptoError> {
+        let expected = mlkem768::secret_key_bytes() + 2;
+        if bytes.len() != expected {
+            return Err(CryptoError::Kdf(format!(
+                "slot payload wrong size: {} (expected {expected})",
+                bytes.len()
+            )));
+        }
+        let (sk, tail) = bytes.split_at(mlkem768::secret_key_bytes());
+        let role = role_from_byte(tail[0])
+            .ok_or_else(|| CryptoError::Kdf(format!("invalid role byte: {}", tail[0])))?;
+        Ok(Self {
+            identity_sk_b64: STANDARD.encode(sk),
+            role,
+            revoke_other_sessions: tail[1] != 0,
+        })
+    }
+}
+
+fn role_to_byte(role: Role) -> u8 {
+    match role {
+        Role::Admin => 0,
+        Role::User => 1,
+        Role::ReadOnly => 2,
+        Role::WriteOnly => 3,
+        Role::Auditor => 4,
+        Role::Disabled => 5,
+    }
+}
+
+fn role_from_byte(b: u8) -> Option<Role> {
+    match b {
+        0 => Some(Role::Admin),
+        1 => Some(Role::User),
+        2 => Some(Role::ReadOnly),
+        3 => Some(Role::WriteOnly),
+        4 => Some(Role::Auditor),
+        5 => Some(Role::Disabled),
+        _ => None,
+    }
+}
+
+/// One user record.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UserRecord {
     /// Login name, case-sensitive.
@@ -56,10 +177,25 @@ pub struct UserRecord {
     pub created_at: u64,
     /// Nanoseconds since Unix epoch of last successful login (`None` if never).
     pub last_login: Option<u64>,
-    /// Argon2id parameters used to derive this user's KEK.
+    /// Argon2id parameters, shared by every slot (see the module docs on
+    /// [`super::kdf`] for why one shared per-record salt is safe).
     pub kdf: Argon2Params,
-    /// The deployment SK wrapped under this user's KEK.
-    pub wrapped_sk: WrappedSk,
+    /// Always exactly [`CREDENTIAL_SLOTS`] entries. Unused slots are
+    /// present and byte-shaped identically to live ones — never trim this.
+    pub slots: Vec<CredentialSlot>,
+    /// Which slot holds the identity a third party grants (`set_acl`,
+    /// `rotate-key`) resolve to for this account — chosen uniformly at
+    /// random on creation ([`kdf::new_slots_random`](super::kdf::new_slots_random)),
+    /// never a fixed position. This is internal server bookkeeping only:
+    /// it is never serialized into any API response (not `UserSummary`,
+    /// not `PersonaView`), because a coercer who can read it off a live
+    /// session would trivially learn "this exact slot is the real one"
+    /// with no cracking required. A disk-holding attacker learns nothing
+    /// beyond what a fixed slot-0 convention already gave away for free —
+    /// the field only closes the *API-only* leak (a technical coercer
+    /// probing `GET /api/v1/personas/me` themselves and reading off a
+    /// suspiciously-privileged slot number).
+    pub primary_slot: u8,
     /// Global role. Defaults to [`Role::User`] so records written before this
     /// field existed deserialize as ordinary users (no migration pass needed).
     #[serde(default)]
@@ -99,12 +235,12 @@ pub struct UserStore {
 impl UserStore {
     /// Open or create the user-records database at `path`.
     ///
-    /// Every record stores a user's Argon2id KDF parameters and their wrapped
-    /// copy of the deployment secret key, so the file is created at mode
-    /// `0600` from the moment it's created (not widen-then-chmod) to close
-    /// any window where it would be world/group-readable. An already-existing
-    /// file (e.g. from a build predating this hardening) has its permissions
-    /// re-tightened on every open as defense in depth.
+    /// Every record stores a user's Argon2id KDF parameters and their
+    /// credential slots, so the file is created at mode `0600` from the
+    /// moment it's created (not widen-then-chmod) to close any window where
+    /// it would be world/group-readable. An already-existing file (e.g. from
+    /// a build predating this hardening) has its permissions re-tightened on
+    /// every open as defense in depth.
     pub fn open(path: &Path) -> Result<Self, CryptoError> {
         let mut open_options = std::fs::OpenOptions::new();
         open_options.read(true).write(true).create(true);
@@ -244,18 +380,22 @@ impl UserStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::kdf::{default_argon2_params, wrap_sk};
+    use crate::crypto::kdf::{self, default_argon2_params};
     use tempfile::tempdir;
 
     fn rec(name: &str) -> UserRecord {
         let params = default_argon2_params();
-        let wrapped = wrap_sk(b"fake-sk-bytes", b"pw", &params).unwrap();
+        let mut slots = vec![kdf::new_slot(name, 0, b"pw", &params, Role::User, false).unwrap()];
+        for i in 1..CREDENTIAL_SLOTS {
+            slots.push(kdf::decoy_slot(name, i, &params).unwrap());
+        }
         UserRecord {
             username: name.to_owned(),
             created_at: 1,
             last_login: None,
             kdf: params,
-            wrapped_sk: wrapped,
+            slots,
+            primary_slot: 0,
             role: Role::User,
         }
     }
@@ -286,6 +426,49 @@ mod tests {
         r.role = Role::Admin;
         let s = UserSummary::from(&r);
         assert_eq!(s.role, Role::Admin);
+    }
+
+    #[test]
+    fn record_always_carries_credential_slots() {
+        let r = rec("alice");
+        assert_eq!(r.slots.len(), CREDENTIAL_SLOTS);
+        // Occupied and decoy slots are byte-shape indistinguishable: every
+        // wrapped ciphertext is the same length (a fixed-size SlotPayload
+        // JSON blob, always the same length regardless of content).
+        let lens: Vec<usize> = r.slots.iter().map(|s| s.wrapped.ciphertext.len()).collect();
+        assert!(lens.iter().all(|&l| l == lens[0]));
+    }
+
+    #[test]
+    fn login_shaped_unwrap_opens_exactly_one_slot_and_none_for_a_wrong_password() {
+        // Mirrors the daemon's login path (`attempt_unwrap`): one Argon2
+        // derivation, then try every slot's unwrap without short-circuiting.
+        // A correct password must open exactly the one real slot; a wrong
+        // password must open none - proving the login path can't
+        // accidentally cross-open a different persona.
+        let r = rec("alice");
+        let kek = r.kdf.derive_kek(b"pw").unwrap();
+        let opened: Vec<usize> = r
+            .slots
+            .iter()
+            .enumerate()
+            .filter(|(i, s)| {
+                kdf::unwrap_slot(&s.wrapped, &kek, &kdf::slot_wrap_aad("alice", *i)).is_ok()
+            })
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(opened, vec![0]);
+
+        let wrong_kek = r.kdf.derive_kek(b"not-the-password").unwrap();
+        let opened_wrong = r
+            .slots
+            .iter()
+            .enumerate()
+            .filter(|(i, s)| {
+                kdf::unwrap_slot(&s.wrapped, &wrong_kek, &kdf::slot_wrap_aad("alice", *i)).is_ok()
+            })
+            .count();
+        assert_eq!(opened_wrong, 0);
     }
 
     #[test]

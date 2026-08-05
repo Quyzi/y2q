@@ -1,7 +1,9 @@
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
 use futures::StreamExt;
 use y2q_client::Y2qClient;
 
-use crate::cli::{LocksCmd, RebuildCmd};
+use crate::cli::{LocksCmd, RebuildCmd, RekeyCmd};
 use crate::client_builder::{client_from_alias, resolve_config_path};
 use crate::config::{CliConfig, default_tokens_path};
 use crate::error::CliError;
@@ -40,6 +42,104 @@ pub async fn rebuild(cmd: RebuildCmd, mode: OutputMode) -> Result<(), CliError> 
             }
         }
     }
+    Ok(())
+}
+
+pub async fn rotate_key(alias: &str, bucket: &str, mode: OutputMode) -> Result<(), CliError> {
+    let client = make_client(alias).await?;
+    let resp = crate::ops::admin::rotate_bucket_key(&client, bucket).await?;
+    if mode == OutputMode::Json {
+        print_json(&serde_json::json!({
+            "epoch": resp.epoch,
+            "key_epochs": resp.key_epochs,
+            "persona_share_warning": resp.persona_share_warning,
+        }));
+    } else {
+        println!(
+            "Rotated `{bucket}` to epoch {} (retained: {:?})",
+            resp.epoch, resp.key_epochs
+        );
+        println!("warning: {}", resp.persona_share_warning);
+    }
+    Ok(())
+}
+
+pub async fn rekey(cmd: RekeyCmd, mode: OutputMode) -> Result<(), CliError> {
+    match cmd {
+        RekeyCmd::Start { alias, bucket } => {
+            let client = make_client(&alias).await?;
+            crate::ops::admin::rekey_start(&client, &bucket).await?;
+            if mode == OutputMode::Json {
+                print_json(&serde_json::json!({ "status": "running" }));
+            } else {
+                println!("Rekey started on `{bucket}` ({alias})");
+            }
+        }
+        RekeyCmd::Status { alias, bucket } => {
+            let client = make_client(&alias).await?;
+            let status = crate::ops::admin::rekey_status(&client, &bucket).await?;
+            if mode == OutputMode::Json {
+                print_json(&serde_json::json!({
+                    "state": status.state,
+                    "percent": status.percent,
+                    "reason": status.reason,
+                }));
+            } else {
+                let desc = match status.state.as_str() {
+                    "running" => format!("running ({}%)", status.percent.unwrap_or(0)),
+                    "failed" => {
+                        format!("failed: {}", status.reason.as_deref().unwrap_or("unknown"))
+                    }
+                    s => s.to_owned(),
+                };
+                println!("Rekey [{bucket}]: {desc}");
+            }
+        }
+    }
+    Ok(())
+}
+
+pub async fn reset_identity(
+    alias: &str,
+    username: &str,
+    password: Option<String>,
+    mode: OutputMode,
+) -> Result<(), CliError> {
+    use zeroize::Zeroizing;
+    let pw = if let Some(p) = password {
+        crate::cmd::auth::warn_password_on_cli_flag();
+        Zeroizing::new(p)
+    } else {
+        Zeroizing::new(
+            rpassword::prompt_password(format!("New password for {username}: "))
+                .map_err(CliError::Io)?,
+        )
+    };
+    let client = make_client(alias).await?;
+    let resp = crate::ops::admin::reset_identity(&client, username, pw.as_str()).await?;
+    if mode == OutputMode::Json {
+        print_json(&serde_json::json!({ "orphaned_buckets": resp.orphaned_buckets }));
+    } else {
+        println!("Reset identity for `{username}`");
+        if !resp.orphaned_buckets.is_empty() {
+            println!(
+                "warning: bucket(s) left with zero grantees: {}",
+                resp.orphaned_buckets.join(", ")
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Generate a random 32-byte node key and print it to stdout as standard
+/// base64, with no trailing prose — so `y2q admin gen-node-key >
+/// /run/secrets/y2q-node-key` works. Pure local generator: no alias, no HTTP
+/// call.
+pub fn gen_node_key() -> Result<(), CliError> {
+    use rand::Rng;
+    let mut key = [0u8; 32];
+    rand::rng().fill_bytes(&mut key);
+    println!("{}", STANDARD.encode(key));
     Ok(())
 }
 

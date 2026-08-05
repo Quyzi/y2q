@@ -1,6 +1,6 @@
 use crate::client::Y2qClient;
 use crate::error::ClientError;
-use crate::model::{AddUserRequest, ListUsersResponse, UserView};
+use crate::model::{AddUserRequest, ListUsersResponse, ResetIdentityResponse, UserView};
 
 impl Y2qClient {
     /// Create a user. `role` is `"admin"`, `"user"`, or `None` to let the
@@ -30,9 +30,17 @@ impl Y2qClient {
         Ok(body.users)
     }
 
-    pub async fn delete_user(&self, username: &str) -> Result<(), ClientError> {
+    /// Delete a user. `force` bypasses the server's guard against stranding
+    /// a bucket this user owns (see `?force=true` on the endpoint).
+    pub async fn delete_user(&self, username: &str, force: bool) -> Result<(), ClientError> {
         let url = self.url(&format!("api/v1/users/{username}"));
-        let resp = self.authed(self.inner.delete(url)).send().await?;
+        let req = self.authed(self.inner.delete(url));
+        let req = if force {
+            req.query(&[("force", "true")])
+        } else {
+            req
+        };
+        let resp = req.send().await?;
         Self::check_status(resp).await?;
         Ok(())
     }
@@ -45,5 +53,20 @@ impl Y2qClient {
         let resp = self.authed(self.inner.put(url)).json(&body).send().await?;
         Self::check_status(resp).await?;
         Ok(())
+    }
+
+    /// Reset a user's identity keypair (all four credential slots) and
+    /// scrub every bucket-key grant they held. Restores login under the new
+    /// password; does not restore access.
+    pub async fn reset_identity(
+        &self,
+        username: &str,
+        password: &str,
+    ) -> Result<ResetIdentityResponse, ClientError> {
+        let url = self.url(&format!("api/v1/users/{username}/reset-identity"));
+        let body = serde_json::json!({ "password": password });
+        let resp = self.authed(self.inner.post(url)).json(&body).send().await?;
+        let resp = Self::check_status(resp).await?;
+        Ok(resp.json::<ResetIdentityResponse>().await?)
     }
 }

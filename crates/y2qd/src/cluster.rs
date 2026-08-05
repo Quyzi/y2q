@@ -1,9 +1,14 @@
 //! Cluster control-plane integration for the daemon.
 //!
-//! Builds the [`ClusterRuntime`] (provisioned MEK unlock, node identity, the
-//! embedded raft [`Controller`] over the HTTP transport), the [`ClusterPeer`]
-//! extractor that authenticates peer requests, and the actix handlers serving
-//! the `/internal/v1` raft RPCs plus the admin `/api/v1/cluster` endpoints.
+//! Builds the [`ClusterRuntime`] (node identity, the embedded raft
+//! [`Controller`] over the HTTP transport), the [`ClusterPeer`] extractor
+//! that authenticates peer requests, and the actix handlers serving the
+//! `/internal/v1` raft RPCs plus the admin `/api/v1/cluster` endpoints.
+//!
+//! Cluster admission is fingerprinted by the node-key verifier (`NKV`,
+//! [`y2q_core::crypto::derive_node_key_verifier`]) rather than a deployment
+//! public key: every node's own key hierarchy comes from its
+//! operator-supplied node key at boot, with no unlock secret to provision.
 //!
 //! Everything here is reached only when `[cluster] enabled = true`; the
 //! single-node path never constructs a runtime or registers these routes.
@@ -36,7 +41,7 @@ use y2q_cluster::{
     LabelMode, MutateMeta, MutateOp, MutateResp, NodeStatus, PREPARE_META_HEADER, PrepareMeta,
     ReadConsistency, ReadPlan, Role, VersionResp, chain_id, resolve_node_id,
 };
-use y2q_core::crypto::{Role as UserRole, UserRecord, envelope, kdf};
+use y2q_core::crypto::{Role as UserRole, UserRecord, envelope};
 use y2q_core::{
     AnyStorage, AnyStreamingPutGuard, BucketConfig, LabelSet, ListOptions, Listing, MAX_LIST_LIMIT,
     PutOptions, Storage, SyncLevel,
@@ -56,12 +61,10 @@ pub struct ClusterRuntime {
     /// Internal HTTP client for peer RPC (used to attest a candidate's identity
     /// on admission).
     client: Arc<InternalClient>,
-    /// This node's deployment public-key fingerprint. The leader admits a peer
-    /// only if it attests the same fingerprint (the shared-MEK invariant).
+    /// This node's node-key verifier (`NKV`), lowercase hex. The leader admits
+    /// a peer only if it attests the same value — nodes sharing a node key
+    /// derive the same verifier, so a mismatch means a different deployment.
     fingerprint: String,
-    /// Deployment public key, used to encrypt at the HEAD without a login (the
-    /// MEK is provisioned at boot; encryption only needs the public key).
-    public_key: Arc<Vec<u8>>,
     /// This node's id.
     pub node_id: u64,
     /// Shared secret used to authenticate peer requests (when `auth_mode` is
@@ -185,24 +188,47 @@ pub async fn cluster_register_bucket(rt: &ClusterRuntime, bucket: &str) -> Resul
     Ok(!existed)
 }
 
-/// Claim a bucket's owner cluster-wide (first-writer-wins at the raft apply) and
+/// Claim a bucket's owner cluster-wide (first-writer-wins at the raft apply,
+/// which serializes every proposer through the log — a stronger guarantee
+/// than the single-node `claim_ownership`'s best-effort race narrowing) and
 /// project the committed config locally.
+///
+/// Generates a candidate epoch-0 key ([`crate::bucket_keys::new_owner_key`])
+/// for `session`'s persona before proposing; if this proposal loses the
+/// race, that key material is simply discarded — the returned config always
+/// reflects whichever claim the raft log actually committed first.
 pub async fn cluster_claim_owner(
     rt: &ClusterRuntime,
+    user_store: &y2q_core::crypto::UserStore,
     bucket: &str,
-    owner: &str,
-) -> Result<(), AppError> {
-    rt.propose_control(ControlCmd::ClaimBucketOwner {
-        bucket: bucket.to_owned(),
-        owner: owner.to_owned(),
-    })
-    .await
-    .map_err(control_err)?;
-    let state = rt.controller.control_state().await;
-    if let Some(cfg) = state.buckets.get(bucket) {
-        project_bucket(rt.distributed.local(), bucket, cfg).await;
+    session: &crate::auth::session::SessionInfo,
+) -> Result<BucketConfig, AppError> {
+    let already_owned = rt
+        .controller
+        .control_state()
+        .await
+        .buckets
+        .get(bucket)
+        .is_some_and(|c| c.owner.is_some());
+    if !already_owned {
+        // Cheap pre-check only — generating an ML-KEM-768 keypair + seals is
+        // nontrivial, so skip it when a claim has clearly already landed.
+        // The actual "who wins" decision is the raft apply's own
+        // `cfg.owner.is_none()` check, not this client-side guess.
+        let key =
+            crate::bucket_keys::new_owner_key(user_store, bucket, session).map_err(AppError)?;
+        rt.propose_control(ControlCmd::ClaimBucketOwner {
+            bucket: bucket.to_owned(),
+            owner: session.username.clone(),
+            key,
+        })
+        .await
+        .map_err(control_err)?;
     }
-    Ok(())
+    let state = rt.controller.control_state().await;
+    let cfg = state.buckets.get(bucket).cloned().unwrap_or_default();
+    project_bucket(rt.distributed.local(), bucket, &cfg).await;
+    Ok(cfg)
 }
 
 /// Replace a bucket's full config (quota/CORS/owner/ACL) cluster-wide through raft
@@ -229,9 +255,15 @@ pub async fn cluster_set_bucket_config(
 // ---------------------------------------------------------------------------
 
 /// Mirror one replicated user record into the local user store. Preserves the
-/// node-local `last_login` (an observation, not replicated state) and, when the
-/// user's role changed, revokes their local sessions so a demote/disable takes
-/// effect on every node — not only where the admin action ran.
+/// node-local `last_login` (an observation, not replicated state) and, when
+/// the user's role changed *or* their credential slots were rebuilt (e.g.
+/// `reset-identity`), revokes their local sessions — so a demote/disable, or
+/// an admin resetting a compromised account's identity, takes effect on
+/// every node, not only where the admin action ran. A live session's
+/// `identity_sk` is only valid against the slots it was issued under; once
+/// those are replaced, the session is unrecoverable garbage exactly like the
+/// old slot's sealed bucket grants, so it must not be allowed to keep
+/// serving requests until natural expiry.
 fn project_user(state: &AuthState, record: &UserRecord) {
     let prev = state.user_store.get(&record.username).ok().flatten();
     let mut rec = record.clone();
@@ -242,8 +274,24 @@ fn project_user(state: &AuthState, record: &UserRecord) {
         tracing::warn!(user = %rec.username, error = %e, "user projector: upsert failed");
         return;
     }
-    if prev.as_ref().map(|p| p.role) != Some(rec.role) {
+    if sessions_stale(prev.as_ref(), &rec) {
         state.sessions.revoke_user(&rec.username);
+    }
+}
+
+/// Whether a live session opened under `prev` (the last record this node
+/// projected) is no longer valid against `new`: either the global role
+/// changed, or the credential slots were rebuilt (a `reset-identity` or
+/// equivalent full identity replacement) — a session's cached
+/// `identity_sk` is only valid against the slot layout it was issued
+/// under, so once that layout changes underneath it, the session is
+/// unrecoverable garbage exactly like the old slot's sealed bucket grants.
+/// `None` (first time this node has seen the user) never counts as a
+/// change — there is nothing to revoke yet.
+fn sessions_stale(prev: Option<&UserRecord>, new: &UserRecord) -> bool {
+    match prev {
+        None => false,
+        Some(p) => p.role != new.role || p.slots != new.slots || p.primary_slot != new.primary_slot,
     }
 }
 
@@ -374,16 +422,15 @@ impl FromRequest for ClusterPeer {
     }
 }
 
-/// Build the cluster runtime: provision the MEK, resolve identity, start the
-/// raft controller over HTTP, and (on the bootstrap node) initialize the cluster
+/// Build the cluster runtime: resolve node identity, start the raft
+/// controller over HTTP, and (on the bootstrap node) initialize the cluster
 /// and schedule peer joins.
 pub async fn build_runtime(
     cfg: &Config,
-    auth_state: &AuthState,
     storage: Arc<AnyStorage>,
+    node_key_fingerprint: &str,
+    control_store_key: [u8; 32],
 ) -> std::io::Result<ClusterRuntime> {
-    provision_mek(auth_state, cfg)?;
-
     let raft_dir = raft_dir(cfg);
     std::fs::create_dir_all(&raft_dir).map_err(|e| {
         std::io::Error::other(format!("create raft dir {}: {e}", raft_dir.display()))
@@ -419,7 +466,7 @@ pub async fn build_runtime(
         virtual_nodes_per_node: cfg.cluster.virtual_nodes_per_node,
     };
     let controller = Arc::new(
-        Controller::start(node_id, &raft_dir, factory, ccfg)
+        Controller::start(node_id, &raft_dir, factory, ccfg, control_store_key)
             .await
             .map_err(|e| std::io::Error::other(format!("start controller: {e}")))?,
     );
@@ -435,8 +482,7 @@ pub async fn build_runtime(
         cfg.cluster.virtual_nodes_per_node,
     ));
 
-    let fingerprint = auth_state.public_keystore.fingerprint.clone();
-    let public_key = Arc::clone(&auth_state.public_keystore.public_key);
+    let fingerprint = node_key_fingerprint.to_owned();
 
     if cfg.cluster.raft.bootstrap {
         bootstrap(&controller, &client, cfg, node_id, fingerprint.clone()).await;
@@ -447,7 +493,6 @@ pub async fn build_runtime(
         distributed,
         client,
         fingerprint,
-        public_key,
         node_id,
         shared_secret: shared_secret.map(Zeroizing::new),
         auth_mode: cfg.cluster.auth,
@@ -672,57 +717,9 @@ async fn set_status_resplice(rt: &ClusterRuntime, id: u64, status: NodeStatus) -
     }
 }
 
-/// Unwrap the deployment SK from the configured `unlock_user`'s record using the
-/// provisioned secret, derive the MEK, and install it for the process lifetime.
-fn provision_mek(auth_state: &AuthState, cfg: &Config) -> std::io::Result<()> {
-    let secret = read_unlock_secret(cfg)?;
-    let record = auth_state
-        .user_store
-        .get(&cfg.cluster.unlock_user)
-        .map_err(|e| std::io::Error::other(format!("read unlock user: {e}")))?
-        .ok_or_else(|| {
-            std::io::Error::other(format!(
-                "cluster.unlock_user {:?} not found in the user store",
-                cfg.cluster.unlock_user
-            ))
-        })?;
-
-    let sk = Zeroizing::new(
-        kdf::unwrap_sk(&record.wrapped_sk, secret.as_bytes(), &record.kdf).map_err(|_| {
-            std::io::Error::other(
-                "cluster provisioned unlock failed: wrong secret for cluster.unlock_user",
-            )
-        })?,
-    );
-    auth_state.install_mek_from_sk(sk.as_slice());
-    tracing::info!(
-        user = %cfg.cluster.unlock_user,
-        "cluster: MEK provisioned at boot (idle-drop disabled while clustered)"
-    );
-    Ok(())
-}
-
-/// Read the provisioned unlock secret from the env var (preferred) or the file.
-fn read_unlock_secret(cfg: &Config) -> std::io::Result<Zeroizing<String>> {
-    if let Ok(s) = std::env::var("Y2QD_CLUSTER__UNLOCK_SECRET") {
-        return Ok(Zeroizing::new(s));
-    }
-    let path = cfg.cluster.unlock_secret_file.trim();
-    if path.is_empty() {
-        return Err(std::io::Error::other(
-            "cluster provisioned unlock requires Y2QD_CLUSTER__UNLOCK_SECRET or cluster.unlock_secret_file",
-        ));
-    }
-    let raw = std::fs::read_to_string(path)
-        .map_err(|e| std::io::Error::other(format!("read unlock_secret_file {path}: {e}")))?;
-    Ok(Zeroizing::new(
-        raw.trim_end_matches(['\n', '\r']).to_string(),
-    ))
-}
-
 /// Initialize a single-node cluster on the bootstrap node, then spawn a task
 /// that registers this node, admits the configured peers (verifying each one's
-/// deployment-key fingerprint), and promotes the voter set.
+/// node-key verifier), and promotes the voter set.
 async fn bootstrap(
     controller: &Arc<Controller>,
     client: &Arc<InternalClient>,
@@ -786,7 +783,7 @@ async fn bootstrap(
                         // retrying this peer (it would silently diverge).
                         tracing::error!(
                             peer = peer.id, url = %peer.url, %expected, %actual,
-                            "REFUSING cluster peer: deployment-key fingerprint mismatch"
+                            "REFUSING cluster peer: node-key verifier mismatch"
                         );
                         break;
                     }
@@ -821,13 +818,12 @@ enum AdmitError {
         /// Underlying transport error.
         error: String,
     },
-    /// The candidate attested a different deployment-key fingerprint, so it does
-    /// not share the cluster's key hierarchy (the shared-MEK invariant). Admitting
-    /// it would make it store data no one else can read and serve reads no one
-    /// else wrote.
+    /// The candidate attested a different node-key verifier, so it does not
+    /// share this cluster's node key. Admitting it would make it store data
+    /// no other node can read and serve reads no other node wrote.
     #[error("fingerprint mismatch (expected {expected}, got {actual})")]
     Fingerprint {
-        /// This cluster's deployment-key fingerprint.
+        /// This cluster's node-key verifier.
         expected: String,
         /// The fingerprint the candidate attested.
         actual: String,
@@ -839,7 +835,7 @@ enum AdmitError {
 
 /// Admit a candidate into the cluster: probe its `/internal/v1/health` over the
 /// authenticated peer channel, reject it unless it attests this cluster's
-/// deployment-key fingerprint, then add it as a learner and record it (with its
+/// node-key verifier, then add it as a learner and record it (with its
 /// fingerprint and URL) in the replicated control state.
 ///
 /// The fingerprint is attested by the candidate over the shared-secret/mTLS
@@ -1024,6 +1020,13 @@ async fn head_write_inner(
         .unwrap_or(0);
     let version = prior_version + 1;
 
+    let cfg = local
+        .get_bucket_config(bucket)
+        .await
+        .map_err(AppError::from)?;
+    let (bucket_epoch, bucket_pk) =
+        crate::bucket_keys::resolve_write_key(&cfg, bucket).map_err(AppError)?;
+
     let (guard, sink, write_offset) = local
         .begin_streaming_put(bucket, key)
         .await
@@ -1031,7 +1034,8 @@ async fn head_write_inner(
     // Cluster-mode max-body/quota enforcement is not yet wired up (single-node
     // covers it); `None` preserves today's uncapped cluster-write behavior.
     let (sink, pm, cm) = cipher::stream_encrypt_for_put(
-        &rt.public_key,
+        &bucket_pk,
+        bucket_epoch,
         payload,
         sink,
         bucket,
@@ -1042,8 +1046,8 @@ async fn head_write_inner(
     )
     .await?;
 
-    // Metadata the replicas persist. The padded v2 `plaintext_len` at envelope
-    // offset 20 is `padme_len(plaintext_size)` (what `EncryptSession::finish`
+    // Metadata the replicas persist. The padded v3 `plaintext_len` at envelope
+    // offset 24 is `padme_len(plaintext_size)` (what `EncryptSession::finish`
     // patched), so derive it directly instead of reading the staged bytes back.
     let label_vec: Vec<(String, String)> = labels.iter().cloned().collect();
     let plaintext_size = pm.size;
@@ -1065,6 +1069,7 @@ async fn head_write_inner(
         kem_alg: cm.kem_alg.clone(),
         aead_alg: cm.aead_alg.clone(),
         envelope_version: cm.envelope_version,
+        key_epoch: cm.key_epoch,
         sync_durable: sync == SyncLevel::Durable,
         labels: label_vec,
     };
@@ -1575,9 +1580,10 @@ async fn version(
 
 /// Serve this node's committed ciphertext envelope for `(bucket, key)` to a peer
 /// (the apportioned read fetch). The envelope is returned verbatim — the peer
-/// decrypts it with the user keystore (this node dropped the deployment SK after
-/// deriving the MEK). The `X-Y2Q-Size` header carries the true plaintext size
-/// for the caller's padding trim.
+/// decrypts it with the user keystore (unrelated to this node's own
+/// server-structural keys — this node needs no login to serve the fetch).
+/// The `X-Y2Q-Size` header carries the true plaintext size for the caller's
+/// padding trim.
 async fn internal_read(
     rt: web::Data<ClusterRuntime>,
     _peer: ClusterPeer,
@@ -1709,6 +1715,7 @@ async fn backfill_object(
         kem_alg: md.kem_alg.unwrap_or_default(),
         aead_alg: md.aead_alg.unwrap_or_default(),
         envelope_version: md.envelope_version.unwrap_or(2),
+        key_epoch: md.key_epoch.unwrap_or(0),
         labels: md.labels.into_iter().collect(),
     };
     let meta_json =
@@ -1844,7 +1851,7 @@ pub struct JoinResponse {
 }
 
 /// Add a node to the cluster (admin). Runs on the leader: verifies the
-/// candidate's deployment-key fingerprint, adds it as a learner, records it in
+/// candidate's node-key verifier, adds it as a learner, records it in
 /// the control state, and (if `voter`) promotes it into the voting membership.
 ///
 /// A fingerprint mismatch is rejected with 403 (the candidate does not share the
@@ -1965,5 +1972,70 @@ mod tests {
         assert!(matches!(e, AdmitError::Fingerprint { .. }));
         assert!(e.to_string().contains("expected aaaa"));
         assert!(e.to_string().contains("got bbbb"));
+    }
+
+    fn dummy_record(role: UserRole, primary_slot: u8, slot_marker: u8) -> UserRecord {
+        UserRecord {
+            username: "alice".to_owned(),
+            created_at: 0,
+            last_login: None,
+            kdf: y2q_core::crypto::Argon2Params::with_random_salt(8, 1, 1),
+            slots: vec![
+                y2q_core::crypto::CredentialSlot {
+                    identity_pk_b64: format!("pk-{slot_marker}"),
+                    wrapped: y2q_core::crypto::kdf::WrappedSk::default(),
+                };
+                4
+            ],
+            primary_slot,
+            role,
+        }
+    }
+
+    /// No prior record (first time this node has seen the user) never
+    /// counts as a change — nothing to revoke yet.
+    #[test]
+    fn sessions_stale_false_with_no_prior_record() {
+        let rec = dummy_record(UserRole::User, 0, 1);
+        assert!(!sessions_stale(None, &rec));
+    }
+
+    /// Identical record: nothing changed, no revoke.
+    #[test]
+    fn sessions_stale_false_when_unchanged() {
+        let rec = dummy_record(UserRole::User, 0, 1);
+        assert!(!sessions_stale(Some(&rec), &rec));
+    }
+
+    /// A role change (demote/disable) must revoke, matching the pre-existing
+    /// behavior this helper was extracted from.
+    #[test]
+    fn sessions_stale_true_on_role_change() {
+        let prev = dummy_record(UserRole::User, 0, 1);
+        let new = dummy_record(UserRole::Disabled, 0, 1);
+        assert!(sessions_stale(Some(&prev), &new));
+    }
+
+    /// A `reset-identity`-style slot rebuild (same role, different
+    /// `slots`/`primary_slot`) must also revoke — a live session's cached
+    /// `identity_sk` is only valid against the slot layout it was issued
+    /// under. This is the fix for the reviewer-flagged gap: previously only
+    /// a role change triggered the cross-node revoke, so `reset-identity`'s
+    /// session kill never propagated past the serving node.
+    #[test]
+    fn sessions_stale_true_on_identity_replacement_with_same_role() {
+        let prev = dummy_record(UserRole::User, 2, 1);
+        let new = dummy_record(UserRole::User, 3, 9);
+        assert!(sessions_stale(Some(&prev), &new));
+    }
+
+    /// Only `primary_slot` moving (slots content otherwise identical) must
+    /// also revoke — it alone signals a different real identity, even if by
+    /// some coincidence every slot's ciphertext were unchanged.
+    #[test]
+    fn sessions_stale_true_on_primary_slot_change_alone() {
+        let prev = dummy_record(UserRole::User, 0, 1);
+        let new = dummy_record(UserRole::User, 1, 1);
+        assert!(sessions_stale(Some(&prev), &new));
     }
 }

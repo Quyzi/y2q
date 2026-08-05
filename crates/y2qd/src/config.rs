@@ -301,15 +301,25 @@ impl Default for Argon2Config {
 /// Keystore + KDF settings.
 #[derive(Debug, Deserialize)]
 pub struct CryptoConfig {
-    /// Directory holding `pubkey.json`, `users.redb`, and the daemon-wide
+    /// Directory holding `keystore.json`, `users.redb`, and the daemon-wide
     /// `.lock` file. Required — no default. Should NOT live under
     /// `storage.base_path`, so a `cp -r` of the storage tree doesn't
     /// accidentally copy or strand authentication state.
     pub keystore_dir: String,
+    /// Path to a file holding the node key: raw binary, or text in hex or
+    /// base64. At least 32 bytes; anything longer is canonicalized down to
+    /// 32 and buys no extra security. Alternatively set `Y2QD_NODE_KEY`. One
+    /// of the two is required — the daemon will not start without it, and it
+    /// is never auto-generated. Must be CSPRNG output, not a passphrase: an
+    /// attacker with the storage tree can test candidates offline at HMAC
+    /// speed. Must not live inside `storage.base_path` or
+    /// `crypto.keystore_dir` (enforced at startup).
+    #[serde(default)]
+    pub node_key_file: String,
     /// Argon2id parameters for new user records.
     #[serde(default)]
     pub argon2: Argon2Config,
-    /// Plaintext chunk size (bytes) for v2 streaming encryption. Default 4 MiB.
+    /// Plaintext chunk size (bytes) for v3 streaming encryption. Default 4 MiB.
     /// Stored per-object in the envelope header, so changing this only affects
     /// objects written afterwards; existing objects keep decrypting with their
     /// own stored chunk size. Bounds enforced at load: 64 KiB ..= 256 MiB.
@@ -344,9 +354,6 @@ fn default_max_failed_logins() -> u32 {
 fn default_lockout_seconds() -> u64 {
     900
 }
-fn default_keystore_idle_drop_seconds() -> u64 {
-    0
-}
 fn default_enforce_authorization() -> bool {
     true
 }
@@ -376,11 +383,6 @@ pub struct AuthConfig {
     /// Lockout duration (seconds) after `max_failed_logins` is exceeded.
     #[serde(default = "default_lockout_seconds")]
     pub lockout_seconds: u64,
-    /// Drop the in-memory decrypted SK this many seconds after the last
-    /// session expires. `0` = drop immediately. Set higher to forgive brief
-    /// gaps between sessions; lower to bound the SK exposure window.
-    #[serde(default = "default_keystore_idle_drop_seconds")]
-    pub keystore_idle_drop_seconds: u64,
     /// Enforce bucket ownership/ACL and the global admin role. When `false`,
     /// any authenticated user has full access to every bucket and every admin
     /// endpoint (the pre-authorization behavior) — intended for single-user or
@@ -623,9 +625,6 @@ fn default_health_probe_interval_ms() -> u64 {
 fn default_health_fail_threshold() -> u32 {
     3
 }
-fn default_cluster_unlock() -> String {
-    "provisioned".to_string()
-}
 fn default_raft_heartbeat_ms() -> u64 {
     250
 }
@@ -732,19 +731,6 @@ pub struct ClusterConfig {
     /// Consecutive failed probes before a peer is reported suspect/down.
     #[serde(default = "default_health_fail_threshold")]
     pub health_fail_threshold: u32,
-    /// MEK unlock strategy. Only `"provisioned"` is implemented: the SK is
-    /// unwrapped at boot from a provisioned secret so the node can commit
-    /// peer-forwarded writes unattended.
-    #[serde(default = "default_cluster_unlock")]
-    pub unlock: String,
-    /// Path to a file holding the provisioned unlock secret. Alternatively set
-    /// `Y2QD_CLUSTER__UNLOCK_SECRET`.
-    #[serde(default)]
-    pub unlock_secret_file: String,
-    /// User whose record the provisioned unlock secret unwraps at boot to
-    /// recover the deployment SK. Default: `"root"`.
-    #[serde(default = "default_unlock_user")]
-    pub unlock_user: String,
     /// Known peers (id + base URL) the controller can dial. The bootstrap node
     /// adds these as learners and promotes those in `raft.voter_seeds`.
     #[serde(default)]
@@ -762,11 +748,6 @@ pub struct PeerConfig {
     /// The peer's base URL, e.g. `https://10.0.0.2:8443`.
     pub url: String,
 }
-
-fn default_unlock_user() -> String {
-    "root".to_string()
-}
-
 impl Default for ClusterConfig {
     fn default() -> Self {
         Self {
@@ -783,9 +764,6 @@ impl Default for ClusterConfig {
             shared_secret: String::new(),
             health_probe_interval_ms: default_health_probe_interval_ms(),
             health_fail_threshold: default_health_fail_threshold(),
-            unlock: default_cluster_unlock(),
-            unlock_secret_file: String::new(),
-            unlock_user: default_unlock_user(),
             peers: Vec::new(),
             raft: RaftConfig::default(),
         }
@@ -828,6 +806,14 @@ impl Config {
             .map_err(|msg| Box::new(figment::Error::from(msg)))?;
 
         validate_cluster(&cfg).map_err(|msg| Box::new(figment::Error::from(msg)))?;
+
+        if cfg.crypto.node_key_file.trim().is_empty() && std::env::var("Y2QD_NODE_KEY").is_err() {
+            return Err(Box::new(figment::Error::from(
+                "[crypto] node_key_file or Y2QD_NODE_KEY is required; generate one with \
+                 `y2q admin gen-node-key`"
+                    .to_string(),
+            )));
+        }
 
         Ok(cfg)
     }
@@ -874,21 +860,6 @@ fn validate_cluster_section(c: &ClusterConfig, has_client_ca: bool) -> Result<()
     if c.auth == ClusterAuth::Mtls && !has_client_ca {
         return Err(
             "cluster.auth = mtls requires server.tls.client_ca_path for peer verification"
-                .to_string(),
-        );
-    }
-    if c.unlock != "provisioned" {
-        return Err(format!(
-            "cluster.unlock = {:?} is unsupported; only \"provisioned\" is implemented",
-            c.unlock
-        ));
-    }
-    if c.unlock_secret_file.trim().is_empty()
-        && std::env::var("Y2QD_CLUSTER__UNLOCK_SECRET").is_err()
-    {
-        return Err(
-            "cluster provisioned unlock requires cluster.unlock_secret_file or \
-             Y2QD_CLUSTER__UNLOCK_SECRET"
                 .to_string(),
         );
     }
@@ -982,7 +953,6 @@ mod tests {
             enabled: true,
             advertise_addr: "10.0.0.1:8443".to_string(),
             shared_secret: "s3cret".to_string(),
-            unlock_secret_file: "/etc/y2q/unlock".to_string(),
             ..ClusterConfig::default()
         }
     }
@@ -1035,15 +1005,6 @@ mod tests {
             ..enabled_cluster()
         };
         assert!(validate_cluster_section(&c, false).is_ok());
-    }
-
-    #[test]
-    fn unsupported_unlock_rejected() {
-        let c = ClusterConfig {
-            unlock: "login-primed".to_string(),
-            ..enabled_cluster()
-        };
-        assert!(validate_cluster_section(&c, false).is_err());
     }
 
     #[test]

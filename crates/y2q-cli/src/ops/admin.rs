@@ -1,7 +1,10 @@
 //! Admin operations shared by the CLI and the TUI: index rebuild, stale-lock
 //! management, user administration, and metrics.
 
-use y2q_client::{AclBody, ClientError, RebuildStatus, StaleLockEntry, UserView, Y2qClient};
+use y2q_client::{
+    AclBody, ClientError, RebuildStatus, RekeyStatus, ResetIdentityResponse, RotateKeyResponse,
+    StaleLockEntry, UserView, Y2qClient,
+};
 
 /// Start a metadata index rebuild.
 pub async fn rebuild_start(client: &Y2qClient) -> Result<(), ClientError> {
@@ -41,9 +44,13 @@ pub async fn list_users(client: &Y2qClient) -> Result<Vec<UserView>, ClientError
     client.list_users().await
 }
 
-/// Delete a user.
-pub async fn delete_user(client: &Y2qClient, username: &str) -> Result<(), ClientError> {
-    client.delete_user(username).await
+/// Delete a user. `force` bypasses the guard against stranding an owned bucket.
+pub async fn delete_user(
+    client: &Y2qClient,
+    username: &str,
+    force: bool,
+) -> Result<(), ClientError> {
+    client.delete_user(username, force).await
 }
 
 /// Change a user's global role.
@@ -97,4 +104,32 @@ pub async fn acl_chown(
 /// Fetch the raw Prometheus scrape body.
 pub async fn prometheus_metrics(client: &Y2qClient) -> Result<String, ClientError> {
     client.prometheus_metrics().await
+}
+
+/// Create a new bucket key epoch.
+pub async fn rotate_bucket_key(
+    client: &Y2qClient,
+    bucket: &str,
+) -> Result<RotateKeyResponse, ClientError> {
+    client.rotate_bucket_key(bucket).await
+}
+
+/// Start a bucket rekey.
+pub async fn rekey_start(client: &Y2qClient, bucket: &str) -> Result<(), ClientError> {
+    client.rekey_start(bucket).await
+}
+
+/// Fetch a bucket's current rekey status.
+pub async fn rekey_status(client: &Y2qClient, bucket: &str) -> Result<RekeyStatus, ClientError> {
+    client.rekey_status(bucket).await
+}
+
+/// Reset a user's identity keypair and password. Restores login; does not
+/// restore bucket access.
+pub async fn reset_identity(
+    client: &Y2qClient,
+    username: &str,
+    password: &str,
+) -> Result<ResetIdentityResponse, ClientError> {
+    client.reset_identity(username, password).await
 }

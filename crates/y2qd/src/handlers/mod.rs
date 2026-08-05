@@ -15,10 +15,12 @@ pub(crate) mod buckets;
 pub(crate) mod delete;
 pub(crate) mod get;
 pub(crate) mod head;
+pub(crate) mod keys;
 pub(crate) mod labels;
 pub(crate) mod list_buckets;
 pub(crate) mod list_objects;
 pub(crate) mod locks;
+pub(crate) mod personas;
 pub(crate) mod put;
 pub(crate) mod rebuild;
 pub(crate) mod search;
@@ -53,6 +55,28 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
     cfg.service(
         web::resource("/api/v1/users/{user}").route(web::delete().to(auth_handlers::delete_user)),
     );
+    cfg.service(
+        web::resource("/api/v1/users/{user}/reset-identity")
+            .route(web::post().to(auth_handlers::reset_identity)),
+    );
+    cfg.service(
+        web::resource("/api/v1/personas").route(web::post().to(auth_handlers::create_persona)),
+    );
+    // Registered before `/api/v1/personas/{slot}` so the literal `me` path
+    // isn't swallowed by the `{slot}: u8` pattern (actix matches by path
+    // shape first, then fails `u8` extraction on non-numeric segments).
+    cfg.service(
+        web::resource("/api/v1/personas/me").route(web::get().to(auth_handlers::whoami_persona)),
+    );
+    cfg.service(
+        web::resource("/api/v1/personas/{slot}")
+            .route(web::delete().to(auth_handlers::delete_persona)),
+    );
+    cfg.service(
+        web::resource("/api/v1/personas/{slot}/grant")
+            .route(web::post().to(personas::grant_persona))
+            .route(web::delete().to(personas::revoke_persona_grant)),
+    );
 
     // Object store + admin endpoints.
     cfg.service(web::resource("/").route(web::get().to(list_buckets::handle)));
@@ -83,6 +107,15 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         web::resource("/api/v1/buckets/{bucket}/acl")
             .route(web::get().to(acl::get_acl))
             .route(web::put().to(acl::set_acl)),
+    );
+    cfg.service(
+        web::resource("/api/v1/buckets/{bucket}/rotate-key")
+            .route(web::post().to(keys::rotate_key)),
+    );
+    cfg.service(
+        web::resource("/api/v1/buckets/{bucket}/rekey")
+            .route(web::post().to(keys::start_rekey))
+            .route(web::get().to(keys::rekey_status)),
     );
 
     cfg.service(

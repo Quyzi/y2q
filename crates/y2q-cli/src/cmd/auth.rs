@@ -6,7 +6,7 @@ use crate::error::CliError;
 use crate::output::{OutputMode, print_json};
 use crate::token::{TokenEntry, TokenStore};
 
-fn prompt_password(prompt: &str) -> Result<Zeroizing<String>, CliError> {
+pub(crate) fn prompt_password(prompt: &str) -> Result<Zeroizing<String>, CliError> {
     rpassword::prompt_password(prompt)
         .map(Zeroizing::new)
         .map_err(CliError::Io)

@@ -10,7 +10,7 @@
 //! backend stores.
 
 use bytes::{Bytes, BytesMut};
-use y2q_core::crypto::{DecryptedKeystore, envelope};
+use y2q_core::crypto::envelope;
 use y2q_core::storage::streaming_sink::StreamingSink;
 use y2q_core::{CipherMetadata, PlaintextMetrics, StreamChecksum};
 
@@ -22,12 +22,12 @@ use crate::error::AppError;
 /// input allocation, avoiding a full ciphertext-sized copy that the older
 /// `&[u8]` variant required.
 pub fn decrypt_after_get(
-    keystore: &DecryptedKeystore,
+    deployment_sk: &[u8],
     bucket: &str,
     key: &str,
     bytes: BytesMut,
 ) -> Result<Bytes, AppError> {
-    match envelope::decrypt_owned(&keystore.secret_key, bytes, bucket, key) {
+    match envelope::decrypt_owned(deployment_sk, bytes, bucket, key) {
         Ok(pt) => Ok(pt),
         Err(y2q_core::crypto::CryptoError::UnsupportedVersion(v)) => {
             Err(AppError(y2q_core::Error::UnsupportedEnvelopeVersion {
@@ -48,48 +48,41 @@ pub fn decrypt_after_get(
     }
 }
 
-/// Decrypt a contiguous run of v2 chunks for a ranged GET.
+/// Decrypt a contiguous run of v3 chunks for a ranged GET.
 ///
-/// `preamble` is the first [`envelope::v2_preamble_len`] bytes of the object,
+/// `preamble` is the first [`envelope::v3_preamble_len`] bytes of the object,
 /// `chunks_ct` the ciphertext window starting at chunk `first_chunk_idx`.
 /// Returns the plaintext of those whole chunks; the caller trims to the exact
 /// requested byte range. Maps crypto errors to the same [`AppError`] variants
 /// as [`decrypt_after_get`].
-pub fn decrypt_v2_chunks(
-    keystore: &DecryptedKeystore,
+pub fn decrypt_v3_chunks(
+    bucket_sk: &[u8],
     bucket: &str,
     key: &str,
     preamble: &[u8],
     chunks_ct: &[u8],
     first_chunk_idx: u64,
 ) -> Result<Vec<u8>, AppError> {
-    envelope::decrypt_v2_chunks(
-        &keystore.secret_key,
-        preamble,
-        chunks_ct,
-        first_chunk_idx,
-        bucket,
-        key,
-    )
-    .map_err(|e| match e {
-        y2q_core::crypto::CryptoError::UnsupportedVersion(v) => {
-            AppError(y2q_core::Error::UnsupportedEnvelopeVersion { version: v })
-        }
-        y2q_core::crypto::CryptoError::Envelope(reason) => {
-            AppError(y2q_core::Error::EnvelopeMalformed {
+    envelope::decrypt_v3_chunks(bucket_sk, preamble, chunks_ct, first_chunk_idx, bucket, key)
+        .map_err(|e| match e {
+            y2q_core::crypto::CryptoError::UnsupportedVersion(v) => {
+                AppError(y2q_core::Error::UnsupportedEnvelopeVersion { version: v })
+            }
+            y2q_core::crypto::CryptoError::Envelope(reason) => {
+                AppError(y2q_core::Error::EnvelopeMalformed {
+                    bucket: bucket.to_owned(),
+                    key: key.to_owned(),
+                    reason: reason.to_owned(),
+                })
+            }
+            _ => AppError(y2q_core::Error::DecryptionFailed {
                 bucket: bucket.to_owned(),
                 key: key.to_owned(),
-                reason: reason.to_owned(),
-            })
-        }
-        _ => AppError(y2q_core::Error::DecryptionFailed {
-            bucket: bucket.to_owned(),
-            key: key.to_owned(),
-        }),
-    })
+            }),
+        })
 }
 
-/// Stream-encrypt a PUT payload directly to `file` using the v2 chunked
+/// Stream-encrypt a PUT payload directly to `file` using the v3 chunked
 /// envelope format, computing plaintext checksums along the way.
 ///
 /// Consumes chunks from `stream` (an `actix_web::web::Payload`), feeds them
@@ -98,14 +91,16 @@ pub fn decrypt_v2_chunks(
 /// [`AnyStreamingPutGuard::commit`]), plus the plaintext metrics and cipher
 /// metadata for the metadata sidecar.
 ///
-/// `write_offset` is the byte offset within `file` at which the v2 envelope
+/// `write_offset` is the byte offset within `file` at which the v3 envelope
 /// starts. Pass the value returned by
 /// [`AnyStorage::begin_streaming_put`]: `0` for the filesystem backend, `64`
 /// for the uring backend.
 ///
-/// Only the deployment **public** key is needed (ML-KEM encapsulation), so this
-/// works both on the client PUT path (from the logged-in keystore) and on the
-/// cluster HEAD path (from the provisioned public keystore, no login).
+/// `bucket_pk`/`key_epoch` are the *current* bucket key epoch's public key
+/// and epoch number (resolved by the caller from the bucket's
+/// [`BucketConfig::keys`](y2q_core::BucketKeyVersion) before calling). Only
+/// the public half is needed (ML-KEM encapsulation), so this works both on
+/// the client PUT path and on the cluster HEAD path (which never logs in).
 ///
 /// `max_bytes`, when set, aborts the stream as soon as the running plaintext
 /// byte count exceeds it — enforced here (not just via a `Content-Length`
@@ -114,7 +109,8 @@ pub fn decrypt_v2_chunks(
 /// cap entirely.
 #[allow(clippy::too_many_arguments)]
 pub async fn stream_encrypt_for_put(
-    public_key: &[u8],
+    bucket_pk: &[u8],
+    key_epoch: u32,
     mut stream: actix_web::web::Payload,
     sink: StreamingSink,
     bucket: &str,
@@ -125,15 +121,22 @@ pub async fn stream_encrypt_for_put(
 ) -> Result<(StreamingSink, PlaintextMetrics, CipherMetadata), AppError> {
     use futures::StreamExt;
 
-    let mut session =
-        envelope::EncryptSession::new(sink, public_key, bucket, key, write_offset, chunk_size)
-            .await
-            .map_err(|_| {
-                AppError(y2q_core::Error::EncryptionFailed {
-                    bucket: bucket.to_owned(),
-                    key: key.to_owned(),
-                })
-            })?;
+    let mut session = envelope::EncryptSession::new(
+        sink,
+        bucket_pk,
+        key_epoch,
+        bucket,
+        key,
+        write_offset,
+        chunk_size,
+    )
+    .await
+    .map_err(|_| {
+        AppError(y2q_core::Error::EncryptionFailed {
+            bucket: bucket.to_owned(),
+            key: key.to_owned(),
+        })
+    })?;
 
     let mut hasher = StreamChecksum::new();
     let mut plaintext_size: u64 = 0;
@@ -189,6 +192,73 @@ pub async fn stream_encrypt_for_put(
         kem_alg: info.kem_alg.to_owned(),
         aead_alg: info.aead_alg.to_owned(),
         envelope_version: info.envelope_version,
+        key_epoch: info.key_epoch,
+    };
+
+    Ok((sink, plaintext_metrics, cipher_metadata))
+}
+
+/// Encrypt an already-in-memory plaintext buffer directly to `sink` using the
+/// v3 chunked envelope format. The non-streaming counterpart to
+/// [`stream_encrypt_for_put`], used by the rekey job: unlike an HTTP PUT, the
+/// plaintext there comes from decrypting an existing object rather than a
+/// client's request body, so there is no [`actix_web::web::Payload`] to
+/// consume from.
+#[allow(clippy::too_many_arguments)]
+pub async fn encrypt_bytes_for_put(
+    bucket_pk: &[u8],
+    key_epoch: u32,
+    plaintext: &[u8],
+    sink: StreamingSink,
+    bucket: &str,
+    key: &str,
+    write_offset: u64,
+    chunk_size: usize,
+) -> Result<(StreamingSink, PlaintextMetrics, CipherMetadata), AppError> {
+    let mut session = envelope::EncryptSession::new(
+        sink,
+        bucket_pk,
+        key_epoch,
+        bucket,
+        key,
+        write_offset,
+        chunk_size,
+    )
+    .await
+    .map_err(|_| {
+        AppError(y2q_core::Error::EncryptionFailed {
+            bucket: bucket.to_owned(),
+            key: key.to_owned(),
+        })
+    })?;
+
+    session.feed(plaintext).await.map_err(|_| {
+        AppError(y2q_core::Error::EncryptionFailed {
+            bucket: bucket.to_owned(),
+            key: key.to_owned(),
+        })
+    })?;
+
+    let (sink, info) = session.finish().await.map_err(|_| {
+        AppError(y2q_core::Error::EncryptionFailed {
+            bucket: bucket.to_owned(),
+            key: key.to_owned(),
+        })
+    })?;
+
+    let mut hasher = StreamChecksum::new();
+    hasher.update(plaintext);
+    let plaintext_metrics = PlaintextMetrics {
+        size: plaintext.len() as u64,
+        checksum_gxhash_b64: hasher.finish_b64(),
+    };
+    let cipher_metadata = CipherMetadata {
+        cipher_size: info.cipher_size,
+        cipher_checksum_b64: info.cipher_checksum_b64,
+        kem_alg: info.kem_alg.to_owned(),
+        aead_alg: info.aead_alg.to_owned(),
+        envelope_version: info.envelope_version,
+        key_epoch: info.key_epoch,
     };
 
     Ok((sink, plaintext_metrics, cipher_metadata))
@@ -235,6 +305,7 @@ mod tests {
         let sink = tempfile_sink().await;
         let (_, _, _) = stream_encrypt_for_put(
             &pk,
+            0,
             payload,
             sink,
             "bucket",

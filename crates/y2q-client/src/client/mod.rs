@@ -2,6 +2,7 @@ mod admin;
 mod auth;
 mod listing;
 mod objects;
+mod personas;
 mod trace;
 mod users;
 

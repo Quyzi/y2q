@@ -26,7 +26,15 @@ How to run, manage, and recover a `y2qd` deployment. Read this before putting an
    RUSTFLAGS="-C target-feature=+sha,+aes,+ssse3,+avx2" cargo build --release -p y2qd
    ```
 
-2. Write a minimal `config.toml`:
+2. Generate a node key (operator-supplied, never auto-generated - the daemon
+   refuses to start without one):
+   ```sh
+   y2q admin gen-node-key > /run/secrets/y2q-node-key
+   ```
+   Back it up out of band from everything else the daemon writes - see
+   [Backup and recovery](#backup-and-recovery) below.
+
+3. Write a minimal `config.toml`:
    ```toml
    [server]
    host = "127.0.0.1"
@@ -37,17 +45,18 @@ How to run, manage, and recover a `y2qd` deployment. Read this before putting an
 
    [crypto]
    keystore_dir = "/var/lib/y2qd/keystore"
+   node_key_file = "/run/secrets/y2q-node-key"   # or set Y2QD_NODE_KEY instead
 
    [auth]
    # defaults are fine for first run
    ```
 
-3. Start it:
+4. Start it:
    ```sh
    ./target/release/y2qd --config config.toml
    ```
 
-4. **Capture the root password.** First start prints this once on stdout:
+5. **Capture the root password.** First start prints this once on stdout:
    ```
    ===========================================================
      y2qd first-run: ROOT PASSWORD (recorded NOWHERE - copy now)
@@ -57,7 +66,7 @@ How to run, manage, and recover a `y2qd` deployment. Read this before putting an
    ```
    It is written by `println!`, bypassing the tracing subscriber, so it always appears regardless of `RUST_LOG`. Save it in your secret store before doing anything else. There is no recovery path if you lose it before adding a second user.
 
-5. (Optional but recommended) Create at least one operator user, then keep `root` for emergency access only:
+6. (Optional but recommended) Create at least one operator user, then keep `root` for emergency access only:
    ```sh
    TOKEN=$(curl -s -X POST http://127.0.0.1:8080/api/v1/auth/login \
      -H 'Content-Type: application/json' \
@@ -88,9 +97,10 @@ make image-dev      # y2q:dev (Pyroscope enabled)
 
 ### First container run
 
-1. Create host directories and write a config:
+1. Create host directories, a node key, and write a config:
    ```sh
    mkdir -p ~/y2q/data ~/y2q/keys
+   y2q admin gen-node-key > ~/y2q/node.key
    cp config.default.toml ~/y2q/config.toml
    # edit ~/y2q/config.toml -- at minimum set base_path and keystore_dir
    ```
@@ -104,12 +114,14 @@ make image-dev      # y2q:dev (Pyroscope enabled)
      -v ~/y2q/config.toml:/etc/y2q/config.toml:ro \
      -v ~/y2q/data:/var/lib/y2q/data \
      -v ~/y2q/keys:/var/lib/y2q/keys \
+     -e Y2QD_NODE_KEY="$(cat ~/y2q/node.key)" \
      y2q:latest
    ```
 
    - `--network=host` - container uses the host network directly; required for rootless podman to expose a port without NAT
    - `--userns=keep-id` - maps your host UID into the container so bind-mounted directories are writable
    - `--user $(id -u):$(id -g)` - runs the daemon as your host user
+   - `-e Y2QD_NODE_KEY` - the node key, same as native. Never bake it into the image or the mounted config; pass it at run time from wherever your secret store puts it
 
 3. **Capture the root password** from stdout - it appears once on first run, same as native.
 
@@ -144,14 +156,14 @@ podman run --entrypoint y2q-warp --network=host \
 
 ## User management
 
-`y2q`'s authentication model is unusual in one key way: **every user record carries its own wrapped copy of the same deployment secret key**. To add a user you must already be logged in (so the daemon has the unwrapped SK in memory), and adding the user re-wraps that SK under the new password.
+Every user has their own independent ML-KEM-768 identity keypair, wrapped under Argon2id(password) - there is no shared deployment secret key. Compromising one user's password only exposes what that user (or duress persona) was granted, not the whole deployment.
 
 Consequences:
 
-- **You cannot add the first user without the root password.** Lose it before creating a second user and the deployment is effectively dead.
-- **Compromising any user's password compromises the deployment.** If a user's password leaks, decrypt access to *every* object is potentially gone. Rotate immediately (see below) and consider whether you trust your at-rest storage.
+- **Adding a user requires only the `admin` role**, not knowledge of any shared secret - the new identity is generated fresh, unrelated to the admin's own.
+- **Compromising one user's password compromises only what that user can reach.** Global `admin`/`auditor` accounts hold no bucket keys at all - see [Key hierarchy](architecture.md#key-hierarchy-and-identity-protection-at-rest).
 - **A user's password change does not affect any other user.** Each `UserRecord` is independent.
-- **You cannot reset a user's password without their current password.** There is no "admin reset". Delete and re-add instead.
+- **An admin can reset a forgotten password** via `reset-identity` (below) - this restores login, not access: the reset identity holds no bucket grants until someone re-grants it.
 
 ### Add a user
 
@@ -182,15 +194,19 @@ curl -X DELETE https://y2qd.example/api/v1/users/bob \
   -H "Authorization: Bearer $TOKEN"
 ```
 
-The daemon refuses to delete the last remaining user (409). Other users are unaffected - their wrapped SK copies remain valid.
+The daemon refuses to delete the last remaining user, the last administrator, or (without `?force=true`) a bucket's sole grantee - deleting a user's only remaining access path to a bucket would strand it with no way to ever grant fresh access again. Other users are unaffected; each has an independent identity.
 
-### "Reset" a forgotten password
+### Reset a forgotten password (admin)
 
-There is no admin reset. Procedure:
+An admin can reset a user's password without knowing their old one:
 
-1. Log in as another user.
-2. `DELETE /api/v1/users/<forgotten>`
-3. `PUT /api/v1/users/add` with the same username and a new password.
+```sh
+curl -X POST https://y2qd.example/api/v1/users/bob/reset-identity \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"password":"new-correct-horse-battery"}'
+```
+
+This rebuilds bob's whole record with a fresh identity keypair (at a slot chosen randomly on creation, under the new password) and fresh decoys in the other three slots, and revokes every live session bob holds. It restores *login*, not *access*: the new identity holds no bucket keys, because the old ones were sealed to the identity keypair that just got replaced - an admin never touches bucket-key material during a reset, so this cannot be used to escalate. The response's `orphaned_buckets` lists any bucket left with zero grantees on its newest key epoch as a result - re-grant those before the data they held becomes permanently unreachable. This also destroys every duress persona bob had; there is no partial reset.
 
 ### Roles and access control
 
@@ -213,18 +229,51 @@ y2q admin acl chown prod photos alice
 
 Equivalent HTTP: `PUT /api/v1/users/{user}/role`, `GET`/`PUT /api/v1/buckets/{bucket}/acl`. Set `auth.enforce_authorization = false` only for single-user or migration deployments where every authenticated user should have full access.
 
+### Duress personas
+
+A user can hold up to three additional passwords, each unlocking a completely separate identity with its own bucket grants. There is no "primary slot" a caller can rely on by number: each account's real identity is placed at a slot chosen uniformly at random on creation, so slot position alone reveals nothing about which credential is the real one. Logging in with a different slot's password behaves exactly like logging in as a different account - there is no shared state, and every `UserRecord` always carries exactly four byte-shape-identical slots, so nothing distinguishes a real persona from an unused decoy from the outside.
+
+Create a persona at any credential slot other than the one your current session is authenticated through (self-service only - the CLI always prompts for the password interactively, never accepts it as an argument):
+
+```sh
+curl -X POST https://y2qd.example/api/v1/personas \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"slot":2,"password":"a-different-password","role":"readonly","revoke_other_sessions":true}'
+```
+
+`role` is capped at the account's own global role - a persona can never grant itself more power than the account already has. `revoke_other_sessions: true` is what makes a persona usable under duress: logging in through it silently switches every other live session on the account over to this persona's identity, in place - same tokens, same expiry, nothing visibly interrupted. A coercer who checks that some other session is still "logged in" sees exactly that; it just now carries the duress persona's own (usually far more limited) access instead of the real one's, with no revocation, error, or log line distinguishing it from an ordinary login.
+
+Share (or revoke) some of your *current* session's bucket access with one of your own other personas - self-service only, there is no admin route to grant someone else's persona, since such a route would be the first thing a coercer with an admin account would reach for:
+
+```sh
+# Share access to "prod" and "staging" with your own slot 2
+curl -X POST https://y2qd.example/api/v1/personas/2/grant \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"buckets":["prod","staging"]}'
+
+# Revoke it again (the grant array keeps the same shape/size - nothing observable changes)
+curl -X DELETE https://y2qd.example/api/v1/personas/2/grant \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"buckets":["prod"]}'
+```
+
+`GET /api/v1/personas/me` reports the calling session's own slot and role - never the duress flag, even for the caller's own session, so a technical coercer who queries this endpoint directly can't read it off. This is the only introspection offered. `DELETE /api/v1/personas/{slot}` overwrites that slot (any slot other than the caller's own active one) with a fresh decoy.
+
+A share made with `POST /api/v1/personas/{slot}/grant` does not survive a bucket key rotation performed by someone else - see the warning under [Key rotation](#key-rotation).
+
 ## Backup and recovery
 
 ### What to back up
 
 | Path | What it is | Priority |
 |---|---|---|
-| `<crypto.keystore_dir>/pubkey.json` | Deployment public key + fingerprint | **Critical** |
-| `<crypto.keystore_dir>/users.redb` | Every user's wrapped SK and Argon2 params | **Critical** |
+| The node key (`crypto.node_key_file`, or wherever `Y2QD_NODE_KEY` sources it from) | Operator-supplied structural key deriving the index, path-blinding, metadata and bucket-config keys | **Critical** - never auto-generated, never persisted anywhere in `keystore_dir` or `base_path` |
+| `<crypto.keystore_dir>/keystore.json` | Node-key verifier | **Critical** |
+| `<crypto.keystore_dir>/users.redb` | Every user's credential slots (wrapped identity keypairs) | **Critical** |
 | `<storage.base_path>/` | All objects - each is a single `.obj` file containing ciphertext and embedded metadata | **Critical** |
 | `<storage.base_path>/_y2q_index.redb` | redb metadata index | Optional - rebuildable |
 
-Lose `pubkey.json` or `users.redb` and your ciphertext is unrecoverable. Back them up to a different host (or at least a different volume) than `base_path`.
+Lose the node key, `keystore.json`, or `users.redb` and your ciphertext is unrecoverable. Back up the node key itself out of band from everything else (it must never live inside `storage.base_path` or `crypto.keystore_dir` - the daemon refuses to start if it does), and back up `keystore_dir`/`users.redb` to a different host (or at least a different volume) than `base_path`.
 
 Recommended: keep `keystore_dir` and `base_path` on different mount points. A `cp -r` of the storage tree by an operator should not accidentally exfiltrate authentication state, and a failure of one volume should not necessarily destroy both halves.
 
@@ -240,7 +289,7 @@ Write locks are in-memory and vanish on process exit - there are no lock files i
 
 1. Stop `y2qd`.
 2. Restore `keystore_dir` and `base_path` from backup to the original paths (or fix up `config.toml` to point at the new paths).
-3. Start `y2qd`. It should find `pubkey.json` and skip first-run.
+3. Start `y2qd`. It should find `keystore.json` and skip first-run.
 4. Inspect: log in as any restored user, `GET /` to list buckets, do a few HEAD/GET round trips on objects you expect to exist.
 5. If listing looks wrong but objects are readable by direct GET, the index is out of sync. Kick off a rebuild:
    ```sh
@@ -253,14 +302,62 @@ Write locks are in-memory and vanish on process exit - there are no lock files i
 
 ## Key rotation
 
-**Not currently implemented.** The deployment's ML-KEM-768 keypair is generated on first run and lives forever. There is no in-place rotation today.
+Two independent things can be rotated: a bucket's content-encryption key (online, per-bucket) and the node key (offline, whole-deployment). They solve different problems and are operated differently.
 
-Workarounds:
+### Revoking a user's access to a bucket
 
-- **Password rotation per user** - `POST /api/v1/auth/password` works fine and re-wraps that user's copy of the SK under fresh Argon2 parameters. Do this routinely.
-- **Migrating to a new keypair** - currently requires standing up a fresh deployment, copying objects through (re-encrypting on the new keypair), and switching consumers over.
+Removing someone from a bucket's ACL does not, by itself, make old ciphertext unreadable to them if they already exfiltrated the bucket's current key. Do all three steps, in order, to actually revoke:
 
-If your threat model requires periodic SK rotation, file an issue or plan for a migration. Don't pretend the existing pubkey is rotatable.
+1. **Remove the grant.**
+   ```sh
+   curl -X PUT https://y2qd.example/api/v1/buckets/mybucket/acl \
+     -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+     -d '{"grants": {"alice": null}}'
+   ```
+   This also kills every live session the removed user holds - their existing bearer tokens stop working immediately.
+
+2. **Rotate the bucket key.**
+   ```sh
+   curl -X POST https://y2qd.example/api/v1/buckets/mybucket/rotate-key -H "Authorization: Bearer $TOKEN"
+   ```
+   New writes immediately move to a fresh key epoch the revoked user never held; existing objects keep decrypting fine under their original epoch, so nothing is unavailable in between. Refuses with 409 once a bucket has 8 retained epochs (`MAX_RETAINED_EPOCHS`) - `rekey` (next step) prunes old ones back down.
+
+3. **Rekey existing objects.**
+   ```sh
+   curl -X POST https://y2qd.example/api/v1/buckets/mybucket/rekey -H "Authorization: Bearer $TOKEN"
+   curl https://y2qd.example/api/v1/buckets/mybucket/rekey -H "Authorization: Bearer $TOKEN"
+   # {"state": "running", "percent": 60}
+   ```
+   Walks every object still on an old epoch, re-encrypts it under the newest key, and once every object is current prunes every retained key below the newest. **Until this completes**, a revoked user who already exfiltrated the old bucket key can still decrypt any old ciphertext they also exfiltrated - rotation only protects new writes; rekey is what closes the old ones.
+
+   **Refused with 501 while `[cluster] enabled = true`.** `rekey` migrates object ciphertext through the node-local storage backend only, never the CRAQ-replicated data path other writes use - running it in a cluster would migrate only the objects that happen to live on the serving node, then still prune the old epoch's key material deployment-wide, permanently stranding every replica that was never independently rekeyed. `rotate-key` (step 2) is unaffected - it only appends to the raft-replicated `BucketConfig` and never touches object data - so revocation via rotation still works in a cluster, but old ciphertext under a prior epoch (and any epoch above `MAX_RETAINED_EPOCHS`) cannot be pruned until cluster-aware rekey ships.
+
+`GET /api/v1/buckets/mybucket/acl` reports `key_epochs` (ascending) so you can confirm a rekey actually pruned down to one epoch.
+
+**Warning: rotating a bucket's key can silently drop persona-to-persona shares.** `rotate-key` reconstructs the new epoch's grantee list from the bucket's cleartext ACL/owner fields plus whichever persona the *caller* is currently authenticated as - it has no way to read who else holds a real (non-decoy) grant on the current epoch, since that is exactly the information sealed grants are designed to hide (see [Duress personas](#duress-personas)). A grant made via self-service persona sharing (`POST /api/v1/personas/{slot}/grant`) is invisible to `rotate-key` unless that same persona happens to be the one running the rotation. If any bucket grantee has shared access with one of their own alternate personas, that persona must re-run its own `grant` call after every rotation performed by someone else. `rotate-key`'s response always carries a `persona_share_warning` field repeating this caveat, so tooling that only reads the API (not this doc) still sees it.
+
+### Node key rotation (offline)
+
+The node key (`[crypto] node_key_file` / `Y2QD_NODE_KEY`) derives every server-structural key - the metadata index, object metadata sidecars, bucket-config sidecars, path blinding, the control store. Password changes and the bucket rotate/rekey above never touch it; those only re-key user- and bucket-scoped material. Rotating the node key touches every object's on-disk path and metadata sidecar, so it is an **offline** tool, not an API call - the same keystore flock the daemon holds for its whole lifetime means a rotation refuses to start against a live daemon, and the daemon refuses to start while a rotation is in progress or interrupted.
+
+```sh
+# Stop the daemon first.
+export Y2QD_NODE_KEY=<current key>
+export Y2QD_NEW_NODE_KEY=$(y2q admin gen-node-key)
+y2qd --config config.toml --rotate-node-key
+# Then restart with the new key:
+export Y2QD_NODE_KEY=$Y2QD_NEW_NODE_KEY
+y2qd --config config.toml
+```
+(`--new-node-key-file` is the file-based equivalent of `Y2QD_NEW_NODE_KEY`, mirroring `node_key_file`/`Y2QD_NODE_KEY`'s precedence rule.)
+
+It walks the whole storage tree once - re-encrypting every object's metadata sidecar and renaming it to its new path-key-derived name, re-encrypting every bucket's `.y2q-bucket.json` and renaming its directory - then deletes and rebuilds `_y2q_index.redb` fresh under the new key, then rewrites the keystore verifier. Object bodies are never touched or re-encrypted: they stay sealed under per-object content keys the node key never sees.
+
+**Crash safety.** The tool writes a journal (`<keystore_dir>/node-key-rotation.json`) before touching anything, and deletes it only once the verifier rewrite completes. While that journal exists, `y2qd`'s normal boot path refuses to start (`node key rotation was interrupted; re-run y2qd --rotate-node-key to finish it`) rather than serving against a half-migrated tree. Re-running `--rotate-node-key` with the same old/new key pair resumes exactly where it left off - every step is idempotent, so already-migrated objects and buckets are skipped, not redone.
+
+`users.redb` and all bucket key material need no rotation here - they are wrapped under user passwords and sealed to identity keypairs, neither of which involves the node key.
+
+**Clustering.** Rotation is per-node and offline-only - there is no rolling rotation. `NKV` (a fingerprint of the node key) is the cluster admission check, so a node on the new key is refused by peers still on the old one. Stop **every** node in the cluster, rotate each one's tree independently (paths are node-local; CRAQ addresses objects by `(bucket, key)`, not by on-disk path), then restart the whole cluster with the new key everywhere.
 
 ## Write locks
 
@@ -434,11 +531,11 @@ location / {
 
 `y2qd` can run as a distributed store (off by default). Operational essentials; full reference in [clustering.md](clustering.md):
 
-- **Shared keystore is mandatory.** Every node must load the *same* deployment keystore (`pubkey.json` + `users.redb`) before joining - the key hierarchy is derived from it and the leader refuses to admit a node whose deployment-key fingerprint differs. Back it up exactly as in single-node mode.
-- **Boot unlock.** Cluster nodes unwrap the secret key at startup from a provisioned secret (`Y2QD_CLUSTER__UNLOCK_SECRET` or `cluster.unlock_secret_file`) so peer-forwarded writes commit unattended; idle-drop is disabled while clustered.
+- **Shared node key is mandatory.** Every node must be started with the same operator-supplied node key and load the *same* deployment keystore (`keystore.json` + `users.redb`) before joining - the key hierarchy is derived from the node key, and the leader refuses to admit a node whose node-key fingerprint (`NKV`) differs. Back the keystore up exactly as in single-node mode; distribute the node key to every node's `Y2QD_NODE_KEY` (or `node_key_file`) out of band, same as single-node boot.
+- **No separate cluster unlock credential.** There is no provisioned "cluster unlock secret" distinct from the node key - every node supplies its own copy of the same node key at boot exactly like single-node mode, and it stays resident in memory for the daemon's whole lifetime (no idle-drop).
 - **Bring-up.** Exactly one node sets `cluster.raft.bootstrap = true` on first boot; the rest join and are admitted as voters (if in `voter_seeds`) or learners. Check `GET /api/v1/cluster/status` for membership, leader, and committed epoch.
 - **Migration.** `POST /api/v1/cluster/migrate` moves objects online in either direction (distribute into the cluster / collect back to one node); it is idempotent and resumable.
-- **Local demo.** `make cluster-up` starts a 5-node cluster via podman-compose ([deploy/cluster/](../deploy/cluster/)); `make cluster-down` tears it down and wipes volumes. The demo's `init` service generates the shared keystore and captures the root password to `/seed/unlock_secret.txt`.
+- **Local demo.** `make cluster-up` starts a 5-node cluster via podman-compose ([deploy/cluster/](../deploy/cluster/)); `make cluster-down` tears it down and wipes volumes. The demo's `init` service generates a shared node key + keystore and captures the root password to `/seed/root_password.txt`.
 - **Keep client and server in lockstep.** After rebuilding the cluster image, run `make install-local` so the `y2q`/`y2q-warp` binaries match the daemon's object-metadata format.
 
 ## Failure modes and how to recognize them
@@ -446,14 +543,14 @@ location / {
 | Symptom | Likely cause | What to do |
 |---|---|---|
 | Daemon refuses to start: `acquire keystore lock` | Another `y2qd` is already running against the same `keystore_dir` | Check `ps` / systemd. If stale, the flock is released by the OS - investigate why the daemon didn't exit cleanly. |
-| `503` on any object op | `KeystoreUnavailable` - SK not in memory (idle-dropped, no active sessions) | Log in (any user). The SK is reinstalled on the first successful login. |
+| `503` on any object op | `KeystoreNotFound` - `keystore.json`/`users.redb` missing at the configured `keystore_dir` (misconfiguration, or a copy that left the keystore behind) | Confirm `[crypto] keystore_dir` and the node key are correct. On a genuine first boot this doesn't happen - first-run setup runs automatically and prints the root password. |
 | `409 Conflict` on PUT | Active in-flight write lock for that key (same key PUT in two concurrent requests) | Normally self-resolves; if stuck, use `GET /api/v1/locks` to check and `DELETE /api/v1/locks` to force-release. |
-| `500` on any op against an old object | The object or its metadata predates the v2 chunked envelope (v1 whole-object or unencrypted legacy data). There is no unauthenticated passthrough or v1 decode - such objects are unreadable | If you have an out-of-band copy of the original plaintext, re-PUT it so it is stored as v2. Otherwise the object is unrecoverable through the API. |
+| `500` on any op against an old object | The object or its metadata predates the current v3 per-bucket envelope (magic bytes aren't `Y2Q3` - e.g. leftover v1/v2 data from before this deployment adopted per-bucket keys). There is no unauthenticated passthrough or legacy decode - such objects are unreadable | If you have an out-of-band copy of the original plaintext, re-PUT it so it is stored as v3. Otherwise the object is unrecoverable through the API. |
 | `429 Too Many Requests` on login | Either the per-source-IP rate limit (bursty requests from one client, checked before credentials) or the per-username lockout after repeated failures | For the lockout, wait `lockout_seconds` or use another user - `Retry-After` tells you exactly how long. The IP rate limit clears itself after a few seconds; no body/header details are returned for it. |
 | Listing shows missing or stale objects after restore | Index drift after bulk restore | Run `POST /api/v1/rebuild` (or restart the daemon - startup auto-rebuild handles it). |
 | Data-loss `tracing::error!` messages at startup | `.obj` files referenced in index are gone | Indicates actual data loss (e.g. from a partial restore). Startup rebuild logs the affected keys. |
 | `503` cluster writes stall; reads still work | Raft quorum lost (voter-majority partition) - correct CP behavior | Restore connectivity / a voter majority. Reads keep serving; writes resume once quorum returns. See [clustering.md](clustering.md). |
-| Joined node 404s or `STALE_EPOCH` on peer ops | Wrong keystore (fingerprint mismatch) or stale topology after a re-splice | Verify every node shares the deployment keystore; check `GET /api/v1/cluster/status` for the committed epoch and member states. |
+| Joined node 404s or `STALE_EPOCH` on peer ops | Wrong node key (`NKV` fingerprint mismatch) or stale topology after a re-splice | Verify every node was started with the same node key; check `GET /api/v1/cluster/status` for the committed epoch and member states. |
 
 ## Source
 

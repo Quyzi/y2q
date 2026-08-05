@@ -53,7 +53,7 @@ pub enum Commands {
         alias: String,
         #[arg(long, short)]
         user: Option<String>,
-        #[arg(long, short)]
+        #[arg(long, short, allow_hyphen_values = true)]
         password: Option<String>,
         #[arg(long, value_name = "SECONDS")]
         ttl: Option<u64>,
@@ -63,9 +63,9 @@ pub enum Commands {
     /// Change password for an alias.
     Passwd {
         alias: String,
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         current: Option<String>,
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         new: Option<String>,
     },
     /// Copy files between local and remote storage.
@@ -271,6 +271,12 @@ pub enum Commands {
         #[command(subcommand)]
         cmd: AdminCmd,
     },
+    /// Manage your own personas (multiple passwords per account, usable as
+    /// duress passwords). Ordinary user commands - not admin subcommands.
+    Persona {
+        #[command(subcommand)]
+        cmd: PersonaCmd,
+    },
     /// Launch the interactive TUI file explorer.
     Tui,
     /// Print a shell completion script to stdout.
@@ -400,12 +406,35 @@ pub enum AdminCmd {
         #[command(subcommand)]
         cmd: AclCmd,
     },
+    /// Create a new bucket key epoch. New writes use it immediately;
+    /// existing objects keep decrypting under their own epoch until
+    /// `rekey` migrates them.
+    RotateKey { alias: String, bucket: String },
+    /// Migrate a bucket's existing objects onto its newest key epoch and
+    /// prune retired ones.
+    Rekey {
+        #[command(subcommand)]
+        cmd: RekeyCmd,
+    },
     /// Stream live request/response trace from a server.
     Trace {
         alias: String,
         /// Show only requests with status 400 or above.
         #[arg(long, short = 'e')]
         errors: bool,
+    },
+    /// Generate a random 32-byte node key (standard base64), for
+    /// `[crypto] node_key_file` or `Y2QD_NODE_KEY`. Pure local generator —
+    /// takes no alias, makes no HTTP call.
+    GenNodeKey,
+    /// Reset a user's identity keypair and password. Restores login; does
+    /// not restore bucket access (every grant they held is scrubbed, since
+    /// it was sealed to the identity keypair this replaces).
+    ResetIdentity {
+        alias: String,
+        username: String,
+        #[arg(long, short, allow_hyphen_values = true)]
+        password: Option<String>,
     },
 }
 
@@ -415,7 +444,7 @@ pub enum UserCmd {
     Add {
         alias: String,
         username: String,
-        #[arg(long, short)]
+        #[arg(long, short, allow_hyphen_values = true)]
         password: Option<String>,
         /// Global role for the new user: `admin` or `user` (default).
         #[arg(long, default_value = "user")]
@@ -426,7 +455,15 @@ pub enum UserCmd {
     List { alias: String },
     /// Delete a user.
     #[command(alias = "rm")]
-    Remove { alias: String, username: String },
+    Remove {
+        alias: String,
+        username: String,
+        /// Delete even if this user owns a bucket that would become
+        /// unrecoverable (no other identity could ever open its bucket key
+        /// again).
+        #[arg(long)]
+        force: bool,
+    },
     /// Change a user's global role.
     Role {
         alias: String,
@@ -472,6 +509,14 @@ pub enum RebuildCmd {
 }
 
 #[derive(Subcommand, Debug)]
+pub enum RekeyCmd {
+    /// Start a bucket rekey.
+    Start { alias: String, bucket: String },
+    /// Show the current rekey status for a bucket.
+    Status { alias: String, bucket: String },
+}
+
+#[derive(Subcommand, Debug)]
 pub enum LocksCmd {
     /// List stale write locks.
     #[command(alias = "ls")]
@@ -485,5 +530,56 @@ pub enum LocksCmd {
         alias: String,
         #[arg(long)]
         older_than: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum PersonaCmd {
+    /// Write (or overwrite) a persona into a credential slot
+    /// (`0..CREDENTIAL_SLOTS`). No slot is privileged - each account's real
+    /// identity lives at a slot chosen randomly on creation, changed via
+    /// `y2q passwd`. The server refuses to overwrite whichever slot the
+    /// current session is authenticated through.
+    Add {
+        alias: String,
+        #[arg(long)]
+        slot: u8,
+        /// Effective role for sessions opened through this persona: admin,
+        /// user, readonly, writeonly, auditor, or disabled. Must not exceed
+        /// the account's own global role. Defaults to the account's role.
+        #[arg(long)]
+        role: Option<String>,
+        /// Revoke every other live session of this account on login
+        /// through this persona - what makes it usable as a duress slot.
+        #[arg(long)]
+        duress: bool,
+    },
+    /// Overwrite a persona slot (excluding the one the current session is
+    /// authenticated through) with a fresh decoy and revoke any live
+    /// session opened through it.
+    #[command(alias = "remove")]
+    Rm {
+        alias: String,
+        #[arg(long)]
+        slot: u8,
+    },
+    /// Show the current session's persona slot and role. The server never
+    /// reports the duress flag, even for your own session.
+    Whoami { alias: String },
+    /// Share buckets your current persona holds with one of your own
+    /// other personas.
+    Grant {
+        alias: String,
+        #[arg(long)]
+        slot: u8,
+        buckets: Vec<String>,
+    },
+    /// Revoke a persona's access to buckets (your own persona keeps its
+    /// access).
+    Revoke {
+        alias: String,
+        #[arg(long)]
+        slot: u8,
+        buckets: Vec<String>,
     },
 }

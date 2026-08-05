@@ -2132,7 +2132,7 @@ impl App {
                         let client =
                             client_from_alias(profile, Some(token)).map_err(|e| e.to_string())?;
                         client
-                            .delete_user(&username)
+                            .delete_user(&username, false)
                             .await
                             .map_err(|e| e.to_string())?;
                         client.list_users().await.map_err(|e| e.to_string())

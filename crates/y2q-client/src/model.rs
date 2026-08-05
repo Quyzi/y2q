@@ -63,6 +63,9 @@ pub struct AclBody {
     /// Per-user grants: username → `"read"` | `"write"` | `"admin"`.
     #[serde(default)]
     pub grants: BTreeMap<String, String>,
+    /// Retained bucket key epochs, ascending. Read-only.
+    #[serde(default)]
+    pub key_epochs: Vec<u32>,
 }
 
 // ── Objects ───────────────────────────────────────────────────────────────────
@@ -169,6 +172,33 @@ pub struct RebuildStatus {
     pub reason: Option<String>,
 }
 
+/// Response body for `POST /api/v1/buckets/{bucket}/rotate-key`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RotateKeyResponse {
+    pub epoch: u32,
+    pub key_epochs: Vec<u32>,
+    /// Always present: grants shared with another persona via
+    /// `POST /api/v1/personas/{slot}/grant` are not preserved unless that
+    /// same persona performs this rotation. See `docs/operations.md`'s
+    /// "Key rotation" section.
+    pub persona_share_warning: String,
+}
+
+/// Response body for `GET /api/v1/buckets/{bucket}/rekey`. Mirrors
+/// [`RebuildStatus`]'s shape, scoped per bucket.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RekeyStatus {
+    pub state: String,
+    pub percent: Option<u8>,
+    pub reason: Option<String>,
+}
+
+/// Response body for `POST /api/v1/users/{user}/reset-identity`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ResetIdentityResponse {
+    pub orphaned_buckets: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StaleLockEntry {
     pub bucket: String,
@@ -180,4 +210,46 @@ pub struct StaleLockEntry {
 #[derive(Debug, Deserialize)]
 pub struct ClearStaleLocksResponse {
     pub removed: u64,
+}
+
+// ── Personas ─────────────────────────────────────────────────────────────────
+
+/// Request body for `POST /api/v1/personas`.
+#[derive(Debug, Serialize)]
+pub struct PersonaCreateRequest {
+    /// Credential slot, `0..CREDENTIAL_SLOTS`. No slot number is
+    /// privileged — each account's real identity lives at a slot chosen
+    /// uniformly at random on creation, never a fixed index. The one slot
+    /// the server refuses to overwrite is whichever one the caller is
+    /// currently authenticated through.
+    pub slot: u8,
+    pub password: String,
+    /// Effective role for sessions opened through this persona. Omitted
+    /// (server defaults to `user`) when `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    #[serde(default)]
+    pub revoke_other_sessions: bool,
+}
+
+/// Response body for `POST /api/v1/personas`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PersonaCreateResponse {
+    pub warning: String,
+}
+
+/// Response body for `GET /api/v1/personas/me`. Deliberately has no
+/// `revoke_other_sessions` field: the server never reports it, even for the
+/// caller's own session, so a technical coercer probing this endpoint
+/// directly can't read off whether they were handed a duress persona.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersonaView {
+    pub slot: u8,
+    pub role: String,
+}
+
+/// Request body for `POST`/`DELETE /api/v1/personas/{slot}/grant`.
+#[derive(Debug, Serialize)]
+pub struct PersonaGrantBody {
+    pub buckets: Vec<String>,
 }

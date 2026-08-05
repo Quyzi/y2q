@@ -55,6 +55,7 @@ fn output(acl: &AclBody, mode: OutputMode) {
         return;
     }
     println!("owner: {}", acl.owner.as_deref().unwrap_or("(none)"));
+    println!("key_epochs: {:?}", acl.key_epochs);
     if acl.grants.is_empty() {
         println!("grants: (none)");
     } else {

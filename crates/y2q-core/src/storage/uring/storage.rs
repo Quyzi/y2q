@@ -11,7 +11,7 @@ use std::{
     sync::Arc,
 };
 
-use crate::crypto::metadata_key::MekSlot;
+use crate::crypto::node_keys::NodeKeySlot;
 
 use bytes::Bytes;
 
@@ -39,10 +39,9 @@ pub struct UringStorage {
     index: Arc<MetadataIndex>,
     rebuild_state: Arc<tokio::sync::Mutex<CacheRebuildStatus>>,
     config: UringConfig,
-    /// Shared MEK slot, also held by `index`. Empty until a login installs the
-    /// key derived from the deployment secret key; zeroized on idle; never read
-    /// from disk.
-    mek: Arc<MekSlot>,
+    /// Shared node-key slot, also held by `index`. Installed once at boot;
+    /// never cleared — the daemon cannot serve anything without it.
+    mek: Arc<NodeKeySlot>,
     /// `Arc` so a spawned rebuild task can share dispatch without making
     /// `WorkerPool` cloneable (the `JoinHandle`s aren't).
     pool: Arc<WorkerPool>,
@@ -51,9 +50,9 @@ pub struct UringStorage {
 
 /// Tunables for [`UringStorage`].
 ///
-/// Note: the Metadata Encryption Key is no longer a construction-time config
-/// field. It is installed at runtime via [`UringStorage::install_mek`] once a
-/// login unwraps the deployment secret key.
+/// Note: the node key is not a construction-time config field. It is
+/// installed at runtime via [`UringStorage::install_node_key`], once, at
+/// boot.
 #[derive(Clone, Debug)]
 pub struct UringConfig {
     /// Number of dedicated tokio-uring worker threads. Defaults to the number
@@ -146,7 +145,7 @@ impl UringStorage {
             })?;
         }
         let index = MetadataIndex::new(index_path);
-        let mek = index.mek_slot();
+        let mek = index.node_key_slot();
         let pool = Arc::new(
             WorkerPool::spawn(&config).map_err(|msg| Error::InternalError {
                 bucket: String::new(),
@@ -166,25 +165,17 @@ impl UringStorage {
         })
     }
 
-    /// Install the Metadata Encryption Key (derived from the deployment secret
-    /// key when a login unwraps it). Object sidecar metadata is encrypted under
-    /// the MEK, and the whole-file-encrypted metadata index is opened (its file
-    /// key is derived from the MEK). Idempotent across re-logins.
-    pub fn install_mek(&self, mek: [u8; 32]) {
-        self.index.set_mek(mek);
+    /// Install the node key (supplied by the operator at boot). Object
+    /// sidecar metadata is encrypted under the derived Object Metadata Key,
+    /// and the whole-file-encrypted metadata index is opened (its file key
+    /// is derived from the node key too). Idempotent, though only ever
+    /// called once in practice.
+    pub fn install_node_key(&self, nk: [u8; 32]) {
+        self.index.set_node_key(nk);
     }
 
-    /// Clear the MEK and close the metadata index, leaving only ciphertext on
-    /// disk. Returns whether a key was present. Called on idle drop.
-    pub fn clear_mek(&self) -> bool {
-        let had = self.mek.clear();
-        self.index.close();
-        had
-    }
-
-    /// Shared handle to the MEK slot, so the daemon can install or clear the key
-    /// in step with login / idle-drop.
-    pub fn mek_slot(&self) -> Arc<MekSlot> {
+    /// Shared handle to the node-key slot.
+    pub fn node_key_slot(&self) -> Arc<NodeKeySlot> {
         Arc::clone(&self.mek)
     }
 
@@ -196,7 +187,8 @@ impl UringStorage {
     /// Canonical on-disk path for the single-file object record of
     /// `(bucket, key)`: `<base>/<bucket_dir>/<xx>/<yy>/<id>.obj`, where
     /// `bucket_dir` and `id` are keyed HMACs under the login-gated path key.
-    /// Errors if no login has installed the MEK (and hence the path key) yet.
+    /// Errors if the node key (and hence the path key) is not installed —
+    /// which should never happen post-boot.
     fn obj_path(&self, bucket: &str, key: &str) -> Result<PathBuf, Error> {
         let path_key = require_path_key(&self.mek)?;
         Ok(obj_path_for(&self.base_path, &path_key, bucket, key))
@@ -276,7 +268,7 @@ impl UringStorage {
                 let (reply, reply_rx) = tokio::sync::oneshot::channel();
                 let op = UringOp::ReadObjectMeta {
                     path: obj_path.clone(),
-                    mek: self.mek.mek(),
+                    mek: self.mek.object_metadata_key(),
                     reply,
                 };
                 self.pool
@@ -348,7 +340,7 @@ impl UringStorage {
             key.to_owned(),
             is_overwrite,
             prior_created,
-            self.mek.mek(),
+            self.mek.object_metadata_key(),
             self.index.clone(),
         );
 
@@ -477,7 +469,7 @@ impl Storage for UringStorage {
             crypto,
             large_object_bytes: self.config.large_object_bytes,
             sync: options.sync,
-            mek: self.mek.mek(),
+            mek: self.mek.object_metadata_key(),
             reply,
         };
         let dispatch_result = self.dispatch(op, bucket, key, "put", reply_rx).await;
@@ -538,7 +530,7 @@ impl Storage for UringStorage {
             locks: self.locks.clone(),
             bucket: bucket.to_owned(),
             key: key.to_owned(),
-            mek: self.mek.mek(),
+            mek: self.mek.object_metadata_key(),
             reply,
         };
         let result = self.dispatch(op, bucket, key, "describe", reply_rx).await;
@@ -565,7 +557,7 @@ impl Storage for UringStorage {
             crate::storage::filesystem::set_labels_impl(
                 &self.base_path,
                 &self.index,
-                self.mek.mek().as_ref(),
+                self.mek.object_metadata_key().as_ref(),
                 &path_key,
                 bucket,
                 key,
@@ -616,7 +608,14 @@ impl Listing for UringStorage {
 
     async fn get_bucket_config(&self, bucket: &str) -> Result<crate::BucketConfig, Error> {
         let path_key = require_path_key(&self.mek)?;
-        crate::storage::filesystem::get_bucket_config_impl(&self.base_path, &path_key, bucket).await
+        let config_key = crate::storage::filesystem::require_bucket_config_key(&self.mek)?;
+        crate::storage::filesystem::get_bucket_config_impl(
+            &self.base_path,
+            &path_key,
+            &config_key,
+            bucket,
+        )
+        .await
     }
 
     async fn set_bucket_config(
@@ -625,9 +624,11 @@ impl Listing for UringStorage {
         config: &crate::BucketConfig,
     ) -> Result<(), Error> {
         let path_key = require_path_key(&self.mek)?;
+        let config_key = crate::storage::filesystem::require_bucket_config_key(&self.mek)?;
         crate::storage::filesystem::set_bucket_config_impl(
             &self.base_path,
             &path_key,
+            &config_key,
             bucket,
             config,
         )
@@ -703,7 +704,7 @@ impl StorageExt for UringStorage {
         let index = self.index.clone();
         let state = self.rebuild_state.clone();
         let pool = Arc::clone(&self.pool);
-        let mek = self.mek.mek();
+        let mek = self.mek.object_metadata_key();
         tokio::spawn(async move {
             let result = run_rebuild(base_path, index, state.clone(), pool, mek).await;
             let mut s = state.lock().await;
@@ -890,8 +891,8 @@ mod tests {
     use bytes::Bytes;
     use tempfile::TempDir;
 
-    /// Stand-in for the login-derived MEK; metadata writes require one.
-    const TEST_MEK: [u8; 32] = [7u8; 32];
+    /// The node key; metadata writes require one installed.
+    const TEST_NODE_KEY: [u8; 32] = [7u8; 32];
 
     fn make_storage(dir: &TempDir, workers: usize) -> UringStorage {
         let s = UringStorage::new(
@@ -903,7 +904,7 @@ mod tests {
             },
         )
         .unwrap();
-        s.install_mek(TEST_MEK);
+        s.install_node_key(TEST_NODE_KEY);
         s
     }
 
@@ -924,7 +925,7 @@ mod tests {
             },
         )
         .unwrap();
-        s.install_mek(TEST_MEK);
+        s.install_node_key(TEST_NODE_KEY);
         s
     }
 
@@ -1335,7 +1336,7 @@ mod tests {
             },
         )
         .unwrap();
-        storage.install_mek(TEST_MEK);
+        storage.install_node_key(TEST_NODE_KEY);
         // Index is empty right now.
         let page = storage
             .list_objects("b", ListOptions::default())

@@ -1,7 +1,7 @@
 //! The encrypted metadata index.
 //!
-//! Stores per-object metadata and label postings, sealed under a metadata
-//! encryption key (MEK) and blinded under a derived index key. Backs object
+//! Stores per-object metadata and label postings, sealed under an index
+//! encryption key and blinded under a derived index key. Backs object
 //! listing, key lookups, and label search. Construction is a constructor rather
 //! than behavior and is left to the implementor.
 

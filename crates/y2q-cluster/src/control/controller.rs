@@ -68,17 +68,20 @@ pub struct Controller {
 
 impl Controller {
     /// Construct a controller: open the redb raft store at `raft_dir/raft.redb`
-    /// and start the raft engine with the given `network`.
+    /// (whole-file-encrypted under `file_key` — the Control Store Key derived
+    /// from the operator-supplied node key) and start the raft engine with the
+    /// given `network`.
     pub async fn start<NF>(
         node_id: NodeId,
         raft_dir: &Path,
         network: NF,
         cfg: ControllerConfig,
+        file_key: [u8; 32],
     ) -> Result<Self, ControllerError>
     where
         NF: RaftNetworkFactory<TypeConfig>,
     {
-        let (log_store, sm) = store::open(&raft_dir.join("raft.redb"))
+        let (log_store, sm) = store::open(&raft_dir.join("raft.redb"), file_key)
             .map_err(|e| ControllerError::Storage(e.to_string()))?;
 
         let raft_config = Config {
@@ -338,7 +341,7 @@ mod tests {
             let factory = RouterFactory {
                 registry: registry.clone(),
             };
-            let c = Controller::start(id, dir.path(), factory, fast_cfg())
+            let c = Controller::start(id, dir.path(), factory, fast_cfg(), [7u8; 32])
                 .await
                 .unwrap();
             registry.lock().unwrap().insert(id, c.raft().clone());
