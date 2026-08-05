@@ -18,8 +18,7 @@
 //! | `PATHK` | `path-key` | bucket dir + object filename blinding |
 //! | `OMK` | `object-metadata-key` | object metadata sidecars |
 //! | `BCK` | `bucket-config-key` | the `.y2q-bucket.json` sidecar |
-//! | `CSK` | `control-store-key` | whole-file AES-GCM of the Raft control redb |
-//! | `NKV` | `node-key-verifier` | wrong-NK detection; cluster admission fingerprint |
+//! | `NKV` | `node-key-verifier` | wrong-NK detection |
 //!
 //! An attacker holding only the on-disk files — the storage directory and
 //! the keystore directory — cannot derive any of these without the node
@@ -74,7 +73,6 @@ const INDEX_KEY_LABEL: &[u8] = b"y2q/v3/index-key";
 const PATH_KEY_LABEL: &[u8] = b"y2q/v3/path-key";
 const OBJECT_METADATA_KEY_LABEL: &[u8] = b"y2q/v3/object-metadata-key";
 const BUCKET_CONFIG_KEY_LABEL: &[u8] = b"y2q/v3/bucket-config-key";
-const CONTROL_STORE_KEY_LABEL: &[u8] = b"y2q/v3/control-store-key";
 const NODE_KEY_VERIFIER_LABEL: &[u8] = b"y2q/v3/node-key-verifier";
 
 const VERSION_BYTE: u8 = 0x01;
@@ -134,18 +132,9 @@ pub fn derive_bucket_config_key(nk: &[u8; 32]) -> [u8; 32] {
     prf(nk, BUCKET_CONFIG_KEY_LABEL)
 }
 
-/// Derive the Control Store Key (CSK): `prf(NK, "y2q/v3/control-store-key")`.
-///
-/// Used to whole-file-encrypt the Raft control redb in cluster builds.
-pub fn derive_control_store_key(nk: &[u8; 32]) -> [u8; 32] {
-    prf(nk, CONTROL_STORE_KEY_LABEL)
-}
-
 /// Derive the Node Key Verifier (NKV): `prf(NK, "y2q/v3/node-key-verifier")`.
 ///
-/// Stored in `keystore.json` to detect a wrong node key at boot, and reused
-/// as the cluster admission fingerprint (nodes sharing a node key derive the
-/// same verifier).
+/// Stored in `keystore.json` to detect a wrong node key at boot.
 pub fn derive_node_key_verifier(nk: &[u8; 32]) -> [u8; 32] {
     prf(nk, NODE_KEY_VERIFIER_LABEL)
 }
@@ -311,7 +300,6 @@ mod tests {
             derive_path_key(&k),
             derive_object_metadata_key(&k),
             derive_bucket_config_key(&k),
-            derive_control_store_key(&k),
             derive_node_key_verifier(&k),
         ];
         for i in 0..derived.len() {

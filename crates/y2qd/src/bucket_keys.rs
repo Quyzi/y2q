@@ -28,9 +28,8 @@ use zeroize::Zeroizing;
 
 /// Hard cap on retained [`BucketConfig::keys`] epochs. `rotate-key` refuses
 /// with [`Error::TooManyBucketKeyEpochs`] at this count; `rekey` prunes every
-/// epoch below the newest back down to one. Bounds how large the
-/// Raft-replicated bucket config (clustered) or sidecar (single-node) can
-/// grow from repeated rotation without an intervening rekey.
+/// epoch below the newest back down to one. Bounds how large the sidecar
+/// bucket config can grow from repeated rotation without an intervening rekey.
 pub const MAX_RETAINED_EPOCHS: usize = 8;
 
 /// Which of a grantee's credential slots (personas) may open a bucket key

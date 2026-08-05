@@ -24,7 +24,6 @@ governor                    = { workspace = true }
 metrics                     = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
 metrics-rs-dashboard-actix  = { workspace = true }
-openraft                    = { workspace = true }
 parking_lot                 = { workspace = true }
 pqcrypto                    = { workspace = true }
 pqcrypto-traits             = { workspace = true }
@@ -44,7 +43,6 @@ tracing-subscriber          = { workspace = true }
 utoipa                      = { workspace = true }
 utoipa-swagger-ui           = { workspace = true }
 uuid                        = { workspace = true }
-y2q-cluster                 = { path = "../y2q-cluster" }
 y2q-core                    = { path = "../y2q-core" }
 zeroize                     = { workspace = true }
 

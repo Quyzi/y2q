@@ -18,7 +18,6 @@ use y2q_core::{
 use super::list_objects::{ListObjectsResponse, MetadataView};
 use crate::auth::Authenticated;
 use crate::authz::{authorize_bucket, bucket_readable};
-use crate::cluster::{self, ClusterRuntime};
 use crate::error::{AppError, ErrorBody};
 
 /// Continuation cursor for cross-bucket search, mirroring the core index's
@@ -71,7 +70,6 @@ pub struct SearchQuery {
 pub async fn handle(
     query: web::Query<SearchQuery>,
     storage: web::Data<Arc<AnyStorage>>,
-    cluster: Option<web::Data<ClusterRuntime>>,
     auth: Authenticated,
 ) -> Result<HttpResponse, AppError> {
     let q = query.into_inner();
@@ -88,14 +86,10 @@ pub async fn handle(
             after: q.after,
             limit: user_limit,
         };
-        let page = if let Some(rt) = cluster.as_ref() {
-            cluster::scatter_list(rt, Some(b), Some(&q.q), &opts).await?
-        } else {
-            storage
-                .search_objects(&parsed, Some(b), opts)
-                .await
-                .map_err(AppError::from)?
-        };
+        let page = storage
+            .search_objects(&parsed, Some(b), opts)
+            .await
+            .map_err(AppError::from)?;
         return Ok(HttpResponse::Ok().json(ListObjectsResponse {
             items: page.items.into_iter().map(MetadataView::from).collect(),
             next: page.next,
@@ -110,14 +104,10 @@ pub async fn handle(
             after: q.after,
             limit: user_limit,
         };
-        let page = if let Some(rt) = cluster.as_ref() {
-            cluster::scatter_list(rt, None, Some(&q.q), &opts).await?
-        } else {
-            storage
-                .search_objects(&parsed, None, opts)
-                .await
-                .map_err(AppError::from)?
-        };
+        let page = storage
+            .search_objects(&parsed, None, opts)
+            .await
+            .map_err(AppError::from)?;
         return Ok(HttpResponse::Ok().json(ListObjectsResponse {
             items: page.items.into_iter().map(MetadataView::from).collect(),
             next: page.next,
@@ -134,14 +124,10 @@ pub async fn handle(
         after: q.after,
         limit: Some(MAX_LIST_LIMIT),
     };
-    let raw = if let Some(rt) = cluster.as_ref() {
-        cluster::scatter_list(rt, None, Some(&q.q), &wide).await?
-    } else {
-        storage
-            .search_objects(&parsed, None, wide)
-            .await
-            .map_err(AppError::from)?
-    };
+    let raw = storage
+        .search_objects(&parsed, None, wide)
+        .await
+        .map_err(AppError::from)?;
     let more_raw = raw.next.is_some();
 
     let mut readable: HashMap<String, bool> = HashMap::new();

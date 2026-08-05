@@ -1,8 +1,8 @@
 # y2q
 
-Post-quantum secure object storage. `y2qd` is a REST daemon that encrypts every object at rest using ML-KEM-768 key encapsulation and AES-256-GCM, with token-based session authentication, per-bucket access control, optional post-quantum TLS, and an optional distributed mode (CRAQ chain replication over an embedded Raft control plane).
+Post-quantum secure object storage. `y2qd` is a REST daemon that encrypts every object at rest using ML-KEM-768 key encapsulation and AES-256-GCM, with token-based session authentication, per-bucket access control, and optional post-quantum TLS.
 
-> Early development - APIs and on-disk formats may change. Distributed (cluster) mode is **experimental** - see [Clustering](#clustering).
+> Early development - APIs and on-disk formats may change.
 
 ## Contents
 
@@ -15,7 +15,6 @@ Post-quantum secure object storage. `y2qd` is a REST daemon that encrypts every 
 - [FUSE Mount (`y2q-fuse`)](#fuse-mount-y2q-fuse)
 - [Configuration](#configuration)
 - [API Reference](#api-reference)
-- [Clustering](#clustering)
 - [Object Data Security](#object-data-security)
 - [Development](#development)
 
@@ -23,10 +22,9 @@ Post-quantum secure object storage. `y2qd` is a REST daemon that encrypts every 
 
 - [docs/architecture.md](docs/architecture.md) - system design, encryption envelope (v2 chunked), storage backends, metadata index, sessions, authorization
 - [docs/configuration.md](docs/configuration.md) - full config reference: every field, default, TLS, and override syntax
-- [docs/operations.md](docs/operations.md) - first run, user/role/ACL management, TLS, clustering, backup/recovery, runbook
+- [docs/operations.md](docs/operations.md) - first run, user/role/ACL management, TLS, backup/recovery, runbook
 - [docs/api.md](docs/api.md) - complete HTTP API reference: routes, authorization model, schemas, error codes, examples
 - [docs/search.md](docs/search.md) - label search query language: operators, regex, grammar, examples
-- [docs/clustering.md](docs/clustering.md) - distributed mode: CRAQ data plane, Raft control plane, replication, migration, internal API
 
 ## Features
 
@@ -36,7 +34,6 @@ Post-quantum secure object storage. `y2qd` is a REST daemon that encrypts every 
 - **Argon2id-protected secret key** - the ML-KEM private key is never stored in plaintext; it is wrapped under each user's password and only held in memory during an active session
 - **Token-based session auth** - Bearer tokens with configurable TTL, per-account lockout after repeated failures
 - **Bucket ownership, ACLs, and global roles** - new buckets are private to their creator; per-bucket grants (read/write/writeonly/admin) plus account-wide roles (admin/user/readonly/writeonly/auditor/disabled). Disable with `auth.enforce_authorization = false` for single-user deployments
-- **Distributed mode (experimental, optional)** - run multiple daemons as one store: CRAQ chain replication for object data, an embedded Raft controller for topology + user/bucket metadata, apportioned reads, online migration single-node <-> cluster. Off by default; experimental - not yet recommended for production data. See [docs/clustering.md](docs/clustering.md)
 - **Dual storage backends** - portable filesystem backend (all platforms); optional Linux io_uring fast path (kernel >= 5.6); both use the same on-disk `.obj` format and are fully cross-compatible
 - **Encrypted, fast listing** - embedded [redb](https://github.com/cberner/redb) metadata index, itself encrypted at rest under a key derived from the operator-supplied node key; auto-rebuilt on startup; can be triggered manually
 - **Best-effort mode with background flusher** - skip per-PUT fsyncs for throughput; a background task drains the dirty queue on a configurable interval
@@ -55,7 +52,6 @@ Post-quantum secure object storage. `y2qd` is a REST daemon that encrypts every 
 | `y2q-behavior` | - | Trait-only behavioral contract mirroring `y2q-core` (I/O, crypto, storage, index), no implementations |
 | `y2q-cli` | `y2q` | Client CLI and TUI |
 | `y2q-client` | - | HTTP client library |
-| `y2q-cluster` | - | CRAQ data plane + embedded Raft control plane |
 | `y2q-config` | - | Shared config types |
 | `y2q-warp` | `y2q-warp` | Load benchmarking tool |
 | `y2q-fuse` | `y2q-fuse` | FUSE filesystem driver (mount a store as a directory tree) |
@@ -117,7 +113,6 @@ Build images locally with `make`:
 ```sh
 make image          # y2q:latest         - distroless runtime (filesystem + uring both compiled in)
 make image-dev      # y2q:dev            - same, with Pyroscope profiling enabled
-make image-cluster  # y2q-cluster:latest - shell-bearing image used by the cluster demo
 ```
 
 Run with rootless podman:
@@ -145,8 +140,6 @@ podman run --entrypoint y2q --network=host ... y2q:latest ls prod/
 ```
 
 **The root password is printed once on first run** - same as the native path. Check stdout/container logs before doing anything else.
-
-For a self-contained multi-node cluster on one host, see [Clustering](#clustering) below and [deploy/cluster/README.md](deploy/cluster/README.md).
 
 ## CLI (`y2q`)
 
@@ -357,7 +350,7 @@ y2q-warp prod cleanup
 y2q-warp prod put --obj-size-min 64KiB --obj-size-max 16MiB
 ```
 
-### Multi-node fan-out (clusters)
+### Multi-node fan-out
 
 The alias is node 0; add extra contact endpoints with repeatable `--node` URLs. Workers round-robin across all nodes. Because sessions are node-local, a multi-node run needs a password (`--password` or `Y2QWARP_PASSWORD`) to log into each extra node:
 
@@ -460,10 +453,6 @@ enforce_authorization = true           # bucket ownership/ACLs + global admin ro
 [observability]
 log_filter = "info"      # RUST_LOG syntax; RUST_LOG env var takes precedence
 log_format = "text"      # "text" or "json"
-
-[cluster]
-enabled = false          # master switch; false => single node, zero clustering behavior
-# see docs/clustering.md for the full distributed-mode reference
 ```
 
 Environment variables override any config file value: prefix the dotted key with `Y2QD_` and use `__` (two underscores) as the section separator - e.g. `Y2QD_SERVER__PORT=9090`, `Y2QD_OBSERVABILITY__LOG_FORMAT=json`. Full schema: [docs/configuration.md](docs/configuration.md).
@@ -529,25 +518,6 @@ Object keys may contain `/`. Use `/{bucket}/{key}` where `{key}` is the full pat
 
 `/metrics/*`, `/swagger-ui/`, and `/api-docs/openapi.json` are served **only** when `server.unauthenticated_metrics = true`, and then without auth. With the default `false` they are not registered at all.
 
-When clustering is enabled, additional `/api/v1/cluster/{status,join,migrate}` and peer-only `/internal/v1/*` routes are exposed - see [docs/clustering.md](docs/clustering.md).
-
-## Clustering
-
-> **Experimental.** Distributed mode works and is covered by integration tests, but it is young and not yet recommended for production data. The single-node path (`cluster.enabled = false`, the default) is unaffected and is the supported deployment.
-
-`y2qd` can run as a distributed store. The data plane is **CRAQ** (chain replication with apportioned reads); the control plane is an **embedded Raft** controller that replicates only topology plus low-volume user/bucket metadata - object data never enters the Raft log. Every node is given the same operator-supplied node key, so the derived tier-0 key hierarchy is identical and ciphertext is portable verbatim (no re-encryption on replication or migration).
-
-Enable per node with `[cluster] enabled = true` and the same node key on every node; one node bootstraps Raft and admits the others. Online migration moves data either direction between a single node and a cluster. The whole feature is off by default - with `enabled = false`, behavior is byte-for-byte single-node.
-
-A ready-to-run 5-node demo lives in [deploy/cluster/](deploy/cluster/):
-
-```sh
-make cluster-up      # build + start a 5-node cluster (podman-compose)
-make cluster-down    # stop and wipe its volumes
-```
-
-Full design, configuration, internal API, failure handling, and migration: [docs/clustering.md](docs/clustering.md).
-
 ## Object Data Security
 
 `y2qd` protects not just the object *contents* but the information *about* the data - sizes, names, labels, and the listing index. Every layer below is enforced by default (TLS and authorization are opt-in via config). Full design and threat model: [docs/architecture.md](docs/architecture.md).
@@ -568,8 +538,6 @@ Full design, configuration, internal API, failure handling, and migration: [docs
 | **Duress passwords** | Up to three additional passwords per account (`POST /api/v1/personas`), each unlocking a fully separate identity with its own bucket grants and an optional flag that silently switches every other live session on the account over to this persona on login, in place - deniable under coercion, no revocation, no silent alarm. | [docs/operations.md#duress-personas](docs/operations.md#duress-personas) |
 
 **What it does not defend against:** a compromised running daemon (a session's identity key is in memory while that session is active), a leaked Bearer token until it expires or is revoked, and traffic analysis when TLS is disabled. See the full [threat model](docs/architecture.md#threat-model-brief).
-
-> In **cluster mode** (experimental) every node is given the same operator-supplied node key, so all of the above holds identically on each node and ciphertext replicates verbatim (never re-encrypted). Inter-node traffic is authenticated by a shared secret or mutual TLS over the same TLS stack.
 
 ## Development
 

@@ -16,13 +16,11 @@ use std::sync::Arc;
 use actix_web::{HttpRequest, HttpResponse, web};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
-use y2q_cluster::LabelMode;
 use y2q_core::{AnyStorage, BucketPermission, Storage};
 
 use super::labels::extract_labels;
 use crate::auth::Authenticated;
 use crate::authz::authorize_bucket;
-use crate::cluster::{self, ClusterRuntime};
 use crate::config::LabelLimits;
 use crate::error::{AppError, ErrorBody};
 
@@ -30,6 +28,50 @@ use crate::error::{AppError, ErrorBody};
 pub struct TagQuery {
     #[serde(default)]
     op: Option<String>,
+}
+
+/// How a `PATCH` label edit combines with the object's existing labels.
+#[derive(Debug, Clone, Copy)]
+enum LabelMode {
+    /// Add the supplied labels to the existing set.
+    Set,
+    /// Remove every value of each supplied label name (or clear all if empty).
+    Remove,
+    /// Replace the entire set with the supplied labels.
+    Replace,
+}
+
+impl LabelMode {
+    /// Resolve an edit against `current` into the final label set. Inputs and
+    /// output are deduplicated and ordered (collected through a `BTreeSet`).
+    fn resolve(
+        self,
+        current: Vec<(String, String)>,
+        incoming: Vec<(String, String)>,
+    ) -> Vec<(String, String)> {
+        match self {
+            LabelMode::Set => {
+                let mut merged: BTreeSet<(String, String)> = current.into_iter().collect();
+                merged.extend(incoming);
+                merged.into_iter().collect()
+            }
+            LabelMode::Remove => {
+                if incoming.is_empty() {
+                    return Vec::new();
+                }
+                let names: BTreeSet<&String> = incoming.iter().map(|(n, _)| n).collect();
+                let kept: BTreeSet<(String, String)> = current
+                    .into_iter()
+                    .filter(|(n, _)| !names.contains(n))
+                    .collect();
+                kept.into_iter().collect()
+            }
+            LabelMode::Replace => {
+                let set: BTreeSet<(String, String)> = incoming.into_iter().collect();
+                set.into_iter().collect()
+            }
+        }
+    }
 }
 
 /// Response body for `PATCH /{bucket}/{key}`.
@@ -67,7 +109,6 @@ pub async fn handle(
     req: HttpRequest,
     storage: web::Data<Arc<AnyStorage>>,
     limits: web::Data<LabelLimits>,
-    cluster: Option<web::Data<ClusterRuntime>>,
     auth: Authenticated,
 ) -> Result<HttpResponse, AppError> {
     let (bucket, key) = path.into_inner();
@@ -85,30 +126,22 @@ pub async fn handle(
         }
     };
 
-    // Clustered: the edit is resolved at the chain HEAD against its committed
-    // copy and applied verbatim across the chain. The contact node may not hold
-    // the object, so it must not read the current set locally. Single-node:
-    // read-modify-write against the local copy.
-    let final_labels: BTreeSet<(String, String)> = if let Some(rt) = cluster.as_ref() {
-        cluster::chain_edit_labels(rt, &bucket, &key, mode, incoming.into_iter().collect()).await?
-    } else {
-        let current: Vec<(String, String)> = storage
-            .describe(&bucket, &key)
-            .await
-            .map_err(AppError::from)?
-            .labels
-            .into_iter()
-            .collect();
-        let resolved: BTreeSet<(String, String)> = mode
-            .resolve(current, incoming.into_iter().collect())
-            .into_iter()
-            .collect();
-        storage
-            .set_labels(&bucket, &key, resolved.clone())
-            .await
-            .map_err(AppError::from)?;
-        resolved
-    };
+    // Read-modify-write against the local copy.
+    let current: Vec<(String, String)> = storage
+        .describe(&bucket, &key)
+        .await
+        .map_err(AppError::from)?
+        .labels
+        .into_iter()
+        .collect();
+    let final_labels: BTreeSet<(String, String)> = mode
+        .resolve(current, incoming.into_iter().collect())
+        .into_iter()
+        .collect();
+    storage
+        .set_labels(&bucket, &key, final_labels.clone())
+        .await
+        .map_err(AppError::from)?;
 
     Ok(HttpResponse::Ok().json(SetTagsResponse {
         bucket,

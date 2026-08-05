@@ -10,7 +10,6 @@ use y2q_core::{AnyStorage, BucketPermission, ListOptions, Listing, MAX_LIST_LIMI
 
 use crate::auth::Authenticated;
 use crate::authz::authorize_bucket;
-use crate::cluster::{self, ClusterRuntime};
 use crate::error::{AppError, ErrorBody};
 
 /// Query-string parameters for `GET /{bucket}/`.
@@ -124,7 +123,6 @@ pub async fn handle(
     path: web::Path<String>,
     query: web::Query<ListQuery>,
     storage: web::Data<Arc<AnyStorage>>,
-    cluster: Option<web::Data<ClusterRuntime>>,
     auth: Authenticated,
 ) -> Result<HttpResponse, AppError> {
     let bucket = path.into_inner();
@@ -136,16 +134,10 @@ pub async fn handle(
         limit: q.limit.map(|n| n.min(MAX_LIST_LIMIT)),
     };
 
-    // Clustered: each object lives on R nodes, so a correct listing must
-    // scatter-gather across the cluster and dedup. Single-node serves locally.
-    let page = if let Some(rt) = cluster.as_ref() {
-        cluster::scatter_list(rt, Some(&bucket), None, &options).await?
-    } else {
-        storage
-            .list_objects(&bucket, options)
-            .await
-            .map_err(AppError::from)?
-    };
+    let page = storage
+        .list_objects(&bucket, options)
+        .await
+        .map_err(AppError::from)?;
 
     let response = ListObjectsResponse {
         items: page.items.into_iter().map(MetadataView::from).collect(),

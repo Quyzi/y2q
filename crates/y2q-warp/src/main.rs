@@ -349,7 +349,7 @@ async fn init_client(
     Ok((profile, client, expires_at, token))
 }
 
-/// One authed runtime per cluster node a multi-node run fans across.
+/// One authed runtime per target node a multi-node run fans across.
 struct NodeRuntime {
     /// Short label tagged onto every record (the round-robin endpoint index).
     label: String,
@@ -363,7 +363,7 @@ struct NodeRuntime {
     token_rx: watch::Receiver<Zeroizing<String>>,
 }
 
-/// Initialise one [`NodeRuntime`] per cluster node a multi-node run targets.
+/// Initialise one [`NodeRuntime`] per target node a multi-node run targets.
 ///
 /// Node 0 is the `alias` (token resolved from the cache, persisted on refresh).
 /// Each `--node` URL is an extra contact node reached with the alias's

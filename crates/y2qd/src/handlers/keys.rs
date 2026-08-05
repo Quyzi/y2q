@@ -3,10 +3,6 @@
 //! and the background job that migrates existing objects onto the newest
 //! epoch and prunes retired ones.
 //!
-//! `rekey` refuses outright when cluster mode is enabled — see
-//! [`y2q_core::Error::RekeyUnsupportedInCluster`] and `start_rekey`'s doc
-//! comment for why.
-//!
 //! Revocation only fully takes effect after all three steps run in order:
 //! `set_acl` (drop the ACL entry — kills live sessions, but old epochs the
 //! revoked user already held a real grant on are untouched), `rotate-key`
@@ -32,7 +28,6 @@ use crate::auth::{AuthState, Authenticated};
 use crate::authz::authorize_bucket;
 use crate::bucket_keys::{self, MAX_RETAINED_EPOCHS};
 use crate::cipher;
-use crate::cluster::{self, ClusterRuntime};
 use crate::error::{AppError, ErrorBody};
 
 /// State of a bucket's rekey job. Mirrors [`y2q_core::CacheRebuildStatus`],
@@ -74,12 +69,7 @@ impl RekeyRegistry {
 
     /// Claim the right to start a rekey job for `bucket`. Fails if one is
     /// already running — never silently overlaps two runs against the same
-    /// bucket, which could race on which epoch ends up pruned. This
-    /// guarantee is node-local only; it holds cluster-wide today solely
-    /// because `start_rekey` refuses outright whenever cluster mode is
-    /// enabled (see [`y2q_core::Error::RekeyUnsupportedInCluster`]) — if
-    /// that guard is ever lifted, this registry must become cluster-aware
-    /// (e.g. raft-backed) too, or two nodes could still race independently.
+    /// bucket, which could race on which epoch ends up pruned.
     fn try_start(&self, bucket: &str) -> Result<(), AppError> {
         let mut map = self.inner.lock().expect("rekey registry poisoned");
         if matches!(map.get(bucket), Some(RekeyState::Running(_))) {
@@ -139,7 +129,6 @@ pub async fn rotate_key(
     path: web::Path<String>,
     storage: web::Data<Arc<AnyStorage>>,
     state: web::Data<AuthState>,
-    cluster: Option<web::Data<ClusterRuntime>>,
     auth: Authenticated,
 ) -> Result<HttpResponse, AppError> {
     let bucket = path.into_inner();
@@ -152,10 +141,7 @@ pub async fn rotate_key(
         return Err(not_found(&bucket));
     }
 
-    // Clustered: read the raft *authoritative* in-memory state, not the
-    // local filesystem projection — same reasoning as `set_acl`.
-    let mut cfg =
-        authoritative_config(&storage, cluster.as_ref().map(|d| d.get_ref()), &bucket).await?;
+    let mut cfg = authoritative_config(&storage, &bucket).await?;
 
     let newest = bucket_keys::current_key(&cfg).cloned().ok_or_else(|| {
         AppError(y2q_core::Error::InternalError {
@@ -206,13 +192,7 @@ pub async fn rotate_key(
     cfg.keys.push(kv);
     let key_epochs: Vec<u32> = cfg.keys.iter().map(|k| k.epoch).collect();
 
-    persist_config(
-        &storage,
-        cluster.as_ref().map(|d| d.get_ref()),
-        &bucket,
-        &cfg,
-    )
-    .await?;
+    persist_config(&storage, &bucket, &cfg).await?;
 
     Ok(HttpResponse::Ok().json(RotateKeyResponse {
         epoch: new_epoch,
@@ -235,13 +215,7 @@ pub struct RekeyStartResponse {
 /// failure — including one caused by the caller not actually holding a real
 /// grant on some *older* epoch an object was written under — aborts the
 /// whole run without pruning anything; already-migrated objects stay on
-/// their new epoch (idempotent to re-run). Refuses with
-/// [`y2q_core::Error::RekeyUnsupportedInCluster`] when cluster mode is
-/// enabled: the migration below reads/writes through the node-local
-/// [`AnyStorage`] only, never `ClusterRuntime.distributed` (the
-/// CRAQ-replicated path other writes use), so a clustered run would migrate
-/// only the objects that happen to live on this node, then still prune the
-/// old epoch's key material deployment-wide.
+/// their new epoch (idempotent to re-run).
 #[utoipa::path(
     post,
     operation_id = "start_bucket_rekey",
@@ -254,7 +228,6 @@ pub struct RekeyStartResponse {
         (status = 404, description = "Bucket not found (or not visible to the caller)", body = ErrorBody, content_type = "application/json"),
         (status = 409, description = "A rekey is already running for this bucket", body = ErrorBody, content_type = "application/json"),
         (status = 500, description = "Internal error", body = ErrorBody, content_type = "application/json"),
-        (status = 501, description = "Rekey is not supported while cluster mode is enabled", body = ErrorBody, content_type = "application/json"),
     ),
     security(("bearer" = [])),
     tag = "buckets",
@@ -262,7 +235,6 @@ pub struct RekeyStartResponse {
 pub async fn start_rekey(
     path: web::Path<String>,
     storage: web::Data<Arc<AnyStorage>>,
-    cluster: Option<web::Data<ClusterRuntime>>,
     registry: web::Data<RekeyRegistry>,
     auth: Authenticated,
     encryption: web::Data<crate::config::EncryptionParams>,
@@ -277,23 +249,7 @@ pub async fn start_rekey(
         return Err(not_found(&bucket));
     }
 
-    // Rekey re-encrypts and prunes objects through the node-local storage
-    // backend only (`storage.get`/`begin_streaming_put`/`.commit()` below,
-    // and `collect_stale_keys`'s `storage.list_objects`) — never through
-    // `ClusterRuntime.distributed`, the CRAQ-replicated data path `head_write`
-    // and friends use. In a clustered deployment that means only the slice
-    // of the bucket's objects that happen to live on *this* node would be
-    // migrated, yet the run still prunes the old epoch's key material
-    // deployment-wide via raft on completion — permanently stranding every
-    // replica that was never independently rekeyed on its own node. Refuse
-    // outright rather than risk that until rekey is made cluster-aware.
-    if cluster.is_some() {
-        return Err(AppError(y2q_core::Error::RekeyUnsupportedInCluster {
-            bucket: bucket.clone(),
-        }));
-    }
-    let cfg =
-        authoritative_config(&storage, cluster.as_ref().map(|d| d.get_ref()), &bucket).await?;
+    let cfg = authoritative_config(&storage, &bucket).await?;
     let newest = bucket_keys::current_key(&cfg).cloned().ok_or_else(|| {
         AppError(y2q_core::Error::InternalError {
             bucket: bucket.clone(),
@@ -342,21 +298,12 @@ pub async fn start_rekey(
     }
 
     let storage = Arc::clone(storage.get_ref());
-    let cluster: Option<web::Data<ClusterRuntime>> = cluster.clone();
     let registry_bg = registry.get_ref().clone();
     let chunk_size = encryption.chunk_size_bytes;
     let bucket_bg = bucket.clone();
 
     tokio::spawn(async move {
-        let result = run_rekey(
-            &storage,
-            cluster.as_ref().map(|d| d.get_ref()),
-            &bucket_bg,
-            &epoch_sks,
-            chunk_size,
-            &registry_bg,
-        )
-        .await;
+        let result = run_rekey(&storage, &bucket_bg, &epoch_sks, chunk_size, &registry_bg).await;
         drop(epoch_sks);
         match result {
             Ok(()) => registry_bg.set(bucket_bg, RekeyState::Completed),
@@ -378,13 +325,12 @@ pub async fn start_rekey(
 /// `Running(percent)` entry as each object completes.
 async fn run_rekey(
     storage: &AnyStorage,
-    cluster: Option<&ClusterRuntime>,
     bucket: &str,
     epoch_sks: &BTreeMap<u32, Zeroizing<Vec<u8>>>,
     chunk_size: usize,
     registry: &RekeyRegistry,
 ) -> Result<(), String> {
-    let cfg = authoritative_config(storage, cluster, bucket)
+    let cfg = authoritative_config(storage, bucket)
         .await
         .map_err(|e| e.to_string())?;
     let newest = bucket_keys::current_key(&cfg)
@@ -461,11 +407,11 @@ async fn run_rekey(
     }
 
     // Prune every epoch below the newest and persist.
-    let mut cfg = authoritative_config(storage, cluster, bucket)
+    let mut cfg = authoritative_config(storage, bucket)
         .await
         .map_err(|e| e.to_string())?;
     cfg.keys.retain(|k| k.epoch == newest.epoch);
-    persist_config(storage, cluster, bucket, &cfg)
+    persist_config(storage, bucket, &cfg)
         .await
         .map_err(|e| e.to_string())?;
     Ok(())
@@ -512,45 +458,27 @@ fn base64_decode(s: &str) -> Result<Vec<u8>, base64::DecodeError> {
     STANDARD.decode(s)
 }
 
-/// Read `bucket`'s config from the authoritative source: raft in-memory
-/// state when clustered (the local filesystem projection can lag), the local
-/// sidecar otherwise. Same pattern `set_acl` uses.
+/// Read `bucket`'s config from the local sidecar.
 async fn authoritative_config(
     storage: &AnyStorage,
-    cluster: Option<&ClusterRuntime>,
     bucket: &str,
 ) -> Result<BucketConfig, AppError> {
-    match cluster {
-        Some(rt) => Ok(rt
-            .controller
-            .control_state()
-            .await
-            .buckets
-            .get(bucket)
-            .cloned()
-            .unwrap_or_default()),
-        None => storage
-            .get_bucket_config(bucket)
-            .await
-            .map_err(AppError::from),
-    }
+    storage
+        .get_bucket_config(bucket)
+        .await
+        .map_err(AppError::from)
 }
 
-/// Persist `cfg` for `bucket` through the same path `set_acl` uses: raft
-/// `SetBucketConfig` when clustered, the local sidecar otherwise.
+/// Persist `cfg` for `bucket` through the local sidecar. Same path `set_acl` uses.
 async fn persist_config(
     storage: &AnyStorage,
-    cluster: Option<&ClusterRuntime>,
     bucket: &str,
     cfg: &BucketConfig,
 ) -> Result<(), AppError> {
-    match cluster {
-        Some(rt) => cluster::cluster_set_bucket_config(rt, bucket, cfg).await,
-        None => storage
-            .set_bucket_config(bucket, cfg)
-            .await
-            .map_err(AppError::from),
-    }
+    storage
+        .set_bucket_config(bucket, cfg)
+        .await
+        .map_err(AppError::from)
 }
 
 /// Response body for `GET /api/v1/buckets/{bucket}/rekey`.

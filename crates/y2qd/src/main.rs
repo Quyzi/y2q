@@ -87,7 +87,6 @@ mod authz;
 mod bucket_keys;
 mod cipher;
 mod cli;
-mod cluster;
 mod config;
 mod error;
 mod handlers;
@@ -415,10 +414,7 @@ async fn main() -> std::io::Result<()> {
     // Install the node key on the active backend — the daemon's own keys
     // (index, paths, object metadata) now come from the operator, not from
     // whoever logs in first. Drop the raw key immediately afterward; every
-    // holder from here on is a derived, domain-separated sub-key. Cluster
-    // builds also need the Control Store Key (CSK) to encrypt the Raft
-    // control redb; derive it now, before the raw node key is dropped.
-    let control_store_key = y2q_core::crypto::derive_control_store_key(&nk);
+    // holder from here on is a derived, domain-separated sub-key.
     storage_data.install_node_key(*nk);
     drop(nk);
 
@@ -441,34 +437,6 @@ async fn main() -> std::io::Result<()> {
         cfg.auth.clone(),
         cfg.crypto.argon2.clone(),
     ));
-
-    // Build the cluster runtime (control plane) when clustering is enabled.
-    // Cluster admission is fingerprinted by the node-key verifier — every
-    // node already has its own node key, so there is no unlock secret to
-    // provision here.
-    let cluster_runtime: Option<web::Data<cluster::ClusterRuntime>> = if cfg.cluster.enabled {
-        let rt = cluster::build_runtime(
-            &cfg,
-            Arc::clone(storage_data.as_ref()),
-            &node_key_fingerprint,
-            control_store_key,
-        )
-        .await
-        .map_err(|e| std::io::Error::other(format!("cluster startup: {e}")))?;
-        let rt = web::Data::new(rt);
-        // Leader-driven failure detection + re-splice loop.
-        cluster::spawn_maintenance(
-            rt.clone(),
-            cfg.cluster.health_probe_interval_ms,
-            cfg.cluster.health_fail_threshold,
-        );
-        // Mirror the replicated bucket + user registries into local stores on
-        // every apply (a joined node inherits all bucket configs and users).
-        cluster::spawn_registry_projector(rt.clone(), auth_state.clone());
-        Some(rt)
-    } else {
-        None
-    };
 
     // Background sweeper for expired sessions.
     {
@@ -567,14 +535,6 @@ async fn main() -> std::io::Result<()> {
                     Matcher::Suffix(observability::STORAGE_DURATION_METRIC_SUFFIX.to_string()),
                     observability::STORAGE_DURATION_BUCKETS_MILLIS,
                 ),
-                (
-                    Matcher::Full(observability::CLUSTER_PREPARE_HOP_DURATION.to_string()),
-                    observability::DURATION_BUCKETS_MILLIS,
-                ),
-                (
-                    Matcher::Full(observability::CLUSTER_COMMIT_DURATION.to_string()),
-                    observability::DURATION_BUCKETS_MILLIS,
-                ),
             ],
         };
         let dashboard_scope = create_metrics_actx_scope(&dashboard_input)
@@ -596,12 +556,6 @@ async fn main() -> std::io::Result<()> {
             .app_data(rekey_registry.clone())
             .app_data(auth_state.clone())
             .app_data(web::PayloadConfig::new(max_body_bytes));
-        // Register cluster routes before handlers::configure so the specific
-        // /internal/v1 and /api/v1/cluster paths win over the greedy object
-        // route. Only present when clustering is enabled.
-        if let Some(rt) = &cluster_runtime {
-            app = app.app_data(rt.clone()).configure(cluster::configure);
-        }
         // Swagger UI and metrics dashboard are unauthenticated (actix doesn't
         // make it easy to wrap third-party scopes with our extractor). Only
         // register them when the operator has explicitly opted in.

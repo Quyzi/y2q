@@ -25,7 +25,6 @@ use y2q_core::{AnyStorage, Error as CoreError, Listing};
 
 use crate::auth::{AuthState, Authenticated};
 use crate::bucket_keys::{self, GranteeSlots};
-use crate::cluster::{self, ClusterRuntime};
 use crate::error::AppError;
 
 /// `POST`/`DELETE /api/v1/personas/{slot}/grant` request body.
@@ -64,13 +63,12 @@ fn validate_slot(slot: usize) -> Result<(), AppError> {
     security(("bearer" = [])),
     tag = "personas",
 )]
-#[tracing::instrument(skip(storage, state, cluster, auth, body), fields(username = %auth.username))]
+#[tracing::instrument(skip(storage, state, auth, body), fields(username = %auth.username))]
 pub async fn grant_persona(
     path: web::Path<u8>,
     body: web::Json<PersonaGrantBody>,
     storage: web::Data<Arc<AnyStorage>>,
     state: web::Data<AuthState>,
-    cluster: Option<web::Data<ClusterRuntime>>,
     auth: Authenticated,
 ) -> Result<HttpResponse, AppError> {
     share_or_revoke(
@@ -78,7 +76,6 @@ pub async fn grant_persona(
         body.into_inner(),
         storage.get_ref(),
         state.get_ref(),
-        cluster.as_ref().map(|d| d.get_ref()),
         &auth,
         true,
     )
@@ -102,13 +99,12 @@ pub async fn grant_persona(
     security(("bearer" = [])),
     tag = "personas",
 )]
-#[tracing::instrument(skip(storage, state, cluster, auth, body), fields(username = %auth.username))]
+#[tracing::instrument(skip(storage, state, auth, body), fields(username = %auth.username))]
 pub async fn revoke_persona_grant(
     path: web::Path<u8>,
     body: web::Json<PersonaGrantBody>,
     storage: web::Data<Arc<AnyStorage>>,
     state: web::Data<AuthState>,
-    cluster: Option<web::Data<ClusterRuntime>>,
     auth: Authenticated,
 ) -> Result<HttpResponse, AppError> {
     share_or_revoke(
@@ -116,7 +112,6 @@ pub async fn revoke_persona_grant(
         body.into_inner(),
         storage.get_ref(),
         state.get_ref(),
-        cluster.as_ref().map(|d| d.get_ref()),
         &auth,
         false,
     )
@@ -129,7 +124,6 @@ async fn share_or_revoke(
     body: PersonaGrantBody,
     storage: &AnyStorage,
     state: &AuthState,
-    cluster: Option<&ClusterRuntime>,
     auth: &Authenticated,
     authorize_target: bool,
 ) -> Result<(), AppError> {
@@ -161,30 +155,19 @@ async fn share_or_revoke(
         .collect();
 
     for bucket in &body.buckets {
-        let cfg = match cluster {
-            Some(rt) => rt
-                .controller
-                .control_state()
-                .await
-                .buckets
-                .get(bucket)
-                .cloned(),
-            None => {
-                if storage
-                    .bucket_exists(bucket)
+        let cfg = if storage
+            .bucket_exists(bucket)
+            .await
+            .map_err(AppError::from)?
+        {
+            Some(
+                storage
+                    .get_bucket_config(bucket)
                     .await
-                    .map_err(AppError::from)?
-                {
-                    Some(
-                        storage
-                            .get_bucket_config(bucket)
-                            .await
-                            .map_err(AppError::from)?,
-                    )
-                } else {
-                    None
-                }
-            }
+                    .map_err(AppError::from)?,
+            )
+        } else {
+            None
         };
         let Some(mut cfg) = cfg else { continue }; // no such bucket: nothing to share
         if cfg.keys.is_empty() {
@@ -221,14 +204,10 @@ async fn share_or_revoke(
         if !changed {
             continue;
         }
-        if let Some(rt) = cluster {
-            cluster::cluster_set_bucket_config(rt, bucket, &cfg).await?;
-        } else {
-            storage
-                .set_bucket_config(bucket, &cfg)
-                .await
-                .map_err(AppError::from)?;
-        }
+        storage
+            .set_bucket_config(bucket, &cfg)
+            .await
+            .map_err(AppError::from)?;
     }
     Ok(())
 }

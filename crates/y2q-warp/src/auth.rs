@@ -58,7 +58,7 @@ pub async fn resolve_token(
 }
 
 /// Log into a single node directly (bypassing the token-store cache), returning
-/// the node-local bearer token and its expiry. Used for the extra cluster nodes
+/// the node-local bearer token and its expiry. Used for the extra target nodes
 /// a multi-node run fans across; their tokens are per-run and in-memory only,
 /// because sessions are node-local and the alias's cached token is node-0's.
 pub async fn login_node(
@@ -72,7 +72,7 @@ pub async fn login_node(
 
 /// Spawn a background task that refreshes the token 5 minutes before expiry.
 /// Sends updated tokens on `tx`. When `alias` is `Some`, the refreshed token is
-/// also written back to tokens.toml; extra cluster nodes pass `None` so their
+/// also written back to tokens.toml; extra target nodes pass `None` so their
 /// per-run, node-local tokens stay in memory and never clobber the alias entry.
 pub fn spawn_refresh_task(
     client: Y2qClient,

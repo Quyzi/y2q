@@ -77,11 +77,9 @@ const FORMAT_VER_V3: u16 = 3;
 pub const DEFAULT_CHUNK_SIZE_BYTES: usize = 4 << 20;
 /// Byte offset of `plaintext_len` inside the v3 fixed header.
 ///
-/// Public so cluster replicas can backfill this field verbatim: the CRAQ HEAD
-/// patches it locally at `finish()` but does not forward the patch down-chain
-/// (the [`Tee`](crate::storage::streaming_sink::StreamingSink::Tee) only mirrors
-/// appends), so a downstream node applies the same patch from a PREPARE header
-/// to keep its on-disk envelope byte-identical.
+/// `EncryptSession::finish` patches this field in place once the true
+/// plaintext length is known, after the rest of the header has already been
+/// written.
 pub const V3_PLAINTEXT_LEN_OFFSET: u64 = 24;
 
 // ── shared constants ─────────────────────────────────────────────────────────
