@@ -82,6 +82,48 @@ pub fn decrypt_v3_chunks(
         })
 }
 
+/// Decrypt a contiguous run of v4 chunks for a ranged GET. Same contract as
+/// [`decrypt_v3_chunks`] plus `total_chunks` — the object's true total chunk
+/// count, required so the v4 final-chunk AAD marker (see
+/// `y2q_core::crypto::envelope`'s module docs) is applied to the right
+/// chunk. See [`decrypt_v4_chunks`] in `envelope` for how callers compute it.
+#[allow(clippy::too_many_arguments)]
+pub fn decrypt_v4_chunks(
+    bucket_sk: &[u8],
+    bucket: &str,
+    key: &str,
+    preamble: &[u8],
+    chunks_ct: &[u8],
+    first_chunk_idx: u64,
+    total_chunks: u64,
+) -> Result<Vec<u8>, AppError> {
+    envelope::decrypt_v4_chunks(
+        bucket_sk,
+        preamble,
+        chunks_ct,
+        first_chunk_idx,
+        total_chunks,
+        bucket,
+        key,
+    )
+    .map_err(|e| match e {
+        y2q_core::crypto::CryptoError::UnsupportedVersion(v) => {
+            AppError(y2q_core::Error::UnsupportedEnvelopeVersion { version: v })
+        }
+        y2q_core::crypto::CryptoError::Envelope(reason) => {
+            AppError(y2q_core::Error::EnvelopeMalformed {
+                bucket: bucket.to_owned(),
+                key: key.to_owned(),
+                reason: reason.to_owned(),
+            })
+        }
+        _ => AppError(y2q_core::Error::DecryptionFailed {
+            bucket: bucket.to_owned(),
+            key: key.to_owned(),
+        }),
+    })
+}
+
 /// Stream-encrypt a PUT payload directly to `file` using the v3 chunked
 /// envelope format, computing plaintext checksums along the way.
 ///
