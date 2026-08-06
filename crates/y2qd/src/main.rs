@@ -585,6 +585,21 @@ async fn main() -> std::io::Result<()> {
         .shutdown_timeout(actix_shutdown);
 
     let bind_addr = (cfg.server.host.as_str(), cfg.server.port);
+    if !cfg.server.tls.enabled {
+        if !config::host_is_loopback(&cfg.server.host) && !cfg.server.allow_insecure_bind {
+            return Err(std::io::Error::other(format!(
+                "refusing to bind {}:{} without TLS ([server.tls] enabled = false) on a \
+                 non-loopback address — session tokens, passwords, and object plaintext \
+                 would cross the network unencrypted. Enable TLS, bind a loopback \
+                 address (127.0.0.1/::1), or set [server] allow_insecure_bind = true \
+                 to override.",
+                cfg.server.host, cfg.server.port
+            )));
+        }
+        tracing::warn!(
+            "TLS disabled — y2qd is serving plaintext HTTP. Set [server.tls] enabled = true for production."
+        );
+    }
     let server = if cfg.server.tls.enabled {
         let cert_path = cfg.server.tls.cert_path.as_deref().ok_or_else(|| {
             std::io::Error::other("server.tls.enabled = true but server.tls.cert_path is unset")
@@ -622,9 +637,6 @@ async fn main() -> std::io::Result<()> {
         }
         server.bind_rustls_0_23(bind_addr, tls_cfg)?
     } else {
-        tracing::warn!(
-            "TLS disabled — y2qd is serving plaintext HTTP. Set [server.tls] enabled = true for production."
-        );
         server.bind(bind_addr)?
     };
 
