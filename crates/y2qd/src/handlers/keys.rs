@@ -164,7 +164,7 @@ pub async fn rotate_key(
     // only a real grantee's own persona can recover. A global admin with no
     // grant on this bucket cannot conjure one here either (see `set_acl`'s
     // matching comment on the strict-admin-exclusion property).
-    bucket_keys::open_bwk(
+    bucket_keys::open_verified_bwk(
         &cfg,
         &bucket,
         newest.epoch,
@@ -258,7 +258,7 @@ pub async fn start_rekey(
             message: "bucket has no key material yet".to_owned(),
         })
     })?;
-    bucket_keys::open_bwk(
+    bucket_keys::open_verified_bwk(
         &cfg,
         &bucket,
         newest.epoch,

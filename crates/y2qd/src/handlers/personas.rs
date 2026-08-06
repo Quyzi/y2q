@@ -21,9 +21,10 @@ use actix_web::{HttpResponse, web};
 use serde::Deserialize;
 use utoipa::ToSchema;
 use y2q_core::crypto::CREDENTIAL_SLOTS;
-use y2q_core::{AnyStorage, Error as CoreError, Listing};
+use y2q_core::{AnyStorage, BucketPermission, Error as CoreError, Listing};
 
 use crate::auth::{AuthState, Authenticated};
+use crate::authz::authorize_bucket;
 use crate::bucket_keys::{self, GranteeSlots};
 use crate::error::AppError;
 
@@ -177,10 +178,25 @@ async fn share_or_revoke(
         let mut changed = false;
         for i in 0..cfg.keys.len() {
             let epoch = cfg.keys[i].epoch;
-            // Recover the caller's own BWK at this epoch. If the caller has
-            // no real grant here, there's nothing of theirs to share/revoke
-            // at this epoch — skip it rather than error.
-            let Ok(bwk) = bucket_keys::open_bwk(
+            // The caller must still hold an active, authorized relationship
+            // to this bucket — not merely a stale cryptographic grant on an
+            // old epoch left over from before an ACL revocation. Skip
+            // (rather than error) so a partial bucket list still processes
+            // every bucket the caller genuinely can act on.
+            if authorize_bucket(auth, storage, bucket, BucketPermission::Read)
+                .await
+                .is_err()
+            {
+                continue;
+            }
+            // Recover the caller's own BWK at this epoch, verifying it's a
+            // REAL grant and not a decoy — `open_bwk` alone cannot tell the
+            // two apart (see its doc comment), and a decoy/duress persona
+            // passing this gate could otherwise overwrite the real
+            // grantee's row with garbage. If the caller has no real grant
+            // here, there's nothing of theirs to share/revoke at this
+            // epoch — skip it rather than error.
+            let Ok(bwk) = bucket_keys::open_verified_bwk(
                 &cfg,
                 bucket,
                 epoch,
@@ -208,6 +224,14 @@ async fn share_or_revoke(
             .set_bucket_config(bucket, &cfg)
             .await
             .map_err(AppError::from)?;
+    }
+    if !authorize_target {
+        // Withdrawing access: a session already opened through the target
+        // persona holds the plaintext bucket secret key in its per-session
+        // cache (see `bucket_keys::resolve_read_key`), which a config
+        // change alone does not invalidate. Drop its sessions so a token
+        // minted under the old grant can't keep reading from cache.
+        state.sessions.revoke_user_persona(&auth.username, slot);
     }
     Ok(())
 }
