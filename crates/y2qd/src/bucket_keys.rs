@@ -221,6 +221,15 @@ pub fn put_grant_slot(
 /// Every failure path — missing bucket key config, missing epoch, missing
 /// grant entry for this user, an out-of-range slot, or an AEAD open failure
 /// — returns the same [`Error::Forbidden`]; see [`read_key`]'s docs for why.
+///
+/// **This function alone does NOT prove the caller holds a real (non-decoy)
+/// grant.** A decoy slot is sealed with 32 freshly-generated random bytes
+/// under the identical AAD a real slot uses, so its AEAD open succeeds
+/// exactly like a real grant's — that's the whole point of the deniability
+/// property (see the module docs): the server itself cannot tell them
+/// apart from the ciphertext alone. Any caller treating a successful
+/// `open_bwk` as proof of authorization (rather than merely a candidate
+/// BWK to further verify) MUST use [`open_verified_bwk`] instead.
 pub fn open_bwk(
     config: &BucketConfig,
     bucket: &str,
@@ -250,6 +259,40 @@ pub fn open_bwk(
     let grant_aad = bucket_grant_aad(bucket, epoch, username, slot);
     let bwk = open_sealed(identity_sk, sealed, &grant_aad).map_err(|_| forbidden(bucket))?;
     bwk.as_slice().try_into().map_err(|_| forbidden(bucket))
+}
+
+/// Like [`open_bwk`], but additionally verifies the recovered BWK actually
+/// unwraps this epoch's `sk_blob` before returning it — i.e. confirms the
+/// caller holds a REAL grant, not merely a decoy. `open_bwk` alone cannot
+/// make this distinction (see its doc comment); every caller that uses a
+/// successful open as proof of authorization — `rotate-key`, `rekey`,
+/// `set_acl`, and persona-grant share/revoke all gate on "does this caller
+/// hold real crypto access on this epoch" — MUST call this instead of
+/// `open_bwk` directly, or a duress/decoy persona passes the gate and can
+/// mint a new epoch it alone can read, reseal grantees with garbage,
+/// destroy the real grantee's access, or overwrite decoy rows into other
+/// personas' slots.
+pub fn open_verified_bwk(
+    config: &BucketConfig,
+    bucket: &str,
+    epoch: u32,
+    username: &str,
+    slot: usize,
+    identity_sk: &[u8],
+) -> Result<[u8; 32], Error> {
+    let kv = config
+        .keys
+        .iter()
+        .find(|k| k.epoch == epoch)
+        .ok_or_else(|| forbidden(bucket))?;
+    let bwk = open_bwk(config, bucket, epoch, username, slot, identity_sk)?;
+    let sk_aad = bucket_sk_wrap_aad(bucket, epoch);
+    // Discard the unwrapped secret key — this call's only purpose is to
+    // confirm `bwk` actually opens `sk_blob`, i.e. that it's real. Every
+    // failure here collapses to the same `Forbidden` as every other
+    // failure mode, matching `read_key`'s no-distinguishing-oracle property.
+    unwrap_with_key(&kv.sk_blob, &bwk, &sk_aad).map_err(|_| forbidden(bucket))?;
+    Ok(bwk)
 }
 
 /// Recover the bucket secret key for `bucket` at `epoch`, using `identity_sk`
@@ -553,5 +596,111 @@ mod tests {
             lens.iter().all(|&l| l == lens[0]),
             "sealed grant lengths differ: {lens:?}"
         );
+    }
+
+    #[test]
+    fn open_bwk_accepts_a_decoy_slot_but_open_verified_bwk_rejects_it() {
+        // Regression test for the fix: `open_bwk` alone cannot distinguish
+        // a decoy from a real grant (both are validly-sealed AEAD
+        // ciphertext under the identical AAD — that's the deniability
+        // property working as designed). `open_verified_bwk` closes the
+        // gap by additionally confirming the recovered BWK unwraps
+        // `sk_blob`.
+        let (alice_pk0, alice_sk0) = identity(0);
+        let (alice_pk1, alice_sk1) = identity(1);
+        let (j2, _) = identity(2);
+        let (j3, _) = identity(3);
+        let pks = vec![alice_pk0, alice_pk1, j2, j3];
+
+        // Only slot 0 (the real persona) is authorized; slot 1 is the
+        // duress persona and gets a decoy.
+        let (kv, real_bwk) =
+            new_bucket_key_version(0, "b", &[("alice".to_owned(), slots_for(&pks, &[0]))]).unwrap();
+        let mut cfg = BucketConfig::default();
+        cfg.keys.push(kv);
+
+        // `open_bwk` still succeeds for the decoy slot — that's inherent to
+        // the deniability property, not a bug.
+        let decoy_opened = open_bwk(&cfg, "b", 0, "alice", 1, &alice_sk1);
+        assert!(decoy_opened.is_ok());
+        assert_ne!(decoy_opened.unwrap(), *real_bwk);
+
+        // `open_verified_bwk` correctly rejects it...
+        assert!(matches!(
+            open_verified_bwk(&cfg, "b", 0, "alice", 1, &alice_sk1),
+            Err(Error::Forbidden { .. })
+        ));
+        // ...and correctly accepts the real persona's real grant.
+        assert_eq!(
+            open_verified_bwk(&cfg, "b", 0, "alice", 0, &alice_sk0).unwrap(),
+            *real_bwk
+        );
+    }
+
+    #[test]
+    fn open_verified_bwk_prevents_rotation_hijack_by_a_decoy_persona() {
+        // Regression test for the rotate_key/start_rekey attack: with the
+        // old open_bwk-only gate, a duress persona could pass the
+        // precondition and mint a new epoch real only to itself. With
+        // open_verified_bwk, the gate now fails for the duress persona
+        // before any new epoch is ever minted.
+        let (alice_pk0, alice_sk0) = identity(0);
+        let (alice_pk1, alice_sk1) = identity(1);
+        let (j2, _) = identity(2);
+        let (j3, _) = identity(3);
+        let pks = vec![alice_pk0, alice_pk1, j2, j3];
+
+        let (kv, _) =
+            new_bucket_key_version(0, "b", &[("alice".to_owned(), slots_for(&pks, &[0]))]).unwrap();
+        let mut cfg = BucketConfig {
+            owner: Some("alice".to_owned()),
+            ..Default::default()
+        };
+        cfg.keys.push(kv);
+
+        // The duress persona (slot 1) no longer passes the precondition.
+        assert!(matches!(
+            open_verified_bwk(&cfg, "b", 0, "alice", 1, &alice_sk1),
+            Err(Error::Forbidden { .. })
+        ));
+        // The real persona (slot 0) still does.
+        assert!(open_verified_bwk(&cfg, "b", 0, "alice", 0, &alice_sk0).is_ok());
+    }
+
+    #[test]
+    fn open_verified_bwk_prevents_a_decoy_persona_from_destroying_the_real_grant() {
+        // Regression test: with the fix, a decoy persona cannot pass the
+        // precondition that `personas::share_or_revoke` uses before
+        // overwriting a grant row, so it can no longer clobber the real
+        // persona's real grant with a garbage-BWK reseal.
+        let (alice_pk0, alice_sk0) = identity(0);
+        let (alice_pk1, alice_sk1) = identity(1);
+        let (alice_pk2, _) = identity(2);
+        let (alice_pk3, _) = identity(3);
+        let pks = vec![alice_pk0, alice_pk1, alice_pk2, alice_pk3];
+
+        let mut cfg = BucketConfig {
+            owner: Some("alice".to_owned()),
+            ..Default::default()
+        };
+        for epoch in [0u32, 1] {
+            let (kv, _) =
+                new_bucket_key_version(epoch, "b", &[("alice".to_owned(), slots_for(&pks, &[0]))])
+                    .unwrap();
+            cfg.keys.push(kv);
+        }
+
+        for epoch in [0u32, 1] {
+            assert!(matches!(
+                open_verified_bwk(&cfg, "b", epoch, "alice", 1, &alice_sk1),
+                Err(Error::Forbidden { .. })
+            ));
+        }
+        // The real persona's access on both epochs is untouched — nothing
+        // was ever resealed, since the duress persona never got past the
+        // precondition to call `put_grant_slot` at all.
+        for epoch in [0u32, 1] {
+            assert!(read_key(&cfg, "b", epoch, "alice", 0, &alice_sk0).is_ok());
+        }
     }
 }

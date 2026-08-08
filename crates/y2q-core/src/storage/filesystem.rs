@@ -58,12 +58,21 @@ impl FilesystemStorage {
     /// secondary metadata index file at `index_path`.
     pub fn new(base_path: impl Into<PathBuf>, index_path: impl AsRef<Path>) -> Result<Self, Error> {
         let base_path = base_path.into();
-        std::fs::create_dir_all(&base_path).map_err(|e| Error::InternalError {
-            bucket: String::new(),
-            key: String::new(),
-            operation: "open".to_owned(),
-            message: format!("create base_path: {e}"),
-        })?;
+        let mut base_dir_builder = std::fs::DirBuilder::new();
+        base_dir_builder.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            base_dir_builder.mode(0o700);
+        }
+        base_dir_builder
+            .create(&base_path)
+            .map_err(|e| Error::InternalError {
+                bucket: String::new(),
+                key: String::new(),
+                operation: "open".to_owned(),
+                message: format!("create base_path: {e}"),
+            })?;
         let base_path = std::fs::canonicalize(&base_path).map_err(|e| Error::InternalError {
             bucket: String::new(),
             key: String::new(),
@@ -242,7 +251,12 @@ pub(crate) async fn create_bucket_impl(
     if tokio::fs::try_exists(&dir).await.unwrap_or(false) {
         return Ok(false);
     }
-    tokio::fs::create_dir_all(&dir)
+    let mut bucket_dir_builder = tokio::fs::DirBuilder::new();
+    bucket_dir_builder.recursive(true);
+    #[cfg(unix)]
+    bucket_dir_builder.mode(0o700);
+    bucket_dir_builder
+        .create(&dir)
         .await
         .map_err(|e| Error::InternalError {
             bucket: bucket.to_owned(),
@@ -384,12 +398,17 @@ pub(crate) async fn set_labels_impl(
     let header =
         Header::decode(&header_buf).map_err(|e| internal(format!("decode header: {e}")))?;
 
+    if header
+        .checked_total_len()
+        .is_none_or(|total| total > bytes.len() as u64)
+    {
+        return Err(internal(
+            "header fields inconsistent with file length".to_owned(),
+        ));
+    }
     let data_start = header.data_offset as usize;
     let meta_start = header.meta_offset() as usize;
     let meta_end = meta_start + header.meta_len as usize;
-    if meta_end > bytes.len() {
-        return Err(internal("meta block extends past end of file".to_owned()));
-    }
     let data = &bytes[data_start..meta_start];
     let meta_bytes = &bytes[meta_start..meta_end];
 
@@ -860,7 +879,12 @@ impl FilesystemStorage {
         let tmp_path = obj_path.with_extension("tmp");
 
         if let Some(parent) = obj_path.parent() {
-            tokio::fs::create_dir_all(parent)
+            let mut shard_dir_builder = tokio::fs::DirBuilder::new();
+            shard_dir_builder.recursive(true);
+            #[cfg(unix)]
+            shard_dir_builder.mode(0o700);
+            shard_dir_builder
+                .create(parent)
                 .await
                 .map_err(|e| Error::InternalError {
                     bucket: bucket.to_owned(),
@@ -889,11 +913,11 @@ impl FilesystemStorage {
 
         let lock = self.locks.try_acquire(bucket, key)?;
 
-        let mut file = tokio::fs::OpenOptions::new()
-            .write(true)
-            .read(true)
-            .create(true)
-            .truncate(true)
+        let mut open_opts = tokio::fs::OpenOptions::new();
+        open_opts.write(true).read(true).create(true).truncate(true);
+        #[cfg(unix)]
+        open_opts.mode(0o600);
+        let mut file = open_opts
             .open(&tmp_path)
             .await
             .map_err(|e| Error::InternalError {
@@ -973,6 +997,28 @@ impl Storage for FilesystemStorage {
                 operation: "get".to_owned(),
                 message: format!("decode header: {e}"),
             })?;
+
+            let file_len = file
+                .metadata()
+                .await
+                .map_err(|e| Error::InternalError {
+                    bucket: bucket.to_owned(),
+                    key: key.to_owned(),
+                    operation: "get".to_owned(),
+                    message: format!("stat: {e}"),
+                })?
+                .len();
+            if header
+                .checked_total_len()
+                .is_none_or(|total| total > file_len)
+            {
+                return Err(Error::InternalError {
+                    bucket: bucket.to_owned(),
+                    key: key.to_owned(),
+                    operation: "get".to_owned(),
+                    message: "header fields inconsistent with file length".to_owned(),
+                });
+            }
 
             file.seek(std::io::SeekFrom::Start(header.data_offset as u64))
                 .await
@@ -1092,7 +1138,12 @@ impl Storage for FilesystemStorage {
             let tmp_path = obj_path.with_extension("tmp");
 
             if let Some(parent) = obj_path.parent() {
-                tokio::fs::create_dir_all(parent)
+                let mut shard_dir_builder = tokio::fs::DirBuilder::new();
+                shard_dir_builder.recursive(true);
+                #[cfg(unix)]
+                shard_dir_builder.mode(0o700);
+                shard_dir_builder
+                    .create(parent)
                     .await
                     .map_err(|e| Error::InternalError {
                         bucket: bucket.to_owned(),
@@ -1209,18 +1260,20 @@ impl Storage for FilesystemStorage {
                 version: format::VERSION,
             };
 
-            let mut tmp_file = tokio::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(&tmp_path)
-                .await
-                .map_err(|e| Error::InternalError {
-                    bucket: bucket.to_owned(),
-                    key: key.to_owned(),
-                    operation: "put".to_owned(),
-                    message: e.to_string(),
-                })?;
+            let mut tmp_open_opts = tokio::fs::OpenOptions::new();
+            tmp_open_opts.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            tmp_open_opts.mode(0o600);
+            let mut tmp_file =
+                tmp_open_opts
+                    .open(&tmp_path)
+                    .await
+                    .map_err(|e| Error::InternalError {
+                        bucket: bucket.to_owned(),
+                        key: key.to_owned(),
+                        operation: "put".to_owned(),
+                        message: e.to_string(),
+                    })?;
 
             tmp_file
                 .write_all(&header.encode())
@@ -1361,6 +1414,28 @@ impl Storage for FilesystemStorage {
                 message: format!("decode header: {e}"),
             })?;
 
+            let file_len = file
+                .metadata()
+                .await
+                .map_err(|e| Error::InternalError {
+                    bucket: bucket.to_owned(),
+                    key: key.to_owned(),
+                    operation: "delete".to_owned(),
+                    message: format!("stat: {e}"),
+                })?
+                .len();
+            if header
+                .checked_total_len()
+                .is_none_or(|total| total > file_len)
+            {
+                return Err(Error::InternalError {
+                    bucket: bucket.to_owned(),
+                    key: key.to_owned(),
+                    operation: "delete".to_owned(),
+                    message: "header fields inconsistent with file length".to_owned(),
+                });
+            }
+
             file.seek(std::io::SeekFrom::Start(header.data_offset as u64))
                 .await
                 .map_err(|e| Error::InternalError {
@@ -1381,7 +1456,16 @@ impl Storage for FilesystemStorage {
                 })?;
             drop(file);
 
-            tokio::fs::remove_file(&obj_path).await.ok();
+            if let Err(e) = tokio::fs::remove_file(&obj_path).await
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                return Err(Error::InternalError {
+                    bucket: bucket.to_owned(),
+                    key: key.to_owned(),
+                    operation: "delete".to_owned(),
+                    message: format!("unlink: {e}"),
+                });
+            }
 
             if let Err(e) = self.index.remove(bucket, key).await {
                 tracing::warn!(
@@ -1962,6 +2046,101 @@ mod tests {
         let err = s.get("b", "k").await.unwrap_err();
         assert!(matches!(err, crate::Error::NotFound { .. }));
         assert!(!s.key_path("b", "k").unwrap().exists());
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn delete_propagates_unlink_error_and_keeps_index_row() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (s, _dir) = make_storage();
+        s.put("b", "k", make_object(b"data"), PutOptions::default())
+            .await
+            .unwrap();
+        let obj_path = s.key_path("b", "k").unwrap();
+        let shard_dir = obj_path.parent().unwrap().to_path_buf();
+
+        // Strip write permission on the containing shard directory so the
+        // unlink inside `delete` fails with EACCES instead of succeeding.
+        let orig_perm = std::fs::metadata(&shard_dir).unwrap().permissions();
+        std::fs::set_permissions(&shard_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let result = s.delete("b", "k").await;
+
+        // Restore permissions unconditionally (even if an assertion below
+        // panics) so the tempdir can be cleaned up.
+        std::fs::set_permissions(&shard_dir, orig_perm).unwrap();
+
+        assert!(
+            matches!(result, Err(crate::Error::InternalError { .. })),
+            "a genuine unlink failure must propagate, not be swallowed: {result:?}"
+        );
+        // The index row must NOT have been removed since the unlink failed:
+        // the object is still readable.
+        let got = s.get("b", "k").await.unwrap();
+        assert_eq!(&got[..], b"data");
+    }
+
+    #[tokio::test]
+    async fn delete_ignores_already_missing_obj_file() {
+        // A `NotFound` unlink (the file is already gone) is idempotent-delete
+        // semantics, not an error — unlike a genuine permission/IO failure.
+        let (s, _dir) = make_storage();
+        s.put("b", "k", make_object(b"data"), PutOptions::default())
+            .await
+            .unwrap();
+        let obj_path = s.key_path("b", "k").unwrap();
+        tokio::fs::remove_file(&obj_path).await.unwrap();
+        // `delete` re-opens the file itself first, so a pre-vanished file
+        // surfaces as `NotFound` from the initial open, exercising the same
+        // `ErrorKind::NotFound`-is-fine code path as a racing unlink would.
+        let err = s.delete("b", "k").await.unwrap_err();
+        assert!(matches!(err, crate::Error::NotFound { .. }));
+    }
+
+    #[tokio::test]
+    async fn set_labels_rejects_header_inconsistent_with_file_length() {
+        let (s, _dir) = make_storage();
+        s.put("b", "k", make_object(b"data"), PutOptions::default())
+            .await
+            .unwrap();
+        let obj_path = s.key_path("b", "k").unwrap();
+
+        // Corrupt the on-disk header so `data_offset + data_len + meta_len +
+        // 64` wildly exceeds the actual file length. Before the bounds
+        // check this desynced the `data`/`meta` slice bounds and panicked
+        // instead of erroring.
+        let mut bytes = std::fs::read(&obj_path).unwrap();
+        let mut header_buf = [0u8; HEADER_SIZE];
+        header_buf.copy_from_slice(&bytes[..HEADER_SIZE]);
+        let mut header = Header::decode(&header_buf).unwrap();
+        header.data_len = 1_000_000_000;
+        bytes[..HEADER_SIZE].copy_from_slice(&header.encode());
+        std::fs::write(&obj_path, &bytes).unwrap();
+
+        let result = s.set_labels("b", "k", crate::LabelSet::new()).await;
+        assert!(
+            matches!(result, Err(crate::Error::InternalError { .. })),
+            "malformed header must error, not panic: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn base_path_and_object_file_have_restrictive_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (s, dir) = make_storage();
+        let base = std::fs::canonicalize(dir.path().join("data")).unwrap();
+        let base_mode = std::fs::metadata(&base).unwrap().permissions().mode() & 0o777;
+        assert_eq!(base_mode, 0o700, "base_path must be created 0700");
+
+        s.put("b", "k", make_object(b"secret"), PutOptions::default())
+            .await
+            .unwrap();
+        let obj_path = s.key_path("b", "k").unwrap();
+        let obj_mode = std::fs::metadata(&obj_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(obj_mode, 0o600, "object file must be created 0600");
     }
 
     #[tokio::test]

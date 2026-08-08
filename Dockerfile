@@ -91,8 +91,14 @@ LABEL org.opencontainers.image.title="y2q" \
       org.opencontainers.image.description="Post-quantum secure storage daemon"
 
 # config.default.toml binds to 127.0.0.1; override so the daemon is
-# reachable outside the container.
+# reachable outside the container. y2qd refuses to bind a non-loopback
+# address without TLS, so this also requires an explicit insecure-bind
+# opt-in — operators SHOULD instead supply server.tls.cert_path/key_path
+# (or terminate TLS at a reverse proxy in front of this container and set
+# ALLOW_INSECURE_BIND only on that trusted internal network) rather than
+# rely on this default.
 ENV Y2QD_SERVER__HOST=0.0.0.0
+ENV Y2QD_SERVER__ALLOW_INSECURE_BIND=true
 
 EXPOSE 8080
 

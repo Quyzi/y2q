@@ -16,10 +16,13 @@ use actix_governor::{
 };
 use actix_web::dev::ServiceRequest;
 
-/// Keys the rate limiter by the caller's real IP address (proxy-aware via
-/// `Forwarded`/`X-Forwarded-For`, see [`actix_web::dev::ConnectionInfo`]),
-/// not by username — the per-username lockout already exists separately and
-/// is exactly what a varying-username flood bypasses.
+/// Keys the rate limiter by the caller's actual TCP peer address — never a
+/// client-supplied header. y2qd binds directly with no mandated trusted
+/// reverse proxy in front of it, so trusting `Forwarded`/`X-Forwarded-For`
+/// (what `ConnectionInfo::realip_remote_addr()` prefers) would let an
+/// attacker mint an unlimited quota simply by sending a fresh value on
+/// every request — defeating the exact varying-username flood this
+/// middleware exists to throttle.
 #[derive(Clone)]
 pub struct RealIpKeyExtractor;
 
@@ -29,10 +32,9 @@ impl KeyExtractor for RealIpKeyExtractor {
 
     fn extract(&self, req: &ServiceRequest) -> Result<Self::Key, Self::KeyExtractionError> {
         Ok(req
-            .connection_info()
-            .realip_remote_addr()
-            .unwrap_or("unknown")
-            .to_owned())
+            .peer_addr()
+            .map(|addr| addr.ip().to_string())
+            .unwrap_or_else(|| "unknown".to_owned()))
     }
 }
 
@@ -46,6 +48,23 @@ pub static LOGIN_GOVERNOR_CONFIG: LazyLock<GovernorConfig<RealIpKeyExtractor, No
         let mut builder = GovernorConfigBuilder::default();
         let mut builder = builder.key_extractor(RealIpKeyExtractor);
         builder.burst_size(5).seconds_per_request(4);
+        builder.finish().expect("valid governor config")
+    });
+
+/// Rate-limit config for `POST /api/v1/personas`: bursts of up to 5
+/// requests per source IP, replenishing one every 10 seconds thereafter.
+/// Unlike login this endpoint is authenticated, but its 409 `PasswordReused`
+/// response is a verification oracle for the caller's own other credential
+/// slot passwords (and, combined with the primary-slot silent-no-op, for
+/// which slot is the account's real primary) — throttling raises the cost
+/// of automating that probe. Legitimate persona setup is a handful of calls
+/// per account, never a tight loop, so this cap should not be felt in
+/// normal use.
+pub static PERSONA_GOVERNOR_CONFIG: LazyLock<GovernorConfig<RealIpKeyExtractor, NoOpMiddleware>> =
+    LazyLock::new(|| {
+        let mut builder = GovernorConfigBuilder::default();
+        let mut builder = builder.key_extractor(RealIpKeyExtractor);
+        builder.burst_size(5).seconds_per_request(10);
         builder.finish().expect("valid governor config")
     });
 

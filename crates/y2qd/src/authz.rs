@@ -88,10 +88,21 @@ pub(crate) fn role_is_global(role: Role) -> bool {
 /// `candidate` grants nothing `ceiling` doesn't already grant. Used to stop
 /// a persona (phase 5, `POST /api/v1/personas`) from being minted with more
 /// power than the account's own global role.
+///
+/// The capability-triple comparison alone cannot distinguish `Admin` from
+/// `User`, or `Auditor` from `ReadOnly` — each pair shares an identical
+/// [`Caps`] set. Only [`role_is_global`] tells them apart: `Admin`/`Auditor`
+/// additionally grant visibility into every bucket in the deployment, not
+/// just ones the account owns or was granted. Without this check, any
+/// account (even a plain `user`) could mint an `admin` persona for itself
+/// and log in as a global administrator — see the module docs on
+/// [`role_is_global`].
 pub(crate) fn role_permits(candidate: Role, ceiling: Role) -> bool {
     let c = role_caps(candidate);
     let m = role_caps(ceiling);
-    (!c.read || m.read) && (!c.write || m.write) && (!c.admin || m.admin)
+    let caps_permitted = (!c.read || m.read) && (!c.write || m.write) && (!c.admin || m.admin);
+    let global_permitted = !role_is_global(candidate) || role_is_global(ceiling);
+    caps_permitted && global_permitted
 }
 
 /// Verb capabilities a bucket grants `username` by ownership or ACL. `None`
@@ -139,15 +150,16 @@ pub enum Decision {
 /// relationship). The bool is whether the caller can *see* the bucket at all
 /// (owner, ACL grant, or a globally-scoped role) — used to choose 403 vs 404.
 ///
-/// `read` is additionally gated on `auth`'s *persona* actually holding a
-/// working cryptographic bucket-key grant (see [`crate::bucket_keys::is_visible`]):
-/// the ACL/ownership fields are username-keyed and persona-agnostic, but the
-/// sealed bucket-key grants are per-persona, so a duress persona whose slot
-/// was sealed with a decoy must not read here even when the ACL says the
-/// *user* can. `write`/`admin` are unaffected by this gate — writing only
-/// needs the bucket's public key, never a persona-specific secret-key grant,
-/// so a `WriteOnly` drop-box grantee (who never gets a real grant row at
-/// all) keeps working.
+/// `read` and `admin` are additionally gated on `auth`'s *persona* actually
+/// holding a working cryptographic bucket-key grant (see
+/// [`crate::bucket_keys::is_visible`]): the ACL/ownership fields are
+/// username-keyed and persona-agnostic, but the sealed bucket-key grants
+/// are per-persona, so a duress persona whose slot was sealed with a decoy
+/// must not read — or administer (rotate keys, manage the ACL, delete the
+/// bucket) — here even when the ACL says the *user* can. `write` is
+/// unaffected by this gate — writing only needs the bucket's public key,
+/// never a persona-specific secret-key grant, so a `WriteOnly` drop-box
+/// grantee (who never gets a real grant row at all) keeps working.
 fn effective_caps(auth: &Authenticated, cfg: &BucketConfig, bucket: &str) -> (Caps, bool) {
     let rc = role_caps(auth.role);
     if role_is_global(auth.role) {
@@ -155,8 +167,12 @@ fn effective_caps(auth: &Authenticated, cfg: &BucketConfig, bucket: &str) -> (Ca
     }
     match bucket_grant_caps(cfg, &auth.username) {
         Some(mut bc) => {
-            if bc.read && !crate::bucket_keys::is_visible(&auth.session, cfg, bucket) {
+            let real_grant = crate::bucket_keys::is_visible(&auth.session, cfg, bucket);
+            if bc.read && !real_grant {
                 bc.read = false;
+            }
+            if bc.admin && !real_grant {
+                bc.admin = false;
             }
             (rc.intersect(bc), true)
         }
@@ -228,9 +244,12 @@ pub async fn authorize_bucket(
         return Ok(Decision::Allowed);
     }
 
-    let denied_only_by_missing_crypto_grant = required == BucketPermission::Read
-        && !role_is_global(auth.role)
-        && bucket_grant_caps(&cfg, &auth.username).is_some_and(|bc| bc.read);
+    let denied_only_by_missing_crypto_grant = !role_is_global(auth.role)
+        && bucket_grant_caps(&cfg, &auth.username).is_some_and(|bc| match required {
+            BucketPermission::Read => bc.read,
+            BucketPermission::Admin => bc.admin,
+            _ => false,
+        });
     if visible && !denied_only_by_missing_crypto_grant {
         // Caller can see the bucket but lacks the verb.
         return Err(AppError(CoreError::Forbidden {
@@ -445,5 +464,32 @@ mod tests {
         assert!(!role_permits(Role::ReadOnly, Role::WriteOnly));
         // Disabled permits nothing but is itself permitted by anything.
         assert!(role_permits(Role::Disabled, Role::ReadOnly));
+    }
+
+    #[test]
+    fn role_permits_rejects_global_role_escalation_from_a_non_global_ceiling() {
+        // Regression test: `role_caps` gives `Admin`/`User` (and
+        // `Auditor`/`ReadOnly`) identical capability sets, so the cap-triple
+        // comparison alone cannot stop a plain `user` account from minting
+        // an `admin` persona and logging in as a global administrator.
+        assert!(
+            !role_permits(Role::Admin, Role::User),
+            "a User-ceiling account must not be able to mint an Admin persona"
+        );
+        assert!(
+            !role_permits(Role::Auditor, Role::User),
+            "a User-ceiling account must not be able to mint an Auditor persona"
+        );
+        assert!(
+            !role_permits(Role::Auditor, Role::ReadOnly),
+            "a ReadOnly-ceiling account must not gain Auditor's global visibility"
+        );
+        // A global ceiling may still mint global personas.
+        assert!(role_permits(Role::Admin, Role::Admin));
+        assert!(role_permits(Role::Auditor, Role::Admin));
+        // Sanity: role_caps really does conflate these pairs, which is
+        // exactly why the cap check alone is insufficient.
+        assert_eq!(role_caps(Role::Admin), role_caps(Role::User));
+        assert_eq!(role_caps(Role::Auditor), role_caps(Role::ReadOnly));
     }
 }

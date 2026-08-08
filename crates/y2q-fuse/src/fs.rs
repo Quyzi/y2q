@@ -1,5 +1,6 @@
 use std::collections::{BTreeSet, HashMap};
 use std::io::{Seek, SeekFrom, Write as IoWrite};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -23,21 +24,88 @@ const WRITE_BUF_TEMPFILE_PREFIX: &str = "y2q-fuse-writebuf-";
 /// Create a new write-buffer temp file, tagged with
 /// [`WRITE_BUF_TEMPFILE_PREFIX`] so [`sweep_orphaned_tempfiles`] can find it
 /// if the process is killed before it's cleaned up normally.
-fn new_write_tempfile() -> std::io::Result<NamedTempFile> {
-    tempfile::Builder::new()
-        .prefix(WRITE_BUF_TEMPFILE_PREFIX)
-        .tempfile()
+///
+/// `dir`, when set (from `--write-buf-dir`), places the file there instead
+/// of the shared, often world-writable `std::env::temp_dir()` — the write
+/// buffer holds the fully decrypted object body, so restricting which
+/// directory it can spill into reduces exposure to other local users.
+fn new_write_tempfile(dir: Option<&Path>) -> std::io::Result<NamedTempFile> {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(WRITE_BUF_TEMPFILE_PREFIX);
+    match dir {
+        Some(dir) => builder.tempfile_in(dir),
+        None => builder.tempfile(),
+    }
+}
+
+/// Overwrite `f`'s first `len` bytes with zeros, in bounded chunks so an
+/// arbitrarily large write buffer doesn't require an arbitrarily large
+/// zero-fill allocation. Leaves the write cursor after the zeroed region.
+fn zero_fill<T: IoWrite + Seek>(f: &mut T, len: u64) -> std::io::Result<()> {
+    f.seek(SeekFrom::Start(0))?;
+    const CHUNK: usize = 64 * 1024;
+    let zeros = [0u8; CHUNK];
+    let mut remaining = len;
+    while remaining > 0 {
+        let n = remaining.min(CHUNK as u64) as usize;
+        f.write_all(&zeros[..n])?;
+        remaining -= n as u64;
+    }
+    f.flush()
+}
+
+/// Overwrite a write-buffer temp file's current on-disk contents with
+/// zeros. `NamedTempFile::set_len(0)` alone would NOT do this — it only
+/// changes the file's reported length, not the disk blocks it already
+/// wrote the decrypted object body into. Best-effort: a failure is logged,
+/// never propagated (the caller still removes/drops the file regardless).
+fn zero_fill_tempfile(tmp: &mut NamedTempFile) -> std::io::Result<()> {
+    let len = tmp.as_file().metadata()?.len();
+    zero_fill(tmp, len)
+}
+
+/// Scrub (best-effort) then drop a write-buffer temp file, which unlinks
+/// it. No-op if `tmp` is `None`.
+fn scrub_write_tempfile(tmp: Option<NamedTempFile>) {
+    let Some(mut tmp) = tmp else { return };
+    if let Err(e) = zero_fill_tempfile(&mut tmp) {
+        tracing::warn!(path = %tmp.path().display(), error = %e, "write-buffer scrub failed");
+    }
+    // `tmp` drops here, unlinking the file.
+}
+
+/// Overwrite the file at `path` with zeros before it's removed. Used by
+/// [`sweep_orphaned_tempfiles`] on files this process didn't create the
+/// `NamedTempFile` handle for (they're discovered by name after a crash).
+fn scrub_file_before_remove(path: &Path) -> std::io::Result<()> {
+    let mut file = std::fs::OpenOptions::new().write(true).open(path)?;
+    let len = file.metadata()?.len();
+    zero_fill(&mut file, len)
 }
 
 /// Best-effort cleanup of write-buffer temp files orphaned by a prior
 /// `SIGKILL`/crash (normal exits clean these up via `Drop`, which doesn't run
 /// on an abrupt kill). Only removes files whose name starts with
-/// [`WRITE_BUF_TEMPFILE_PREFIX`] in the OS temp directory — never touches
-/// anything else there. Never blocks or fails the mount: every error is
-/// logged and skipped.
-pub fn sweep_orphaned_tempfiles() {
-    let dir = std::env::temp_dir();
-    let entries = match std::fs::read_dir(&dir) {
+/// [`WRITE_BUF_TEMPFILE_PREFIX`] in the OS temp directory, and (when
+/// `extra_dir` is set, i.e. `--write-buf-dir` is in use) that directory too.
+/// Never touches anything else there. Each matching file has its contents
+/// zeroed before removal (see [`scrub_file_before_remove`]). Never blocks or
+/// fails the mount: every error is logged and skipped.
+pub fn sweep_orphaned_tempfiles(extra_dir: Option<&Path>) {
+    let mut dirs = vec![std::env::temp_dir()];
+    if let Some(d) = extra_dir {
+        let d = d.to_path_buf();
+        if !dirs.contains(&d) {
+            dirs.push(d);
+        }
+    }
+    for dir in &dirs {
+        sweep_dir(dir);
+    }
+}
+
+fn sweep_dir(dir: &Path) {
+    let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(e) => {
             tracing::debug!(dir = %dir.display(), error = %e, "tempfile sweep: read_dir failed");
@@ -52,10 +120,16 @@ pub fn sweep_orphaned_tempfiles() {
         if !name.starts_with(WRITE_BUF_TEMPFILE_PREFIX) {
             continue;
         }
-        if let Err(e) = std::fs::remove_file(entry.path()) {
-            tracing::debug!(path = %entry.path().display(), error = %e, "tempfile sweep: remove failed");
+        let path = entry.path();
+        if let Err(e) = scrub_file_before_remove(&path) {
+            tracing::debug!(path = %path.display(), error = %e, "tempfile sweep: scrub failed");
+            // Fall through and remove it anyway — unscrubbed-but-unlinked is
+            // no worse than this file was before this fix existed.
+        }
+        if let Err(e) = std::fs::remove_file(&path) {
+            tracing::debug!(path = %path.display(), error = %e, "tempfile sweep: remove failed");
         } else {
-            tracing::info!(path = %entry.path().display(), "removed orphaned write-buffer tempfile");
+            tracing::info!(path = %path.display(), "removed orphaned write-buffer tempfile");
         }
     }
 }
@@ -100,9 +174,14 @@ pub struct Y2qFuse {
     /// `0644`/`0755` — restricting the additional access `--allow-other`
     /// grants to members of one group rather than every local user.
     allow_other_gid: Option<u32>,
+    /// When set (from `--write-buf-dir`), write-buffer temp files are
+    /// created here instead of `std::env::temp_dir()` — see
+    /// [`new_write_tempfile`].
+    write_buf_dir: Option<PathBuf>,
 }
 
 impl Y2qFuse {
+    #[allow(clippy::too_many_arguments)] // constructor mirrors the driver's config surface
     pub fn new(
         client: Arc<RwLock<Y2qClient>>,
         rt: tokio::runtime::Handle,
@@ -111,6 +190,7 @@ impl Y2qFuse {
         uid: u32,
         gid: u32,
         allow_other_gid: Option<u32>,
+        write_buf_dir: Option<PathBuf>,
     ) -> Self {
         Self {
             client,
@@ -123,6 +203,7 @@ impl Y2qFuse {
             uid,
             gid,
             allow_other_gid,
+            write_buf_dir,
         }
     }
 
@@ -659,7 +740,7 @@ impl Filesystem for Y2qFuse {
 
         let (write_buf, dirty) = if write_requested {
             let trunc = flags & libc::O_TRUNC != 0;
-            let mut tmp = match new_write_tempfile() {
+            let mut tmp = match new_write_tempfile(self.write_buf_dir.as_deref()) {
                 Ok(f) => f,
                 Err(e) => {
                     tracing::error!("tempfile: {e}");
@@ -765,18 +846,19 @@ impl Filesystem for Y2qFuse {
             .map(|m| m.size);
 
         let start = offset;
+        if size == 0 {
+            reply.data(&[]);
+            return;
+        }
         if let Some(file_size) = cached_size
             && start >= file_size
         {
             reply.data(&[]);
             return;
         }
-        let end = {
-            let raw_end = start + size as u64 - 1;
-            match cached_size {
-                Some(file_size) => raw_end.min(file_size - 1),
-                None => raw_end,
-            }
+        let Some((start, end)) = compute_read_range(start, size, cached_size) else {
+            reply.data(&[]);
+            return;
         };
 
         let client = self.client_clone();
@@ -827,7 +909,7 @@ impl Filesystem for Y2qFuse {
         };
 
         let key = format!("{prefix}{name}");
-        let buf = match new_write_tempfile() {
+        let buf = match new_write_tempfile(self.write_buf_dir.as_deref()) {
             Ok(f) => f,
             Err(e) => {
                 tracing::error!("tempfile: {e}");
@@ -940,53 +1022,21 @@ impl Filesystem for Y2qFuse {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&fh);
-        if let Some(mut of) = of
-            && of.dirty
+        let Some(mut of) = of else {
+            reply.ok();
+            return;
+        };
+        let mut tmp = of.write_buf.take();
+        if of.dirty
             && !of.flushed
-            && let Some(mut tmp) = of.write_buf.take()
+            && let Some(t) = tmp.as_mut()
         {
-            let size = match tmp.as_file().metadata() {
-                Ok(m) => m.len(),
-                Err(e) => {
-                    tracing::error!("release stat: {e}");
-                    reply.ok();
-                    return;
-                }
-            };
-            if let Err(e) = tmp.seek(SeekFrom::Start(0)) {
-                tracing::error!("release seek: {e}");
-                reply.ok();
-                return;
-            }
-            let std_file = match tmp.reopen() {
-                Ok(f) => f,
-                Err(e) => {
-                    tracing::error!("release reopen: {e}");
-                    reply.ok();
-                    return;
-                }
-            };
-            let bucket = of.bucket.clone();
-            let key = of.key.clone();
-            let client = self.client_clone();
-            let result = self.rt.block_on(async move {
-                let async_file = tokio::fs::File::from_std(std_file);
-                client
-                    .put_from_reader(
-                        &bucket,
-                        &key,
-                        async_file,
-                        Some(size),
-                        &Default::default(),
-                        None,
-                    )
-                    .await
-            });
-            if let Err(e) = result {
-                tracing::error!("release PUT {}/{}: {e}", of.bucket, of.key);
-            }
-            drop(tmp);
+            self.put_write_buffer(&of.bucket, &of.key, t);
         }
+        // Zero the write buffer's on-disk contents (it held the fully
+        // decrypted object body) before it's unlinked, so the plaintext
+        // doesn't linger in freed blocks under the write-buffer directory.
+        scrub_write_tempfile(tmp);
         reply.ok();
     }
 
@@ -1015,9 +1065,12 @@ impl Filesystem for Y2qFuse {
                 let fh = fh.0;
                 let mut guard = self.open_files.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(of) = guard.get_mut(&fh) {
-                    match new_write_tempfile() {
+                    match new_write_tempfile(self.write_buf_dir.as_deref()) {
                         Ok(fresh) => {
-                            of.write_buf = Some(fresh);
+                            // The old buffer may hold a decrypted read-modify-
+                            // write seed (open() without O_TRUNC); scrub it
+                            // before it's replaced and dropped.
+                            scrub_write_tempfile(of.write_buf.replace(fresh));
                             of.dirty = true;
                             of.flushed = false; // truncate after flush must re-PUT
                         }
@@ -1267,7 +1320,7 @@ impl Filesystem for Y2qFuse {
             return;
         }
 
-        let tmp = match new_write_tempfile() {
+        let tmp = match new_write_tempfile(self.write_buf_dir.as_deref()) {
             Ok(f) => f,
             Err(e) => {
                 tracing::error!("rename tempfile: {e}");
@@ -1305,7 +1358,7 @@ impl Filesystem for Y2qFuse {
                 )
                 .await?;
             client.delete(&src_bucket, &src_key).await?;
-            drop(tmp);
+            scrub_write_tempfile(Some(tmp));
             Ok::<(), ClientError>(())
         });
         match result {
@@ -1963,6 +2016,68 @@ impl Y2qFuse {
             Err(e) => reply.error(to_errno(&e)),
         }
     }
+
+    /// Best-effort PUT of a write-buffer tempfile that `flush()` didn't
+    /// already send (i.e. `dirty && !flushed`). Errors are logged only —
+    /// `release()` always replies `Ok` regardless, matching its existing
+    /// "best effort" contract (a FUSE `close()` can't observe `release`'s
+    /// result anyway).
+    fn put_write_buffer(&self, bucket: &str, key: &str, tmp: &mut NamedTempFile) {
+        let size = match tmp.as_file().metadata() {
+            Ok(m) => m.len(),
+            Err(e) => {
+                tracing::error!("release stat: {e}");
+                return;
+            }
+        };
+        if let Err(e) = tmp.seek(SeekFrom::Start(0)) {
+            tracing::error!("release seek: {e}");
+            return;
+        }
+        let std_file = match tmp.reopen() {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::error!("release reopen: {e}");
+                return;
+            }
+        };
+        let client = self.client_clone();
+        let b = bucket.to_owned();
+        let k = key.to_owned();
+        let result = self.rt.block_on(async move {
+            let async_file = tokio::fs::File::from_std(std_file);
+            client
+                .put_from_reader(&b, &k, async_file, Some(size), &Default::default(), None)
+                .await
+        });
+        if let Err(e) = result {
+            tracing::error!("release PUT {bucket}/{key}: {e}");
+        }
+    }
+}
+
+/// Compute the inclusive `[start, end]` byte range for a FUSE `read`
+/// request, given the requested `size` and an optional cached object size
+/// used to clamp the range to EOF.
+///
+/// Returns `None` when `size` is zero — there is no valid range to read
+/// regardless of `start`. Does NOT special-case `cached_size == Some(0)`;
+/// `Filesystem::read` already returns an empty reply via its
+/// `start >= file_size` guard before this is ever called in that case.
+///
+/// All arithmetic saturates instead of wrapping/panicking: a corrupt or
+/// adversarial FUSE frame (or simply `start` near `u64::MAX`) must not be
+/// able to trigger an overflow panic here.
+fn compute_read_range(start: u64, size: u32, cached_size: Option<u64>) -> Option<(u64, u64)> {
+    if size == 0 {
+        return None;
+    }
+    let raw_end = start.saturating_add(size as u64).saturating_sub(1);
+    let end = match cached_size {
+        Some(file_size) => raw_end.min(file_size.saturating_sub(1)),
+        None => raw_end,
+    };
+    Some((start, end))
 }
 
 /// Reject directory-entry names that are empty, `.`/`..`, or contain an
@@ -2116,6 +2231,7 @@ mod tests {
             1000,
             1000,
             allow_other_gid,
+            None,
         )
     }
 
@@ -2150,7 +2266,7 @@ mod tests {
         std::fs::write(&ours, b"stray").unwrap();
         std::fs::write(&other, b"not ours").unwrap();
 
-        sweep_orphaned_tempfiles();
+        sweep_orphaned_tempfiles(None);
 
         assert!(!ours.exists(), "orphaned y2q-fuse tempfile must be removed");
         assert!(other.exists(), "unrelated tempfile must be left alone");
@@ -2173,5 +2289,98 @@ mod tests {
         assert!(is_valid_entry_name("Meeting Notes #3.docx"));
         assert!(is_valid_entry_name("..hidden-but-not-dotdot"));
         assert!(is_valid_entry_name("...three-dots"));
+    }
+
+    #[test]
+    fn zero_fill_tempfile_overwrites_contents_before_removal() {
+        let mut tmp = new_write_tempfile(None).unwrap();
+        tmp.write_all(&[0xAB; 4096]).unwrap();
+        tmp.flush().unwrap();
+        let path = tmp.path().to_path_buf();
+
+        // Scrub, then check the bytes on disk BEFORE the temp file is
+        // removed — proves the overwrite happened, not just that the
+        // directory entry vanished.
+        zero_fill_tempfile(&mut tmp).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(bytes.len(), 4096);
+        assert!(
+            bytes.iter().all(|&b| b == 0),
+            "write-buffer contents must be zeroed before removal"
+        );
+
+        drop(tmp); // now unlinked
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn scrub_write_tempfile_removes_file_after_scrubbing() {
+        let mut tmp = new_write_tempfile(None).unwrap();
+        tmp.write_all(b"decrypted plaintext object body").unwrap();
+        tmp.flush().unwrap();
+        let path = tmp.path().to_path_buf();
+
+        scrub_write_tempfile(Some(tmp));
+
+        assert!(!path.exists(), "write-buffer tempfile must be removed");
+    }
+
+    #[test]
+    fn scrub_write_tempfile_none_is_a_no_op() {
+        // Must not panic when there's nothing to scrub (e.g. a read-only
+        // open, which never populates `write_buf`).
+        scrub_write_tempfile(None);
+    }
+
+    #[test]
+    fn scrub_file_before_remove_zeroes_contents_spanning_multiple_chunks() {
+        // Larger than the 64KiB scrub chunk size, to exercise the loop.
+        let dir = std::env::temp_dir();
+        let unique = format!("{}-{}", std::process::id(), line!());
+        let path = dir.join(format!("{WRITE_BUF_TEMPFILE_PREFIX}scrub-{unique}"));
+        std::fs::write(&path, vec![0x5Au8; 70_000]).unwrap();
+
+        scrub_file_before_remove(&path).unwrap();
+
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(bytes.len(), 70_000);
+        assert!(bytes.iter().all(|&b| b == 0));
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn compute_read_range_zero_size_returns_none() {
+        assert_eq!(compute_read_range(0, 0, None), None);
+        assert_eq!(compute_read_range(100, 0, Some(50)), None);
+    }
+
+    #[test]
+    fn compute_read_range_cached_size_zero_relies_on_callers_eof_guard() {
+        // `Filesystem::read` checks `start >= file_size` (0 >= 0) BEFORE
+        // calling `compute_read_range`, and returns an empty reply there —
+        // this function is never reached with `cached_size == Some(0)` in
+        // practice. Called directly (as here), it doesn't special-case it:
+        // `file_size.saturating_sub(1)` clamps to 0, so it returns a
+        // (harmless but meaningless) `Some((0, 0))` rather than panicking
+        // or inverting the range.
+        assert_eq!(compute_read_range(0, 10, Some(0)), Some((0, 0)));
+    }
+
+    #[test]
+    fn compute_read_range_large_offset_with_no_cached_size_does_not_overflow() {
+        let (start, end) = compute_read_range(u64::MAX - 5, 100, None).unwrap();
+        assert_eq!(start, u64::MAX - 5);
+        assert!(end >= start, "end must not wrap below start");
+        assert_eq!(end, u64::MAX - 1); // saturating_add clamps to u64::MAX, -1
+    }
+
+    #[test]
+    fn compute_read_range_normal_case() {
+        assert_eq!(compute_read_range(0, 10, Some(100)), Some((0, 9)));
+        // Requested range runs past EOF: clamp the end to file_size - 1.
+        assert_eq!(compute_read_range(90, 100, Some(100)), Some((90, 99)));
+        // No cached size: nothing to clamp against.
+        assert_eq!(compute_read_range(5, 10, None), Some((5, 14)));
     }
 }

@@ -57,6 +57,12 @@ pub enum FormatError {
     /// The recomputed CRC32 did not match the stored value.
     #[error("header CRC32 mismatch")]
     Crc,
+    /// `data_offset` was smaller than [`Header::MIN_DATA_OFFSET`], which
+    /// would let the data section overlap the fixed-size header — only
+    /// reachable via a corrupt or adversarial header, since every writer in
+    /// this codebase always sets `data_offset` to a valid value.
+    #[error("data_offset {0} is below the minimum of {min}", min = HEADER_SIZE)]
+    DataOffset(u32),
 }
 
 /// Parsed header of a single-file object record.
@@ -95,10 +101,21 @@ impl Header {
         self.meta_offset() + self.meta_len as u64
     }
 
-    /// Total length of the on-disk file: `data_offset + data + meta + 64`.
-    #[allow(dead_code)] // used by tests now; production callers land with rebuild_cache
-    pub fn total_len(&self) -> u64 {
-        self.data_offset as u64 + self.data_len + self.meta_len as u64 + HEADER_SIZE as u64
+    /// Total length of the on-disk file: `data_offset + data + meta + 64`,
+    /// computed with checked arithmetic. Returns `None` if the fields would
+    /// overflow `u64` — only reachable from a corrupt or adversarial header,
+    /// since every writer in this codebase produces headers whose fields
+    /// sum well within `u64`. Callers MUST treat `None` (and any `Some`
+    /// value exceeding the actual file length) as invalid rather than
+    /// falling back to unchecked arithmetic, which can wrap and desync a
+    /// slice's start/end bounds — see `filesystem::set_labels_impl` and
+    /// `rotation::migrate_object_file` for the production validation this
+    /// backs.
+    pub fn checked_total_len(&self) -> Option<u64> {
+        (self.data_offset as u64)
+            .checked_add(self.data_len)?
+            .checked_add(self.meta_len as u64)?
+            .checked_add(HEADER_SIZE as u64)
     }
 
     /// Encode the header as a fixed 64-byte record.
@@ -132,9 +149,13 @@ impl Header {
     /// Decode and validate a 64-byte header record.
     ///
     /// Returns [`FormatError::Magic`] if the magic prefix doesn't match,
-    /// [`FormatError::Version`] if the version isn't [`VERSION`], or
+    /// [`FormatError::Version`] if the version isn't [`VERSION`],
     /// [`FormatError::Crc`] if the stored CRC32 doesn't match the
-    /// recomputed value.
+    /// recomputed value, or [`FormatError::DataOffset`] if `data_offset` is
+    /// nonzero but smaller than [`Self::MIN_DATA_OFFSET`] (which would let
+    /// the data section overlap the header — only reachable from a
+    /// corrupt or adversarial file, since every writer in this codebase
+    /// only ever sets `data_offset` to `0` or a valid value).
     ///
     /// `data_offset == 0` is interpreted as [`Self::MIN_DATA_OFFSET`] so
     /// step-4 records (written before the field existed) decode correctly
@@ -161,6 +182,9 @@ impl Header {
         } else {
             raw_data_offset
         };
+        if data_offset < Self::MIN_DATA_OFFSET {
+            return Err(FormatError::DataOffset(data_offset));
+        }
         Ok(Self {
             data_len,
             meta_len,
@@ -290,7 +314,7 @@ mod tests {
         assert_eq!(h.data_offset, 64);
         assert_eq!(h.meta_offset(), 64 + 1024);
         assert_eq!(h.trailer_offset(), 64 + 1024 + 512);
-        assert_eq!(h.total_len(), 64 + 1024 + 512 + 64);
+        assert_eq!(h.checked_total_len(), Some(64 + 1024 + 512 + 64));
     }
 
     #[test]
@@ -304,7 +328,34 @@ mod tests {
         };
         assert_eq!(h.meta_offset(), 4096 + 1024 * 1024);
         assert_eq!(h.trailer_offset(), 4096 + 1024 * 1024 + 512);
-        assert_eq!(h.total_len(), 4096 + 1024 * 1024 + 512 + 64);
+        assert_eq!(h.checked_total_len(), Some(4096 + 1024 * 1024 + 512 + 64));
+    }
+
+    #[test]
+    fn decode_rejects_data_offset_below_minimum() {
+        // A nonzero but sub-minimum data_offset would let the data section
+        // overlap the 64-byte header. `raw_data_offset == 0` is the
+        // legitimate legacy sentinel (see `legacy_zero_data_offset_decodes_to_min`);
+        // anything else below `MIN_DATA_OFFSET` is adversarial/corrupt.
+        let mut h = sample();
+        h.data_offset = 32;
+        let buf = h.encode();
+        assert_eq!(Header::decode(&buf), Err(FormatError::DataOffset(32)));
+    }
+
+    #[test]
+    fn checked_total_len_none_on_overflow() {
+        // data_len alone is within u64::MAX - HEADER_SIZE - meta_len, so
+        // plain `+` wraps silently instead of erroring; checked arithmetic
+        // must catch it.
+        let h = Header {
+            data_len: u64::MAX - 100,
+            meta_len: 1000,
+            data_offset: Header::MIN_DATA_OFFSET,
+            flags: 0,
+            version: VERSION,
+        };
+        assert_eq!(h.checked_total_len(), None);
     }
 
     #[test]

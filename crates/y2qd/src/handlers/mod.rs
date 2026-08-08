@@ -60,7 +60,9 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             .route(web::post().to(auth_handlers::reset_identity)),
     );
     cfg.service(
-        web::resource("/api/v1/personas").route(web::post().to(auth_handlers::create_persona)),
+        web::resource("/api/v1/personas")
+            .wrap(Governor::new(&crate::rate_limit::PERSONA_GOVERNOR_CONFIG))
+            .route(web::post().to(auth_handlers::create_persona)),
     );
     // Registered before `/api/v1/personas/{slot}` so the literal `me` path
     // isn't swallowed by the `{slot}: u8` pattern (actix matches by path

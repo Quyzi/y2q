@@ -211,6 +211,15 @@ pub struct ServerConfig {
     /// TLS (HTTPS) settings. Disabled by default.
     #[serde(default)]
     pub tls: TlsConfig,
+    /// Permit binding a non-loopback address while TLS is disabled.
+    /// Defaults to `false`: y2qd refuses to start rather than silently
+    /// serve session tokens, passwords, and object plaintext in the clear
+    /// to the network. Loopback binds (`127.0.0.1`/`::1`) are always
+    /// permitted without this flag, since they're not reachable off-host.
+    /// Set `true` only behind a TLS-terminating reverse proxy on a
+    /// trusted network, or for local development.
+    #[serde(default)]
+    pub allow_insecure_bind: bool,
 }
 
 /// TLS settings. When `enabled` is true, the daemon binds HTTPS at
@@ -665,6 +674,16 @@ fn insert_nested(
     }
 }
 
+/// Whether `host` is a loopback address (`127.0.0.1`, `::1`, or the literal
+/// string `localhost`) — exempt from the [`ServerConfig::allow_insecure_bind`]
+/// requirement since it isn't reachable off-host.
+pub(crate) fn host_is_loopback(host: &str) -> bool {
+    host.parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
+        || host.eq_ignore_ascii_case("localhost")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -678,5 +697,16 @@ mod tests {
         assert!(validate_envelope_chunk_size(ENVELOPE_CHUNK_SIZE_MIN - 1).is_err());
         assert!(validate_envelope_chunk_size(ENVELOPE_CHUNK_SIZE_MAX + 1).is_err());
         assert!(validate_envelope_chunk_size(0).is_err());
+    }
+
+    #[test]
+    fn host_is_loopback_recognizes_loopback_forms_only() {
+        assert!(host_is_loopback("127.0.0.1"));
+        assert!(host_is_loopback("::1"));
+        assert!(host_is_loopback("localhost"));
+        assert!(host_is_loopback("LOCALHOST"));
+        assert!(!host_is_loopback("0.0.0.0"));
+        assert!(!host_is_loopback("10.0.0.5"));
+        assert!(!host_is_loopback("example.com"));
     }
 }

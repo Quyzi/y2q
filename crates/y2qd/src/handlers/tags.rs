@@ -113,6 +113,16 @@ pub async fn handle(
 ) -> Result<HttpResponse, AppError> {
     let (bucket, key) = path.into_inner();
     authorize_bucket(&auth, &storage, &bucket, BucketPermission::Write).await?;
+    // A `WriteOnly` drop-box grantee never gets a real cryptographic grant
+    // and must never learn an object's pre-existing labels — but `Write`
+    // gates this handler, and `Write`'s grant level also implies `Read`
+    // (see `authz::grant_caps`), so a second, explicit `Read` check is the
+    // only way to tell a genuine write-only caller apart from one who can
+    // also read. Gates the RESPONSE only; the label mutation itself still
+    // succeeds either way — that's the drop-box's whole point.
+    let can_read = authorize_bucket(&auth, &storage, &bucket, BucketPermission::Read)
+        .await
+        .is_ok();
     let incoming = extract_labels(&req, limits.get_ref())?;
     let op = query.op.as_deref().unwrap_or("set");
     let mode = match op {
@@ -134,8 +144,9 @@ pub async fn handle(
         .labels
         .into_iter()
         .collect();
+    let incoming_set: BTreeSet<(String, String)> = incoming.into_iter().collect();
     let final_labels: BTreeSet<(String, String)> = mode
-        .resolve(current, incoming.into_iter().collect())
+        .resolve(current, incoming_set.iter().cloned().collect())
         .into_iter()
         .collect();
     storage
@@ -143,9 +154,14 @@ pub async fn handle(
         .await
         .map_err(AppError::from)?;
 
+    // Without read access, echo back only what the caller itself just
+    // submitted (which it already knows), never the merged result — that
+    // would reveal labels attached before this call, or by someone else.
+    let response_labels = if can_read { final_labels } else { incoming_set };
+
     Ok(HttpResponse::Ok().json(SetTagsResponse {
         bucket,
         key,
-        labels: final_labels,
+        labels: response_labels,
     }))
 }

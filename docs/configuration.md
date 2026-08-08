@@ -61,6 +61,7 @@ CLI values are coerced as integer first, then `true`/`false`, then string.
 | `port` | u16 | *required* | TCP port |
 | `max_body_bytes` | usize | `268435456` (256 MiB) | Maximum PUT request body size |
 | `unauthenticated_metrics` | bool | `false` | When `true`, `/metrics/prometheus`, `/metrics/dashboard`, `/swagger-ui/`, and `/api-docs/openapi.json` are exposed without a Bearer token. When `false` (default) they are **not registered at all** - there is no auth-gated variant; the daemon logs that they are disabled. |
+| `allow_insecure_bind` | bool | `false` | Permit binding a non-loopback `host` while `[server.tls] enabled = false`. Defaults to `false`: the daemon refuses to start rather than silently serve session tokens, passwords, and object plaintext unencrypted. Loopback (`127.0.0.1`/`::1`/`localhost`) is always permitted regardless of this flag. |
 
 ### `[server.actix]`
 
