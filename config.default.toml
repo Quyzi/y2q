@@ -64,6 +64,13 @@ shutdown_timeout_secs = 30
 #
 # To run plaintext HTTP and HTTPS side by side, run two y2qd processes on
 # different ports — this section flips a single listener between modes.
+#
+# y2qd refuses to start if TLS is disabled AND [server] host is a
+# non-loopback address, since that would serve session tokens, passwords,
+# and object plaintext unencrypted to the network. Loopback binds
+# (127.0.0.1/::1) are always exempt. To bind non-loopback without TLS
+# anyway (e.g. behind a TLS-terminating reverse proxy on a trusted
+# network), set [server] allow_insecure_bind = true explicitly.
 # ---------------------------------------------------------------------------
 [server.tls]
 enabled   = false

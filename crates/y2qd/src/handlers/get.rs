@@ -120,8 +120,8 @@ pub async fn handle(
     }
 
     match md.envelope_version {
-        // v3 chunked (the only supported format): read only the covering
-        // ciphertext chunks and decrypt them.
+        // v3 chunked (legacy, read-only — every new write is v4): read only
+        // the covering ciphertext chunks and decrypt them.
         Some(3) => {
             let preamble_len = envelope::v3_preamble_len() as u64;
             let preamble = storage
@@ -151,9 +151,82 @@ pub async fn handle(
                 .get_range(&bucket, &key, (cipher_start..=cipher_end).into())
                 .await
                 .map_err(AppError::from)?;
+            // The backend must return exactly the requested range; a short
+            // read means the on-disk object is smaller than the trusted
+            // metadata says it should be (truncated after the fact).
+            if window.len() as u64 != cipher_end - cipher_start + 1 {
+                return Err(AppError(y2q_core::Error::EnvelopeMalformed {
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                    reason: "on-disk object shorter than recorded metadata".to_owned(),
+                }));
+            }
 
             let chunks_pt =
                 cipher::decrypt_v3_chunks(&bucket_sk, &bucket, &key, &preamble, &window, first)?;
+
+            let trim_front = (start - first * chunk_size) as usize;
+            let take = (end - start + 1) as usize;
+            let body = Bytes::from(chunks_pt).slice(trim_front..trim_front + take);
+            Ok(partial_content(start, end, size, body))
+        }
+        // v4 chunked (current format): same chunk math as v3, plus the
+        // object's true total chunk count so the final-chunk AAD marker
+        // (see `envelope`'s module docs) is checked against the right
+        // chunk — `size` is the authenticated true plaintext size from the
+        // metadata sidecar, so `total_chunks` cannot be forged by an
+        // on-disk tamperer even though `chunk_size` itself is read from the
+        // (self-authenticating, via the AAD) on-disk header.
+        Some(4) => {
+            let preamble_len = envelope::v3_preamble_len() as u64;
+            let preamble = storage
+                .get_range(&bucket, &key, (0..=preamble_len - 1).into())
+                .await
+                .map_err(AppError::from)?;
+            let (_epoch, chunk_size_u32, _) =
+                envelope::parse_v4_geometry(&preamble).map_err(|_| {
+                    AppError(y2q_core::Error::EnvelopeMalformed {
+                        bucket: bucket.clone(),
+                        key: key.clone(),
+                        reason: "bad v4 header".to_owned(),
+                    })
+                })?;
+            let chunk_size = chunk_size_u32 as u64;
+            let stride = chunk_size + TAG_LEN;
+            let total_chunks = envelope::padme_len(size).div_ceil(chunk_size);
+            let first = start / chunk_size;
+            let last = end / chunk_size;
+            let cipher_start = preamble_len + first * stride;
+            let cipher_end_calc = preamble_len + (last + 1) * stride - 1;
+            // Clamp to the on-disk envelope size; the final chunk is shorter.
+            let cipher_end = match md.cipher_size {
+                Some(cs) => cipher_end_calc.min(cs - 1),
+                None => cipher_end_calc,
+            };
+            let window = storage
+                .get_range(&bucket, &key, (cipher_start..=cipher_end).into())
+                .await
+                .map_err(AppError::from)?;
+            // The backend must return exactly the requested range; a short
+            // read means the on-disk object is smaller than the trusted
+            // metadata says it should be (truncated after the fact).
+            if window.len() as u64 != cipher_end - cipher_start + 1 {
+                return Err(AppError(y2q_core::Error::EnvelopeMalformed {
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                    reason: "on-disk object shorter than recorded metadata".to_owned(),
+                }));
+            }
+
+            let chunks_pt = cipher::decrypt_v4_chunks(
+                &bucket_sk,
+                &bucket,
+                &key,
+                &preamble,
+                &window,
+                first,
+                total_chunks,
+            )?;
 
             let trim_front = (start - first * chunk_size) as usize;
             let take = (end - start + 1) as usize;

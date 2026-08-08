@@ -194,7 +194,20 @@ pub async fn login(
     match result {
         Ok((rec, slot_idx, payload)) => {
             // A disabled persona authenticates but may not obtain a session.
-            if payload.role == Role::Disabled {
+            // The account's cleartext role (`rec.role`) is the authoritative
+            // ceiling and can be lowered at any time via `PUT
+            // /users/{user}/role` — but the server cannot rewrite a
+            // password-wrapped slot's baked-in `payload.role` (it doesn't
+            // hold the password). Enforce the ceiling here too: a persona
+            // whose role no longer fits under the current account ceiling
+            // (including the account being fully disabled) is refused
+            // login, identically to an explicitly disabled slot, until the
+            // slot is recreated or the ceiling is raised again — otherwise
+            // a demotion or disable is undone by the persona's next login.
+            if payload.role == Role::Disabled
+                || rec.role == Role::Disabled
+                || !crate::authz::role_permits(payload.role, rec.role)
+            {
                 record_login("disabled", None);
                 apply_floor(state.config.min_login_response_ms, started).await;
                 return Err(AuthError::AccountDisabled);
@@ -609,6 +622,21 @@ pub async fn delete_user(
     if !removed {
         return Err(AuthError::UserNotFound { username });
     }
+    // Scrub every bucket-key grant row and ACL entry this user held: the
+    // crypto grant is unrecoverable garbage the moment the account is gone
+    // (nobody can ever open it again), and leaving the ACL entry behind
+    // would let a later `PUT /api/v1/users/add` reusing this exact
+    // username silently inherit write/admin access on buckets it has no
+    // relationship to — see `scrub_deleted_user_acl_entries`'s doc comment
+    // for why bucket ownership is deliberately left untouched.
+    scrub_user_grants(storage.get_ref(), &username).await?;
+    scrub_deleted_user_acl_entries(storage.get_ref(), &username).await?;
+    // Apply immediately rather than waiting for the token's natural expiry
+    // (up to `max_ttl_seconds`, default 24h) — matches `set_role` and
+    // `reset_identity`, which both revoke on the same kind of identity
+    // change. The `Authenticated` extractor never re-checks the user store,
+    // so without this a deleted user's live token keeps authenticating.
+    state.sessions.revoke_user(&username);
     Ok(HttpResponse::NoContent().finish())
 }
 
@@ -820,6 +848,50 @@ async fn scrub_user_grants(storage: &AnyStorage, username: &str) -> Result<Vec<S
     Ok(orphaned)
 }
 
+/// Remove `username`'s ACL entry from every bucket. Called by
+/// [`delete_user`] (never `reset_identity`, whose target account still
+/// exists and keeps its bucket relationships pending re-grant) so a later
+/// `PUT /api/v1/users/add` reusing the same username starts with a clean
+/// slate instead of silently inheriting every stale ACL entry. The
+/// cryptographic grant rows are already scrubbed by [`scrub_user_grants`]
+/// (called first, from `delete_user`), which closes read; this closes the
+/// residual `write`/`admin` exposure an ACL entry alone still confers,
+/// since those verbs are not gated on any key material.
+///
+/// Deliberately does NOT clear `BucketConfig::owner` even when it equals
+/// `username`: `claim_ownership` only seeds new key material for a bucket
+/// its own `create_bucket` call just physically created, so an
+/// already-existing bucket left with `owner: None` could never be claimed
+/// by anyone again. A reused owner username still cannot read (no crypto
+/// grant survives) or administer this bucket (the `admin` capability is
+/// gated on the same crypto grant — see `authz::effective_caps`); only
+/// `write` on an owned-but-orphaned bucket remains a residual gap, tracked
+/// as a known limitation pending a dedicated orphaned-bucket reassignment
+/// path.
+async fn scrub_deleted_user_acl_entries(
+    storage: &AnyStorage,
+    username: &str,
+) -> Result<(), AuthError> {
+    let buckets = storage
+        .list_buckets()
+        .await
+        .map_err(|e| AuthError::Backend(e.to_string()))?;
+    for bucket in buckets {
+        let mut cfg = storage
+            .get_bucket_config(&bucket)
+            .await
+            .map_err(|e| AuthError::Backend(e.to_string()))?;
+        if cfg.acl.remove(username).is_none() {
+            continue;
+        }
+        storage
+            .set_bucket_config(&bucket, &cfg)
+            .await
+            .map_err(|e| AuthError::Backend(e.to_string()))?;
+    }
+    Ok(())
+}
+
 /// Run Argon2id-derivation + all-four-slot-unwrap on a worker thread
 /// (CPU-bound). Tries every slot's AEAD open regardless of whether an
 /// earlier one already matched — timing must not reveal which slot opened
@@ -979,7 +1051,13 @@ pub async fn create_persona(
         .map_err(|e| AuthError::Backend(e.to_string()))?
         .ok_or(AuthError::InvalidCredentials)?;
 
-    if !crate::authz::role_permits(role, rec.role) {
+    // Cap against both the account's cleartext ceiling AND the calling
+    // session's own effective role. `rec.role` alone is insufficient: a
+    // low-privilege persona (e.g. the account's duress slot) authenticates
+    // with a session role narrower than the account ceiling, and without
+    // this second check it could still mint a brand-new persona carrying
+    // the account's full ceiling role — self-escalating within one call.
+    if !crate::authz::role_permits(role, rec.role) || !crate::authz::role_permits(role, auth.role) {
         return Err(AuthError::RoleExceedsAccount);
     }
 

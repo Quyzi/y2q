@@ -187,16 +187,19 @@ async fn migrate_object_file(
     header_buf.copy_from_slice(&bytes[..HEADER_SIZE]);
     let header = Header::decode(&header_buf)
         .map_err(|e| internal(bucket, "rotate-node-key", format!("decode header: {e}")))?;
-    let data_start = header.data_offset as usize;
-    let meta_start = header.meta_offset() as usize;
-    let meta_end = meta_start + header.meta_len as usize;
-    if meta_end > bytes.len() {
+    if header
+        .checked_total_len()
+        .is_none_or(|total| total > bytes.len() as u64)
+    {
         return Err(internal(
             bucket,
             "rotate-node-key",
-            "meta block extends past end of file".to_owned(),
+            "header fields inconsistent with file length".to_owned(),
         ));
     }
+    let data_start = header.data_offset as usize;
+    let meta_start = header.meta_offset() as usize;
+    let meta_end = meta_start + header.meta_len as usize;
     let data = &bytes[data_start..meta_start];
     let meta_bytes = &bytes[meta_start..meta_end];
 
@@ -258,7 +261,13 @@ async fn migrate_object_file(
             .await
             .map_err(|e| io_err(bucket, "rotate-node-key", e))?;
     }
-    let tmp_path = new_path.with_extension("obj.rotate-tmp");
+    // Extension must be exactly `tmp` (not e.g. `obj.rotate-tmp`, whose
+    // `Path::extension()` is "rotate-tmp") so a staging file orphaned by a
+    // crash mid-rotation is recognized and swept by
+    // `filesystem::clear_orphan_tmp_files`. `new_id` (keyed by the *new*
+    // path key) essentially never collides with a concurrent regular PUT's
+    // `<old-path-key-id>.tmp` in the same shard directory.
+    let tmp_path = new_path.with_extension("tmp");
     tokio::fs::write(&tmp_path, &out)
         .await
         .map_err(|e| io_err(bucket, "rotate-node-key", e))?;
@@ -344,4 +353,76 @@ async fn collect_bucket_obj_files(bucket_dir: &Path) -> std::io::Result<Vec<Path
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A `.obj` file whose header declares far more data than the file
+    /// actually holds: `data_offset + data_len + meta_len + HEADER_SIZE`
+    /// wildly exceeds the real byte count. Before the bounds check in
+    /// `migrate_object_file` this desynced the `data`/`meta` slice bounds
+    /// (`&bytes[data_start..meta_start]`) instead of erroring.
+    fn write_malformed_obj(dir: &Path) -> PathBuf {
+        let header = Header {
+            data_len: 1_000_000,
+            meta_len: 500,
+            data_offset: Header::MIN_DATA_OFFSET,
+            flags: 0,
+            version: crate::storage::format::VERSION,
+        };
+        let mut bytes = header.encode().to_vec();
+        bytes.extend_from_slice(&[0u8; 32]); // far short of the declared data_len
+        let path = dir.join("malformed.obj");
+        std::fs::write(&path, &bytes).unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn migrate_object_file_rejects_inconsistent_header_instead_of_panicking() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = write_malformed_obj(dir.path());
+        let old_omk = [1u8; 32];
+        let new_omk = [2u8; 32];
+        let new_path_key = [3u8; 32];
+
+        let result = migrate_object_file(&path, &old_omk, &new_omk, &new_path_key, "bucket").await;
+        assert!(
+            result.is_err(),
+            "a malformed header must error, not panic: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rotate_tmp_staging_file_is_swept_as_orphan() {
+        // Regression test for the `.obj.rotate-tmp` naming bug: that
+        // extension is "rotate-tmp" (not "tmp"), so
+        // `filesystem::clear_orphan_tmp_files`'s `extension() == "tmp"`
+        // filter never collected a rotate-tmp staging file orphaned by a
+        // crash mid-rotation. The fixed naming must be swept like any other
+        // orphan.
+        let dir = tempfile::TempDir::new().unwrap();
+        let base = dir.path().join("data");
+        let shard = base.join("bucketdirhex").join("ab").join("cd");
+        tokio::fs::create_dir_all(&shard).await.unwrap();
+
+        // Mirror the exact construction `migrate_object_file` now uses: the
+        // destination `.obj` path with its extension swapped for `.tmp`.
+        let new_obj_path = shard.join("abcd1234.obj");
+        let tmp_path = new_obj_path.with_extension("tmp");
+        tokio::fs::write(&tmp_path, b"orphaned rotation staging data")
+            .await
+            .unwrap();
+
+        let future = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+        let removed = crate::storage::filesystem::clear_orphan_tmp_files(&base, future)
+            .await
+            .unwrap();
+        assert_eq!(
+            removed, 1,
+            "rotate-tmp staging file must be recognized as an orphan and swept"
+        );
+        assert!(!tmp_path.exists());
+    }
 }

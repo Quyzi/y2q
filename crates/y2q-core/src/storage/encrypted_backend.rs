@@ -156,12 +156,18 @@ impl EncryptedFileBackend {
     /// index) and recreated empty - the caller is expected to rebuild it.
     pub fn open(path: &Path, file_key: [u8; 32]) -> Result<Self, io::Error> {
         let cipher = Aes256Gcm::new((&file_key).into());
-        let mut file = OpenOptions::new()
+        let mut open_options = OpenOptions::new();
+        open_options
             .read(true)
             .write(true)
             .create(true)
-            .truncate(false)
-            .open(path)?;
+            .truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            open_options.mode(0o600);
+        }
+        let mut file = open_options.open(path)?;
 
         let initial_phys = file.metadata()?.len();
         let logical_len = if initial_phys == 0 {
@@ -171,7 +177,15 @@ impl EncryptedFileBackend {
         } else if initial_phys >= 8 && read_magic(&mut file)? == *MAGIC {
             read_header(&cipher, &mut file)?
         } else {
-            // Foreign/legacy/corrupt file with no recognizable magic. Recreate.
+            // Foreign/legacy/corrupt file with no recognizable magic.
+            // Recreate — but this is destructive (the prior contents are
+            // gone), so make it observable in logs where it would otherwise
+            // be silent.
+            tracing::error!(
+                path = %path.display(),
+                phys_len = initial_phys,
+                "encrypted index file has no recognizable magic; destroying and recreating it"
+            );
             file.set_len(0)?;
             write_header(&cipher, &mut file, 0)?;
             0
@@ -547,5 +561,16 @@ mod tests {
         std::fs::write(&path, b"redb-or-some-other-format-without-our-magic").unwrap();
         let be = EncryptedFileBackend::open(&path, [4u8; 32]).unwrap();
         assert_eq!(be.len().unwrap(), 0);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn index_file_is_created_with_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.redb");
+        let _be = EncryptedFileBackend::open(&path, [5u8; 32]).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "index file must be created 0600");
     }
 }
