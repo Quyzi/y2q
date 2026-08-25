@@ -195,6 +195,37 @@ pub(crate) fn require_object_metadata_key(node_keys: &NodeKeySlot) -> Result<[u8
         })
 }
 
+/// Read the container header key from `node_keys`, erroring if the node key
+/// has not been installed (which should never happen post-boot).
+///
+/// Every `.obj` header is MAC'd under this key on write and verified with it
+/// on read, so both paths require the node key.
+pub(crate) fn require_container_header_key(node_keys: &NodeKeySlot) -> Result<[u8; 32], Error> {
+    node_keys
+        .container_header_key()
+        .ok_or_else(|| Error::InternalError {
+            bucket: String::new(),
+            key: String::new(),
+            operation: "container-header".to_owned(),
+            message: "object header operation attempted without an installed node key".to_owned(),
+        })
+}
+
+/// The three node-derived keys an object-level operation needs.
+///
+/// Passed as one value rather than three positional `&[u8; 32]` parameters:
+/// they are indistinguishable at a call site, so transposing two is an easy
+/// mistake that type-checks and then fails at runtime as an auth error.
+#[derive(Clone, Copy)]
+pub(crate) struct ObjectKeys<'a> {
+    /// Object Metadata Key — seals the metadata sidecar.
+    pub mek: &'a [u8; 32],
+    /// Container Header Key — authenticates the 64-byte `Y2QO` header.
+    pub chk: &'a [u8; 32],
+    /// Path Key — derives the object's opaque on-disk location.
+    pub path_key: &'a [u8; 32],
+}
+
 /// Keyed opaque directory name for `bucket`:
 /// `hex(HMAC-SHA256(path_key, "y2q-bucket\0" || len(bucket) || bucket))`.
 pub(crate) fn encode_bucket_dir(path_key: &[u8; 32], bucket: &str) -> String {
@@ -376,12 +407,12 @@ pub(crate) fn obj_path_for(
 pub(crate) async fn set_labels_impl(
     base_path: &Path,
     index: &MetadataIndex,
-    mek: &[u8; 32],
-    path_key: &[u8; 32],
+    keys: &ObjectKeys<'_>,
     bucket: &str,
     key: &str,
     labels: crate::LabelSet,
 ) -> Result<(), Error> {
+    let ObjectKeys { mek, chk, path_key } = *keys;
     validate_bucket(bucket)?;
     validate_key(key)?;
 
@@ -416,25 +447,20 @@ pub(crate) async fn set_labels_impl(
     }
     let mut header_buf = [0u8; HEADER_SIZE];
     header_buf.copy_from_slice(&bytes[..HEADER_SIZE]);
-    let header =
-        Header::decode(&header_buf).map_err(|e| internal(format!("decode header: {e}")))?;
-
-    if header
-        .checked_total_len()
-        .is_none_or(|total| total > bytes.len() as u64)
-    {
-        return Err(internal(
-            "header fields inconsistent with file length".to_owned(),
-        ));
-    }
+    let object_id = object_id_from_path(&obj_path)
+        .ok_or_else(|| internal("cannot derive object id from path".to_owned()))?;
+    let header = Header::decode(&header_buf, chk, object_id)
+        .map_err(|e| internal(format!("decode header: {e}")))?;
+    header
+        .check_total_len(bytes.len() as u64)
+        .map_err(|e| internal(e.to_string()))?;
     let data_start = header.data_offset as usize;
     let meta_start = header.meta_offset() as usize;
     let meta_end = meta_start + header.meta_len as usize;
     let data = &bytes[data_start..meta_start];
     let meta_bytes = &bytes[meta_start..meta_end];
 
-    let object_id = object_id_from_path(&obj_path)
-        .ok_or_else(|| internal("cannot derive object id from path".to_owned()))?;
+    // `object_id` was resolved above, before the header was authenticated.
     let meta_json = decrypt_meta(mek, meta_bytes, object_id)
         .map_err(|e| internal(format!("decrypt meta: {e}")))?;
     let mut metadata: Metadata =
@@ -455,7 +481,7 @@ pub(crate) async fn set_labels_impl(
         flags: header.flags,
         version: header.version,
     };
-    let header_enc = new_header.encode();
+    let header_enc = new_header.encode(chk, object_id);
 
     let mut out = Vec::with_capacity(data_start + data.len() + new_meta.len() + HEADER_SIZE);
     out.extend_from_slice(&header_enc);
@@ -641,22 +667,27 @@ fn record_storage_op<T, E>(op: &'static str, result: &Result<T, E>, elapsed_ms: 
 }
 
 /// Read and decode the metadata embedded in a `.obj` file at `path`.
-async fn read_obj_metadata(path: &Path, mek: &[u8; 32]) -> Result<Metadata, std::io::Error> {
+async fn read_obj_metadata(
+    path: &Path,
+    mek: &[u8; 32],
+    chk: &[u8; 32],
+) -> Result<Metadata, std::io::Error> {
+    let invalid = |msg: String| std::io::Error::new(std::io::ErrorKind::InvalidData, msg);
     let mut file = tokio::fs::File::open(path).await?;
+    let actual_len = file.metadata().await?.len();
     let mut header_buf = [0u8; HEADER_SIZE];
     file.read_exact(&mut header_buf).await?;
-    let header = Header::decode(&header_buf)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+    let object_id = object_id_from_path(path)
+        .ok_or_else(|| invalid("cannot derive object id from path".into()))?;
+    let header = Header::decode(&header_buf, chk, object_id).map_err(|e| invalid(e.to_string()))?;
+    // Bounds `meta_len` before it sizes the allocation below.
+    header
+        .check_total_len(actual_len)
+        .map_err(|e| invalid(e.to_string()))?;
     file.seek(std::io::SeekFrom::Start(header.meta_offset()))
         .await?;
     let mut meta_buf = vec![0u8; header.meta_len as usize];
     file.read_exact(&mut meta_buf).await?;
-    let object_id = object_id_from_path(path).ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "cannot derive object id from path",
-        )
-    })?;
     let json = decrypt_meta(mek, &meta_buf, object_id)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
     serde_json::from_slice(&json)
@@ -665,8 +696,11 @@ async fn read_obj_metadata(path: &Path, mek: &[u8; 32]) -> Result<Metadata, std:
 
 /// Read the `created` timestamp from an existing `.obj` file, returning `None`
 /// if the file cannot be read or parsed.
-async fn read_obj_created(path: &Path, mek: &[u8; 32]) -> Option<u64> {
-    read_obj_metadata(path, mek).await.ok().map(|m| m.created)
+async fn read_obj_created(path: &Path, mek: &[u8; 32], chk: &[u8; 32]) -> Option<u64> {
+    read_obj_metadata(path, mek, chk)
+        .await
+        .ok()
+        .map(|m| m.created)
 }
 
 /// RAII guard returned by [`FilesystemStorage::begin_streaming_put`].
@@ -734,14 +768,15 @@ impl StreamingPutGuard {
             message: format!("encode meta: {e}"),
         })?;
         let mek = require_object_metadata_key(&self.mek)?;
-        let meta_bytes = {
-            let object_id =
-                object_id_from_path(&self.obj_path).ok_or_else(|| Error::InternalError {
-                    bucket: bucket.to_owned(),
-                    key: key.to_owned(),
-                    operation: "put".to_owned(),
-                    message: "cannot derive object id from path".to_owned(),
-                })?;
+        let chk = require_container_header_key(&self.mek)?;
+        let object_id =
+            object_id_from_path(&self.obj_path).ok_or_else(|| Error::InternalError {
+                bucket: bucket.to_owned(),
+                key: key.to_owned(),
+                operation: "put".to_owned(),
+                message: "cannot derive object id from path".to_owned(),
+            })?;
+        let meta_bytes =
             encrypt_meta(&mek, &meta_json, object_id, META_PAD_BLOCK).map_err(|e| {
                 Error::InternalError {
                     bucket: bucket.to_owned(),
@@ -749,8 +784,7 @@ impl StreamingPutGuard {
                     operation: "put".to_owned(),
                     message: format!("encrypt meta: {e}"),
                 }
-            })?
-        };
+            })?;
 
         let mut flags = 0u16;
         if options.sync == SyncLevel::Durable {
@@ -763,6 +797,7 @@ impl StreamingPutGuard {
             flags,
             version: format::VERSION,
         };
+        let header_enc = header.encode(&chk, object_id);
 
         // File is at EOF after EncryptSession. Append meta then trailer.
         file.write_all(&meta_bytes)
@@ -773,7 +808,7 @@ impl StreamingPutGuard {
                 operation: "put".to_owned(),
                 message: format!("write meta: {e}"),
             })?;
-        file.write_all(&header.encode())
+        file.write_all(&header_enc)
             .await
             .map_err(|e| Error::InternalError {
                 bucket: bucket.to_owned(),
@@ -791,7 +826,7 @@ impl StreamingPutGuard {
                 operation: "put".to_owned(),
                 message: format!("seek to header: {e}"),
             })?;
-        file.write_all(&header.encode())
+        file.write_all(&header_enc)
             .await
             .map_err(|e| Error::InternalError {
                 bucket: bucket.to_owned(),
@@ -893,9 +928,10 @@ impl FilesystemStorage {
         }
 
         let mek = require_object_metadata_key(&self.mek)?;
+        let chk = require_container_header_key(&self.mek)?;
         let (is_overwrite, prior_created) = match tokio::fs::metadata(&obj_path).await {
             Ok(_) => {
-                let created = read_obj_created(&obj_path, &mek).await;
+                let created = read_obj_created(&obj_path, &mek, &chk).await;
                 (true, created)
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => (false, None),
@@ -989,12 +1025,20 @@ impl Storage for FilesystemStorage {
                     operation: "get".to_owned(),
                     message: format!("read header: {e}"),
                 })?;
-            let header = Header::decode(&header_buf).map_err(|e| Error::InternalError {
+            let chk = require_container_header_key(&self.mek)?;
+            let object_id = object_id_from_path(&obj_path).ok_or_else(|| Error::InternalError {
                 bucket: bucket.to_owned(),
                 key: key.to_owned(),
                 operation: "get".to_owned(),
-                message: format!("decode header: {e}"),
+                message: "cannot derive object id from path".to_owned(),
             })?;
+            let header =
+                Header::decode(&header_buf, &chk, object_id).map_err(|e| Error::InternalError {
+                    bucket: bucket.to_owned(),
+                    key: key.to_owned(),
+                    operation: "get".to_owned(),
+                    message: format!("decode header: {e}"),
+                })?;
 
             let file_len = file
                 .metadata()
@@ -1006,17 +1050,14 @@ impl Storage for FilesystemStorage {
                     message: format!("stat: {e}"),
                 })?
                 .len();
-            if header
-                .checked_total_len()
-                .is_none_or(|total| total > file_len)
-            {
-                return Err(Error::InternalError {
+            header
+                .check_total_len(file_len)
+                .map_err(|e| Error::InternalError {
                     bucket: bucket.to_owned(),
                     key: key.to_owned(),
                     operation: "get".to_owned(),
-                    message: "header fields inconsistent with file length".to_owned(),
-                });
-            }
+                    message: e.to_string(),
+                })?;
 
             file.seek(std::io::SeekFrom::Start(header.data_offset as u64))
                 .await
@@ -1083,12 +1124,38 @@ impl Storage for FilesystemStorage {
                 operation: "get_range".to_owned(),
                 message: format!("read header: {e}"),
             })?;
-        let header = Header::decode(&header_buf).map_err(|e| Error::InternalError {
+        let chk = require_container_header_key(&self.mek)?;
+        let object_id = object_id_from_path(&obj_path).ok_or_else(|| Error::InternalError {
             bucket: bucket.to_owned(),
             key: key.to_owned(),
             operation: "get_range".to_owned(),
-            message: format!("decode header: {e}"),
+            message: "cannot derive object id from path".to_owned(),
         })?;
+        let header =
+            Header::decode(&header_buf, &chk, object_id).map_err(|e| Error::InternalError {
+                bucket: bucket.to_owned(),
+                key: key.to_owned(),
+                operation: "get_range".to_owned(),
+                message: format!("decode header: {e}"),
+            })?;
+        let file_len = file
+            .metadata()
+            .await
+            .map_err(|e| Error::InternalError {
+                bucket: bucket.to_owned(),
+                key: key.to_owned(),
+                operation: "get_range".to_owned(),
+                message: format!("stat: {e}"),
+            })?
+            .len();
+        header
+            .check_total_len(file_len)
+            .map_err(|e| Error::InternalError {
+                bucket: bucket.to_owned(),
+                key: key.to_owned(),
+                operation: "get_range".to_owned(),
+                message: e.to_string(),
+            })?;
 
         if header.data_len == 0 || range.start >= header.data_len {
             return Ok(Bytes::new());
@@ -1154,9 +1221,10 @@ impl Storage for FilesystemStorage {
             let _lock = self.locks.try_acquire(bucket, key)?;
 
             let mek = require_object_metadata_key(&self.mek)?;
+            let chk = require_container_header_key(&self.mek)?;
             let (is_overwrite, prior_created) = match tokio::fs::metadata(&obj_path).await {
                 Ok(_) => {
-                    let created = read_obj_created(&obj_path, &mek).await;
+                    let created = read_obj_created(&obj_path, &mek, &chk).await;
                     (true, created)
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => (false, None),
@@ -1219,14 +1287,13 @@ impl Storage for FilesystemStorage {
                 operation: "put".to_owned(),
                 message: e.to_string(),
             })?;
-            let meta_bytes = {
-                let object_id =
-                    object_id_from_path(&obj_path).ok_or_else(|| Error::InternalError {
-                        bucket: bucket.to_owned(),
-                        key: key.to_owned(),
-                        operation: "put".to_owned(),
-                        message: "cannot derive object id from path".to_owned(),
-                    })?;
+            let object_id = object_id_from_path(&obj_path).ok_or_else(|| Error::InternalError {
+                bucket: bucket.to_owned(),
+                key: key.to_owned(),
+                operation: "put".to_owned(),
+                message: "cannot derive object id from path".to_owned(),
+            })?;
+            let meta_bytes =
                 encrypt_meta(&mek, &meta_json, object_id, META_PAD_BLOCK).map_err(|e| {
                     Error::InternalError {
                         bucket: bucket.to_owned(),
@@ -1234,8 +1301,7 @@ impl Storage for FilesystemStorage {
                         operation: "put".to_owned(),
                         message: e.to_string(),
                     }
-                })?
-            };
+                })?;
 
             let mut header_flags = 0u16;
             if options.sync == SyncLevel::Durable {
@@ -1248,6 +1314,7 @@ impl Storage for FilesystemStorage {
                 flags: header_flags,
                 version: format::VERSION,
             };
+            let header_enc = header.encode(&chk, object_id);
 
             let mut tmp_open_opts = tokio::fs::OpenOptions::new();
             tmp_open_opts.write(true).create(true).truncate(true);
@@ -1265,7 +1332,7 @@ impl Storage for FilesystemStorage {
                     })?;
 
             tmp_file
-                .write_all(&header.encode())
+                .write_all(&header_enc)
                 .await
                 .map_err(|e| Error::InternalError {
                     bucket: bucket.to_owned(),
@@ -1292,7 +1359,7 @@ impl Storage for FilesystemStorage {
                     message: format!("write meta: {e}"),
                 })?;
             tmp_file
-                .write_all(&header.encode())
+                .write_all(&header_enc)
                 .await
                 .map_err(|e| Error::InternalError {
                     bucket: bucket.to_owned(),
@@ -1396,12 +1463,20 @@ impl Storage for FilesystemStorage {
                     operation: "delete".to_owned(),
                     message: format!("read header: {e}"),
                 })?;
-            let header = Header::decode(&header_buf).map_err(|e| Error::InternalError {
+            let chk = require_container_header_key(&self.mek)?;
+            let object_id = object_id_from_path(&obj_path).ok_or_else(|| Error::InternalError {
                 bucket: bucket.to_owned(),
                 key: key.to_owned(),
                 operation: "delete".to_owned(),
-                message: format!("decode header: {e}"),
+                message: "cannot derive object id from path".to_owned(),
             })?;
+            let header =
+                Header::decode(&header_buf, &chk, object_id).map_err(|e| Error::InternalError {
+                    bucket: bucket.to_owned(),
+                    key: key.to_owned(),
+                    operation: "delete".to_owned(),
+                    message: format!("decode header: {e}"),
+                })?;
 
             let file_len = file
                 .metadata()
@@ -1413,17 +1488,14 @@ impl Storage for FilesystemStorage {
                     message: format!("stat: {e}"),
                 })?
                 .len();
-            if header
-                .checked_total_len()
-                .is_none_or(|total| total > file_len)
-            {
-                return Err(Error::InternalError {
+            header
+                .check_total_len(file_len)
+                .map_err(|e| Error::InternalError {
                     bucket: bucket.to_owned(),
                     key: key.to_owned(),
                     operation: "delete".to_owned(),
-                    message: "header fields inconsistent with file length".to_owned(),
-                });
-            }
+                    message: e.to_string(),
+                })?;
 
             file.seek(std::io::SeekFrom::Start(header.data_offset as u64))
                 .await
@@ -1482,11 +1554,16 @@ impl Storage for FilesystemStorage {
         let result = async {
             self.locks.check_not_locked(bucket, key)?;
             let path_key = require_path_key(&self.mek)?;
+            let mek = require_object_metadata_key(&self.mek)?;
+            let chk = require_container_header_key(&self.mek)?;
             set_labels_impl(
                 &self.base_path,
                 &self.index,
-                &require_object_metadata_key(&self.mek)?,
-                &path_key,
+                &ObjectKeys {
+                    mek: &mek,
+                    chk: &chk,
+                    path_key: &path_key,
+                },
                 bucket,
                 key,
                 labels,
@@ -1518,14 +1595,18 @@ impl Storage for FilesystemStorage {
                 });
             }
 
-            read_obj_metadata(&obj_path, &require_object_metadata_key(&self.mek)?)
-                .await
-                .map_err(|e| Error::InternalError {
-                    bucket: bucket.to_owned(),
-                    key: key.to_owned(),
-                    operation: "describe".to_owned(),
-                    message: e.to_string(),
-                })
+            read_obj_metadata(
+                &obj_path,
+                &require_object_metadata_key(&self.mek)?,
+                &require_container_header_key(&self.mek)?,
+            )
+            .await
+            .map_err(|e| Error::InternalError {
+                bucket: bucket.to_owned(),
+                key: key.to_owned(),
+                operation: "describe".to_owned(),
+                message: e.to_string(),
+            })
         }
         .await;
         record_storage_op(
@@ -1633,8 +1714,9 @@ impl StorageExt for FilesystemStorage {
         let index = self.index.clone();
         let state = self.rebuild_state.clone();
         let mek = require_object_metadata_key(&self.mek)?;
+        let chk = require_container_header_key(&self.mek)?;
         tokio::spawn(async move {
-            let result = run_rebuild(base_path, index, state.clone(), mek).await;
+            let result = run_rebuild(base_path, index, state.clone(), mek, chk).await;
             let mut s = state.lock().await;
             *s = match result {
                 Ok(()) => CacheRebuildStatus::Completed,
@@ -1725,6 +1807,7 @@ async fn run_rebuild(
     index: Arc<MetadataIndex>,
     state: Arc<tokio::sync::Mutex<CacheRebuildStatus>>,
     mek: [u8; 32],
+    chk: [u8; 32],
 ) -> Result<(), String> {
     let obj_files = collect_obj_files(&base_path)
         .await
@@ -1736,7 +1819,7 @@ async fn run_rebuild(
     let report_every = (total / 100).max(1);
 
     for (i, path) in obj_files.into_iter().enumerate() {
-        match read_obj_metadata(&path, &mek).await {
+        match read_obj_metadata(&path, &mek, &chk).await {
             Ok(meta) => {
                 if let Err(e) = index.upsert(&meta, SyncLevel::Durable).await {
                     tracing::warn!(
@@ -2125,13 +2208,16 @@ mod tests {
         // Corrupt the on-disk header so `data_offset + data_len + meta_len +
         // 64` wildly exceeds the actual file length. Before the bounds
         // check this desynced the `data`/`meta` slice bounds and panicked
-        // instead of erroring.
+        // instead of erroring. Re-MAC it under the real key so the test
+        // exercises the length check rather than stopping at the MAC.
+        let chk = crate::crypto::derive_container_header_key(&TEST_NODE_KEY);
+        let object_id = object_id_from_path(&obj_path).unwrap().to_owned();
         let mut bytes = std::fs::read(&obj_path).unwrap();
         let mut header_buf = [0u8; HEADER_SIZE];
         header_buf.copy_from_slice(&bytes[..HEADER_SIZE]);
-        let mut header = Header::decode(&header_buf).unwrap();
+        let mut header = Header::decode(&header_buf, &chk, &object_id).unwrap();
         header.data_len = 1_000_000_000;
-        bytes[..HEADER_SIZE].copy_from_slice(&header.encode());
+        bytes[..HEADER_SIZE].copy_from_slice(&header.encode(&chk, &object_id));
         std::fs::write(&obj_path, &bytes).unwrap();
 
         let result = s.set_labels("b", "k", crate::LabelSet::new()).await;
@@ -2849,9 +2935,13 @@ mod tests {
         assert_eq!(&bytes[..4], &MAGIC);
 
         let header_arr: [u8; HEADER_SIZE] = bytes[..HEADER_SIZE].try_into().unwrap();
-        let header = Header::decode(&header_arr).unwrap();
+        let chk = crate::crypto::derive_container_header_key(&TEST_NODE_KEY);
+        let object_id = object_id_from_path(&obj_path).unwrap();
+        let header = Header::decode(&header_arr, &chk, object_id).unwrap();
         assert_eq!(header.data_len, body.len() as u64);
         assert_eq!(header.data_offset, Header::MIN_DATA_OFFSET);
+        // The header authenticates only for its own object id.
+        assert!(Header::decode(&header_arr, &chk, "some-other-id").is_err());
         assert_eq!(
             &bytes[header.data_offset as usize..header.data_offset as usize + body.len()],
             body

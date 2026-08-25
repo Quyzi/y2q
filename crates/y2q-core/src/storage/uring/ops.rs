@@ -48,6 +48,8 @@ pub(super) enum UringOp {
         locks: LockRegistry,
         bucket: String,
         key: String,
+        /// Container Header Key for verifying the object header's MAC.
+        chk: [u8; 32],
         reply: oneshot::Sender<Result<Object, Error>>,
     },
     /// Read a byte range of the object payload.
@@ -56,6 +58,8 @@ pub(super) enum UringOp {
         locks: LockRegistry,
         bucket: String,
         key: String,
+        /// Container Header Key for verifying the object header's MAC.
+        chk: [u8; 32],
         range: RangeInclusive<u64>,
         reply: oneshot::Sender<Result<Bytes, Error>>,
     },
@@ -81,6 +85,8 @@ pub(super) enum UringOp {
         /// Metadata Encryption Key. When set, the metadata JSON blob is
         /// encrypted before being written to the `.obj` file.
         mek: [u8; 32],
+        /// Container Header Key the object header is MAC'd under.
+        chk: [u8; 32],
         reply: oneshot::Sender<Result<(bool, Metadata), Error>>,
     },
     /// Read the object, then unlink it. Returns the deleted bytes.
@@ -89,6 +95,8 @@ pub(super) enum UringOp {
         locks: LockRegistry,
         bucket: String,
         key: String,
+        /// Container Header Key for verifying the object header's MAC.
+        chk: [u8; 32],
         reply: oneshot::Sender<Result<Object, Error>>,
     },
     /// Read and decode just the metadata blob.
@@ -99,6 +107,8 @@ pub(super) enum UringOp {
         key: String,
         /// Metadata Encryption Key for decrypting the embedded metadata blob.
         mek: [u8; 32],
+        /// Container Header Key for verifying the object header's MAC.
+        chk: [u8; 32],
         reply: oneshot::Sender<Result<Metadata, Error>>,
     },
     /// Read the on-disk metadata for an object given its file path, without
@@ -114,6 +124,8 @@ pub(super) enum UringOp {
         path: PathBuf,
         /// Metadata Encryption Key for decrypting the embedded metadata blob.
         mek: [u8; 32],
+        /// Container Header Key for verifying the object header's MAC.
+        chk: [u8; 32],
         reply: oneshot::Sender<Result<Metadata, Error>>,
     },
     /// Create a streaming-put tmp file and write a placeholder header at
@@ -155,19 +167,21 @@ pub(super) async fn handle(op: UringOp) {
             locks,
             bucket,
             key,
+            chk,
             reply,
         } => {
-            let _ = reply.send(do_get(obj_path, locks, bucket, key).await);
+            let _ = reply.send(do_get(obj_path, locks, bucket, key, chk).await);
         }
         UringOp::GetRange {
             obj_path,
             locks,
             bucket,
             key,
+            chk,
             range,
             reply,
         } => {
-            let _ = reply.send(do_get_range(obj_path, locks, bucket, key, range).await);
+            let _ = reply.send(do_get_range(obj_path, locks, bucket, key, chk, range).await);
         }
         UringOp::Put {
             obj_path,
@@ -182,6 +196,7 @@ pub(super) async fn handle(op: UringOp) {
             large_object_bytes,
             sync,
             mek,
+            chk,
             reply,
         } => {
             let (plaintext_metrics, cipher_metadata) = match crypto {
@@ -203,6 +218,7 @@ pub(super) async fn handle(op: UringOp) {
                     large_object_bytes,
                     sync,
                     mek,
+                    chk,
                 )
                 .await,
             );
@@ -212,9 +228,10 @@ pub(super) async fn handle(op: UringOp) {
             locks,
             bucket,
             key,
+            chk,
             reply,
         } => {
-            let _ = reply.send(do_delete(obj_path, locks, bucket, key).await);
+            let _ = reply.send(do_delete(obj_path, locks, bucket, key, chk).await);
         }
         UringOp::Describe {
             obj_path,
@@ -222,12 +239,18 @@ pub(super) async fn handle(op: UringOp) {
             bucket,
             key,
             mek,
+            chk,
             reply,
         } => {
-            let _ = reply.send(do_describe(obj_path, locks, bucket, key, mek).await);
+            let _ = reply.send(do_describe(obj_path, locks, bucket, key, mek, chk).await);
         }
-        UringOp::ReadObjectMeta { path, mek, reply } => {
-            let _ = reply.send(do_read_object_meta(path, mek).await);
+        UringOp::ReadObjectMeta {
+            path,
+            mek,
+            chk,
+            reply,
+        } => {
+            let _ = reply.send(do_read_object_meta(path, mek, chk).await);
         }
         UringOp::StreamCreate {
             path,
@@ -282,6 +305,7 @@ async fn open_and_read_header(
     bucket: &str,
     key: &str,
     op_name: &str,
+    chk: &[u8; 32],
 ) -> Result<(File, Header), Error> {
     let file = match File::open(obj_path).await {
         Ok(f) => f,
@@ -304,7 +328,19 @@ async fn open_and_read_header(
     }
     let header_bytes: [u8; HEADER_SIZE] = buf.as_slice().try_into().expect("HEADER_SIZE buffer");
     bufpool::release(buf);
-    let header = match Header::decode(&header_bytes) {
+    let object_id = match object_id_from_path(obj_path) {
+        Some(id) => id,
+        None => {
+            let _ = file.close().await;
+            return Err(internal(
+                bucket,
+                key,
+                op_name,
+                "cannot derive object id from path",
+            ));
+        }
+    };
+    let header = match Header::decode(&header_bytes, chk, object_id) {
         Ok(h) => h,
         Err(e) => {
             let _ = file.close().await;
@@ -316,6 +352,20 @@ async fn open_and_read_header(
             ));
         }
     };
+    // Bound `meta_len`/`data_len` against the real file size before either can
+    // size a read or an allocation.
+    match file.statx().await {
+        Ok(st) => {
+            if let Err(e) = header.check_total_len(st.stx_size) {
+                let _ = file.close().await;
+                return Err(internal(bucket, key, op_name, e.to_string()));
+            }
+        }
+        Err(e) => {
+            let _ = file.close().await;
+            return Err(internal(bucket, key, op_name, format!("stat: {e}")));
+        }
+    }
     Ok((file, header))
 }
 
@@ -363,9 +413,10 @@ async fn do_describe(
     bucket: String,
     key: String,
     mek: [u8; 32],
+    chk: [u8; 32],
 ) -> Result<Metadata, Error> {
     locks.check_not_locked(&bucket, &key)?;
-    let (file, header) = open_and_read_header(&obj_path, &bucket, &key, "describe").await?;
+    let (file, header) = open_and_read_header(&obj_path, &bucket, &key, "describe", &chk).await?;
     let meta = read_meta_blob(&file, &header, &obj_path, &bucket, &key, "describe", &mek).await;
     let _ = file.close().await;
     meta
@@ -375,7 +426,11 @@ async fn do_describe(
 /// bucket/key validation. Used by the rebuild walker, which has thousands
 /// of paths to process and identifies each object by the metadata embedded
 /// in the file itself.
-async fn do_read_object_meta(path: PathBuf, mek: [u8; 32]) -> Result<Metadata, Error> {
+async fn do_read_object_meta(
+    path: PathBuf,
+    mek: [u8; 32],
+    chk: [u8; 32],
+) -> Result<Metadata, Error> {
     let make_err = |msg: String| Error::InternalError {
         bucket: String::new(),
         key: String::new(),
@@ -396,13 +451,32 @@ async fn do_read_object_meta(path: PathBuf, mek: [u8; 32]) -> Result<Metadata, E
     }
     let header_bytes: [u8; HEADER_SIZE] = buf.as_slice().try_into().expect("HEADER_SIZE buffer");
     bufpool::release(buf);
-    let header = match Header::decode(&header_bytes) {
+    let object_id = match object_id_from_path(&path) {
+        Some(id) => id,
+        None => {
+            let _ = file.close().await;
+            return Err(make_err("cannot derive object id from path".to_owned()));
+        }
+    };
+    let header = match Header::decode(&header_bytes, &chk, object_id) {
         Ok(h) => h,
         Err(e) => {
             let _ = file.close().await;
             return Err(make_err(format!("decode header: {e}")));
         }
     };
+    match file.statx().await {
+        Ok(st) => {
+            if let Err(e) = header.check_total_len(st.stx_size) {
+                let _ = file.close().await;
+                return Err(make_err(e.to_string()));
+            }
+        }
+        Err(e) => {
+            let _ = file.close().await;
+            return Err(make_err(format!("stat: {e}")));
+        }
+    }
     // SAFETY: read_exact_at writes exactly meta_len bytes on Ok.
     let meta_buf = unsafe { bufpool::acquire_uninit(header.meta_len as usize) };
     let (res, meta_buf) = file.read_exact_at(meta_buf, header.meta_offset()).await;
@@ -427,9 +501,10 @@ async fn do_get(
     locks: LockRegistry,
     bucket: String,
     key: String,
+    chk: [u8; 32],
 ) -> Result<Object, Error> {
     locks.check_not_locked(&bucket, &key)?;
-    let (file, header) = open_and_read_header(&obj_path, &bucket, &key, "get").await?;
+    let (file, header) = open_and_read_header(&obj_path, &bucket, &key, "get", &chk).await?;
 
     let data_len = header.data_len as usize;
     // SAFETY: read_exact_at writes exactly data_len bytes on Ok; the buffer
@@ -449,10 +524,11 @@ async fn do_get_range(
     locks: LockRegistry,
     bucket: String,
     key: String,
+    chk: [u8; 32],
     range: RangeInclusive<u64>,
 ) -> Result<Bytes, Error> {
     locks.check_not_locked(&bucket, &key)?;
-    let (file, header) = open_and_read_header(&obj_path, &bucket, &key, "get_range").await?;
+    let (file, header) = open_and_read_header(&obj_path, &bucket, &key, "get_range", &chk).await?;
 
     if header.data_len == 0 || range.start >= header.data_len {
         let _ = file.close().await;
@@ -484,9 +560,10 @@ async fn do_delete(
     locks: LockRegistry,
     bucket: String,
     key: String,
+    chk: [u8; 32],
 ) -> Result<Object, Error> {
     locks.check_not_locked(&bucket, &key)?;
-    let (file, header) = open_and_read_header(&obj_path, &bucket, &key, "delete").await?;
+    let (file, header) = open_and_read_header(&obj_path, &bucket, &key, "delete", &chk).await?;
 
     let data_len = header.data_len as usize;
     // SAFETY: read_exact_at writes exactly data_len bytes on Ok.
@@ -520,6 +597,7 @@ async fn do_put(
     large_object_bytes: u64,
     sync: SyncLevel,
     mek: [u8; 32],
+    chk: [u8; 32],
 ) -> Result<(bool, Metadata), Error> {
     if let Some(parent) = obj_path.parent() {
         std::fs::create_dir_all(parent)
@@ -532,7 +610,7 @@ async fn do_put(
     // gives us its prior `created` timestamp for preservation.
     let (is_overwrite, prior_created) = match File::open(&obj_path).await {
         Ok(file) => {
-            let prior = read_existing_created(&file, &obj_path, &mek).await;
+            let prior = read_existing_created(&file, &obj_path, &mek, &chk).await;
             let _ = file.close().await;
             (true, prior)
         }
@@ -596,32 +674,31 @@ async fn do_put(
 
     let meta_json = serde_json::to_vec(&metadata)
         .map_err(|e| internal(&bucket, &key, "put", format!("encode meta: {e}")))?;
-    let meta_bytes = {
-        let object_id = object_id_from_path(&obj_path).ok_or_else(|| {
+    let object_id = object_id_from_path(&obj_path)
+        .ok_or_else(|| {
             internal(
                 &bucket,
                 &key,
                 "put",
                 "cannot derive object id from path".to_owned(),
             )
-        })?;
-        encrypt_meta(&mek, &meta_json, object_id, META_PAD_BLOCK)
-            .map_err(|e| internal(&bucket, &key, "put", format!("encrypt meta: {e}")))?
+        })?
+        .to_owned();
+    let meta_bytes = encrypt_meta(&mek, &meta_json, &object_id, META_PAD_BLOCK)
+        .map_err(|e| internal(&bucket, &key, "put", format!("encrypt meta: {e}")))?;
+
+    let target = WriteTarget {
+        obj_path: &obj_path,
+        tmp_path: &tmp_path,
+        bucket: &bucket,
+        key: &key,
+        object_id: &object_id,
+        chk: &chk,
     };
 
     let use_direct = large_object_bytes > 0 && payload.len() as u64 >= large_object_bytes;
     if use_direct {
-        match put_via_direct(
-            &obj_path,
-            &tmp_path,
-            &bucket,
-            &key,
-            &payload,
-            &meta_bytes,
-            sync,
-        )
-        .await
-        {
+        match put_via_direct(&target, &payload, &meta_bytes, sync).await {
             Ok(true) => return Ok((is_overwrite, metadata)),
             Ok(false) => {
                 tracing::warn!(
@@ -639,30 +716,41 @@ async fn do_put(
             .insert(("y2q.direct_io".to_owned(), "fallback".to_owned()));
     }
 
-    put_via_buffered(
-        &obj_path,
-        &tmp_path,
-        &bucket,
-        &key,
-        &payload,
-        &meta_bytes,
-        sync,
-    )
-    .await?;
+    put_via_buffered(&target, &payload, &meta_bytes, sync).await?;
     Ok((is_overwrite, metadata))
+}
+
+/// Destination and identity of one object write.
+///
+/// Bundled so the two write paths stay inside clippy's argument budget and so
+/// the several `&str`/`&Path` values cannot be transposed at a call site.
+struct WriteTarget<'a> {
+    obj_path: &'a Path,
+    tmp_path: &'a Path,
+    bucket: &'a str,
+    key: &'a str,
+    /// Opaque on-disk id; the header MAC is bound to it.
+    object_id: &'a str,
+    /// Container Header Key the header and trailer are MAC'd under.
+    chk: &'a [u8; 32],
 }
 
 /// Buffered write path: one fd, four positioned writes, optional fdatasync,
 /// rename, optional dir-fsync. Uses [`Header::MIN_DATA_OFFSET`], no padding.
 async fn put_via_buffered(
-    obj_path: &Path,
-    tmp_path: &Path,
-    bucket: &str,
-    key: &str,
+    target: &WriteTarget<'_>,
     payload: &Bytes,
     meta_bytes: &[u8],
     sync: SyncLevel,
 ) -> Result<(), Error> {
+    let WriteTarget {
+        obj_path,
+        tmp_path,
+        bucket,
+        key,
+        object_id,
+        chk,
+    } = *target;
     let mut header_flags = 0u16;
     if sync == SyncLevel::Durable {
         header_flags |= format::flags::DURABLE;
@@ -674,8 +762,8 @@ async fn put_via_buffered(
         flags: header_flags,
         version: format::VERSION,
     };
-    let header_bytes = header.encode().to_vec();
-    let trailer_bytes = header.encode().to_vec();
+    let header_bytes = header.encode(chk, object_id).to_vec();
+    let trailer_bytes = header_bytes.clone();
 
     let tmp = OpenOptions::new()
         .write(true)
@@ -723,14 +811,19 @@ async fn put_via_buffered(
 /// should fall back to the buffered path. Other I/O errors propagate as
 /// `Err`.
 async fn put_via_direct(
-    obj_path: &Path,
-    tmp_path: &Path,
-    bucket: &str,
-    key: &str,
+    target: &WriteTarget<'_>,
     payload: &Bytes,
     meta_bytes: &[u8],
     sync: SyncLevel,
 ) -> Result<bool, Error> {
+    let WriteTarget {
+        obj_path,
+        tmp_path,
+        bucket,
+        key,
+        object_id,
+        chk,
+    } = *target;
     // Try the O_DIRECT open first so the EINVAL case has zero cleanup. If
     // it succeeds it has also created and truncated the tmp file, so the
     // buffered fd that follows just opens-without-create.
@@ -772,8 +865,8 @@ async fn put_via_direct(
         flags: header_flags,
         version: format::VERSION,
     };
-    let header_bytes = header.encode().to_vec();
-    let trailer_bytes = header.encode().to_vec();
+    let header_bytes = header.encode(chk, object_id).to_vec();
+    let trailer_bytes = header_bytes.clone();
 
     // Header at offset 0 — buffered (the kernel will leave [64, 4096) as a
     // sparse hole; reads of that range return zero, which is what we want).
@@ -959,7 +1052,12 @@ async fn do_stream_rename(from: PathBuf, to: PathBuf, sync: SyncLevel) -> Result
     Ok(())
 }
 
-async fn read_existing_created(file: &File, obj_path: &Path, mek: &[u8; 32]) -> Option<u64> {
+async fn read_existing_created(
+    file: &File,
+    obj_path: &Path,
+    mek: &[u8; 32],
+    chk: &[u8; 32],
+) -> Option<u64> {
     // SAFETY: read_exact_at writes exactly HEADER_SIZE bytes on Ok.
     let buf = unsafe { bufpool::acquire_uninit(HEADER_SIZE) };
     let (res, buf) = file.read_exact_at(buf, 0).await;
@@ -969,7 +1067,11 @@ async fn read_existing_created(file: &File, obj_path: &Path, mek: &[u8; 32]) -> 
     }
     let header_bytes: [u8; HEADER_SIZE] = buf.as_slice().try_into().ok()?;
     bufpool::release(buf);
-    let header = Header::decode(&header_bytes).ok()?;
+    let object_id = object_id_from_path(obj_path)?;
+    let header = Header::decode(&header_bytes, chk, object_id).ok()?;
+    header
+        .check_total_len(file.statx().await.ok()?.stx_size)
+        .ok()?;
     // SAFETY: read_exact_at writes exactly meta_len bytes on Ok.
     let meta_buf = unsafe { bufpool::acquire_uninit(header.meta_len as usize) };
     let (res, meta_buf) = file.read_exact_at(meta_buf, header.meta_offset()).await;
@@ -977,8 +1079,7 @@ async fn read_existing_created(file: &File, obj_path: &Path, mek: &[u8; 32]) -> 
         bufpool::release(meta_buf);
         return None;
     }
-    let plaintext = object_id_from_path(obj_path)
-        .and_then(|object_id| decrypt_meta(mek, &meta_buf, object_id).ok());
+    let plaintext = decrypt_meta(mek, &meta_buf, object_id).ok();
     bufpool::release(meta_buf);
     let m: Option<Metadata> = plaintext.and_then(|p| serde_json::from_slice(&p).ok());
     Some(m?.created)

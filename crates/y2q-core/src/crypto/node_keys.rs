@@ -75,6 +75,7 @@ const PATH_KEY_LABEL: &[u8] = b"y2q/v3/path-key";
 const OBJECT_METADATA_KEY_LABEL: &[u8] = b"y2q/v3/object-metadata-key";
 const BUCKET_CONFIG_KEY_LABEL: &[u8] = b"y2q/v3/bucket-config-key";
 const NODE_KEY_VERIFIER_LABEL: &[u8] = b"y2q/v3/node-key-verifier";
+const CONTAINER_HEADER_KEY_LABEL: &[u8] = b"y2q/v3/container-header-key";
 
 const VERSION_BYTE: u8 = 0x01;
 /// Length-prefixed and padded metadata blob; see [`encrypt_meta`].
@@ -153,8 +154,18 @@ pub fn derive_node_key_verifier(nk: &[u8; 32]) -> [u8; 32] {
     prf(nk, NODE_KEY_VERIFIER_LABEL)
 }
 
-/// Live holder for the four "hot" node-derived keys used on every request:
-/// the Index Key, Path Key, Object Metadata Key, and Bucket Config Key.
+/// Derive the Container Header Key (CHK): `prf(NK, "y2q/v3/container-header-key")`.
+///
+/// Authenticates the 64-byte `Y2QO` header of every `.obj` file. The header is
+/// otherwise protected only by a CRC32, which an attacker with write access to
+/// the device can simply recompute.
+pub fn derive_container_header_key(nk: &[u8; 32]) -> [u8; 32] {
+    prf(nk, CONTAINER_HEADER_KEY_LABEL)
+}
+
+/// Live holder for the "hot" node-derived keys used on every request: the
+/// Index Key, Path Key, Object Metadata Key, Bucket Config Key, and Container
+/// Header Key.
 ///
 /// Installed once at boot from the operator-supplied node key (see
 /// [`super::node_key::load_node_key`]) and never cleared — the daemon cannot
@@ -171,6 +182,7 @@ struct NodeKeys {
     path_key: Zeroizing<[u8; 32]>,
     object_metadata_key: Zeroizing<[u8; 32]>,
     bucket_config_key: Zeroizing<[u8; 32]>,
+    container_header_key: Zeroizing<[u8; 32]>,
 }
 
 impl NodeKeySlot {
@@ -181,7 +193,7 @@ impl NodeKeySlot {
         }
     }
 
-    /// Install the node key, deriving and storing the four hot keys.
+    /// Install the node key, deriving and storing the hot keys.
     /// Replaces any prior value. Called exactly once, at boot.
     pub fn install(&self, nk: [u8; 32]) {
         *self.inner.write().expect("NodeKeySlot poisoned") = Some(NodeKeys {
@@ -189,6 +201,7 @@ impl NodeKeySlot {
             path_key: Zeroizing::new(derive_path_key(&nk)),
             object_metadata_key: Zeroizing::new(derive_object_metadata_key(&nk)),
             bucket_config_key: Zeroizing::new(derive_bucket_config_key(&nk)),
+            container_header_key: Zeroizing::new(derive_container_header_key(&nk)),
         });
     }
 
@@ -227,6 +240,15 @@ impl NodeKeySlot {
             .expect("NodeKeySlot poisoned")
             .as_ref()
             .map(|k| *k.bucket_config_key)
+    }
+
+    /// A copy of the Container Header Key, if installed.
+    pub fn container_header_key(&self) -> Option<[u8; 32]> {
+        self.inner
+            .read()
+            .expect("NodeKeySlot poisoned")
+            .as_ref()
+            .map(|k| *k.container_header_key)
     }
 
     /// Whether the node key has been installed.
@@ -383,6 +405,7 @@ mod tests {
         let derived = [
             derive_index_file_key(&k),
             derive_user_store_file_key(&k),
+            derive_container_header_key(&k),
             derive_index_key(&k),
             derive_path_key(&k),
             derive_object_metadata_key(&k),

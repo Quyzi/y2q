@@ -19,7 +19,8 @@ use std::time::Duration;
 use y2q_core::crypto::keystore;
 use y2q_core::crypto::node_key;
 use y2q_core::crypto::{
-    derive_bucket_config_key, derive_node_key_verifier, derive_object_metadata_key, derive_path_key,
+    derive_bucket_config_key, derive_container_header_key, derive_node_key_verifier,
+    derive_object_metadata_key, derive_path_key,
 };
 use y2q_core::storage::rotation::rotate_storage_tree;
 use y2q_core::{CacheRebuildStatus, FilesystemStorage, Listing, StorageExt};
@@ -91,6 +92,8 @@ pub async fn run(cfg: &Config, new_node_key_file: &str) -> std::io::Result<()> {
     let new_omk = derive_object_metadata_key(&new_nk);
     let old_bck = derive_bucket_config_key(&old_nk);
     let new_bck = derive_bucket_config_key(&new_nk);
+    let old_chk = derive_container_header_key(&old_nk);
+    let new_chk = derive_container_header_key(&new_nk);
 
     let base_path = PathBuf::from(&cfg.storage.base_path);
     let index_path = cfg
@@ -148,6 +151,8 @@ pub async fn run(cfg: &Config, new_node_key_file: &str) -> std::io::Result<()> {
                     new_omk: &new_omk,
                     old_bck: &old_bck,
                     new_bck: &new_bck,
+                    old_chk: &old_chk,
+                    new_chk: &new_chk,
                 },
             )
             .await
@@ -204,6 +209,55 @@ pub async fn run(cfg: &Config, new_node_key_file: &str) -> std::io::Result<()> {
         .map_err(|e| other(format!("delete rotation journal: {e}")))?;
 
     tracing::info!("node-key rotation complete");
+    Ok(())
+}
+
+/// Re-MAC every object's container header under the current node key, then
+/// exit. Drives `--upgrade-container-headers`.
+///
+/// A one-shot upgrade for deployments written before the header carried an
+/// HMAC. Only 128 bytes per object are rewritten and already-upgraded files
+/// are skipped, so an interrupted run is simply re-run.
+pub async fn upgrade_headers(cfg: &Config) -> std::io::Result<()> {
+    let keystore_dir = PathBuf::from(&cfg.crypto.keystore_dir);
+
+    // Same flock as rotation: refuses to run against a live daemon, and two
+    // concurrent upgrades refuse each other.
+    let _flock = keystore::acquire_lock(&keystore_dir).map_err(other)?;
+
+    let nk = *node_key::load_node_key(&cfg.crypto.node_key_file)
+        .map_err(|e| other(format!("node key: {e}")))?;
+    keystore::verify_node_key(&keystore_dir, &nk)
+        .map_err(|e| other(format!("verify node key against keystore: {e}")))?;
+
+    let path_key = derive_path_key(&nk);
+    let chk = derive_container_header_key(&nk);
+
+    let base_path = PathBuf::from(&cfg.storage.base_path);
+    let index_path = cfg
+        .storage
+        .index_path
+        .clone()
+        .unwrap_or_else(|| format!("{}/_y2q_index.redb", cfg.storage.base_path));
+
+    // The header MAC does not change how the index is encrypted, so the
+    // plaintext bucket list is readable under the current key as usual.
+    let storage = FilesystemStorage::new(&base_path, &index_path)
+        .map_err(|e| other(format!("open storage: {e}")))?;
+    storage.install_node_key(nk);
+    let buckets = storage
+        .list_buckets()
+        .await
+        .map_err(|e| other(format!("list buckets: {e}")))?;
+
+    tracing::info!(buckets = buckets.len(), "upgrading container headers");
+    let upgraded = y2q_core::storage::rotation::upgrade_container_headers(
+        &base_path, &buckets, &path_key, &chk,
+    )
+    .await
+    .map_err(|e| other(format!("upgrade container headers: {e}")))?;
+
+    tracing::info!(upgraded, "container header upgrade complete");
     Ok(())
 }
 
