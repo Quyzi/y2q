@@ -21,13 +21,19 @@ use crate::error::AppError;
 /// Takes an owned [`BytesMut`] so the AEAD open can run in-place on the
 /// input allocation, avoiding a full ciphertext-sized copy that the older
 /// `&[u8]` variant required.
+///
+/// `expected_size` is the object's authenticated plaintext size from its
+/// sealed metadata sidecar. The envelope layer requires it because the
+/// envelope header's own length field is not covered by the chunk AAD; see
+/// [`envelope::decrypt`].
 pub fn decrypt_after_get(
     deployment_sk: &[u8],
     bucket: &str,
     key: &str,
     bytes: BytesMut,
+    expected_size: u64,
 ) -> Result<Bytes, AppError> {
-    match envelope::decrypt_owned(deployment_sk, bytes, bucket, key) {
+    match envelope::decrypt_owned(deployment_sk, bytes, bucket, key, expected_size) {
         Ok(pt) => Ok(pt),
         Err(y2q_core::crypto::CryptoError::UnsupportedVersion(v)) => {
             Err(AppError(y2q_core::Error::UnsupportedEnvelopeVersion {

@@ -64,17 +64,29 @@ pub trait ObjectCipher {
     /// records (itself authenticated — see the trait docs); supplying the
     /// wrong epoch's key derives the wrong content key and every chunk fails
     /// to authenticate the same way a wrong `bucket`/`key` address does.
+    ///
+    /// `expected_plaintext_len` is the object's authenticated size, carried in
+    /// the sealed metadata sidecar rather than in this envelope. It is
+    /// mandatory: the envelope header's own length field is deliberately
+    /// excluded from the chunk AAD (a streaming writer does not know the final
+    /// length when it seals the first chunk), so a disk-write attacker can
+    /// truncate an envelope to its preamble and patch that field to zero. An
+    /// implementation MUST reject a plaintext shorter than
+    /// `expected_plaintext_len` and MUST truncate a longer one to exactly that
+    /// many bytes, which is also how the Padmé body padding is stripped.
     fn decrypt(
         &self,
         sk_bytes: &[u8],
         envelope: &[u8],
         bucket: &str,
         key: &str,
+        expected_plaintext_len: u64,
     ) -> Result<Vec<u8>, Self::Error>;
 
     /// Open an envelope in place, decrypting into the owned input buffer and
     /// returning a view of the plaintext so no copy is made. Suited to large
-    /// objects already held in memory. Same `bucket`/`key`/epoch binding as
+    /// objects already held in memory. Same `bucket`/`key`/epoch binding and
+    /// the same `expected_plaintext_len` contract as
     /// [`decrypt`](Self::decrypt).
     fn decrypt_owned(
         &self,
@@ -82,6 +94,7 @@ pub trait ObjectCipher {
         envelope: BytesMut,
         bucket: &str,
         key: &str,
+        expected_plaintext_len: u64,
     ) -> Result<Bytes, Self::Error>;
 
     /// Open a contiguous run of chunks.
