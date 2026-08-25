@@ -69,6 +69,7 @@ type HmacSha256 = Hmac<Sha256>;
 use sha2::Sha256;
 
 const INDEX_FILE_KEY_LABEL: &[u8] = b"y2q/v3/index-file-key";
+const USER_STORE_FILE_KEY_LABEL: &[u8] = b"y2q/v3/user-store-file-key";
 const INDEX_KEY_LABEL: &[u8] = b"y2q/v3/index-key";
 const PATH_KEY_LABEL: &[u8] = b"y2q/v3/path-key";
 const OBJECT_METADATA_KEY_LABEL: &[u8] = b"y2q/v3/object-metadata-key";
@@ -98,6 +99,14 @@ pub fn prf(key: &[u8; 32], data: &[u8]) -> [u8; 32] {
 /// the `_y2q_index.redb` file at rest.
 pub fn derive_index_file_key(nk: &[u8; 32]) -> [u8; 32] {
     prf(nk, INDEX_FILE_KEY_LABEL)
+}
+
+/// Derive the User Store File Key (USK): `prf(NK, "y2q/v3/user-store-file-key")`.
+///
+/// Used by [`crate::storage::EncryptedFileBackend`] to encrypt every block of
+/// `users.redb` at rest.
+pub fn derive_user_store_file_key(nk: &[u8; 32]) -> [u8; 32] {
+    prf(nk, USER_STORE_FILE_KEY_LABEL)
 }
 
 /// Derive the Index Key (IK): `prf(NK, "y2q/v3/index-key")`.
@@ -296,6 +305,7 @@ mod tests {
         assert_eq!(derive_index_file_key(&k), derive_index_file_key(&k));
         let derived = [
             derive_index_file_key(&k),
+            derive_user_store_file_key(&k),
             derive_index_key(&k),
             derive_path_key(&k),
             derive_object_metadata_key(&k),

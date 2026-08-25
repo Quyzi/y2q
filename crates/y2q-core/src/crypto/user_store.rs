@@ -233,15 +233,21 @@ pub struct UserStore {
 }
 
 impl UserStore {
-    /// Open or create the user-records database at `path`.
+    /// Open or create the user-records database at `path`, encrypted at rest
+    /// under the User Store File Key derived from `nk`.
     ///
-    /// Every record stores a user's Argon2id KDF parameters and their
-    /// credential slots, so the file is created at mode `0600` from the
-    /// moment it's created (not widen-then-chmod) to close any window where
-    /// it would be world/group-readable. An already-existing file (e.g. from
-    /// a build predating this hardening) has its permissions re-tightened on
-    /// every open as defense in depth.
-    pub fn open(path: &Path) -> Result<Self, CryptoError> {
+    /// Every record stores a user's Argon2id KDF parameters, their ML-KEM
+    /// identity public key and their wrapped identity secret key, so the whole
+    /// file is sealed block-by-block through
+    /// [`crate::storage::EncryptedFileBackend`] — a raw-disk reader learns
+    /// nothing but the file's size. It is additionally created at mode `0600`
+    /// from the moment it's created (not widen-then-chmod) to close any window
+    /// where it would be world/group-readable, and an already-existing file has
+    /// its permissions re-tightened on every open as defense in depth.
+    ///
+    /// A pre-encryption plaintext file is *not* silently destroyed; see
+    /// [`migrate_plaintext_user_store`].
+    pub fn open(path: &Path, nk: &[u8; 32]) -> Result<Self, CryptoError> {
         let mut open_options = std::fs::OpenOptions::new();
         open_options.read(true).write(true).create(true);
         #[cfg(unix)]
@@ -257,8 +263,14 @@ impl UserStore {
             use std::os::unix::fs::PermissionsExt;
             let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
         }
+        let backend = crate::storage::EncryptedFileBackend::open_file(
+            file,
+            super::node_keys::derive_user_store_file_key(nk),
+            crate::storage::ForeignFile::Reject,
+        )
+        .map_err(|e| CryptoError::UserStore(format!("open {}: {e}", path.display())))?;
         let db = redb::Builder::new()
-            .create_file(file)
+            .create_with_backend(backend)
             .map_err(|e| CryptoError::UserStore(format!("open {}: {e}", path.display())))?;
         let txn = db
             .begin_write()
@@ -375,6 +387,166 @@ impl UserStore {
             .map_err(|e| CryptoError::UserStore(format!("len: {e}")))?;
         Ok(n as usize)
     }
+
+    /// Every `(username, serialized record)` pair, verbatim.
+    ///
+    /// Deliberately does not deserialize into [`UserRecord`]: this exists to
+    /// copy a store between file keys, and that copy must not depend on the
+    /// record schema the running binary happens to know.
+    pub fn export_raw(&self) -> Result<Vec<(String, Vec<u8>)>, CryptoError> {
+        let txn = self
+            .db
+            .begin_read()
+            .map_err(|e| CryptoError::UserStore(format!("begin_read: {e}")))?;
+        let t = txn
+            .open_table(USERS)
+            .map_err(|e| CryptoError::UserStore(format!("open table: {e}")))?;
+        let mut out = Vec::new();
+        for entry in t
+            .iter()
+            .map_err(|e| CryptoError::UserStore(format!("iter: {e}")))?
+        {
+            let (k, v) = entry.map_err(|e| CryptoError::UserStore(format!("iter: {e}")))?;
+            out.push((k.value().to_owned(), v.value().to_vec()));
+        }
+        Ok(out)
+    }
+
+    /// Insert every pair from [`Self::export_raw`] in one transaction.
+    pub fn import_raw(&self, records: &[(String, Vec<u8>)]) -> Result<(), CryptoError> {
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| CryptoError::UserStore(format!("begin_write: {e}")))?;
+        {
+            let mut t = txn
+                .open_table(USERS)
+                .map_err(|e| CryptoError::UserStore(format!("open table: {e}")))?;
+            for (username, payload) in records {
+                t.insert(username.as_str(), payload.as_slice())
+                    .map_err(|e| CryptoError::UserStore(format!("insert: {e}")))?;
+            }
+        }
+        txn.commit()
+            .map_err(|e| CryptoError::UserStore(format!("commit: {e}")))?;
+        Ok(())
+    }
+}
+
+/// Magic prefix written by [`crate::storage::EncryptedFileBackend`].
+const ENCRYPTED_MAGIC: &[u8; 8] = b"Y2QIDX01";
+
+/// True when `path` exists, is non-empty, and does not start with the
+/// encrypted-backend magic — i.e. a plaintext redb from before this file
+/// was encrypted at rest.
+pub fn is_plaintext_user_store(path: &Path) -> Result<bool, CryptoError> {
+    use std::io::Read;
+
+    let mut file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => {
+            return Err(CryptoError::UserStore(format!(
+                "open {}: {e}",
+                path.display()
+            )));
+        }
+    };
+    let mut head = [0u8; 8];
+    let mut read = 0usize;
+    while read < head.len() {
+        match file.read(&mut head[read..]) {
+            Ok(0) => break,
+            Ok(n) => read += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => {
+                return Err(CryptoError::UserStore(format!(
+                    "read {}: {e}",
+                    path.display()
+                )));
+            }
+        }
+    }
+    if read == 0 {
+        // Empty file: `UserStore::open` initializes it in place.
+        return Ok(false);
+    }
+    Ok(read < head.len() || &head != ENCRYPTED_MAGIC)
+}
+
+/// Rewrite a plaintext `users.redb` as an encrypted one under `nk`.
+///
+/// Reads every record through a plain redb handle, writes them to
+/// `<path>.migrating` through an encrypted backend, fsyncs it, renames over
+/// `path`, then fsyncs the parent directory. A crash before the rename
+/// leaves the plaintext original intact and the partial temp is overwritten
+/// on the next attempt.
+pub fn migrate_plaintext_user_store(path: &Path, nk: &[u8; 32]) -> Result<(), CryptoError> {
+    let tmp = path.with_extension("migrating");
+    // A partial temp from an interrupted earlier attempt is worthless.
+    match std::fs::remove_file(&tmp) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(CryptoError::UserStore(format!(
+                "remove {}: {e}",
+                tmp.display()
+            )));
+        }
+    }
+
+    // Copy raw (username, payload) pairs rather than deserializing into
+    // `UserRecord`: the migration must not care what the record schema is.
+    let records = {
+        let plain = redb::Builder::new().open(path).map_err(|e| {
+            CryptoError::UserStore(format!("open plaintext {}: {e}", path.display()))
+        })?;
+        let txn = plain
+            .begin_read()
+            .map_err(|e| CryptoError::UserStore(format!("begin_read: {e}")))?;
+        let t = txn
+            .open_table(USERS)
+            .map_err(|e| CryptoError::UserStore(format!("open table: {e}")))?;
+        let mut out: Vec<(String, Vec<u8>)> = Vec::new();
+        for entry in t
+            .iter()
+            .map_err(|e| CryptoError::UserStore(format!("iter: {e}")))?
+        {
+            let (k, v) = entry.map_err(|e| CryptoError::UserStore(format!("iter: {e}")))?;
+            out.push((k.value().to_owned(), v.value().to_vec()));
+        }
+        out
+    };
+
+    {
+        // `import_raw`'s commit already drives the encrypted backend's
+        // `sync_data`; the `sync_all` below additionally forces file metadata.
+        let dest = UserStore::open(&tmp, nk)?;
+        dest.import_raw(&records)?;
+    }
+    // Reopening for the fsync keeps redb's own file handle out of the way.
+    std::fs::File::open(&tmp)
+        .and_then(|f| f.sync_all())
+        .map_err(|e| CryptoError::UserStore(format!("sync {}: {e}", tmp.display())))?;
+
+    std::fs::rename(&tmp, path).map_err(|e| {
+        CryptoError::UserStore(format!(
+            "rename {} -> {}: {e}",
+            tmp.display(),
+            path.display()
+        ))
+    })?;
+    if let Some(parent) = path.parent() {
+        // Durably record the rename itself, not just the new file's contents.
+        let _ = std::fs::File::open(parent).and_then(|d| d.sync_all());
+    }
+
+    tracing::warn!(
+        path = %path.display(),
+        records = records.len(),
+        "migrated plaintext user store to encrypted-at-rest format"
+    );
+    Ok(())
 }
 
 #[cfg(test)]
@@ -474,7 +646,7 @@ mod tests {
     #[test]
     fn upsert_get_delete_list() {
         let dir = tempdir().unwrap();
-        let s = UserStore::open(&dir.path().join("u.redb")).unwrap();
+        let s = UserStore::open(&dir.path().join("u.redb"), &[7u8; 32]).unwrap();
         s.upsert(&rec("alice")).unwrap();
         s.upsert(&rec("bob")).unwrap();
         assert_eq!(s.count().unwrap(), 2);
@@ -497,8 +669,63 @@ mod tests {
 
         let dir = tempdir().unwrap();
         let path = dir.path().join("u.redb");
-        let _s = UserStore::open(&path).unwrap();
+        let _s = UserStore::open(&path, &[7u8; 32]).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[test]
+    fn record_contents_are_not_readable_off_disk() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("u.redb");
+        {
+            let s = UserStore::open(&path, &[7u8; 32]).unwrap();
+            s.upsert(&rec("alice-secret")).unwrap();
+        }
+        let raw = std::fs::read(&path).unwrap();
+        assert!(
+            !raw.windows(12).any(|w| w == b"alice-secret"),
+            "username leaked to disk in cleartext"
+        );
+        assert_eq!(&raw[..8], b"Y2QIDX01", "store must carry the encrypted magic");
+    }
+
+    #[test]
+    fn wrong_node_key_cannot_open_the_store() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("u.redb");
+        {
+            let s = UserStore::open(&path, &[7u8; 32]).unwrap();
+            s.upsert(&rec("alice")).unwrap();
+        }
+        assert!(UserStore::open(&path, &[8u8; 32]).is_err());
+    }
+
+    #[test]
+    fn plaintext_store_is_detected_and_migrated() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("u.redb");
+
+        // Build a pre-encryption plaintext store the old way.
+        {
+            let db = redb::Builder::new().create(&path).unwrap();
+            let txn = db.begin_write().unwrap();
+            {
+                let mut t = txn.open_table(USERS).unwrap();
+                let payload = serde_json::to_vec(&rec("alice")).unwrap();
+                t.insert("alice", payload.as_slice()).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+        assert!(is_plaintext_user_store(&path).unwrap());
+        // A plaintext store must not be silently destroyed.
+        assert!(UserStore::open(&path, &[7u8; 32]).is_err());
+
+        migrate_plaintext_user_store(&path, &[7u8; 32]).unwrap();
+
+        assert!(!is_plaintext_user_store(&path).unwrap());
+        let s = UserStore::open(&path, &[7u8; 32]).unwrap();
+        assert_eq!(s.get("alice").unwrap().unwrap().username, "alice");
+        assert!(!dir.path().join("u.migrating").exists());
     }
 }

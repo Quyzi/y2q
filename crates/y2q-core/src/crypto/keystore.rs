@@ -27,7 +27,9 @@ use subtle::ConstantTimeEq;
 use super::CryptoError;
 use super::kdf::{self, Argon2Params};
 use super::node_keys::derive_node_key_verifier;
-use super::user_store::{Role, UserRecord, UserStore};
+use super::user_store::{
+    Role, UserRecord, UserStore, is_plaintext_user_store, migrate_plaintext_user_store,
+};
 
 /// On-disk format version written to `keystore.json`.
 pub const KEYSTORE_FORMAT_VERSION: u16 = 3;
@@ -96,6 +98,25 @@ pub struct FirstRunOutcome {
 ///
 /// Returns the user store.
 pub fn load(dir: &Path, nk: &[u8; 32]) -> Result<UserStore, CryptoError> {
+    verify_node_key(dir, nk)?;
+    let files = KeystoreFiles::new(dir);
+
+    // A store written before the file was encrypted at rest would otherwise be
+    // rejected by `ForeignFile::Reject`; convert it in place instead.
+    if is_plaintext_user_store(&files.users)? {
+        migrate_plaintext_user_store(&files.users, nk)?;
+    }
+
+    UserStore::open(&files.users, nk)
+}
+
+/// Validate `nk` against the keystore manifest at `dir` without opening the
+/// user store.
+///
+/// Performs checks 1-5 of [`load`]. Split out so node-key rotation can prove
+/// it holds the old key *before* it starts re-keying the store the old key
+/// would be needed to open.
+pub fn verify_node_key(dir: &Path, nk: &[u8; 32]) -> Result<(), CryptoError> {
     let files = KeystoreFiles::new(dir);
 
     let legacy_pubkey = files.root.join("pubkey.json");
@@ -147,7 +168,7 @@ pub fn load(dir: &Path, nk: &[u8; 32]) -> Result<UserStore, CryptoError> {
         return Err(CryptoError::NodeKeyMismatch);
     }
 
-    UserStore::open(&files.users)
+    Ok(())
 }
 
 /// Generate a fresh root persona, write `keystore.json` and `users.redb`,
@@ -192,7 +213,7 @@ pub fn first_run(
     };
     write_manifest(&files.manifest, &manifest)?;
 
-    let user_store = UserStore::open(&files.users)?;
+    let user_store = UserStore::open(&files.users, nk)?;
     let record = UserRecord {
         username: root_username.to_owned(),
         created_at: now_ns(),
@@ -210,6 +231,83 @@ pub fn first_run(
         root_password,
         root_username: root_username.to_owned(),
     })
+}
+
+/// Rewrite `users.redb` from `old_nk`'s file key to `new_nk`'s.
+///
+/// Node-key rotation changes every derived key, including the one the user
+/// store is sealed under, so the store must be re-keyed alongside the object
+/// tree or the next boot cannot open it.
+///
+/// Idempotent for a resumed rotation: if the store no longer opens under
+/// `old_nk` but does open under `new_nk`, the re-key already completed and
+/// this is a no-op.
+pub fn rekey_user_store(
+    dir: &Path,
+    old_nk: &[u8; 32],
+    new_nk: &[u8; 32],
+) -> Result<(), CryptoError> {
+    let files = KeystoreFiles::new(dir);
+    let tmp = files.users.with_extension("rekeying");
+
+    // A partial temp from an interrupted earlier attempt is worthless.
+    match fs::remove_file(&tmp) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(CryptoError::KeystoreIo(format!(
+                "remove {}: {e}",
+                tmp.display()
+            )));
+        }
+    }
+
+    let source = match UserStore::open(&files.users, old_nk) {
+        Ok(s) => s,
+        Err(old_err) => {
+            return match UserStore::open(&files.users, new_nk) {
+                Ok(_) => {
+                    tracing::info!(
+                        path = %files.users.display(),
+                        "user store already re-keyed; resuming rotation past it"
+                    );
+                    Ok(())
+                }
+                // Opens under neither key: do not paper over it, the store is
+                // either corrupt or sealed under a third key.
+                Err(_) => Err(old_err),
+            };
+        }
+    };
+
+    let records = source.export_raw()?;
+    drop(source);
+
+    {
+        let dest = UserStore::open(&tmp, new_nk)?;
+        dest.import_raw(&records)?;
+    }
+    fs::File::open(&tmp)
+        .and_then(|f| f.sync_all())
+        .map_err(|e| CryptoError::KeystoreIo(format!("sync {}: {e}", tmp.display())))?;
+
+    fs::rename(&tmp, &files.users).map_err(|e| {
+        CryptoError::KeystoreIo(format!(
+            "rename {} -> {}: {e}",
+            tmp.display(),
+            files.users.display()
+        ))
+    })?;
+    if let Some(parent) = files.users.parent() {
+        let _ = fs::File::open(parent).and_then(|d| d.sync_all());
+    }
+
+    tracing::info!(
+        path = %files.users.display(),
+        records = records.len(),
+        "re-keyed user store under the new node key"
+    );
+    Ok(())
 }
 
 fn write_manifest(path: &Path, manifest: &KeystoreManifest) -> Result<(), CryptoError> {

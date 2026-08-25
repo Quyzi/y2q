@@ -61,9 +61,10 @@ pub async fn run(cfg: &Config, new_node_key_file: &str) -> std::io::Result<()> {
         ));
     }
 
-    // Verifies the old key against keystore.json (NodeKeyMismatch on a
-    // wrong key) and that users.redb opens cleanly.
-    keystore::load(&keystore_dir, &old_nk)
+    // Verifies the old key against keystore.json (NodeKeyMismatch on a wrong
+    // key). Deliberately does *not* open users.redb: a resumed rotation may
+    // already have re-keyed it, and the re-key step below handles that case.
+    keystore::verify_node_key(&keystore_dir, &old_nk)
         .map_err(|e| other(format!("verify old node key against keystore: {e}")))?;
 
     match keystore::read_rotation_journal(&keystore_dir).map_err(other)? {
@@ -191,6 +192,11 @@ pub async fn run(cfg: &Config, new_node_key_file: &str) -> std::io::Result<()> {
         }
     }
     tracing::info!("index rebuilt under the new node key");
+
+    // users.redb is sealed under a node-key-derived file key too, so it must be
+    // re-keyed before the verifier flips or the next boot cannot open it.
+    keystore::rekey_user_store(&keystore_dir, &old_nk, &new_nk)
+        .map_err(|e| other(format!("re-key user store: {e}")))?;
 
     keystore::rewrite_verifier(&keystore_dir, &new_nk)
         .map_err(|e| other(format!("rewrite keystore verifier: {e}")))?;

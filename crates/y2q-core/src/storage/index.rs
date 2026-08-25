@@ -108,7 +108,8 @@ impl MetadataIndex {
     /// derived from `nk`, ensuring both tables exist.
     fn open_db(path: &Path, nk: &[u8; 32]) -> Result<Database, Error> {
         let file_key = derive_index_file_key(nk);
-        let backend = EncryptedFileBackend::open(path, file_key).map_err(map_redb)?;
+        let backend =
+            EncryptedFileBackend::open(path, file_key, super::ForeignFile::Recreate).map_err(map_redb)?;
         let db = Builder::new()
             .create_with_backend(backend)
             .map_err(map_redb)?;

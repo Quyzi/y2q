@@ -21,7 +21,7 @@ pub mod locks;
 /// Offline node-key rotation across the whole storage tree.
 pub mod rotation;
 
-pub use encrypted_backend::EncryptedFileBackend;
+pub use encrypted_backend::{EncryptedFileBackend, ForeignFile};
 pub mod streaming_sink;
 
 #[cfg(target_os = "linux")]

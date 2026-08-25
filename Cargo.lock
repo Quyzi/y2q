@@ -5863,7 +5863,7 @@ dependencies = [
 name = "y2q-cli"
 version = "0.2.0"
 dependencies = [
- "base64 0.22.1",
+ "base64",
  "bytes",
  "chrono",
  "clap",

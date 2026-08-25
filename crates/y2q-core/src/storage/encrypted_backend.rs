@@ -146,16 +146,29 @@ fn invalid_data(msg: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg.into())
 }
 
+/// What [`EncryptedFileBackend::open`] does with a non-empty file that does not
+/// carry [`MAGIC`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForeignFile {
+    /// Truncate and recreate. Only correct for a rebuildable cache.
+    Recreate,
+    /// Refuse to open. Correct for anything whose loss is unrecoverable.
+    Reject,
+}
+
 impl EncryptedFileBackend {
     /// Open (or create) the encrypted file at `path` under `file_key`.
     ///
     /// If the file is empty it is initialized with a fresh header. If it carries
     /// our [`MAGIC`] the header is decrypted and validated (a wrong key or
     /// tampering yields an error). If it is non-empty but does **not** carry our
-    /// magic it is treated as a stale/foreign file (e.g. a pre-encryption redb
-    /// index) and recreated empty - the caller is expected to rebuild it.
-    pub fn open(path: &Path, file_key: [u8; 32]) -> Result<Self, io::Error> {
-        let cipher = Aes256Gcm::new((&file_key).into());
+    /// magic, `on_foreign` decides: [`ForeignFile::Recreate`] destroys and
+    /// recreates it (for a rebuildable index), [`ForeignFile::Reject`] refuses.
+    pub fn open(
+        path: &Path,
+        file_key: [u8; 32],
+        on_foreign: ForeignFile,
+    ) -> Result<Self, io::Error> {
         let mut open_options = OpenOptions::new();
         open_options
             .read(true)
@@ -167,7 +180,20 @@ impl EncryptedFileBackend {
             use std::os::unix::fs::OpenOptionsExt;
             open_options.mode(0o600);
         }
-        let mut file = open_options.open(path)?;
+        let file = open_options.open(path)?;
+        Self::open_file(file, file_key, on_foreign)
+    }
+
+    /// Same as [`Self::open`] for a file the caller has already opened.
+    ///
+    /// The handle must be readable and writable. Used by callers that need to
+    /// control the create mode themselves (e.g. the user store).
+    pub fn open_file(
+        mut file: File,
+        file_key: [u8; 32],
+        on_foreign: ForeignFile,
+    ) -> Result<Self, io::Error> {
+        let cipher = Aes256Gcm::new((&file_key).into());
 
         let initial_phys = file.metadata()?.len();
         let logical_len = if initial_phys == 0 {
@@ -176,13 +202,16 @@ impl EncryptedFileBackend {
             0
         } else if initial_phys >= 8 && read_magic(&mut file)? == *MAGIC {
             read_header(&cipher, &mut file)?
+        } else if on_foreign == ForeignFile::Reject {
+            return Err(invalid_data(
+                "encrypted file has no recognizable magic",
+            ));
         } else {
             // Foreign/legacy/corrupt file with no recognizable magic.
             // Recreate — but this is destructive (the prior contents are
             // gone), so make it observable in logs where it would otherwise
             // be silent.
             tracing::error!(
-                path = %path.display(),
                 phys_len = initial_phys,
                 "encrypted index file has no recognizable magic; destroying and recreating it"
             );
@@ -446,7 +475,7 @@ mod tests {
     use rand::RngExt;
 
     fn backend(dir: &std::path::Path) -> EncryptedFileBackend {
-        EncryptedFileBackend::open(&dir.join("t.redb"), [7u8; 32]).unwrap()
+        EncryptedFileBackend::open(&dir.join("t.redb"), [7u8; 32], ForeignFile::Recreate).unwrap()
     }
 
     #[test]
@@ -510,12 +539,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("t.redb");
         {
-            let be = EncryptedFileBackend::open(&path, [9u8; 32]).unwrap();
+            let be = EncryptedFileBackend::open(&path, [9u8; 32], ForeignFile::Recreate).unwrap();
             be.set_len(5000).unwrap();
             be.write(123, b"hello encrypted world").unwrap();
             be.sync_data().unwrap();
         }
-        let be = EncryptedFileBackend::open(&path, [9u8; 32]).unwrap();
+        let be = EncryptedFileBackend::open(&path, [9u8; 32], ForeignFile::Recreate).unwrap();
         assert_eq!(be.len().unwrap(), 5000);
         let mut buf = vec![0u8; 21];
         be.read(123, &mut buf).unwrap();
@@ -527,11 +556,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("t.redb");
         {
-            let be = EncryptedFileBackend::open(&path, [1u8; 32]).unwrap();
+            let be = EncryptedFileBackend::open(&path, [1u8; 32], ForeignFile::Recreate).unwrap();
             be.write(0, b"secret").unwrap();
             be.sync_data().unwrap();
         }
-        assert!(EncryptedFileBackend::open(&path, [2u8; 32]).is_err());
+        assert!(EncryptedFileBackend::open(&path, [2u8; 32], ForeignFile::Recreate).is_err());
     }
 
     #[test]
@@ -540,7 +569,7 @@ mod tests {
         let path = dir.path().join("t.redb");
         let needle = b"TOPSECRETNEEDLE12345";
         {
-            let be = EncryptedFileBackend::open(&path, [3u8; 32]).unwrap();
+            let be = EncryptedFileBackend::open(&path, [3u8; 32], ForeignFile::Recreate).unwrap();
             be.write(64, needle).unwrap();
             be.sync_data().unwrap();
         }
@@ -559,8 +588,24 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("t.redb");
         std::fs::write(&path, b"redb-or-some-other-format-without-our-magic").unwrap();
-        let be = EncryptedFileBackend::open(&path, [4u8; 32]).unwrap();
+        let be =
+            EncryptedFileBackend::open(&path, [4u8; 32], ForeignFile::Recreate).unwrap();
         assert_eq!(be.len().unwrap(), 0);
+    }
+
+    #[test]
+    fn foreign_file_is_rejected_when_asked() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.redb");
+        std::fs::write(&path, b"redb-or-some-other-format-without-our-magic").unwrap();
+        let err =
+            EncryptedFileBackend::open(&path, [4u8; 32], ForeignFile::Reject).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        // The foreign contents must survive an attempted open.
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"redb-or-some-other-format-without-our-magic"
+        );
     }
 
     #[test]
@@ -569,7 +614,8 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("t.redb");
-        let _be = EncryptedFileBackend::open(&path, [5u8; 32]).unwrap();
+        let _be =
+            EncryptedFileBackend::open(&path, [5u8; 32], ForeignFile::Recreate).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "index file must be created 0600");
     }
