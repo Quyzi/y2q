@@ -203,9 +203,7 @@ impl EncryptedFileBackend {
         } else if initial_phys >= 8 && read_magic(&mut file)? == *MAGIC {
             read_header(&cipher, &mut file)?
         } else if on_foreign == ForeignFile::Reject {
-            return Err(invalid_data(
-                "encrypted file has no recognizable magic",
-            ));
+            return Err(invalid_data("encrypted file has no recognizable magic"));
         } else {
             // Foreign/legacy/corrupt file with no recognizable magic.
             // Recreate — but this is destructive (the prior contents are
@@ -588,8 +586,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("t.redb");
         std::fs::write(&path, b"redb-or-some-other-format-without-our-magic").unwrap();
-        let be =
-            EncryptedFileBackend::open(&path, [4u8; 32], ForeignFile::Recreate).unwrap();
+        let be = EncryptedFileBackend::open(&path, [4u8; 32], ForeignFile::Recreate).unwrap();
         assert_eq!(be.len().unwrap(), 0);
     }
 
@@ -598,8 +595,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("t.redb");
         std::fs::write(&path, b"redb-or-some-other-format-without-our-magic").unwrap();
-        let err =
-            EncryptedFileBackend::open(&path, [4u8; 32], ForeignFile::Reject).unwrap_err();
+        let err = EncryptedFileBackend::open(&path, [4u8; 32], ForeignFile::Reject).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         // The foreign contents must survive an attempted open.
         assert_eq!(
@@ -614,8 +610,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("t.redb");
-        let _be =
-            EncryptedFileBackend::open(&path, [5u8; 32], ForeignFile::Recreate).unwrap();
+        let _be = EncryptedFileBackend::open(&path, [5u8; 32], ForeignFile::Recreate).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "index file must be created 0600");
     }

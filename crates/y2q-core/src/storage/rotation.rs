@@ -36,6 +36,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::Error;
+use crate::crypto::node_keys::{BUCKET_CONFIG_PAD_BLOCK, META_PAD_BLOCK};
 use crate::crypto::{decrypt_meta, encrypt_meta};
 use crate::storage::filesystem::{
     bucket_dir_path, encode_bucket_dir, encode_object_id, object_id_from_path,
@@ -237,7 +238,7 @@ async fn migrate_object_file(
         return Ok(false);
     }
 
-    let new_meta = encrypt_meta(new_omk, &plain_json, &new_id).map_err(|e| {
+    let new_meta = encrypt_meta(new_omk, &plain_json, &new_id, META_PAD_BLOCK).map_err(|e| {
         internal(
             bucket,
             "rotate-node-key",
@@ -313,13 +314,14 @@ async fn migrate_bucket_config(
         )
     })?;
 
-    let new_bytes = encrypt_meta(new_bck, &plain, &new_aad).map_err(|e| {
-        internal(
-            bucket,
-            "rotate-node-key",
-            format!("re-encrypt bucket config: {e}"),
-        )
-    })?;
+    let new_bytes =
+        encrypt_meta(new_bck, &plain, &new_aad, BUCKET_CONFIG_PAD_BLOCK).map_err(|e| {
+            internal(
+                bucket,
+                "rotate-node-key",
+                format!("re-encrypt bucket config: {e}"),
+            )
+        })?;
     let tmp = path.with_extension("json.rotate-tmp");
     tokio::fs::write(&tmp, &new_bytes)
         .await

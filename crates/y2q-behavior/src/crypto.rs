@@ -214,18 +214,30 @@ pub trait MetadataCipher {
     /// metadata, the bucket config key for bucket config) for storage,
     /// bound to `object_id` via AAD so the blob cannot be relocated to a
     /// different object's/bucket's storage location and still decrypt.
+    ///
+    /// The sealed plaintext is `u32_be(json.len()) || json || zero_pad`,
+    /// rounded up to a multiple of `pad_block` (0 or 1 disables padding).
+    /// Padding is load-bearing: the container header's `meta_len` is
+    /// necessarily cleartext, so an unpadded sidecar turns it into a
+    /// per-object fingerprint of `len(bucket) + len(key) + Σ len(labels)`
+    /// that survives the Padmé padding applied to the object body.
     fn encrypt_meta(
         &self,
         key: &[u8; 32],
         json: &[u8],
         object_id: &str,
+        pad_block: usize,
     ) -> Result<Vec<u8>, Self::Error>;
 
     /// Open a metadata blob under a derived key, requiring it to have been
-    /// sealed for the same `object_id`. A blob without the recognized
-    /// version byte is rejected rather than treated as legacy plaintext; a
-    /// blob sealed for a different object fails the same way as a tampered
-    /// blob.
+    /// sealed for the same `object_id`, and strip any padding.
+    ///
+    /// Both the unpadded and the length-prefixed padded version bytes are
+    /// accepted so sidecars written before padding keep opening. A blob
+    /// without a recognized version byte is rejected rather than treated as
+    /// legacy plaintext; a blob sealed for a different object fails the same
+    /// way as a tampered blob. A padded blob whose length prefix exceeds its
+    /// decrypted plaintext is rejected.
     fn decrypt_meta(
         &self,
         key: &[u8; 32],

@@ -687,7 +687,11 @@ mod tests {
             !raw.windows(12).any(|w| w == b"alice-secret"),
             "username leaked to disk in cleartext"
         );
-        assert_eq!(&raw[..8], b"Y2QIDX01", "store must carry the encrypted magic");
+        assert_eq!(
+            &raw[..8],
+            b"Y2QIDX01",
+            "store must carry the encrypted magic"
+        );
     }
 
     #[test]

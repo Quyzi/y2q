@@ -12,7 +12,11 @@ use crate::{
     CacheRebuildStatus, CipherMetadata, DEFAULT_LIST_LIMIT, Error, ListOptions, ListPage, Listing,
     MAX_LIST_LIMIT, Metadata, MetadataIndex, Object, PlaintextMetrics, PutOptions, StaleLock,
     Storage, StorageExt, SyncLevel,
-    crypto::{decrypt_meta, encrypt_meta, node_keys::NodeKeySlot, prf},
+    crypto::{
+        decrypt_meta, encrypt_meta,
+        node_keys::{BUCKET_CONFIG_PAD_BLOCK, META_PAD_BLOCK, NodeKeySlot},
+        prf,
+    },
     storage::{
         format::{self, HEADER_SIZE, Header},
         locks::LockRegistry,
@@ -172,6 +176,23 @@ pub(crate) fn require_path_key(node_keys: &NodeKeySlot) -> Result<[u8; 32], Erro
         operation: "path".to_owned(),
         message: "path operation attempted without an installed node key".to_owned(),
     })
+}
+
+/// Read the object metadata key from `node_keys`, erroring if the node key has
+/// not been installed (which should never happen post-boot).
+///
+/// Every metadata sidecar is sealed under this key on write and opened with it
+/// on read; there is deliberately no plaintext-sidecar fallback, so a missing
+/// node key is an error on both paths rather than a silent downgrade.
+pub(crate) fn require_object_metadata_key(node_keys: &NodeKeySlot) -> Result<[u8; 32], Error> {
+    node_keys
+        .object_metadata_key()
+        .ok_or_else(|| Error::InternalError {
+            bucket: String::new(),
+            key: String::new(),
+            operation: "metadata".to_owned(),
+            message: "metadata operation attempted without an installed node key".to_owned(),
+        })
 }
 
 /// Keyed opaque directory name for `bucket`:
@@ -355,7 +376,7 @@ pub(crate) fn obj_path_for(
 pub(crate) async fn set_labels_impl(
     base_path: &Path,
     index: &MetadataIndex,
-    mek: Option<&[u8; 32]>,
+    mek: &[u8; 32],
     path_key: &[u8; 32],
     bucket: &str,
     key: &str,
@@ -414,11 +435,8 @@ pub(crate) async fn set_labels_impl(
 
     let object_id = object_id_from_path(&obj_path)
         .ok_or_else(|| internal("cannot derive object id from path".to_owned()))?;
-    let meta_json = match mek {
-        Some(k) => decrypt_meta(k, meta_bytes, object_id)
-            .map_err(|e| internal(format!("decrypt meta: {e}")))?,
-        None => meta_bytes.to_vec(),
-    };
+    let meta_json = decrypt_meta(mek, meta_bytes, object_id)
+        .map_err(|e| internal(format!("decrypt meta: {e}")))?;
     let mut metadata: Metadata =
         serde_json::from_slice(&meta_json).map_err(|e| internal(format!("parse meta: {e}")))?;
 
@@ -427,16 +445,8 @@ pub(crate) async fn set_labels_impl(
 
     let new_json =
         serde_json::to_vec(&metadata).map_err(|e| internal(format!("encode meta: {e}")))?;
-    // Writes require an installed node key; refuse rather than persisting plaintext.
-    let new_meta = match mek {
-        Some(k) => encrypt_meta(k, &new_json, object_id)
-            .map_err(|e| internal(format!("encrypt meta: {e}")))?,
-        None => {
-            return Err(internal(
-                "metadata write attempted without an installed node key".to_owned(),
-            ));
-        }
-    };
+    let new_meta = encrypt_meta(mek, &new_json, object_id, META_PAD_BLOCK)
+        .map_err(|e| internal(format!("encrypt meta: {e}")))?;
 
     let new_header = Header {
         data_len: header.data_len,
@@ -534,11 +544,13 @@ pub(crate) async fn set_bucket_config_impl(
     })?;
     let object_id = encode_bucket_dir(path_key, bucket);
     let ciphertext =
-        encrypt_meta(config_key, &json, &object_id).map_err(|e| Error::InternalError {
-            bucket: bucket.to_owned(),
-            key: String::new(),
-            operation: "set_bucket_config".to_owned(),
-            message: format!("encrypt config: {e}"),
+        encrypt_meta(config_key, &json, &object_id, BUCKET_CONFIG_PAD_BLOCK).map_err(|e| {
+            Error::InternalError {
+                bucket: bucket.to_owned(),
+                key: String::new(),
+                operation: "set_bucket_config".to_owned(),
+                message: format!("encrypt config: {e}"),
+            }
         })?;
     let path = dir.join(BUCKET_CONFIG_FILE);
     let tmp = dir.join(".y2q-bucket.json.tmp");
@@ -629,10 +641,7 @@ fn record_storage_op<T, E>(op: &'static str, result: &Result<T, E>, elapsed_ms: 
 }
 
 /// Read and decode the metadata embedded in a `.obj` file at `path`.
-async fn read_obj_metadata(
-    path: &Path,
-    mek: Option<&[u8; 32]>,
-) -> Result<Metadata, std::io::Error> {
+async fn read_obj_metadata(path: &Path, mek: &[u8; 32]) -> Result<Metadata, std::io::Error> {
     let mut file = tokio::fs::File::open(path).await?;
     let mut header_buf = [0u8; HEADER_SIZE];
     file.read_exact(&mut header_buf).await?;
@@ -642,25 +651,21 @@ async fn read_obj_metadata(
         .await?;
     let mut meta_buf = vec![0u8; header.meta_len as usize];
     file.read_exact(&mut meta_buf).await?;
-    let json = if let Some(mek) = mek {
-        let object_id = object_id_from_path(path).ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "cannot derive object id from path",
-            )
-        })?;
-        decrypt_meta(mek, &meta_buf, object_id)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?
-    } else {
-        meta_buf
-    };
+    let object_id = object_id_from_path(path).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "cannot derive object id from path",
+        )
+    })?;
+    let json = decrypt_meta(mek, &meta_buf, object_id)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
     serde_json::from_slice(&json)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
 
 /// Read the `created` timestamp from an existing `.obj` file, returning `None`
 /// if the file cannot be read or parsed.
-async fn read_obj_created(path: &Path, mek: Option<&[u8; 32]>) -> Option<u64> {
+async fn read_obj_created(path: &Path, mek: &[u8; 32]) -> Option<u64> {
     read_obj_metadata(path, mek).await.ok().map(|m| m.created)
 }
 
@@ -728,30 +733,23 @@ impl StreamingPutGuard {
             operation: "put".to_owned(),
             message: format!("encode meta: {e}"),
         })?;
-        let meta_bytes = match self.mek.object_metadata_key() {
-            Some(mek) => {
-                let object_id =
-                    object_id_from_path(&self.obj_path).ok_or_else(|| Error::InternalError {
-                        bucket: bucket.to_owned(),
-                        key: key.to_owned(),
-                        operation: "put".to_owned(),
-                        message: "cannot derive object id from path".to_owned(),
-                    })?;
-                encrypt_meta(&mek, &meta_json, object_id).map_err(|e| Error::InternalError {
+        let mek = require_object_metadata_key(&self.mek)?;
+        let meta_bytes = {
+            let object_id =
+                object_id_from_path(&self.obj_path).ok_or_else(|| Error::InternalError {
+                    bucket: bucket.to_owned(),
+                    key: key.to_owned(),
+                    operation: "put".to_owned(),
+                    message: "cannot derive object id from path".to_owned(),
+                })?;
+            encrypt_meta(&mek, &meta_json, object_id, META_PAD_BLOCK).map_err(|e| {
+                Error::InternalError {
                     bucket: bucket.to_owned(),
                     key: key.to_owned(),
                     operation: "put".to_owned(),
                     message: format!("encrypt meta: {e}"),
-                })?
-            }
-            None => {
-                return Err(Error::InternalError {
-                    bucket: bucket.to_owned(),
-                    key: key.to_owned(),
-                    operation: "put".to_owned(),
-                    message: "metadata write attempted without an installed node key".to_owned(),
-                });
-            }
+                }
+            })?
         };
 
         let mut flags = 0u16;
@@ -894,10 +892,10 @@ impl FilesystemStorage {
                 })?;
         }
 
+        let mek = require_object_metadata_key(&self.mek)?;
         let (is_overwrite, prior_created) = match tokio::fs::metadata(&obj_path).await {
             Ok(_) => {
-                let created =
-                    read_obj_created(&obj_path, self.mek.object_metadata_key().as_ref()).await;
+                let created = read_obj_created(&obj_path, &mek).await;
                 (true, created)
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => (false, None),
@@ -1155,10 +1153,10 @@ impl Storage for FilesystemStorage {
 
             let _lock = self.locks.try_acquire(bucket, key)?;
 
+            let mek = require_object_metadata_key(&self.mek)?;
             let (is_overwrite, prior_created) = match tokio::fs::metadata(&obj_path).await {
                 Ok(_) => {
-                    let created =
-                        read_obj_created(&obj_path, self.mek.object_metadata_key().as_ref()).await;
+                    let created = read_obj_created(&obj_path, &mek).await;
                     (true, created)
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => (false, None),
@@ -1221,31 +1219,22 @@ impl Storage for FilesystemStorage {
                 operation: "put".to_owned(),
                 message: e.to_string(),
             })?;
-            let meta_bytes = match self.mek.object_metadata_key() {
-                Some(mek) => {
-                    let object_id =
-                        object_id_from_path(&obj_path).ok_or_else(|| Error::InternalError {
-                            bucket: bucket.to_owned(),
-                            key: key.to_owned(),
-                            operation: "put".to_owned(),
-                            message: "cannot derive object id from path".to_owned(),
-                        })?;
-                    encrypt_meta(&mek, &meta_json, object_id).map_err(|e| Error::InternalError {
+            let meta_bytes = {
+                let object_id =
+                    object_id_from_path(&obj_path).ok_or_else(|| Error::InternalError {
+                        bucket: bucket.to_owned(),
+                        key: key.to_owned(),
+                        operation: "put".to_owned(),
+                        message: "cannot derive object id from path".to_owned(),
+                    })?;
+                encrypt_meta(&mek, &meta_json, object_id, META_PAD_BLOCK).map_err(|e| {
+                    Error::InternalError {
                         bucket: bucket.to_owned(),
                         key: key.to_owned(),
                         operation: "put".to_owned(),
                         message: e.to_string(),
-                    })?
-                }
-                None => {
-                    return Err(Error::InternalError {
-                        bucket: bucket.to_owned(),
-                        key: key.to_owned(),
-                        operation: "put".to_owned(),
-                        message: "metadata write attempted without an installed node key"
-                            .to_owned(),
-                    });
-                }
+                    }
+                })?
             };
 
             let mut header_flags = 0u16;
@@ -1496,7 +1485,7 @@ impl Storage for FilesystemStorage {
             set_labels_impl(
                 &self.base_path,
                 &self.index,
-                self.mek.object_metadata_key().as_ref(),
+                &require_object_metadata_key(&self.mek)?,
                 &path_key,
                 bucket,
                 key,
@@ -1529,7 +1518,7 @@ impl Storage for FilesystemStorage {
                 });
             }
 
-            read_obj_metadata(&obj_path, self.mek.object_metadata_key().as_ref())
+            read_obj_metadata(&obj_path, &require_object_metadata_key(&self.mek)?)
                 .await
                 .map_err(|e| Error::InternalError {
                     bucket: bucket.to_owned(),
@@ -1643,7 +1632,7 @@ impl StorageExt for FilesystemStorage {
         let base_path = self.base_path.clone();
         let index = self.index.clone();
         let state = self.rebuild_state.clone();
-        let mek = self.mek.object_metadata_key();
+        let mek = require_object_metadata_key(&self.mek)?;
         tokio::spawn(async move {
             let result = run_rebuild(base_path, index, state.clone(), mek).await;
             let mut s = state.lock().await;
@@ -1735,7 +1724,7 @@ async fn run_rebuild(
     base_path: PathBuf,
     index: Arc<MetadataIndex>,
     state: Arc<tokio::sync::Mutex<CacheRebuildStatus>>,
-    mek: Option<[u8; 32]>,
+    mek: [u8; 32],
 ) -> Result<(), String> {
     let obj_files = collect_obj_files(&base_path)
         .await
@@ -1747,7 +1736,7 @@ async fn run_rebuild(
     let report_every = (total / 100).max(1);
 
     for (i, path) in obj_files.into_iter().enumerate() {
-        match read_obj_metadata(&path, mek.as_ref()).await {
+        match read_obj_metadata(&path, &mek).await {
             Ok(meta) => {
                 if let Err(e) = index.upsert(&meta, SyncLevel::Durable).await {
                     tracing::warn!(
@@ -1901,6 +1890,33 @@ mod tests {
         let future = SystemTime::now() + std::time::Duration::from_secs(3600);
         assert_eq!(s.clear_stale_locks(future).await.unwrap(), 1);
         assert!(!tmp.exists(), "stale orphan tmp must be swept");
+    }
+
+    #[tokio::test]
+    async fn meta_len_does_not_leak_object_key_length() {
+        let (s, _dir) = make_storage();
+        // Without padding the cleartext `meta_len` in each container header
+        // tracks `len(bucket) + len(key) + Σ len(labels)` byte for byte, which
+        // fingerprints the object to anyone holding the raw device. Span the
+        // whole legal range: one character up to `validate_key`'s 1024 cap.
+        let max_key = "k".repeat(1024);
+        let keys = ["a", "a-very-long-object-key-name-here", max_key.as_str()];
+        for k in keys {
+            s.put("b", k, make_object(b"x"), PutOptions::default())
+                .await
+                .unwrap();
+        }
+
+        let mut lens = Vec::new();
+        for k in keys {
+            let bytes = tokio::fs::read(s.key_path("b", k).unwrap()).await.unwrap();
+            lens.push(u32::from_le_bytes(bytes[16..20].try_into().unwrap()));
+        }
+
+        assert!(
+            lens.iter().all(|l| *l == lens[0]),
+            "meta_len must not track the object key length: {lens:?}"
+        );
     }
 
     #[tokio::test]
