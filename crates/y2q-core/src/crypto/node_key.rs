@@ -190,7 +190,7 @@ fn decode_hex(text: &str) -> Option<Vec<u8>> {
     }
     let mut out = Vec::with_capacity(text.len() / 2);
     let bytes = text.as_bytes();
-    for chunk in bytes.chunks_exact(2) {
+    for chunk in bytes.as_chunks::<2>().0 {
         let hi = (chunk[0] as char).to_digit(16)?;
         let lo = (chunk[1] as char).to_digit(16)?;
         out.push(((hi << 4) | lo) as u8);
