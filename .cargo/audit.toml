@@ -1,0 +1,14 @@
+# cargo-audit configuration. See https://docs.rs/cargo-audit for the full
+# schema. Keep this file's ignore list minimal and justified — it is a CI
+# security gate, not a place to silence noise.
+
+[advisories]
+ignore = [
+    # h2 unbounded empty DATA frames (DoS). Reaches us transitively via
+    # actix-http 3.13.3, which pins h2 ^0.3 — a branch RustSec never
+    # backported the fix to (latest release is 0.3.27, still unpatched;
+    # the fix only shipped in h2 >=0.4.16). No newer actix-http exists to
+    # pick up h2 0.4.x. Re-check on every actix-http bump and drop this
+    # entry the moment a fixed release is available.
+    "RUSTSEC-2026-0258",
+]
