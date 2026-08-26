@@ -25,7 +25,7 @@ use crate::storage::{filesystem::object_id_from_path, locks::LockGuard};
 
 use crate::{
     CipherMetadata, Error, Metadata, MetadataIndex, PlaintextMetrics, PutOptions, SyncLevel,
-    crypto::encrypt_meta,
+    crypto::{encrypt_meta, node_keys::META_PAD_BLOCK},
 };
 
 use super::format::{self, HEADER_SIZE, Header};
@@ -57,7 +57,8 @@ pub struct UringStreamingPutGuard {
     pub(super) key: String,
     pub(super) is_overwrite: bool,
     pub(super) prior_created: Option<u64>,
-    pub(super) mek: Option<[u8; 32]>,
+    pub(super) mek: [u8; 32],
+    pub(super) chk: [u8; 32],
     pub(super) index: Arc<MetadataIndex>,
 }
 
@@ -71,7 +72,8 @@ impl UringStreamingPutGuard {
         key: String,
         is_overwrite: bool,
         prior_created: Option<u64>,
-        mek: Option<[u8; 32]>,
+        mek: [u8; 32],
+        chk: [u8; 32],
         index: Arc<MetadataIndex>,
     ) -> Self {
         Self {
@@ -83,6 +85,7 @@ impl UringStreamingPutGuard {
             is_overwrite,
             prior_created,
             mek,
+            chk,
             index,
         }
     }
@@ -136,32 +139,23 @@ impl UringStreamingPutGuard {
             operation: "put".to_owned(),
             message: format!("encode meta: {e}"),
         })?;
-        // Writes require an installed node key; refuse rather than persisting plaintext.
-        let meta_bytes = match self.mek {
-            Some(ref mek) => {
-                let object_id =
-                    object_id_from_path(&self.obj_path).ok_or_else(|| Error::InternalError {
-                        bucket: bucket.to_owned(),
-                        key: key.to_owned(),
-                        operation: "put".to_owned(),
-                        message: "cannot derive object id from path".to_owned(),
-                    })?;
-                encrypt_meta(mek, &meta_json, object_id).map_err(|e| Error::InternalError {
+        let object_id = object_id_from_path(&self.obj_path)
+            .ok_or_else(|| Error::InternalError {
+                bucket: bucket.to_owned(),
+                key: key.to_owned(),
+                operation: "put".to_owned(),
+                message: "cannot derive object id from path".to_owned(),
+            })?
+            .to_owned();
+        let meta_bytes =
+            encrypt_meta(&self.mek, &meta_json, &object_id, META_PAD_BLOCK).map_err(|e| {
+                Error::InternalError {
                     bucket: bucket.to_owned(),
                     key: key.to_owned(),
                     operation: "put".to_owned(),
                     message: format!("encrypt meta: {e}"),
-                })?
-            }
-            None => {
-                return Err(Error::InternalError {
-                    bucket: bucket.to_owned(),
-                    key: key.to_owned(),
-                    operation: "put".to_owned(),
-                    message: "metadata write attempted without an installed node key".to_owned(),
-                });
-            }
-        };
+                }
+            })?;
 
         let mut flags = 0u16;
         if options.sync == SyncLevel::Durable {
@@ -189,7 +183,7 @@ impl UringStreamingPutGuard {
             .write_all(&meta_bytes)
             .await
             .map_err(|e| map_io("write meta", e))?;
-        let trailer = header.encode();
+        let trailer = header.encode(&self.chk, &object_id);
         writer
             .write_all(&trailer)
             .await
@@ -197,7 +191,7 @@ impl UringStreamingPutGuard {
 
         // Overwrite the placeholder header at offset 0 with the real one.
         writer
-            .write_all_at(&header.encode(), 0)
+            .write_all_at(&trailer, 0)
             .await
             .map_err(|e| map_io("write header", e))?;
 

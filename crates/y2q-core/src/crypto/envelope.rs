@@ -197,6 +197,16 @@ pub struct EnvelopeInfo {
 /// filesystem-write attacker could substitute one object's envelope for
 /// another's and have it decrypt successfully under the wrong address.
 ///
+/// `expected_plaintext_len` is the object's authenticated size, taken from the
+/// sealed metadata sidecar rather than from this envelope. It is required
+/// because the header's own `plaintext_len` field (bytes `24..32`) is
+/// deliberately *not* covered by the chunk AAD — `build_v3_aad` skips it, since
+/// a streaming writer does not know the final length when it seals the first
+/// chunk. A disk-write attacker can therefore truncate an envelope to its
+/// preamble and patch `plaintext_len` to 0, at which point the chunk loop never
+/// runs and the internal length check passes on an empty plaintext. Comparing
+/// against the independently authenticated size closes that.
+///
 /// Returns the recovered plaintext on success, or an error if the magic bytes
 /// are unrecognized (including any pre-v3 or otherwise legacy data — there is
 /// no unauthenticated passthrough).
@@ -205,6 +215,7 @@ pub fn decrypt(
     envelope: &[u8],
     bucket: &str,
     key: &str,
+    expected_plaintext_len: u64,
 ) -> Result<Vec<u8>, CryptoError> {
     if envelope.len() < 4 {
         return Err(CryptoError::Envelope("truncated header"));
@@ -216,10 +227,43 @@ pub fn decrypt(
         return Err(CryptoError::Envelope("truncated header"));
     }
     match u16::from_be_bytes([envelope[4], envelope[5]]) {
-        FORMAT_VER_V3 => decrypt_v3(sk_bytes, envelope, bucket, key),
-        FORMAT_VER_V4 => decrypt_v4(sk_bytes, envelope, bucket, key),
+        FORMAT_VER_V3 => decrypt_v3(sk_bytes, envelope, bucket, key, expected_plaintext_len),
+        FORMAT_VER_V4 => decrypt_v4(sk_bytes, envelope, bucket, key, expected_plaintext_len),
         other => Err(CryptoError::UnsupportedVersion(other)),
     }
+}
+
+/// Reject a decrypted plaintext shorter than the authenticated size, then trim
+/// the Padmé padding off the end.
+///
+/// The bound is sound for both formats: `padme_len(l) >= l` for all `l`, so a
+/// well-formed envelope always decrypts to at least the true size.
+fn finish_plaintext(
+    mut plaintext: Vec<u8>,
+    expected_plaintext_len: u64,
+) -> Result<Vec<u8>, CryptoError> {
+    if (plaintext.len() as u64) < expected_plaintext_len {
+        return Err(CryptoError::Envelope(
+            "plaintext shorter than authenticated size",
+        ));
+    }
+    plaintext.truncate(expected_plaintext_len as usize);
+    Ok(plaintext)
+}
+
+/// `BytesMut` counterpart to [`finish_plaintext`]; truncating a `BytesMut` is
+/// O(1) and keeps the zero-copy `freeze`.
+fn finish_plaintext_owned(
+    mut plaintext: BytesMut,
+    expected_plaintext_len: u64,
+) -> Result<Bytes, CryptoError> {
+    if (plaintext.len() as u64) < expected_plaintext_len {
+        return Err(CryptoError::Envelope(
+            "plaintext shorter than authenticated size",
+        ));
+    }
+    plaintext.truncate(expected_plaintext_len as usize);
+    Ok(plaintext.freeze())
 }
 
 fn decrypt_v3(
@@ -227,6 +271,7 @@ fn decrypt_v3(
     envelope: &[u8],
     bucket: &str,
     key: &str,
+    expected_plaintext_len: u64,
 ) -> Result<Vec<u8>, CryptoError> {
     let preamble_len = ENVELOPE_V3_HEADER_FIXED_LEN + mlkem768::ciphertext_bytes();
     if envelope.len() < preamble_len {
@@ -267,7 +312,9 @@ fn decrypt_v3(
     // verified, so it isn't trustworthy yet — cap the pre-allocation at the
     // received envelope's length (a real upper bound on achievable plaintext
     // regardless of what the header claims) instead of trusting it outright.
-    let cap = plaintext_len.min(envelope.len() as u64) as usize;
+    let cap = plaintext_len
+        .min(envelope.len() as u64)
+        .max(expected_plaintext_len.min(envelope.len() as u64)) as usize;
     let mut plaintext = Vec::with_capacity(cap);
 
     let mut pos = preamble_len;
@@ -290,7 +337,7 @@ fn decrypt_v3(
     if plaintext.len() as u64 != plaintext_len {
         return Err(CryptoError::Envelope("plaintext length mismatch"));
     }
-    Ok(plaintext)
+    finish_plaintext(plaintext, expected_plaintext_len)
 }
 
 fn decrypt_v4(
@@ -298,6 +345,7 @@ fn decrypt_v4(
     envelope: &[u8],
     bucket: &str,
     key: &str,
+    expected_plaintext_len: u64,
 ) -> Result<Vec<u8>, CryptoError> {
     let preamble_len = ENVELOPE_V3_HEADER_FIXED_LEN + mlkem768::ciphertext_bytes();
     if envelope.len() < preamble_len {
@@ -338,7 +386,9 @@ fn decrypt_v4(
     // verified, so it isn't trustworthy yet — cap the pre-allocation at the
     // received envelope's length (a real upper bound on achievable plaintext
     // regardless of what the header claims) instead of trusting it outright.
-    let cap = plaintext_len.min(envelope.len() as u64) as usize;
+    let cap = plaintext_len
+        .min(envelope.len() as u64)
+        .max(expected_plaintext_len.min(envelope.len() as u64)) as usize;
     let mut plaintext = Vec::with_capacity(cap);
 
     let mut pos = preamble_len;
@@ -368,7 +418,7 @@ fn decrypt_v4(
     if plaintext.len() as u64 != plaintext_len {
         return Err(CryptoError::Envelope("plaintext length mismatch"));
     }
-    Ok(plaintext)
+    finish_plaintext(plaintext, expected_plaintext_len)
 }
 
 /// Decrypt a complete envelope, consuming an owned `BytesMut` buffer.
@@ -384,6 +434,7 @@ pub fn decrypt_owned(
     envelope: BytesMut,
     bucket: &str,
     key: &str,
+    expected_plaintext_len: u64,
 ) -> Result<Bytes, CryptoError> {
     if envelope.len() < 4 {
         return Err(CryptoError::Envelope("truncated header"));
@@ -395,8 +446,8 @@ pub fn decrypt_owned(
         return Err(CryptoError::Envelope("truncated header"));
     }
     match u16::from_be_bytes([envelope[4], envelope[5]]) {
-        FORMAT_VER_V3 => decrypt_v3_owned(sk_bytes, envelope, bucket, key),
-        FORMAT_VER_V4 => decrypt_v4_owned(sk_bytes, envelope, bucket, key),
+        FORMAT_VER_V3 => decrypt_v3_owned(sk_bytes, envelope, bucket, key, expected_plaintext_len),
+        FORMAT_VER_V4 => decrypt_v4_owned(sk_bytes, envelope, bucket, key, expected_plaintext_len),
         other => Err(CryptoError::UnsupportedVersion(other)),
     }
 }
@@ -406,6 +457,7 @@ fn decrypt_v3_owned(
     mut envelope: BytesMut,
     bucket: &str,
     key: &str,
+    expected_plaintext_len: u64,
 ) -> Result<Bytes, CryptoError> {
     let preamble_len = ENVELOPE_V3_HEADER_FIXED_LEN + mlkem768::ciphertext_bytes();
     if envelope.len() < preamble_len {
@@ -448,7 +500,9 @@ fn decrypt_v3_owned(
     // See the matching comment in `decrypt_v3` — `plaintext_len` isn't
     // trustworthy until the chunks are verified, so the pre-allocation is
     // capped by the received body length instead of the raw header value.
-    let cap = plaintext_len.min(body.len() as u64) as usize;
+    let cap = plaintext_len
+        .min(body.len() as u64)
+        .max(expected_plaintext_len.min(body.len() as u64)) as usize;
     let mut plaintext = BytesMut::with_capacity(cap);
 
     let mut chunk_idx: u64 = 0;
@@ -471,7 +525,7 @@ fn decrypt_v3_owned(
     if plaintext.len() as u64 != plaintext_len {
         return Err(CryptoError::Envelope("plaintext length mismatch"));
     }
-    Ok(plaintext.freeze())
+    finish_plaintext_owned(plaintext, expected_plaintext_len)
 }
 
 fn decrypt_v4_owned(
@@ -479,6 +533,7 @@ fn decrypt_v4_owned(
     mut envelope: BytesMut,
     bucket: &str,
     key: &str,
+    expected_plaintext_len: u64,
 ) -> Result<Bytes, CryptoError> {
     let preamble_len = ENVELOPE_V3_HEADER_FIXED_LEN + mlkem768::ciphertext_bytes();
     if envelope.len() < preamble_len {
@@ -525,7 +580,9 @@ fn decrypt_v4_owned(
     // See the matching comment in `decrypt_v4` — `plaintext_len` isn't
     // trustworthy until the chunks are verified, so the pre-allocation is
     // capped by the received body length instead of the raw header value.
-    let cap = plaintext_len.min(body.len() as u64) as usize;
+    let cap = plaintext_len
+        .min(body.len() as u64)
+        .max(expected_plaintext_len.min(body.len() as u64)) as usize;
     let mut plaintext = BytesMut::with_capacity(cap);
 
     let mut chunk_idx: u64 = 0;
@@ -552,7 +609,7 @@ fn decrypt_v4_owned(
     if plaintext.len() as u64 != plaintext_len {
         return Err(CryptoError::Envelope("plaintext length mismatch"));
     }
-    Ok(plaintext.freeze())
+    finish_plaintext_owned(plaintext, expected_plaintext_len)
 }
 
 /// Number of bytes before the first chunk in a v3 envelope: the 36-byte fixed
@@ -1114,7 +1171,7 @@ mod tests {
         let env = vec![0u8; ENVELOPE_V3_HEADER_FIXED_LEN + 2000];
         let (_, sk) = mlkem768::keypair();
         assert!(matches!(
-            decrypt(sk.as_bytes(), &env, "bucket", "key"),
+            decrypt(sk.as_bytes(), &env, "bucket", "key", 0),
             Err(CryptoError::Envelope("bad magic"))
         ));
         assert!(matches!(
@@ -1122,7 +1179,8 @@ mod tests {
                 sk.as_bytes(),
                 BytesMut::from(env.as_slice()),
                 "bucket",
-                "key"
+                "key",
+                0
             ),
             Err(CryptoError::Envelope("bad magic"))
         ));
@@ -1148,7 +1206,7 @@ mod tests {
         env[4] = 0xff;
         env[5] = 0xff;
         assert!(matches!(
-            decrypt(sk.as_bytes(), &env, "bucket", "key"),
+            decrypt(sk.as_bytes(), &env, "bucket", "key", 0),
             Err(CryptoError::UnsupportedVersion(_))
         ));
     }
@@ -1172,7 +1230,7 @@ mod tests {
         session.feed(b"hi").await.unwrap();
         let (file, _) = session.finish().await.unwrap();
         let env = read_file(file).await;
-        assert!(decrypt(sk2.as_bytes(), &env, "bucket", "key").is_err());
+        assert!(decrypt(sk2.as_bytes(), &env, "bucket", "key", 2).is_err());
     }
 
     #[tokio::test]
@@ -1225,13 +1283,24 @@ mod tests {
         assert_eq!(info.envelope_version, 4);
         assert_eq!(info.key_epoch, EPOCH);
         let env = read_file(file).await;
-        let recovered = decrypt(sk.as_bytes(), &env, "bucket", "key").unwrap();
-        // The envelope zero-pads to a Padmé boundary to hide the exact size; the
-        // higher layer trims to the true size from metadata. The recovered
-        // plaintext therefore carries the original bytes followed by zero pad.
-        assert_eq!(recovered.len() as u64, padme_len(pt.len() as u64));
-        assert_eq!(&recovered[..pt.len()], pt);
-        assert!(recovered[pt.len()..].iter().all(|&b| b == 0));
+        // The envelope zero-pads to a Padmé boundary to hide the exact size;
+        // `decrypt` trims back to the authenticated size it is given, so the
+        // recovered plaintext is exactly the original bytes.
+        let recovered = decrypt(sk.as_bytes(), &env, "bucket", "key", pt.len() as u64).unwrap();
+        assert_eq!(recovered, pt);
+        // Asking for more than was sealed is rejected rather than served short.
+        assert!(matches!(
+            decrypt(
+                sk.as_bytes(),
+                &env,
+                "bucket",
+                "key",
+                padme_len(pt.len() as u64) + 1
+            ),
+            Err(CryptoError::Envelope(
+                "plaintext shorter than authenticated size"
+            ))
+        ));
     }
 
     #[test]
@@ -1285,8 +1354,8 @@ mod tests {
             // The decrypted plaintext is padded; trimming to the true size (as
             // the GET handler does from metadata) recovers the original bytes.
             let env = read_file(file).await;
-            let recovered = decrypt(sk.as_bytes(), &env, "bucket", "key").unwrap();
-            assert_eq!(&recovered[..pt.len()], pt.as_slice());
+            let recovered = decrypt(sk.as_bytes(), &env, "bucket", "key", pt.len() as u64).unwrap();
+            assert_eq!(recovered.as_slice(), pt.as_slice());
         }
         // The on-disk envelope size is identical for both, so it leaks only the
         // bucket, not which of the two objects was stored.
@@ -1310,7 +1379,7 @@ mod tests {
         .unwrap();
         let (file, _) = session.finish().await.unwrap();
         let env = read_file(file).await;
-        let recovered = decrypt(sk.as_bytes(), &env, "bucket", "key").unwrap();
+        let recovered = decrypt(sk.as_bytes(), &env, "bucket", "key", 0).unwrap();
         assert!(recovered.is_empty());
     }
 
@@ -1341,7 +1410,7 @@ mod tests {
             env.len() as u64
         });
         let env = read_file(file).await;
-        let recovered = decrypt(sk.as_bytes(), &env, "bucket", "key").unwrap();
+        let recovered = decrypt(sk.as_bytes(), &env, "bucket", "key", pt.len() as u64).unwrap();
         assert_eq!(recovered, pt);
     }
 
@@ -1371,6 +1440,7 @@ mod tests {
             BytesMut::from(env.as_slice()),
             "bucket",
             "key",
+            pt.len() as u64,
         )
         .unwrap();
         assert_eq!(rec.as_ref(), pt.as_slice());
@@ -1456,7 +1526,7 @@ mod tests {
         let mut env = read_file(file).await;
         let last = env.len() - 1;
         env[last] ^= 1;
-        assert!(decrypt(sk.as_bytes(), &env, "bucket", "key").is_err());
+        assert!(decrypt(sk.as_bytes(), &env, "bucket", "key", 12).is_err());
     }
 
     #[tokio::test]
@@ -1489,7 +1559,7 @@ mod tests {
         env[32..36].copy_from_slice(&tampered.to_be_bytes());
 
         assert!(matches!(
-            decrypt(sk.as_bytes(), &env, "bucket", "key"),
+            decrypt(sk.as_bytes(), &env, "bucket", "key", 12),
             Err(CryptoError::AuthFailed)
         ));
     }
@@ -1521,7 +1591,7 @@ mod tests {
         env[8..12].copy_from_slice(&99u32.to_be_bytes());
 
         assert!(matches!(
-            decrypt(sk.as_bytes(), &env, "bucket", "key"),
+            decrypt(sk.as_bytes(), &env, "bucket", "key", 12),
             Err(CryptoError::AuthFailed)
         ));
     }
@@ -1555,24 +1625,24 @@ mod tests {
 
         // Byte-for-byte identical ciphertext, decrypted for its real address:
         // must succeed.
-        assert!(decrypt(sk.as_bytes(), &env, "bucket-a", "secret-object").is_ok());
+        assert!(decrypt(sk.as_bytes(), &env, "bucket-a", "secret-object", 31).is_ok());
 
         // The exact same bytes, relocated to a different bucket/key (as if
         // an attacker had copied the raw file onto another object's on-disk
         // path): must fail, not silently return object A's plaintext under
         // object B's identity.
         assert!(matches!(
-            decrypt(sk.as_bytes(), &env, "bucket-b", "other-object"),
+            decrypt(sk.as_bytes(), &env, "bucket-b", "other-object", 31),
             Err(CryptoError::AuthFailed)
         ));
         // Same bucket, different key.
         assert!(matches!(
-            decrypt(sk.as_bytes(), &env, "bucket-a", "other-object"),
+            decrypt(sk.as_bytes(), &env, "bucket-a", "other-object", 31),
             Err(CryptoError::AuthFailed)
         ));
         // Different bucket, same key.
         assert!(matches!(
-            decrypt(sk.as_bytes(), &env, "bucket-b", "secret-object"),
+            decrypt(sk.as_bytes(), &env, "bucket-b", "secret-object", 31),
             Err(CryptoError::AuthFailed)
         ));
 
@@ -1583,7 +1653,8 @@ mod tests {
                 sk.as_bytes(),
                 BytesMut::from(env.as_slice()),
                 "bucket-b",
-                "other-object"
+                "other-object",
+                31
             ),
             Err(CryptoError::AuthFailed)
         ));
@@ -1633,7 +1704,7 @@ mod tests {
         env[24..32].copy_from_slice(&u64::MAX.to_be_bytes());
 
         assert!(matches!(
-            decrypt(sk.as_bytes(), &env, "bucket", "key"),
+            decrypt(sk.as_bytes(), &env, "bucket", "key", 4),
             Err(CryptoError::Envelope("plaintext length mismatch"))
         ));
         assert!(matches!(
@@ -1641,7 +1712,8 @@ mod tests {
                 sk.as_bytes(),
                 BytesMut::from(env.as_slice()),
                 "bucket",
-                "key"
+                "key",
+                4
             ),
             Err(CryptoError::Envelope("plaintext length mismatch"))
         ));
@@ -1681,7 +1753,7 @@ mod tests {
 
         assert!(
             matches!(
-                decrypt(sk.as_bytes(), &forged, "bucket", "key"),
+                decrypt(sk.as_bytes(), &forged, "bucket", "key", forged_len),
                 Err(CryptoError::AuthFailed)
             ),
             "truncated v4 envelope must fail authentication, not decrypt cleanly"
@@ -1691,7 +1763,8 @@ mod tests {
                 sk.as_bytes(),
                 BytesMut::from(forged.as_slice()),
                 "bucket",
-                "key"
+                "key",
+                forged_len
             ),
             Err(CryptoError::AuthFailed)
         ));
@@ -1802,13 +1875,72 @@ mod tests {
             let (file, info) = session.finish().await.unwrap();
             assert_eq!(info.envelope_version, 4);
             let env = read_file(file).await;
-            let recovered = decrypt(sk.as_bytes(), &env, "bucket", "key").unwrap();
+            let recovered = decrypt(sk.as_bytes(), &env, "bucket", "key", pt.len() as u64).unwrap();
             assert_eq!(
-                &recovered[..pt.len()],
+                recovered.as_slice(),
                 pt.as_slice(),
                 "round trip failed for total_bytes={total_bytes}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn truncation_to_preamble_with_zeroed_length_is_rejected() {
+        // The envelope header's plaintext_len (bytes 24..32) is deliberately
+        // excluded from the chunk AAD, so a disk-write attacker can truncate an
+        // envelope to its preamble and patch that field to 0. The chunk loop
+        // then never runs, the internal length check passes on an empty
+        // plaintext, and without the authenticated-size cross-check the caller
+        // would serve 200 OK with an empty body.
+        let (pk, sk) = mlkem768::keypair();
+        let pt = vec![0x5Au8; 5000];
+        let file = tempfile_v3().await;
+        let mut session = EncryptSession::new(
+            file,
+            pk.as_bytes(),
+            EPOCH,
+            "bucket",
+            "key",
+            0,
+            DEFAULT_CHUNK_SIZE_BYTES,
+        )
+        .await
+        .unwrap();
+        session.feed(&pt).await.unwrap();
+        let (file, _) = session.finish().await.unwrap();
+        let env = read_file(file).await;
+
+        let mut forged = env[..v3_preamble_len()].to_vec();
+        forged[V3_PLAINTEXT_LEN_OFFSET as usize..V3_PLAINTEXT_LEN_OFFSET as usize + 8]
+            .copy_from_slice(&0u64.to_be_bytes());
+
+        assert!(
+            matches!(
+                decrypt(sk.as_bytes(), &forged, "bucket", "key", pt.len() as u64),
+                Err(CryptoError::Envelope(
+                    "plaintext shorter than authenticated size"
+                ))
+            ),
+            "a truncated envelope must not decrypt to an empty body"
+        );
+        assert!(matches!(
+            decrypt_owned(
+                sk.as_bytes(),
+                BytesMut::from(forged.as_slice()),
+                "bucket",
+                "key",
+                pt.len() as u64
+            ),
+            Err(CryptoError::Envelope(
+                "plaintext shorter than authenticated size"
+            ))
+        ));
+
+        // The untampered envelope still returns exactly the true size, with
+        // the Padmé padding stripped.
+        let ok = decrypt(sk.as_bytes(), &env, "bucket", "key", pt.len() as u64).unwrap();
+        assert_eq!(ok.len(), 5000);
+        assert_eq!(ok, pt);
     }
 
     async fn tempfile_v3() -> crate::storage::streaming_sink::StreamingSink {

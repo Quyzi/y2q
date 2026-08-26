@@ -20,7 +20,9 @@ use std::time::{Instant, SystemTime};
 use crate::{
     CacheRebuildStatus, DEFAULT_LIST_LIMIT, Error, ListOptions, ListPage, Listing, MAX_LIST_LIMIT,
     Metadata, MetadataIndex, Object, PutOptions, StaleLock, Storage, StorageExt, SyncLevel,
-    storage::filesystem::{obj_path_for, require_path_key},
+    storage::filesystem::{
+        obj_path_for, require_container_header_key, require_object_metadata_key, require_path_key,
+    },
     storage::locks::LockRegistry,
 };
 
@@ -268,7 +270,8 @@ impl UringStorage {
                 let (reply, reply_rx) = tokio::sync::oneshot::channel();
                 let op = UringOp::ReadObjectMeta {
                     path: obj_path.clone(),
-                    mek: self.mek.object_metadata_key(),
+                    mek: require_object_metadata_key(&self.mek)?,
+                    chk: require_container_header_key(&self.mek)?,
                     reply,
                 };
                 self.pool
@@ -340,7 +343,8 @@ impl UringStorage {
             key.to_owned(),
             is_overwrite,
             prior_created,
-            self.mek.object_metadata_key(),
+            require_object_metadata_key(&self.mek)?,
+            require_container_header_key(&self.mek)?,
             self.index.clone(),
         );
 
@@ -409,6 +413,7 @@ impl Storage for UringStorage {
             locks: self.locks.clone(),
             bucket: bucket.to_owned(),
             key: key.to_owned(),
+            chk: require_container_header_key(&self.mek)?,
             reply,
         };
         let result = self.dispatch(op, bucket, key, "get", reply_rx).await;
@@ -431,6 +436,7 @@ impl Storage for UringStorage {
             locks: self.locks.clone(),
             bucket: bucket.to_owned(),
             key: key.to_owned(),
+            chk: require_container_header_key(&self.mek)?,
             range,
             reply,
         };
@@ -469,7 +475,8 @@ impl Storage for UringStorage {
             crypto,
             large_object_bytes: self.config.large_object_bytes,
             sync: options.sync,
-            mek: self.mek.object_metadata_key(),
+            mek: require_object_metadata_key(&self.mek)?,
+            chk: require_container_header_key(&self.mek)?,
             reply,
         };
         let dispatch_result = self.dispatch(op, bucket, key, "put", reply_rx).await;
@@ -502,6 +509,7 @@ impl Storage for UringStorage {
             locks: self.locks.clone(),
             bucket: bucket.to_owned(),
             key: key.to_owned(),
+            chk: require_container_header_key(&self.mek)?,
             reply,
         };
         let result = self.dispatch(op, bucket, key, "delete", reply_rx).await;
@@ -530,7 +538,8 @@ impl Storage for UringStorage {
             locks: self.locks.clone(),
             bucket: bucket.to_owned(),
             key: key.to_owned(),
-            mek: self.mek.object_metadata_key(),
+            mek: require_object_metadata_key(&self.mek)?,
+            chk: require_container_header_key(&self.mek)?,
             reply,
         };
         let result = self.dispatch(op, bucket, key, "describe", reply_rx).await;
@@ -554,11 +563,16 @@ impl Storage for UringStorage {
         let result = async {
             self.locks.check_not_locked(bucket, key)?;
             let path_key = require_path_key(&self.mek)?;
+            let mek = require_object_metadata_key(&self.mek)?;
+            let chk = require_container_header_key(&self.mek)?;
             crate::storage::filesystem::set_labels_impl(
                 &self.base_path,
                 &self.index,
-                self.mek.object_metadata_key().as_ref(),
-                &path_key,
+                &crate::storage::filesystem::ObjectKeys {
+                    mek: &mek,
+                    chk: &chk,
+                    path_key: &path_key,
+                },
                 bucket,
                 key,
                 labels,
@@ -704,9 +718,10 @@ impl StorageExt for UringStorage {
         let index = self.index.clone();
         let state = self.rebuild_state.clone();
         let pool = Arc::clone(&self.pool);
-        let mek = self.mek.object_metadata_key();
+        let mek = require_object_metadata_key(&self.mek)?;
+        let chk = require_container_header_key(&self.mek)?;
         tokio::spawn(async move {
-            let result = run_rebuild(base_path, index, state.clone(), pool, mek).await;
+            let result = run_rebuild(base_path, index, state.clone(), pool, mek, chk).await;
             let mut s = state.lock().await;
             *s = match result {
                 Ok(()) => CacheRebuildStatus::Completed,
@@ -758,7 +773,8 @@ async fn run_rebuild(
     index: Arc<MetadataIndex>,
     state: Arc<tokio::sync::Mutex<CacheRebuildStatus>>,
     pool: Arc<WorkerPool>,
-    mek: Option<[u8; 32]>,
+    mek: [u8; 32],
+    chk: [u8; 32],
 ) -> Result<(), String> {
     let obj_paths = collect_obj_files(&base_path)
         .await
@@ -778,7 +794,12 @@ async fn run_rebuild(
             let Some(path) = path_iter.next() else { break };
             let (reply, reply_rx) = tokio::sync::oneshot::channel();
             let sender = pool.dispatch_for_path(&path).clone();
-            let op = UringOp::ReadObjectMeta { path, mek, reply };
+            let op = UringOp::ReadObjectMeta {
+                path,
+                mek,
+                chk,
+                reply,
+            };
             if let Err(e) = sender.send(op).await {
                 return Err(format!("worker pool closed mid-rebuild: {e}"));
             }
@@ -1226,7 +1247,9 @@ mod tests {
             [..super::super::format::HEADER_SIZE]
             .try_into()
             .unwrap();
-        let header = super::super::format::Header::decode(&header_arr).unwrap();
+        let chk = crate::crypto::derive_container_header_key(&TEST_NODE_KEY);
+        let object_id = crate::storage::filesystem::object_id_from_path(&obj_path).unwrap();
+        let header = super::super::format::Header::decode(&header_arr, &chk, object_id).unwrap();
         assert_eq!(
             header.data_offset,
             super::super::format::Header::MIN_DATA_OFFSET
@@ -1441,7 +1464,9 @@ mod tests {
             [..super::super::format::HEADER_SIZE]
             .try_into()
             .unwrap();
-        let header = super::super::format::Header::decode(&header_arr).unwrap();
+        let chk = crate::crypto::derive_container_header_key(&TEST_NODE_KEY);
+        let object_id = crate::storage::filesystem::object_id_from_path(&obj_path).unwrap();
+        let header = super::super::format::Header::decode(&header_arr, &chk, object_id).unwrap();
         assert_ne!(
             header.flags & super::super::format::flags::WRITTEN_O_DIRECT,
             0,

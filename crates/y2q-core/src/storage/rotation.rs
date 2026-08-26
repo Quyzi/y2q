@@ -36,6 +36,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::Error;
+use crate::crypto::node_keys::{BUCKET_CONFIG_PAD_BLOCK, META_PAD_BLOCK};
 use crate::crypto::{decrypt_meta, encrypt_meta};
 use crate::storage::filesystem::{
     bucket_dir_path, encode_bucket_dir, encode_object_id, object_id_from_path,
@@ -83,6 +84,8 @@ pub struct RotationKeys<'a> {
     pub new_omk: &'a [u8; 32],
     pub old_bck: &'a [u8; 32],
     pub new_bck: &'a [u8; 32],
+    pub old_chk: &'a [u8; 32],
+    pub new_chk: &'a [u8; 32],
 }
 
 /// Rotate every bucket in `buckets` (plaintext names, read from the
@@ -101,6 +104,8 @@ pub async fn rotate_storage_tree(
         new_omk,
         old_bck,
         new_bck,
+        old_chk,
+        new_chk,
     } = *keys;
     let mut stats = RotationStats::default();
     for bucket in buckets {
@@ -124,8 +129,16 @@ pub async fn rotate_storage_tree(
             .await
             .map_err(|e| io_err(bucket, "rotate-node-key", e))?;
         for path in obj_files {
-            let migrated =
-                migrate_object_file(&path, old_omk, new_omk, new_path_key, bucket).await?;
+            let migrated = migrate_object_file(
+                &path,
+                old_omk,
+                new_omk,
+                old_chk,
+                new_chk,
+                new_path_key,
+                bucket,
+            )
+            .await?;
             if migrated {
                 stats.objects_migrated += 1;
             } else {
@@ -160,6 +173,8 @@ async fn migrate_object_file(
     path: &Path,
     old_omk: &[u8; 32],
     new_omk: &[u8; 32],
+    old_chk: &[u8; 32],
+    new_chk: &[u8; 32],
     new_path_key: &[u8; 32],
     bucket: &str,
 ) -> Result<bool, Error> {
@@ -185,18 +200,13 @@ async fn migrate_object_file(
     }
     let mut header_buf = [0u8; HEADER_SIZE];
     header_buf.copy_from_slice(&bytes[..HEADER_SIZE]);
-    let header = Header::decode(&header_buf)
+    // Rotation runs offline against a tree still written under the old key, so
+    // the header authenticates under the old CHK and the current id.
+    let header = Header::decode(&header_buf, old_chk, &current_id)
         .map_err(|e| internal(bucket, "rotate-node-key", format!("decode header: {e}")))?;
-    if header
-        .checked_total_len()
-        .is_none_or(|total| total > bytes.len() as u64)
-    {
-        return Err(internal(
-            bucket,
-            "rotate-node-key",
-            "header fields inconsistent with file length".to_owned(),
-        ));
-    }
+    header
+        .check_total_len(bytes.len() as u64)
+        .map_err(|e| internal(bucket, "rotate-node-key", e.to_string()))?;
     let data_start = header.data_offset as usize;
     let meta_start = header.meta_offset() as usize;
     let meta_end = meta_start + header.meta_len as usize;
@@ -237,7 +247,7 @@ async fn migrate_object_file(
         return Ok(false);
     }
 
-    let new_meta = encrypt_meta(new_omk, &plain_json, &new_id).map_err(|e| {
+    let new_meta = encrypt_meta(new_omk, &plain_json, &new_id, META_PAD_BLOCK).map_err(|e| {
         internal(
             bucket,
             "rotate-node-key",
@@ -249,12 +259,16 @@ async fn migrate_object_file(
     // length — the header's `meta_len` needs no change.
     debug_assert_eq!(new_meta.len(), meta_bytes.len());
 
+    // The header's MAC is bound to both the key and the object id, so it must
+    // be recomputed under the new CHK and the new id even though no field in
+    // it changed.
+    let new_header_buf = header.encode(new_chk, &new_id);
     let mut out = Vec::with_capacity(bytes.len());
-    out.extend_from_slice(&header_buf);
+    out.extend_from_slice(&new_header_buf);
     out.resize(data_start, 0); // zero padding up to data_offset (O_DIRECT path)
     out.extend_from_slice(data);
     out.extend_from_slice(&new_meta);
-    out.extend_from_slice(&header_buf); // trailer mirrors the header
+    out.extend_from_slice(&new_header_buf); // trailer mirrors the header
 
     if let Some(parent) = new_path.parent() {
         tokio::fs::create_dir_all(parent)
@@ -313,13 +327,14 @@ async fn migrate_bucket_config(
         )
     })?;
 
-    let new_bytes = encrypt_meta(new_bck, &plain, &new_aad).map_err(|e| {
-        internal(
-            bucket,
-            "rotate-node-key",
-            format!("re-encrypt bucket config: {e}"),
-        )
-    })?;
+    let new_bytes =
+        encrypt_meta(new_bck, &plain, &new_aad, BUCKET_CONFIG_PAD_BLOCK).map_err(|e| {
+            internal(
+                bucket,
+                "rotate-node-key",
+                format!("re-encrypt bucket config: {e}"),
+            )
+        })?;
     let tmp = path.with_extension("json.rotate-tmp");
     tokio::fs::write(&tmp, &new_bytes)
         .await
@@ -328,6 +343,138 @@ async fn migrate_bucket_config(
         .await
         .map_err(|e| io_err(bucket, "rotate-node-key", e))?;
     Ok(())
+}
+
+/// Re-MAC every object's container header under `chk`, in place.
+///
+/// One-shot upgrade for a deployment written before the header carried an
+/// HMAC: [`Header::decode`] rejects the old version, so those objects are
+/// unreadable until this has run. Only the 64-byte header and its 64-byte
+/// trailer are rewritten — the data and metadata sections are untouched, so
+/// the cost is 128 bytes per object regardless of object size.
+///
+/// Idempotent: a file whose header already decodes under `chk` at the current
+/// version is skipped, so an interrupted run is simply re-run. Returns the
+/// number of files upgraded.
+pub async fn upgrade_container_headers(
+    base_path: &Path,
+    buckets: &[String],
+    path_key: &[u8; 32],
+    chk: &[u8; 32],
+) -> Result<u64, Error> {
+    let mut upgraded = 0u64;
+    for bucket in buckets {
+        let dir = bucket_dir_path(base_path, path_key, bucket);
+        if !tokio::fs::try_exists(&dir).await.unwrap_or(false) {
+            continue;
+        }
+        let obj_files = collect_bucket_obj_files(&dir)
+            .await
+            .map_err(|e| io_err(bucket, "upgrade-container-headers", e))?;
+        for path in obj_files {
+            if upgrade_one_container_header(&path, chk, bucket).await? {
+                upgraded += 1;
+            }
+        }
+    }
+    Ok(upgraded)
+}
+
+/// Rewrite one object's header and trailer under `chk`. Returns `false` when
+/// the file was already upgraded.
+async fn upgrade_one_container_header(
+    path: &Path,
+    chk: &[u8; 32],
+    bucket: &str,
+) -> Result<bool, Error> {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+
+    let op = "upgrade-container-headers";
+    let object_id = object_id_from_path(path)
+        .ok_or_else(|| internal(bucket, op, "cannot derive object id from path".to_owned()))?
+        .to_owned();
+
+    let mut file = tokio::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .await
+        .map_err(|e| io_err(bucket, op, e))?;
+    let actual_len = file
+        .metadata()
+        .await
+        .map_err(|e| io_err(bucket, op, e))?
+        .len();
+
+    let mut buf = [0u8; HEADER_SIZE];
+    file.read_exact(&mut buf)
+        .await
+        .map_err(|e| io_err(bucket, op, e))?;
+
+    // Already at the current version and correctly MAC'd — nothing to do.
+    if Header::decode(&buf, chk, &object_id).is_ok() {
+        return Ok(false);
+    }
+
+    let header = decode_v1_header(&buf).ok_or_else(|| {
+        internal(
+            bucket,
+            op,
+            format!("{}: unrecognized header", path.display()),
+        )
+    })?;
+    header
+        .check_total_len(actual_len)
+        .map_err(|e| internal(bucket, op, e.to_string()))?;
+
+    let encoded = header.encode(chk, &object_id);
+    file.seek(std::io::SeekFrom::Start(0))
+        .await
+        .map_err(|e| io_err(bucket, op, e))?;
+    file.write_all(&encoded)
+        .await
+        .map_err(|e| io_err(bucket, op, e))?;
+    file.seek(std::io::SeekFrom::Start(header.trailer_offset()))
+        .await
+        .map_err(|e| io_err(bucket, op, e))?;
+    file.write_all(&encoded)
+        .await
+        .map_err(|e| io_err(bucket, op, e))?;
+    file.sync_data().await.map_err(|e| io_err(bucket, op, e))?;
+    Ok(true)
+}
+
+/// Parse a version-1 header: same field layout, CRC only, no MAC.
+///
+/// Deliberately local to the migration rather than a mode on
+/// [`Header::decode`] — the unauthenticated path must not be reachable from
+/// any read path.
+fn decode_v1_header(buf: &[u8; HEADER_SIZE]) -> Option<Header> {
+    if buf[0..4] != crate::storage::format::MAGIC {
+        return None;
+    }
+    if u16::from_le_bytes(buf[4..6].try_into().ok()?) != 1 {
+        return None;
+    }
+    if u32::from_le_bytes(buf[60..64].try_into().ok()?) != crc32fast::hash(&buf[0..60]) {
+        return None;
+    }
+    let raw_data_offset = u32::from_le_bytes(buf[20..24].try_into().ok()?);
+    let data_offset = if raw_data_offset == 0 {
+        Header::MIN_DATA_OFFSET
+    } else {
+        raw_data_offset
+    };
+    if data_offset < Header::MIN_DATA_OFFSET {
+        return None;
+    }
+    Some(Header {
+        data_len: u64::from_le_bytes(buf[8..16].try_into().ok()?),
+        meta_len: u32::from_le_bytes(buf[16..20].try_into().ok()?),
+        data_offset,
+        flags: u16::from_le_bytes(buf[6..8].try_into().ok()?),
+        version: crate::storage::format::VERSION,
+    })
 }
 
 /// Every `*.obj` file directly under `bucket_dir/<xx>/<yy>/`.
@@ -364,7 +511,7 @@ mod tests {
     /// wildly exceeds the real byte count. Before the bounds check in
     /// `migrate_object_file` this desynced the `data`/`meta` slice bounds
     /// (`&bytes[data_start..meta_start]`) instead of erroring.
-    fn write_malformed_obj(dir: &Path) -> PathBuf {
+    fn write_malformed_obj(dir: &Path, chk: &[u8; 32]) -> PathBuf {
         let header = Header {
             data_len: 1_000_000,
             meta_len: 500,
@@ -372,9 +519,12 @@ mod tests {
             flags: 0,
             version: crate::storage::format::VERSION,
         };
-        let mut bytes = header.encode().to_vec();
-        bytes.extend_from_slice(&[0u8; 32]); // far short of the declared data_len
         let path = dir.join("malformed.obj");
+        let object_id = object_id_from_path(&path).unwrap().to_owned();
+        // MAC it correctly so the test exercises the length check rather than
+        // stopping at the MAC.
+        let mut bytes = header.encode(chk, &object_id).to_vec();
+        bytes.extend_from_slice(&[0u8; 32]); // far short of the declared data_len
         std::fs::write(&path, &bytes).unwrap();
         path
     }
@@ -382,12 +532,23 @@ mod tests {
     #[tokio::test]
     async fn migrate_object_file_rejects_inconsistent_header_instead_of_panicking() {
         let dir = tempfile::TempDir::new().unwrap();
-        let path = write_malformed_obj(dir.path());
+        let old_chk = [4u8; 32];
+        let path = write_malformed_obj(dir.path(), &old_chk);
         let old_omk = [1u8; 32];
         let new_omk = [2u8; 32];
+        let new_chk = [5u8; 32];
         let new_path_key = [3u8; 32];
 
-        let result = migrate_object_file(&path, &old_omk, &new_omk, &new_path_key, "bucket").await;
+        let result = migrate_object_file(
+            &path,
+            &old_omk,
+            &new_omk,
+            &old_chk,
+            &new_chk,
+            &new_path_key,
+            "bucket",
+        )
+        .await;
         assert!(
             result.is_err(),
             "a malformed header must error, not panic: {result:?}"
@@ -424,5 +585,79 @@ mod tests {
             "rotate-tmp staging file must be recognized as an orphan and swept"
         );
         assert!(!tmp_path.exists());
+    }
+
+    /// Encode a version-1 header: identical field layout, CRC only, reserved
+    /// bytes 24..60 zero — exactly what the pre-MAC writer produced.
+    fn encode_v1(h: &Header) -> [u8; HEADER_SIZE] {
+        let mut buf = [0u8; HEADER_SIZE];
+        buf[0..4].copy_from_slice(&crate::storage::format::MAGIC);
+        buf[4..6].copy_from_slice(&1u16.to_le_bytes());
+        buf[6..8].copy_from_slice(&h.flags.to_le_bytes());
+        buf[8..16].copy_from_slice(&h.data_len.to_le_bytes());
+        buf[16..20].copy_from_slice(&h.meta_len.to_le_bytes());
+        buf[20..24].copy_from_slice(&h.data_offset.to_le_bytes());
+        let crc = crc32fast::hash(&buf[0..60]);
+        buf[60..64].copy_from_slice(&crc.to_le_bytes());
+        buf
+    }
+
+    #[tokio::test]
+    async fn upgrade_rewrites_a_version_one_header_and_is_idempotent() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let base = dir.path().join("data");
+        let path_key = [3u8; 32];
+        let chk = [4u8; 32];
+        let bucket = "b";
+
+        // Lay out one object exactly as the pre-MAC writer would have.
+        let bucket_dir = bucket_dir_path(&base, &path_key, bucket);
+        let object_id = encode_object_id(&path_key, bucket, "k");
+        let shard = bucket_dir.join(&object_id[0..2]).join(&object_id[2..4]);
+        tokio::fs::create_dir_all(&shard).await.unwrap();
+        let path = shard.join(format!("{object_id}.obj"));
+
+        let data = b"payload bytes";
+        let meta = b"sealed-meta";
+        let header = Header {
+            data_len: data.len() as u64,
+            meta_len: meta.len() as u32,
+            data_offset: Header::MIN_DATA_OFFSET,
+            flags: 0,
+            version: crate::storage::format::VERSION,
+        };
+        let v1 = encode_v1(&header);
+        let mut bytes = v1.to_vec();
+        bytes.extend_from_slice(data);
+        bytes.extend_from_slice(meta);
+        bytes.extend_from_slice(&v1); // trailer mirrors the header
+        tokio::fs::write(&path, &bytes).await.unwrap();
+
+        // A version-1 header does not decode, so the object is unreadable.
+        let head: [u8; HEADER_SIZE] = bytes[..HEADER_SIZE].try_into().unwrap();
+        assert!(Header::decode(&head, &chk, &object_id).is_err());
+
+        let upgraded = upgrade_container_headers(&base, &[bucket.to_owned()], &path_key, &chk)
+            .await
+            .unwrap();
+        assert_eq!(upgraded, 1);
+
+        // Header and trailer both verify, and the body is untouched.
+        let after = tokio::fs::read(&path).await.unwrap();
+        assert_eq!(after.len(), bytes.len());
+        let head: [u8; HEADER_SIZE] = after[..HEADER_SIZE].try_into().unwrap();
+        let decoded = Header::decode(&head, &chk, &object_id).unwrap();
+        assert_eq!(decoded.data_len, header.data_len);
+        assert_eq!(decoded.meta_len, header.meta_len);
+        let tail: [u8; HEADER_SIZE] = after[after.len() - HEADER_SIZE..].try_into().unwrap();
+        assert_eq!(head, tail, "trailer must mirror the header");
+        let data_start = decoded.data_offset as usize;
+        assert_eq!(&after[data_start..data_start + data.len()], data);
+
+        // Re-running is a no-op rather than a second rewrite.
+        let again = upgrade_container_headers(&base, &[bucket.to_owned()], &path_key, &chk)
+            .await
+            .unwrap();
+        assert_eq!(again, 0);
     }
 }
