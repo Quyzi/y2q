@@ -260,8 +260,14 @@ fn bench_envelope_v2_decrypt(c: &mut Criterion) {
 
         group.bench_with_input(BenchmarkId::from_parameter(size), &size, |b, _| {
             b.iter(|| {
-                let pt =
-                    decrypt(black_box(&sk_bytes), black_box(&envelope), "bucket", "key").unwrap();
+                let pt = decrypt(
+                    black_box(&sk_bytes),
+                    black_box(&envelope),
+                    "bucket",
+                    "key",
+                    plaintext.len() as u64,
+                )
+                .unwrap();
                 black_box(pt);
             });
         });

@@ -29,6 +29,18 @@ pub struct Cli {
     /// `Y2QD_NEW_NODE_KEY` takes precedence when set.
     #[arg(long, value_name = "FILE")]
     pub new_node_key_file: Option<PathBuf>,
+
+    /// Re-MAC every object's 64-byte container header instead of starting the
+    /// server, then exit. Needed once when upgrading a deployment written
+    /// before the header carried an HMAC: version-1 headers no longer decode,
+    /// so objects are unreadable until this has run.
+    ///
+    /// Rewrites only 128 bytes per object (header + trailer) and skips files
+    /// already at version 2, so it is fast and safe to re-run after an
+    /// interruption. Takes the same keystore flock as `--rotate-node-key` and
+    /// refuses to run against a live daemon.
+    #[arg(long)]
+    pub upgrade_container_headers: bool,
 }
 
 fn parse_key_value(s: &str) -> Result<(String, String), String> {

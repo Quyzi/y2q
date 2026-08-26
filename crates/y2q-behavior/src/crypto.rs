@@ -64,17 +64,29 @@ pub trait ObjectCipher {
     /// records (itself authenticated — see the trait docs); supplying the
     /// wrong epoch's key derives the wrong content key and every chunk fails
     /// to authenticate the same way a wrong `bucket`/`key` address does.
+    ///
+    /// `expected_plaintext_len` is the object's authenticated size, carried in
+    /// the sealed metadata sidecar rather than in this envelope. It is
+    /// mandatory: the envelope header's own length field is deliberately
+    /// excluded from the chunk AAD (a streaming writer does not know the final
+    /// length when it seals the first chunk), so a disk-write attacker can
+    /// truncate an envelope to its preamble and patch that field to zero. An
+    /// implementation MUST reject a plaintext shorter than
+    /// `expected_plaintext_len` and MUST truncate a longer one to exactly that
+    /// many bytes, which is also how the Padmé body padding is stripped.
     fn decrypt(
         &self,
         sk_bytes: &[u8],
         envelope: &[u8],
         bucket: &str,
         key: &str,
+        expected_plaintext_len: u64,
     ) -> Result<Vec<u8>, Self::Error>;
 
     /// Open an envelope in place, decrypting into the owned input buffer and
     /// returning a view of the plaintext so no copy is made. Suited to large
-    /// objects already held in memory. Same `bucket`/`key`/epoch binding as
+    /// objects already held in memory. Same `bucket`/`key`/epoch binding and
+    /// the same `expected_plaintext_len` contract as
     /// [`decrypt`](Self::decrypt).
     fn decrypt_owned(
         &self,
@@ -82,6 +94,7 @@ pub trait ObjectCipher {
         envelope: BytesMut,
         bucket: &str,
         key: &str,
+        expected_plaintext_len: u64,
     ) -> Result<Bytes, Self::Error>;
 
     /// Open a contiguous run of chunks.
@@ -214,18 +227,30 @@ pub trait MetadataCipher {
     /// metadata, the bucket config key for bucket config) for storage,
     /// bound to `object_id` via AAD so the blob cannot be relocated to a
     /// different object's/bucket's storage location and still decrypt.
+    ///
+    /// The sealed plaintext is `u32_be(json.len()) || json || zero_pad`,
+    /// rounded up to a multiple of `pad_block` (0 or 1 disables padding).
+    /// Padding is load-bearing: the container header's `meta_len` is
+    /// necessarily cleartext, so an unpadded sidecar turns it into a
+    /// per-object fingerprint of `len(bucket) + len(key) + Σ len(labels)`
+    /// that survives the Padmé padding applied to the object body.
     fn encrypt_meta(
         &self,
         key: &[u8; 32],
         json: &[u8],
         object_id: &str,
+        pad_block: usize,
     ) -> Result<Vec<u8>, Self::Error>;
 
     /// Open a metadata blob under a derived key, requiring it to have been
-    /// sealed for the same `object_id`. A blob without the recognized
-    /// version byte is rejected rather than treated as legacy plaintext; a
-    /// blob sealed for a different object fails the same way as a tampered
-    /// blob.
+    /// sealed for the same `object_id`, and strip any padding.
+    ///
+    /// Both the unpadded and the length-prefixed padded version bytes are
+    /// accepted so sidecars written before padding keep opening. A blob
+    /// without a recognized version byte is rejected rather than treated as
+    /// legacy plaintext; a blob sealed for a different object fails the same
+    /// way as a tampered blob. A padded blob whose length prefix exceeds its
+    /// decrypted plaintext is rejected.
     fn decrypt_meta(
         &self,
         key: &[u8; 32],

@@ -64,7 +64,16 @@ fn load_node_key_via(
         .map_err(|e| CryptoError::NodeKeyMalformed(format!("read {node_key_file}: {e}")))?;
     let raw = match std::str::from_utf8(&bytes) {
         Ok(text) => decode_node_key(text.trim())?,
-        Err(_) => bytes,
+        Err(_) => {
+            if bytes.len() < MIN_NODE_KEY_BYTES {
+                return Err(CryptoError::NodeKeyMalformed(format!(
+                    "decoded to {} bytes, need at least {MIN_NODE_KEY_BYTES}",
+                    bytes.len()
+                )));
+            }
+            reject_non_csprng(&bytes)?;
+            bytes
+        }
     };
     Ok(Zeroizing::new(*extract_node_key(&raw)))
 }
@@ -79,11 +88,12 @@ fn load_node_key_via(
 /// Every key derived from the node key is a 256-bit AES/HMAC key, so the
 /// security of the whole hierarchy is capped at 256 bits no matter how much
 /// material is supplied — more than 32 bytes buys nothing. The 32-byte floor
-/// (enforced by [`decode_node_key`] and the raw-bytes fallback in
-/// [`load_node_key`]) is an accident guard against a truncated secret, not
-/// an entropy proof: a 43-character passphrase that happens to decode to 32
-/// bytes passes every check here. The operator must supply CSPRNG output —
-/// see the `node_key_file` config doc comment and `docs/operations.md`.
+/// is an accident guard against a truncated secret; the entropy guard is
+/// [`reject_non_csprng`], applied by [`decode_node_key`] and by the raw-bytes
+/// fallback in [`load_node_key`]. That check rejects obviously-typed material
+/// but cannot prove entropy either, so the operator must still supply CSPRNG
+/// output — see the `node_key_file` config doc comment and
+/// `docs/operations.md`.
 pub fn extract_node_key(ikm: &[u8]) -> Zeroizing<[u8; 32]> {
     let (prk, _) = Hkdf::<Sha256>::extract(Some(NODE_KEY_EXTRACT_SALT), ikm);
     Zeroizing::new(prk.into())
@@ -94,7 +104,8 @@ pub fn extract_node_key(ikm: &[u8]) -> Zeroizing<[u8; 32]> {
 /// Accepted: hex (even number of digits, either case), or base64 (standard
 /// or URL-safe alphabet, padded or unpadded). Surrounding ASCII whitespace
 /// must already be trimmed by the caller. Anything that decodes to fewer
-/// than [`MIN_NODE_KEY_BYTES`] bytes, or fails every decoding, is
+/// than [`MIN_NODE_KEY_BYTES`] bytes, fails every decoding, or does not look
+/// like CSPRNG output (see [`reject_non_csprng`]) is
 /// [`CryptoError::NodeKeyMalformed`].
 pub fn decode_node_key(text: &str) -> Result<Vec<u8>, CryptoError> {
     let decoded = decode_hex(text)
@@ -113,7 +124,61 @@ pub fn decode_node_key(text: &str) -> Result<Vec<u8>, CryptoError> {
             decoded.len()
         )));
     }
+    reject_non_csprng(&decoded)?;
     Ok(decoded)
+}
+
+/// Message returned for material that fails the CSPRNG shape check. A single
+/// literal so operators get the same actionable text from every entry point.
+const NOT_CSPRNG_MSG: &str = "node key material does not look like CSPRNG output; generate one with \
+     `head -c 32 /dev/urandom | base64`";
+
+/// Reject decoded key material that is plainly not CSPRNG output.
+///
+/// A weak node key collapses every Tier-0 protection at once, and the sealed
+/// headers this crate writes to disk are a free offline verification oracle —
+/// an attacker with the device can test candidate keys at roughly HMAC speed.
+/// A typed passphrase is therefore directly crackable, and the 32-byte floor
+/// does not catch one.
+///
+/// This is a shape check, not a canonicalization: running the material through
+/// a memory-hard KDF would change every derived key and force a full rotation
+/// of existing deployments. Two tests, both on the *decoded* bytes, so a
+/// legitimate hex or base64 encoding of random material passes:
+///
+/// - fewer than 20 distinct byte values (a uniform 32-byte string has ~29
+///   expected distinct values; below 20 is astronomically unlikely, and it
+///   catches short alphabets and typed text);
+/// - every byte in printable ASCII (probability `(95/256)^32 ≈ 2^-45` for real
+///   random input; catches a passphrase that was hex-encoded into the key
+///   file, and anything typed rather than generated).
+///
+/// Typed prose usually never reaches here at all: spaces and punctuation are
+/// outside every accepted alphabet, so [`decode_node_key`] rejects it first.
+/// What this cannot catch is a passphrase that happens to be valid base64 —
+/// it decodes to high-diversity, non-printable bytes and looks random by both
+/// tests, while carrying only the passphrase's real entropy. That residual gap
+/// is why the operator requirement stands rather than being replaced by this
+/// check.
+///
+/// There is deliberately no opt-out flag: an escape hatch is the setting every
+/// rushed deployment picks.
+fn reject_non_csprng(decoded: &[u8]) -> Result<(), CryptoError> {
+    let mut seen = [false; 256];
+    let mut distinct = 0usize;
+    for &b in decoded {
+        if !seen[b as usize] {
+            seen[b as usize] = true;
+            distinct += 1;
+        }
+    }
+    if distinct < 20 {
+        return Err(CryptoError::NodeKeyMalformed(NOT_CSPRNG_MSG.to_owned()));
+    }
+    if decoded.iter().all(|b| (0x20..=0x7e).contains(b)) {
+        return Err(CryptoError::NodeKeyMalformed(NOT_CSPRNG_MSG.to_owned()));
+    }
+    Ok(())
 }
 
 fn decode_hex(text: &str) -> Option<Vec<u8>> {
@@ -125,7 +190,7 @@ fn decode_hex(text: &str) -> Option<Vec<u8>> {
     }
     let mut out = Vec::with_capacity(text.len() / 2);
     let bytes = text.as_bytes();
-    for chunk in bytes.chunks_exact(2) {
+    for chunk in bytes.as_chunks::<2>().0 {
         let hi = (chunk[0] as char).to_digit(16)?;
         let lo = (chunk[1] as char).to_digit(16)?;
         out.push(((hi << 4) | lo) as u8);
@@ -229,6 +294,74 @@ mod tests {
             decode_node_key(garbage),
             Err(CryptoError::NodeKeyMalformed(_))
         ));
+    }
+
+    #[test]
+    fn csprng_material_in_either_encoding_is_accepted() {
+        use rand::Rng as _;
+        // 200 independent draws: the heuristic must have no practical
+        // false-positive rate against real CSPRNG output.
+        for _ in 0..200 {
+            let mut raw = [0u8; 32];
+            rand::rng().fill_bytes(&mut raw);
+            let hex: String = raw.iter().map(|b| format!("{b:02x}")).collect();
+            let b64 = STANDARD.encode(raw);
+            assert!(
+                decode_node_key(&hex).is_ok(),
+                "hex encoding of CSPRNG output rejected: {hex}"
+            );
+            assert!(
+                decode_node_key(&b64).is_ok(),
+                "base64 encoding of CSPRNG output rejected: {b64}"
+            );
+            // Both encodings must still canonicalize to the same node key.
+            assert_eq!(
+                *extract_node_key(&decode_node_key(&hex).unwrap()),
+                *extract_node_key(&decode_node_key(&b64).unwrap())
+            );
+        }
+    }
+
+    #[test]
+    fn passphrase_shaped_material_is_rejected() {
+        // Typed prose is not in any accepted alphabet, so the decoder stops it
+        // before the shape check even runs.
+        let passphrase = "correct horse battery staple and some more words";
+        assert!(matches!(
+            decode_node_key(passphrase),
+            Err(CryptoError::NodeKeyMalformed(_))
+        ));
+
+        // A passphrase hex-encoded into the key file *does* decode, and clears
+        // the 32-byte floor. Only the printable-ASCII arm of the shape check
+        // catches it.
+        let typed = "correct horse battery staple and some more words";
+        let hex_of_typed: String = typed.bytes().map(|b| format!("{b:02x}")).collect();
+        match decode_node_key(&hex_of_typed) {
+            Err(CryptoError::NodeKeyMalformed(msg)) => {
+                assert!(msg.contains("does not look like CSPRNG output"), "{msg}");
+            }
+            other => panic!("expected NodeKeyMalformed, got {other:?}"),
+        }
+
+        // 64 'a's are valid hex and clear the 32-byte floor, but decode to 32
+        // copies of 0xaa — one distinct value.
+        let repeated = "a".repeat(64);
+        match decode_node_key(&repeated) {
+            Err(CryptoError::NodeKeyMalformed(msg)) => {
+                assert!(msg.contains("does not look like CSPRNG output"), "{msg}");
+            }
+            other => panic!("expected NodeKeyMalformed, got {other:?}"),
+        }
+
+        // All-zero material clears the floor and has exactly one distinct byte.
+        let zeros: String = "00".repeat(32);
+        match decode_node_key(&zeros) {
+            Err(CryptoError::NodeKeyMalformed(msg)) => {
+                assert!(msg.contains("does not look like CSPRNG output"), "{msg}");
+            }
+            other => panic!("expected NodeKeyMalformed, got {other:?}"),
+        }
     }
 
     #[test]

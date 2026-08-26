@@ -354,23 +354,17 @@ async fn run_rekey(
             .describe(bucket, key)
             .await
             .map_err(|e| e.to_string())?;
-        let padded = cipher::decrypt_after_get(
+        // `decrypt_after_get` trims the Padmé padding to the recorded true
+        // size and rejects anything shorter, so the re-encrypted object cannot
+        // gain trailing null padding or silently shrink on a rekey.
+        let plaintext = cipher::decrypt_after_get(
             old_sk,
             bucket,
             key,
             BytesMut::from(obj.into_inner().as_ref()),
+            existing.size,
         )
         .map_err(|e| e.to_string())?;
-        // `decrypt_after_get` returns the Padmé-padded plaintext (padding is
-        // stripped on GET using `Metadata::size`, not by the decrypt call
-        // itself) — trim to the recorded true size before re-encrypting, or
-        // the object would gain trailing null padding on every rekey.
-        let true_size = existing.size as usize;
-        let plaintext = if padded.len() > true_size {
-            padded.slice(0..true_size)
-        } else {
-            padded
-        };
 
         let (guard, sink, write_offset) = storage
             .begin_streaming_put(bucket, key)

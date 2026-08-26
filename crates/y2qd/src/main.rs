@@ -262,12 +262,23 @@ async fn main() -> std::io::Result<()> {
     // Offline node-key rotation short-circuits the entire normal boot
     // sequence: it acquires its own flock, walks the storage tree, and exits.
     if cli.rotate_node_key {
+        if cli.upgrade_container_headers {
+            return Err(std::io::Error::other(
+                "--upgrade-container-headers cannot be combined with --rotate-node-key; \
+                 rotation already rewrites every header",
+            ));
+        }
         let new_node_key_file = cli
             .new_node_key_file
             .as_deref()
             .and_then(|p| p.to_str())
             .unwrap_or("");
         return node_key_rotation::run(&cfg, new_node_key_file).await;
+    }
+
+    // Same shape as rotation: takes the keystore flock, rewrites headers, exits.
+    if cli.upgrade_container_headers {
+        return node_key_rotation::upgrade_headers(&cfg).await;
     }
 
     #[cfg(feature = "pyroscope")]

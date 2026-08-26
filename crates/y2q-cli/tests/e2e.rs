@@ -15,6 +15,17 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+/// Hex-encoded 32-byte node key for the throwaway test deployment.
+///
+/// Fixed so a failing run reproduces, but drawn from CSPRNG output: the daemon
+/// rejects key material that does not look random (see
+/// `y2q_core::crypto::node_key`), so a low-diversity placeholder fails at boot.
+const TEST_NODE_KEY_HEX: &str = "9f3c1d7a04b8e526cf91072d4ab6539e8c25f0716da3b48c17e69205d3fa8b41";
+
+/// A second, unrelated key used by the rotation test as the *new* node key.
+const TEST_NEW_NODE_KEY_HEX: &str =
+    "2e75b0c9631fa8d405e3927b6c1af84e39d20b57e8146c3a92f5087db4e61c39";
+
 /// Path to the `y2qd` binary, in the same dir as the `y2q` bin Cargo hands us.
 fn y2qd_path() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_y2q"))
@@ -222,9 +233,11 @@ fn start_server_tls(tls: Option<(PathBuf, PathBuf)>) -> Option<Server> {
         .env("Y2QD_SERVER__PORT", port.to_string())
         .env("Y2QD_STORAGE__BASE_PATH", &data)
         .env("Y2QD_CRYPTO__KEYSTORE_DIR", &keys)
-        // 32 raw bytes, hex-encoded — CSPRNG output is not required for a
-        // throwaway test deployment, but the shape must be a valid node key.
-        .env("Y2QD_NODE_KEY", "ab".repeat(32))
+        // 32 raw bytes, hex-encoded. Fixed rather than random so a failing run
+        // reproduces, but it must still pass the CSPRNG shape check in
+        // `crypto::node_key` — a low-diversity constant like "ab" repeated is
+        // rejected at boot.
+        .env("Y2QD_NODE_KEY", TEST_NODE_KEY_HEX)
         // Cheap KDF params so first-run + login are fast in tests.
         .env("Y2QD_CRYPTO__ARGON2__M_COST_KIB", "8")
         .env("Y2QD_CRYPTO__ARGON2__T_COST", "1")
@@ -339,8 +352,8 @@ fn e2e_node_key_rotation_crash_safety() {
         std::fs::create_dir_all(d).unwrap();
     }
 
-    let old_key = "aa".repeat(32);
-    let new_key = "bb".repeat(32);
+    let old_key = TEST_NODE_KEY_HEX.to_owned();
+    let new_key = TEST_NEW_NODE_KEY_HEX.to_owned();
     let port = free_port();
 
     let apply_common_env = |cmd: &mut Command| {

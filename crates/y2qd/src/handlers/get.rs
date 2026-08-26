@@ -97,16 +97,12 @@ pub async fn handle(
         let buf = stored
             .try_into_mut()
             .unwrap_or_else(|b| BytesMut::from(b.as_ref()));
-        let plaintext = cipher::decrypt_after_get(&bucket_sk, &bucket, &key, buf)?;
-        // v3 envelopes are zero-padded to a Padmé boundary to hide the exact
-        // object size, so the decrypted plaintext may carry trailing pad
-        // bytes. Trim to the true size recorded in the (encrypted) metadata.
-        let size = md.size as usize;
-        let plaintext = if plaintext.len() > size {
-            plaintext.slice(0..size)
-        } else {
-            plaintext
-        };
+        // v3/v4 envelopes are zero-padded to a Padmé boundary to hide the exact
+        // object size, so the decrypted plaintext carries trailing pad bytes.
+        // The envelope layer trims to the authenticated size and rejects
+        // anything shorter — a truncated envelope with a patched length field
+        // must not surface as a 200 with a short body.
+        let plaintext = cipher::decrypt_after_get(&bucket_sk, &bucket, &key, buf, md.size)?;
         return Ok(HttpResponse::Ok()
             .content_type("application/octet-stream")
             .body(plaintext));
