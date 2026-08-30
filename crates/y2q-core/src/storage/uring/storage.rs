@@ -181,6 +181,17 @@ impl UringStorage {
         Arc::clone(&self.mek)
     }
 
+    /// Override the metadata index's redb page-cache cap (default
+    /// [`crate::storage::index::DEFAULT_CACHE_SIZE_BYTES`]). Must be called
+    /// before the node key is installed and before the returned value is
+    /// cloned elsewhere (i.e. immediately after [`Self::new`]) to take effect.
+    pub fn with_index_cache_size_bytes(mut self, bytes: usize) -> Self {
+        if let Some(index) = Arc::get_mut(&mut self.index) {
+            index.set_cache_size_bytes(bytes);
+        }
+        self
+    }
+
     /// Access the underlying metadata index, e.g. for `lookup_by_label`.
     pub fn index(&self) -> &MetadataIndex {
         &self.index
@@ -270,8 +281,8 @@ impl UringStorage {
                 let (reply, reply_rx) = tokio::sync::oneshot::channel();
                 let op = UringOp::ReadObjectMeta {
                     path: obj_path.clone(),
-                    mek: require_object_metadata_key(&self.mek)?,
-                    chk: require_container_header_key(&self.mek)?,
+                    mek: *require_object_metadata_key(&self.mek)?,
+                    chk: *require_container_header_key(&self.mek)?,
                     reply,
                 };
                 self.pool
@@ -343,8 +354,8 @@ impl UringStorage {
             key.to_owned(),
             is_overwrite,
             prior_created,
-            require_object_metadata_key(&self.mek)?,
-            require_container_header_key(&self.mek)?,
+            *require_object_metadata_key(&self.mek)?,
+            *require_container_header_key(&self.mek)?,
             self.index.clone(),
         );
 
@@ -413,7 +424,7 @@ impl Storage for UringStorage {
             locks: self.locks.clone(),
             bucket: bucket.to_owned(),
             key: key.to_owned(),
-            chk: require_container_header_key(&self.mek)?,
+            chk: *require_container_header_key(&self.mek)?,
             reply,
         };
         let result = self.dispatch(op, bucket, key, "get", reply_rx).await;
@@ -436,7 +447,7 @@ impl Storage for UringStorage {
             locks: self.locks.clone(),
             bucket: bucket.to_owned(),
             key: key.to_owned(),
-            chk: require_container_header_key(&self.mek)?,
+            chk: *require_container_header_key(&self.mek)?,
             range,
             reply,
         };
@@ -475,8 +486,8 @@ impl Storage for UringStorage {
             crypto,
             large_object_bytes: self.config.large_object_bytes,
             sync: options.sync,
-            mek: require_object_metadata_key(&self.mek)?,
-            chk: require_container_header_key(&self.mek)?,
+            mek: *require_object_metadata_key(&self.mek)?,
+            chk: *require_container_header_key(&self.mek)?,
             reply,
         };
         let dispatch_result = self.dispatch(op, bucket, key, "put", reply_rx).await;
@@ -509,7 +520,7 @@ impl Storage for UringStorage {
             locks: self.locks.clone(),
             bucket: bucket.to_owned(),
             key: key.to_owned(),
-            chk: require_container_header_key(&self.mek)?,
+            chk: *require_container_header_key(&self.mek)?,
             reply,
         };
         let result = self.dispatch(op, bucket, key, "delete", reply_rx).await;
@@ -538,8 +549,8 @@ impl Storage for UringStorage {
             locks: self.locks.clone(),
             bucket: bucket.to_owned(),
             key: key.to_owned(),
-            mek: require_object_metadata_key(&self.mek)?,
-            chk: require_container_header_key(&self.mek)?,
+            mek: *require_object_metadata_key(&self.mek)?,
+            chk: *require_container_header_key(&self.mek)?,
             reply,
         };
         let result = self.dispatch(op, bucket, key, "describe", reply_rx).await;
@@ -718,8 +729,8 @@ impl StorageExt for UringStorage {
         let index = self.index.clone();
         let state = self.rebuild_state.clone();
         let pool = Arc::clone(&self.pool);
-        let mek = require_object_metadata_key(&self.mek)?;
-        let chk = require_container_header_key(&self.mek)?;
+        let mek = *require_object_metadata_key(&self.mek)?;
+        let chk = *require_container_header_key(&self.mek)?;
         tokio::spawn(async move {
             let result = run_rebuild(base_path, index, state.clone(), pool, mek, chk).await;
             let mut s = state.lock().await;

@@ -389,6 +389,7 @@ async fn main() -> std::io::Result<()> {
         config::StorageBackend::Filesystem => AnyStorage::Filesystem(
             FilesystemStorage::new(&cfg.storage.base_path, &index_path)
                 .map_err(|e| std::io::Error::other(format!("storage init: {e}")))?
+                .with_index_cache_size_bytes(cfg.storage.index_cache_size_bytes)
                 .with_dirty_channel(dirty_tx, flush_notify.clone(), cfg.storage.sync_flush_limit),
         ),
         #[cfg(target_os = "linux")]
@@ -412,6 +413,7 @@ async fn main() -> std::io::Result<()> {
             };
             UringStorage::new(&cfg.storage.base_path, &index_path, uring_cfg)
                 .map_err(|e| std::io::Error::other(format!("storage init: {e}")))?
+                .with_index_cache_size_bytes(cfg.storage.index_cache_size_bytes)
         }),
         #[cfg(not(target_os = "linux"))]
         config::StorageBackend::Uring => {

@@ -302,29 +302,35 @@ sequenceDiagram
 
 ### Structure
 
-The index is a single redb database with two tables:
+The index is a single redb database with four tables:
 
 | Table | Key | Value | Purpose |
 |---|---|---|---|
-| `OBJECTS` | `len(bucket) || bucket || len(key) || key` | JSON `Metadata` | Object lookup, bucket scans |
-| `LABELS` | `len(name) || name || len(value) || value || len(bucket) || bucket || len(key) || key` | empty | Forward index for `label_name=value` queries |
+| `OBJECTS` | `HMAC-SHA256(IK, "idx-bucket\0"‖bucket)` ‖ `HMAC-SHA256(IK, "idx-object\0"‖bucket‖key)` | AEAD-sealed (OMK) JSON `Metadata` | Object lookup, bucket scans |
+| `LABELS` | blinded `(label_name, label_value)` prefix ‖ blinded `(bucket, key)` suffix (same scheme as `OBJECTS`) | AEAD-sealed `(bucket, key)` pair | Forward index for `label_name=value` queries |
+| `BUCKETS` | `HMAC-SHA256(IK, "idx-bucket\0"‖bucket)` | AEAD-sealed bucket name | Registry of explicitly-created (possibly empty) buckets |
+| `META` | `"schema_version"` | plaintext version byte | Detects an index written under an older key/value scheme (see Rebuild below) |
 
-All composite keys use a 4-byte big-endian length prefix per field, which makes lexicographic byte order match `(field1, field2, ...)` tuple order. That lets range scans answer "all objects in bucket B" and "all `(bucket, key)` pairs with label N=V" with no extra filtering.
+Every field is length-prefixed before hashing, so blinding is domain-separated and unambiguous (`bucket="ab", key="c"` can never collide with `bucket="a", key="bc"`). Rows for the same bucket share the leading 32 bytes of their key, which is what keeps the per-bucket range scans below working without the key ever containing the plaintext bucket name.
 
 ### Encryption at rest
 
-The entire `_y2q_index.redb` file is encrypted at rest. redb runs on top of a custom `StorageBackend` (`EncryptedFileBackend`) that transparently encrypts every 4 KiB block with AES-256-GCM (fresh per-block nonce, block index bound as AAD) and translates redb's logical offsets to physical ones. A small authenticated header records the logical file length. Inside the database, table keys and values are stored in the clear - the whole-file layer is the sole protection, so nothing about the schema, sizes, or contents leaks on disk.
+The entire `_y2q_index.redb` file is encrypted at rest, as it always has been: redb runs on top of a custom `StorageBackend` (`EncryptedFileBackend`) that transparently encrypts every 4 KiB block with AES-256-GCM (fresh per-block nonce, block index bound as AAD) and translates redb's logical offsets to physical ones. A small authenticated header records the logical file length.
+
+On top of that, every table key and value carries a second, row-level layer (see Structure above): keys are HMAC-SHA256-blinded under the Index Key (`IK = prf(node_key, "index-key")`) and values are AEAD-sealed under the Object Metadata Key (OMK — the same key that seals the on-disk `.obj` sidecar), bound to their own blinded row key via AAD so a sealed value can't be replayed into a different row. Blinding is deterministic, so point lookups and range scans keep working without ever touching a plaintext string. redb's own page cache is also capped (`storage.index_cache_size_bytes`, default 64 MiB, versus redb's 1 GiB default) to bound how much decrypted content can be resident in the cache at once.
+
+**What the row-level layer does and doesn't buy.** Whole-file encryption alone means that once redb decrypts a page into its own page cache, anything on that page — bucket names, object keys, label names/values — sits in cleartext in process memory for as long as the page stays cached, which given `list_buckets`/`search_labels`/index-rebuild all touch every row, is effectively the daemon's whole uptime. Row-level blinding/sealing closes exactly that gap: the raw bytes redb hands back from a decrypted page are opaque HMAC output and AEAD ciphertext, not a recoverable string, regardless of how long the page stays cached. It does **not**, however, raise the bar against a node-key holder or an attacker who can read the running daemon's memory: IK and OMK are both derived from the node key and held, like every tier-0 key, in `NodeKeySlot` for the daemon's entire lifetime with no idle-drop — the same memory an attacker would need cache-page access from in the first place. See [the accepted node-key-holder tradeoff](#threat-model-brief) below, which this does not change.
 
 The file key is derived from the node key (`IFK = prf(node_key, "index-file-key")`), which is resident in memory for the daemon's whole lifetime once boot completes - there is no idle-drop for it (see [Session-scoped identity keys](#session-scoped-identity-keys) below). Because the node key never changes without an explicit offline rotation (`y2qd --rotate-node-key`), the existing encrypted file reopens unchanged across restarts with no rewrapping.
 
 Listing operations are implemented as bounded range scans:
 
-- `list_buckets()` skip-walks the OBJECTS table - one read per bucket, jumping to the lex-successor of each bucket prefix. O(num_buckets) reads instead of O(num_objects).
+- `list_buckets()` skip-walks the OBJECTS table - one read per bucket, jumping to the lex-successor of each bucket's blinded prefix. O(num_buckets) reads instead of O(num_objects). The bucket name itself comes from decrypting that one representative row's value, since the row key is opaque HMAC bytes and can't be decoded back.
 - `scan_objects(bucket, prefix?, after?, limit)` range scans within the bucket, filters by `prefix`, paginates past `after`, and applies `limit`. Returns a `ListPage { items, next }`. Sorted ascending by key. `next` is `None` when the page is the last.
 
 ### Rebuild
 
-The index is a cache. If it goes missing or corrupt, every operation still works against the on-disk truth (by reading `.obj` files directly) - just slower for listings. A pre-encryption (plaintext) index file from an older build is incompatible: on first open the encrypting backend detects the missing magic, recreates the file empty, and the rebuild below repopulates it. Two paths kick off a rebuild:
+The index is a cache. If it goes missing or corrupt, every operation still works against the on-disk truth (by reading `.obj` files directly) - just slower for listings. A pre-encryption (plaintext) index file from an older build is incompatible: on first open the encrypting backend detects the missing magic, recreates the file empty, and the rebuild below repopulates it. An index still written under the pre-blinding key/value scheme (schema version 1, or missing the `META` marker entirely) is detected the same way — via the marker, not the file magic — and wiped rather than risking a misread of incompatible rows. Two paths kick off a rebuild:
 
 1. **Automatic startup rebuild** - on every boot the daemon walks the storage tree and reconciles the index against on-disk `.obj` files. Objects missing from the index are re-inserted; index rows whose `.obj` file is gone are removed and logged as data-loss events.
 2. **Manual rebuild** - `POST /api/v1/rebuild` starts a background scan; `GET /api/v1/rebuild` polls progress.
@@ -392,8 +398,8 @@ What the design defends against:
 
 What it doesn't defend against:
 
-- **Compromised running daemon** - once a persona's identity secret key is unwrapped into memory (on login), anything that can read that request's process memory can read whatever that persona holds a grant for. Session TTL (`[auth] max_ttl_seconds`) bounds this window; there is no idle-drop knob to shorten it further (see [Session-scoped identity keys](#session-scoped-identity-keys)).
-- **The node key holder** - metadata (object sizes, labels, cleartext keys, bucket names) is encrypted at tier 0, not per-bucket, so a node-key-holding operator or attacker sees the *shape* of the deployment - which buckets exist, how many objects, their labels and sizes - without ever seeing content. This is an accepted, deliberate consequence of keeping the metadata index reconstructible without every bucket's key (see the Filesystem backend section above).
+- **Compromised running daemon** - once a persona's identity secret key is unwrapped into memory (on login), anything that can read that request's process memory can read whatever that persona holds a grant for. Session TTL (`[auth] max_ttl_seconds`) bounds this window; there is no idle-drop knob to shorten it further (see [Session-scoped identity keys](#session-scoped-identity-keys)). Tier-0 keys (index, path, object-metadata, bucket-config, container-header) are resident for the daemon's *entire* lifetime with no idle-drop at all, so the same memory access also recovers whatever those protect - including the keys the metadata index's row-level blinding/sealing uses (see [Metadata index](#metadata-index)).
+- **The node key holder** - metadata (object sizes, labels, cleartext keys, bucket names) is encrypted at tier 0, not per-bucket, so a node-key-holding operator or attacker sees the *shape* of the deployment - which buckets exist, how many objects, their labels and sizes - without ever seeing content. This is an accepted, deliberate consequence of keeping the metadata index reconstructible without every bucket's key (see the Filesystem backend section above). The metadata index's row-level blinding/sealing (see [Metadata index](#metadata-index)) closes a *decrypted-page-without-the-node-key* exposure - it does not change this tradeoff, since a node-key holder derives the same blinding/sealing keys the daemon does.
 - **Compromised client** - Bearer tokens are bearer credentials. A client that leaks one gives the holder full access until expiry or revocation.
 - **Plaintext on the wire** - mitigated by the native TLS listener (`[server.tls]`), which can be restricted to the X25519MLKEM768 post-quantum hybrid key exchange and can enforce mutual TLS. When TLS is disabled the daemon serves plaintext HTTP and should sit behind a TLS-terminating reverse proxy.
 - **A stolen node key by itself** - it unlocks metadata and paths, but not object plaintext; combined with disk access it still requires each bucket's own key material (sealed to specific personas) to decrypt anything.

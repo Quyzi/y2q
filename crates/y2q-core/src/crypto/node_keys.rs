@@ -206,49 +206,53 @@ impl NodeKeySlot {
     }
 
     /// A copy of the Index Key, if installed.
-    pub fn index_key(&self) -> Option<[u8; 32]> {
+    ///
+    /// Returned wrapped in [`Zeroizing`] so this scratch copy - not just the
+    /// one held in the slot - is wiped when the caller drops it, rather than
+    /// lingering unzeroized on the stack or in a moved-from heap slot.
+    pub fn index_key(&self) -> Option<Zeroizing<[u8; 32]>> {
         self.inner
             .read()
             .expect("NodeKeySlot poisoned")
             .as_ref()
-            .map(|k| *k.index_key)
+            .map(|k| k.index_key.clone())
     }
 
     /// A copy of the Path Key, if installed. Used to keyed-hash on-disk
     /// bucket and object names.
-    pub fn path_key(&self) -> Option<[u8; 32]> {
+    pub fn path_key(&self) -> Option<Zeroizing<[u8; 32]>> {
         self.inner
             .read()
             .expect("NodeKeySlot poisoned")
             .as_ref()
-            .map(|k| *k.path_key)
+            .map(|k| k.path_key.clone())
     }
 
     /// A copy of the Object Metadata Key, if installed.
-    pub fn object_metadata_key(&self) -> Option<[u8; 32]> {
+    pub fn object_metadata_key(&self) -> Option<Zeroizing<[u8; 32]>> {
         self.inner
             .read()
             .expect("NodeKeySlot poisoned")
             .as_ref()
-            .map(|k| *k.object_metadata_key)
+            .map(|k| k.object_metadata_key.clone())
     }
 
     /// A copy of the Bucket Config Key, if installed.
-    pub fn bucket_config_key(&self) -> Option<[u8; 32]> {
+    pub fn bucket_config_key(&self) -> Option<Zeroizing<[u8; 32]>> {
         self.inner
             .read()
             .expect("NodeKeySlot poisoned")
             .as_ref()
-            .map(|k| *k.bucket_config_key)
+            .map(|k| k.bucket_config_key.clone())
     }
 
     /// A copy of the Container Header Key, if installed.
-    pub fn container_header_key(&self) -> Option<[u8; 32]> {
+    pub fn container_header_key(&self) -> Option<Zeroizing<[u8; 32]>> {
         self.inner
             .read()
             .expect("NodeKeySlot poisoned")
             .as_ref()
-            .map(|k| *k.container_header_key)
+            .map(|k| k.container_header_key.clone())
     }
 
     /// Whether the node key has been installed.
@@ -532,13 +536,16 @@ mod tests {
         let k = nk(1);
         slot.install(k);
         assert!(slot.is_set());
-        assert_eq!(slot.index_key(), Some(derive_index_key(&k)));
-        assert_eq!(slot.path_key(), Some(derive_path_key(&k)));
+        assert_eq!(slot.index_key().map(|z| *z), Some(derive_index_key(&k)));
+        assert_eq!(slot.path_key().map(|z| *z), Some(derive_path_key(&k)));
         assert_eq!(
-            slot.object_metadata_key(),
+            slot.object_metadata_key().map(|z| *z),
             Some(derive_object_metadata_key(&k))
         );
-        assert_eq!(slot.bucket_config_key(), Some(derive_bucket_config_key(&k)));
+        assert_eq!(
+            slot.bucket_config_key().map(|z| *z),
+            Some(derive_bucket_config_key(&k))
+        );
     }
 
     #[test]

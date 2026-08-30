@@ -120,6 +120,12 @@ sync_flush_interval_secs = 5
 # Entries are never dropped — this is a watermark, not a hard cap. Default: 64.
 sync_flush_limit = 64
 
+# Cap on the redb page cache backing the metadata index, in bytes. Bounds how
+# much of the index's decrypted content (bucket/key names, labels, sizes,
+# checksums) can be resident in process memory at once — redb's own default
+# is 1 GiB, unbounded relative to a root-level memory dump. Default: 64 MiB.
+index_cache_size_bytes = 67108864
+
 # Default durability for PUT requests that omit the X-Y2Q-Sync header.
 #   "durable"      — fdatasync on the object file + fsync on the parent directory
 #                    before returning success. Crash-safe. (default)
