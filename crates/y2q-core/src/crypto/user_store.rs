@@ -269,7 +269,15 @@ impl UserStore {
             crate::storage::ForeignFile::Reject,
         )
         .map_err(|e| CryptoError::UserStore(format!("open {}: {e}", path.display())))?;
-        let db = redb::Builder::new()
+        // Cap the redb page cache well below its 1 GiB default: a touched page
+        // is decrypted plaintext (username, wrapped keys) for as long as it
+        // stays cached, and the user table is small enough that a modest cap
+        // costs nothing in practice. See `storage::index::DEFAULT_CACHE_SIZE_BYTES`
+        // for the same reasoning applied to the metadata index.
+        const USER_STORE_CACHE_SIZE_BYTES: usize = 8 * 1024 * 1024;
+        let mut builder = redb::Builder::new();
+        builder.set_cache_size(USER_STORE_CACHE_SIZE_BYTES);
+        let db = builder
             .create_with_backend(backend)
             .map_err(|e| CryptoError::UserStore(format!("open {}: {e}", path.display())))?;
         let txn = db

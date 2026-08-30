@@ -7,6 +7,7 @@ use std::{
 
 use bytes::Bytes;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use zeroize::Zeroizing;
 
 use crate::{
     CacheRebuildStatus, CipherMetadata, DEFAULT_LIST_LIMIT, Error, ListOptions, ListPage, Listing,
@@ -125,6 +126,17 @@ impl FilesystemStorage {
         Arc::clone(&self.mek)
     }
 
+    /// Override the metadata index's redb page-cache cap (default
+    /// [`crate::storage::index::DEFAULT_CACHE_SIZE_BYTES`]). Must be called
+    /// before the node key is installed and before the returned value is
+    /// cloned elsewhere (i.e. immediately after [`Self::new`]) to take effect.
+    pub fn with_index_cache_size_bytes(mut self, bytes: usize) -> Self {
+        if let Some(index) = Arc::get_mut(&mut self.index) {
+            index.set_cache_size_bytes(bytes);
+        }
+        self
+    }
+
     /// Attach a dirty-write channel for best-effort PUT flushing.
     /// After each non-Durable commit, the obj path is sent to `tx`.
     /// When the queue depth reaches `flush_limit`, `notify` is signalled.
@@ -169,7 +181,7 @@ fn to_hex(bytes: &[u8]) -> String {
 ///
 /// Object and bucket on-disk locations are keyed by the path key, so every
 /// path-building operation requires the node key to be installed.
-pub(crate) fn require_path_key(node_keys: &NodeKeySlot) -> Result<[u8; 32], Error> {
+pub(crate) fn require_path_key(node_keys: &NodeKeySlot) -> Result<Zeroizing<[u8; 32]>, Error> {
     node_keys.path_key().ok_or_else(|| Error::InternalError {
         bucket: String::new(),
         key: String::new(),
@@ -184,7 +196,9 @@ pub(crate) fn require_path_key(node_keys: &NodeKeySlot) -> Result<[u8; 32], Erro
 /// Every metadata sidecar is sealed under this key on write and opened with it
 /// on read; there is deliberately no plaintext-sidecar fallback, so a missing
 /// node key is an error on both paths rather than a silent downgrade.
-pub(crate) fn require_object_metadata_key(node_keys: &NodeKeySlot) -> Result<[u8; 32], Error> {
+pub(crate) fn require_object_metadata_key(
+    node_keys: &NodeKeySlot,
+) -> Result<Zeroizing<[u8; 32]>, Error> {
     node_keys
         .object_metadata_key()
         .ok_or_else(|| Error::InternalError {
@@ -200,7 +214,9 @@ pub(crate) fn require_object_metadata_key(node_keys: &NodeKeySlot) -> Result<[u8
 ///
 /// Every `.obj` header is MAC'd under this key on write and verified with it
 /// on read, so both paths require the node key.
-pub(crate) fn require_container_header_key(node_keys: &NodeKeySlot) -> Result<[u8; 32], Error> {
+pub(crate) fn require_container_header_key(
+    node_keys: &NodeKeySlot,
+) -> Result<Zeroizing<[u8; 32]>, Error> {
     node_keys
         .container_header_key()
         .ok_or_else(|| Error::InternalError {
@@ -601,7 +617,9 @@ pub(crate) async fn set_bucket_config_impl(
 
 /// Read the bucket-config key (BCK) from `node_keys`, erroring if the node
 /// key has not been installed (which should never happen post-boot).
-pub(crate) fn require_bucket_config_key(node_keys: &NodeKeySlot) -> Result<[u8; 32], Error> {
+pub(crate) fn require_bucket_config_key(
+    node_keys: &NodeKeySlot,
+) -> Result<Zeroizing<[u8; 32]>, Error> {
     node_keys
         .bucket_config_key()
         .ok_or_else(|| Error::InternalError {
@@ -1597,8 +1615,8 @@ impl Storage for FilesystemStorage {
 
             read_obj_metadata(
                 &obj_path,
-                &require_object_metadata_key(&self.mek)?,
-                &require_container_header_key(&self.mek)?,
+                &*require_object_metadata_key(&self.mek)?,
+                &*require_container_header_key(&self.mek)?,
             )
             .await
             .map_err(|e| Error::InternalError {
@@ -1713,8 +1731,8 @@ impl StorageExt for FilesystemStorage {
         let base_path = self.base_path.clone();
         let index = self.index.clone();
         let state = self.rebuild_state.clone();
-        let mek = require_object_metadata_key(&self.mek)?;
-        let chk = require_container_header_key(&self.mek)?;
+        let mek = *require_object_metadata_key(&self.mek)?;
+        let chk = *require_container_header_key(&self.mek)?;
         tokio::spawn(async move {
             let result = run_rebuild(base_path, index, state.clone(), mek, chk).await;
             let mut s = state.lock().await;

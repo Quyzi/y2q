@@ -416,6 +416,10 @@ fn default_sync_flush_limit() -> usize {
     64
 }
 
+fn default_index_cache_size_bytes() -> usize {
+    y2q_core::storage::index::DEFAULT_CACHE_SIZE_BYTES
+}
+
 /// Selected storage backend implementation.
 ///
 /// Maps to the on-disk format and I/O strategy used at runtime. Set via
@@ -539,6 +543,13 @@ pub struct StorageConfig {
     /// Default: 64.
     #[serde(default = "default_sync_flush_limit")]
     pub sync_flush_limit: usize,
+    /// Cap on the redb page cache backing the metadata index, in bytes.
+    /// Bounds how much of the index's decrypted content (bucket/key names,
+    /// labels, sizes, checksums) can be resident in process memory at once —
+    /// redb's own default is 1 GiB, unbounded relative to a root-level memory
+    /// dump. Default: 64 MiB.
+    #[serde(default = "default_index_cache_size_bytes")]
+    pub index_cache_size_bytes: usize,
     /// Default durability for PUT requests that omit the `X-Y2Q-Sync` header.
     /// `"durable"` (default) — fdatasync + parent dir fsync before returning.
     /// `"best-effort"` — no fsync; higher throughput, not crash-safe.
