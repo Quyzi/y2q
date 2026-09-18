@@ -722,7 +722,7 @@ These are served **only** when `[server] unauthenticated_metrics = true`, and th
 | 416 | `Range` not satisfiable (inverted or out of bounds) |
 | 429 | Login: per-source-IP rate limit, or per-username lockout - see `Retry-After` |
 | 500 | Internal failure: encryption, decryption, index, or storage |
-| 503 | `KeystoreUnavailable` - daemon has no SK in memory (idle-dropped). Log in to install it. |
+| 503 | `KeystoreNotFound` - `keystore.json`/`users.redb` missing at the configured `keystore_dir` (misconfiguration, or a copy that left the keystore behind) |
 
 ## Source
 
