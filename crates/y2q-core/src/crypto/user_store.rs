@@ -12,13 +12,14 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use base64::{Engine as _, engine::general_purpose::STANDARD};
 use pqcrypto::kem::mlkem768;
 use redb::{Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
 use super::CryptoError;
 use super::kdf::{Argon2Params, WrappedSk};
+use crate::secmem::SecretVec;
 
 /// `username` (UTF-8) → JSON-serialized [`UserRecord`].
 const USERS: TableDefinition<&str, &[u8]> = TableDefinition::new("users");
@@ -74,10 +75,10 @@ pub struct CredentialSlot {
 /// cleartext — `role` and `revoke_other_sessions` living outside the wrap
 /// would let an attacker with the disk pick the duress slot out by eye,
 /// defeating the deniability property.
-#[derive(Clone)]
 pub struct SlotPayload {
-    /// Raw ML-KEM-768 secret key bytes for this persona, standard-base64.
-    pub identity_sk_b64: String,
+    /// Raw ML-KEM-768 secret key bytes for this persona, held in guarded
+    /// memory — never plaintext at rest.
+    pub identity_sk: SecretVec,
     /// Effective role for a session opened with this password. Enforced
     /// `<=` the record's cleartext `role` when the slot is written.
     pub role: Role,
@@ -91,7 +92,7 @@ pub struct SlotPayload {
 impl std::fmt::Debug for SlotPayload {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SlotPayload")
-            .field("identity_sk_b64", &"<redacted>")
+            .field("identity_sk", &"<redacted>")
             .field("role", &self.role)
             .field("revoke_other_sessions", &self.revoke_other_sessions)
             .finish()
@@ -107,19 +108,16 @@ impl SlotPayload {
     /// length even though the payload itself stays encrypted. This encoding
     /// is exactly `mlkem768::secret_key_bytes() + 2` bytes for every slot,
     /// occupied or decoy, real role or not.
-    pub fn to_bytes(&self) -> Result<Vec<u8>, CryptoError> {
-        let sk = STANDARD
-            .decode(&self.identity_sk_b64)
-            .map_err(|e| CryptoError::Kdf(format!("decode identity sk: {e}")))?;
-        if sk.len() != mlkem768::secret_key_bytes() {
+    pub fn to_bytes(&self) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
+        if self.identity_sk.len() != mlkem768::secret_key_bytes() {
             return Err(CryptoError::Kdf(format!(
                 "identity secret key wrong size: {} (expected {})",
-                sk.len(),
+                self.identity_sk.len(),
                 mlkem768::secret_key_bytes()
             )));
         }
-        let mut out = Vec::with_capacity(sk.len() + 2);
-        out.extend_from_slice(&sk);
+        let mut out = Zeroizing::new(Vec::with_capacity(self.identity_sk.len() + 2));
+        out.extend_from_slice(&self.identity_sk);
         out.push(role_to_byte(self.role));
         out.push(self.revoke_other_sessions as u8);
         Ok(out)
@@ -138,7 +136,7 @@ impl SlotPayload {
         let role = role_from_byte(tail[0])
             .ok_or_else(|| CryptoError::Kdf(format!("invalid role byte: {}", tail[0])))?;
         Ok(Self {
-            identity_sk_b64: STANDARD.encode(sk),
+            identity_sk: SecretVec::from_slice(sk)?,
             role,
             revoke_other_sessions: tail[1] != 0,
         })

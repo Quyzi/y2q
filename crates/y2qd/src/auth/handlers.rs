@@ -8,17 +8,19 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use actix_web::{HttpResponse, web};
-use base64::{Engine as _, engine::general_purpose::STANDARD};
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use y2q_core::crypto::{
     CREDENTIAL_SLOTS, CredentialSlot, Role, SlotPayload, UserRecord, UserSummary, kdf,
 };
+use y2q_core::secmem::{SecretString, SecretVec};
 use y2q_core::{AnyStorage, BucketConfig, Listing};
 use zeroize::Zeroizing;
 
 use super::error::AuthError;
-use super::session::{SessionInfo, compute_expiry};
+use super::secret_json::SecretJson;
+use super::session::{NewSession, compute_expiry};
 use super::state::AuthState;
 use super::users::validate as validate_username;
 use super::{AdminAuthenticated, AdminReadAuthenticated, Authenticated};
@@ -53,7 +55,8 @@ fn record_login(result_label: &'static str, session_count: Option<usize>) {
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct LoginRequest {
     pub username: String,
-    pub password: String,
+    #[schema(value_type = String)]
+    pub password: SecretString,
     /// Optional session lifetime in seconds. Capped by `auth.max_ttl_seconds`.
     /// Omit to use `auth.default_ttl_seconds`.
     #[serde(default)]
@@ -64,25 +67,57 @@ pub struct LoginRequest {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct TokenResponse {
     /// Bearer token. Send back as `Authorization: Bearer <token>`.
-    pub token: String,
+    #[schema(value_type = String)]
+    pub token: SecretString,
     /// Expiry as seconds since the Unix epoch.
     pub expires_at: u64,
     /// Username this token is bound to.
     pub username: String,
 }
 
+/// Serialize `resp` into a pre-sized, scrubbed-on-drop buffer and wrap it as
+/// the response body, instead of `HttpResponse::json`, whose aggregation
+/// path serializes through an unscrubbed heap buffer. `Bytes::from_owner`
+/// keeps `body` alive until actix has written the socket, then drops (and
+/// zeroizes) it.
+fn token_response(resp: TokenResponse) -> Result<HttpResponse, AuthError> {
+    let mut body = Zeroizing::new(Vec::with_capacity(128 + resp.username.len()));
+    serde_json::to_writer(&mut *body, &resp).map_err(|e| AuthError::Backend(e.to_string()))?;
+    debug_assert_eq!(
+        body.capacity(),
+        128 + resp.username.len(),
+        "token response body reallocated; grow the pre-sized capacity"
+    );
+    Ok(HttpResponse::Ok()
+        .content_type("application/json")
+        .body(Bytes::from_owner(ScrubbedBody(body))))
+}
+
+/// Owner passed to [`Bytes::from_owner`] so the serialized (token-bearing)
+/// response body is zeroized once actix drops it after writing the socket.
+struct ScrubbedBody(Zeroizing<Vec<u8>>);
+
+impl AsRef<[u8]> for ScrubbedBody {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
 /// `POST /api/v1/auth/password` request body.
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct ChangePasswordRequest {
-    pub current: String,
-    pub new: String,
+    #[schema(value_type = String)]
+    pub current: SecretString,
+    #[schema(value_type = String)]
+    pub new: SecretString,
 }
 
 /// `PUT /api/v1/users/add` request body.
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct AddUserRequest {
     pub username: String,
-    pub password: String,
+    #[schema(value_type = String)]
+    pub password: SecretString,
     /// Global role for the new user. Defaults to `user`. Only an administrator
     /// can reach this endpoint, so only an administrator can mint another admin.
     #[serde(default)]
@@ -142,10 +177,11 @@ impl From<UserSummary> for UserView {
 #[tracing::instrument(skip(state, body), fields(username = %body.username))]
 pub async fn login(
     state: web::Data<AuthState>,
-    body: web::Json<LoginRequest>,
+    body: SecretJson<LoginRequest>,
 ) -> Result<HttpResponse, AuthError> {
-    let username = body.username.clone();
-    let password = body.password.clone();
+    let body = body.0;
+    let username = body.username;
+    let password = body.password;
     let ttl_request = body.ttl_seconds;
 
     // Validate format BEFORE the lockout check so we don't leak whether
@@ -180,13 +216,13 @@ pub async fn login(
 
     let not_found = record.is_none();
     let result = match record {
-        Some(rec) => attempt_unwrap(rec, password.clone()).await,
+        Some(rec) => attempt_unwrap(rec, password).await,
         None => {
             // Run the Argon2id unwrap against a throwaway record so an unknown
             // username costs the same KDF work as a wrong password — otherwise
             // login response time is a username-existence oracle. The result is
             // discarded; this branch always reports invalid credentials.
-            let _ = attempt_unwrap(state.dummy_record.clone(), password.clone()).await;
+            let _ = attempt_unwrap(state.dummy_record.clone(), password).await;
             Err(AuthError::InvalidCredentials)
         }
     };
@@ -212,21 +248,25 @@ pub async fn login(
                 apply_floor(state.config.min_login_response_ms, started).await;
                 return Err(AuthError::AccountDisabled);
             }
-            let identity_sk = STANDARD
-                .decode(&payload.identity_sk_b64)
-                .map_err(|e| AuthError::Backend(format!("decode identity sk: {e}")))?;
-            let identity_sk = Zeroizing::new(identity_sk);
+            let identity_sk = payload.identity_sk;
+            // Only needed transiently below if this is a duress login — a
+            // second guarded copy, since `NewSession` takes ownership of
+            // the first.
+            let duress_sk = payload
+                .revoke_other_sessions
+                .then(|| SecretVec::from_slice(&identity_sk))
+                .transpose()
+                .map_err(|e| AuthError::Backend(e.to_string()))?;
 
-            let info = SessionInfo::new(
-                rec.username.clone(),
-                payload.role,
-                SystemTime::now(),
+            let token = state.sessions.insert(NewSession {
+                username: rec.username.clone(),
+                role: payload.role,
+                created_at: SystemTime::now(),
                 expires_at,
-                slot_idx as u8,
-                payload.revoke_other_sessions,
-                identity_sk.clone(),
-            );
-            let token = state.sessions.insert(info);
+                persona: slot_idx as u8,
+                revoke_other_sessions: payload.revoke_other_sessions,
+                identity_sk,
+            })?;
             record_login("success", Some(state.sessions.len()));
 
             // A duress-flagged persona silently takes over every other live
@@ -236,13 +276,13 @@ pub async fn login(
             // just now scoped to the duress persona's own access, rather
             // than visibly losing their session (a dead session is itself
             // a tell that something happened).
-            if payload.revoke_other_sessions {
+            if let Some(duress_sk) = &duress_sk {
                 state.sessions.switch_user_to_persona(
                     &rec.username,
                     slot_idx as u8,
                     payload.role,
                     payload.revoke_other_sessions,
-                    &identity_sk,
+                    duress_sk,
                 );
             }
 
@@ -261,14 +301,14 @@ pub async fn login(
             // Enforce min response time floor.
             apply_floor(state.config.min_login_response_ms, started).await;
 
-            Ok(HttpResponse::Ok().json(TokenResponse {
+            token_response(TokenResponse {
                 token: token.0,
                 expires_at: expires_at
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs(),
                 username: rec.username,
-            }))
+            })
         }
         Err(e) => {
             let result_label = if not_found {
@@ -309,25 +349,15 @@ pub async fn refresh(
         state.config.default_ttl_seconds,
         state.config.max_ttl_seconds,
     )?;
-    let info = SessionInfo::new(
-        auth.username.clone(),
-        auth.role,
-        SystemTime::now(),
-        expires_at,
-        auth.session.persona,
-        auth.session.revoke_other_sessions,
-        auth.session.identity_sk.clone(),
-    );
-    let token = state.sessions.insert(info);
-    state.sessions.revoke(&auth.token_hash);
-    Ok(HttpResponse::Ok().json(TokenResponse {
+    let token = state.sessions.reissue(&auth.token_hash, expires_at)?;
+    token_response(TokenResponse {
         token: token.0,
         expires_at: expires_at
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs(),
         username: auth.username,
-    }))
+    })
 }
 
 /// `POST /api/v1/auth/logout` — revoke the caller's session.
@@ -364,12 +394,13 @@ pub async fn logout(
 pub async fn change_password(
     state: web::Data<AuthState>,
     auth: Authenticated,
-    body: web::Json<ChangePasswordRequest>,
+    body: SecretJson<ChangePasswordRequest>,
 ) -> Result<HttpResponse, AuthError> {
+    let body = body.0;
     let username = auth.username.clone();
-    let current = body.current.clone();
-    let new = body.new.clone();
-    if new.is_empty() {
+    let current = body.current;
+    let new = body.new;
+    if new.as_bytes().is_empty() {
         return Err(AuthError::InvalidBody {
             reason: "new password must not be empty".to_owned(),
         });
@@ -389,7 +420,7 @@ pub async fn change_password(
     // one and vice versa.
     let params = rec.kdf.clone();
     let username_for_aad = rec.username.clone();
-    let new_password = new.clone();
+    let new_password = new;
     let identity_pk_b64 = rec.slots[slot_idx].identity_pk_b64.clone();
     let new_slot = tokio::task::spawn_blocking(move || {
         let payload_bytes = payload.to_bytes()?;
@@ -435,14 +466,15 @@ pub async fn change_password(
 pub async fn add_user(
     state: web::Data<AuthState>,
     auth: AdminAuthenticated,
-    body: web::Json<AddUserRequest>,
+    body: SecretJson<AddUserRequest>,
 ) -> Result<HttpResponse, AuthError> {
     let _ = &auth;
-    let username = body.username.clone();
-    let password = body.password.clone();
+    let body = body.0;
+    let username = body.username;
+    let password = body.password;
     let role = body.role;
     validate_username(&username)?;
-    if password.is_empty() {
+    if password.as_bytes().is_empty() {
         return Err(AuthError::InvalidBody {
             reason: "password must not be empty".to_owned(),
         });
@@ -713,7 +745,8 @@ pub async fn set_role(
 /// `POST /api/v1/users/{user}/reset-identity` request body.
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct ResetIdentityRequest {
-    pub password: String,
+    #[schema(value_type = String)]
+    pub password: SecretString,
 }
 
 /// `POST /api/v1/users/{user}/reset-identity` response body.
@@ -757,11 +790,12 @@ pub async fn reset_identity(
     storage: web::Data<Arc<AnyStorage>>,
     auth: AdminAuthenticated,
     path: web::Path<String>,
-    body: web::Json<ResetIdentityRequest>,
+    body: SecretJson<ResetIdentityRequest>,
 ) -> Result<HttpResponse, AuthError> {
     let _ = &auth;
     let username = path.into_inner();
-    if body.password.is_empty() {
+    let password = body.0.password;
+    if password.as_bytes().is_empty() {
         return Err(AuthError::InvalidBody {
             reason: "password must not be empty".to_owned(),
         });
@@ -775,7 +809,6 @@ pub async fn reset_identity(
             username: username.clone(),
         })?;
 
-    let password = body.password.clone();
     let username_for_slots = username.clone();
     let role = rec.role;
     let params = rec.kdf.clone();
@@ -898,13 +931,13 @@ async fn scrub_deleted_user_acl_entries(
 /// or how many of the four are real.
 async fn attempt_unwrap(
     rec: UserRecord,
-    password: String,
+    password: SecretString,
 ) -> Result<(UserRecord, usize, SlotPayload), AuthError> {
     let params = rec.kdf.clone();
     let slots = rec.slots.clone();
     let username = rec.username.clone();
     let result = tokio::task::spawn_blocking(move || {
-        let kek = params.derive_kek(password.as_bytes()).ok()?;
+        let kek = Zeroizing::new(params.derive_kek(password.as_bytes()).ok()?);
         let mut opened: Option<(usize, SlotPayload)> = None;
         for (i, slot) in slots.iter().enumerate() {
             let aad = kdf::slot_wrap_aad(&username, i);
@@ -950,7 +983,8 @@ pub struct PersonaCreateRequest {
     /// the slot the caller is currently authenticated through, not because
     /// of its numeric value; see [`create_persona`].
     pub slot: u8,
-    pub password: String,
+    #[schema(value_type = String)]
+    pub password: SecretString,
     /// Effective role for sessions opened through this persona. Must not
     /// exceed the account's own global role — enforced server-side, not
     /// merely a UI suggestion.
@@ -1025,8 +1059,9 @@ pub struct PersonaView {
 pub async fn create_persona(
     state: web::Data<AuthState>,
     auth: Authenticated,
-    body: web::Json<PersonaCreateRequest>,
+    body: SecretJson<PersonaCreateRequest>,
 ) -> Result<HttpResponse, AuthError> {
+    let body = body.0;
     let slot = body.slot as usize;
     if !(0..CREDENTIAL_SLOTS).contains(&slot) {
         return Err(AuthError::InvalidPersonaSlot {
@@ -1038,7 +1073,7 @@ pub async fn create_persona(
             reason: "cannot overwrite the slot this session is currently authenticated through",
         });
     }
-    if body.password.is_empty() {
+    if body.password.as_bytes().is_empty() {
         return Err(AuthError::InvalidBody {
             reason: "password must not be empty".to_owned(),
         });
@@ -1063,7 +1098,7 @@ pub async fn create_persona(
 
     let username = rec.username.clone();
     let params = rec.kdf.clone();
-    let password = body.password.clone();
+    let password = body.password;
     let revoke_other_sessions = body.revoke_other_sessions;
     let existing_slots = rec.slots.clone();
     let new_slot = tokio::task::spawn_blocking(
@@ -1072,7 +1107,7 @@ pub async fn create_persona(
             // *current* slot's unwrap without short-circuiting — a reused
             // password must be rejected without timing revealing *which*
             // existing slot it collides with.
-            let kek = params.derive_kek(password.as_bytes())?;
+            let kek = Zeroizing::new(params.derive_kek(password.as_bytes())?);
             let mut collides = false;
             for (i, s) in existing_slots.iter().enumerate() {
                 let aad = kdf::slot_wrap_aad(&username, i);

@@ -71,6 +71,12 @@ shutdown_timeout_secs = 30
 # (127.0.0.1/::1) are always exempt. To bind non-loopback without TLS
 # anyway (e.g. behind a TLS-terminating reverse proxy on a trusted
 # network), set [server] allow_insecure_bind = true explicitly.
+#
+# y2qd also refuses to start if guarded memory is unavailable (e.g.
+# RLIMIT_MEMLOCK too low to lock session key pages out of swap) — core
+# dumps and swap would otherwise expose live session identity keys. To
+# override (not recommended outside local development), set
+# [server] allow_unprotected_memory = true explicitly.
 # ---------------------------------------------------------------------------
 [server.tls]
 enabled   = false

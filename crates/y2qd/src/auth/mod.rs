@@ -13,6 +13,8 @@
 
 pub mod error;
 pub mod handlers;
+pub mod keyring;
+pub mod secret_json;
 pub mod session;
 pub mod state;
 pub mod users;
@@ -126,7 +128,7 @@ fn extract_authenticated(req: &HttpRequest) -> Result<Authenticated, AuthError> 
         .ok_or(AuthError::InternalState)?;
 
     let token = parse_bearer(req)?;
-    let token_hash = session::hash_token(&token);
+    let token_hash = session::hash_token(token.expose());
     let session = state.sessions.get_active(&token_hash)?;
     // A user disabled mid-session is rejected immediately (a role change also
     // revokes their sessions, so this is belt-and-suspenders).
@@ -142,7 +144,7 @@ fn extract_authenticated(req: &HttpRequest) -> Result<Authenticated, AuthError> 
     })
 }
 
-fn parse_bearer(req: &HttpRequest) -> Result<String, AuthError> {
+fn parse_bearer(req: &HttpRequest) -> Result<y2q_core::secmem::SecretString, AuthError> {
     let header = req
         .headers()
         .get(header::AUTHORIZATION)
@@ -157,5 +159,5 @@ fn parse_bearer(req: &HttpRequest) -> Result<String, AuthError> {
     if token.is_empty() {
         return Err(AuthError::TokenMissing);
     }
-    Ok(token.to_owned())
+    y2q_core::secmem::SecretString::from_str(token).map_err(|e| AuthError::Backend(e.to_string()))
 }

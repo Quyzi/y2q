@@ -21,6 +21,10 @@ pub use checksum::StreamChecksum;
 pub mod crypto;
 /// Label search query language: a small boolean grammar over object labels.
 pub mod query;
+/// Guarded memory (guarded allocations, process hardening) for long-lived
+/// and transient secret material. Not a crypto primitive module; see
+/// [`crypto`] for that.
+pub mod secmem;
 pub use query::{LabelQuery, MatchOp};
 /// Storage backends (filesystem and io_uring), metadata index, and lock management.
 pub mod storage;

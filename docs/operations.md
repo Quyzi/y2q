@@ -481,6 +481,64 @@ To profile a running deployment without restarting, rebuild with `--features pyr
 
 `y2qd` holds an exclusive `flock` on `<keystore_dir>/.lock` for its lifetime. Two daemons pointing at the same keystore will refuse to start. Healthy state shows the `.lock` file present and the daemon running; if a daemon crashes the OS releases the flock, so a normal restart Just Works without manual cleanup.
 
+## Memory hardening (Linux only)
+
+`y2qd` refuses to start unless it can hold session identity keys, bucket
+keys, and credentials in guarded memory (`mmap` pages that are locked out
+of swap and `PROT_NONE` except for the instant they're actually read) - see
+[SECURITY.md](../SECURITY.md#guarded-memory-linux-only) for the full
+mechanism. This is Linux-only; see
+[architecture.md#platform-support](architecture.md#platform-support) for
+what happens on other platforms.
+
+The boot-time probe needs a small amount of lockable memory
+(`RLIMIT_MEMLOCK`) - a handful of pages, not a meaningful fraction of any
+reasonable limit. Most distributions default `RLIMIT_MEMLOCK` well above
+what's needed (commonly 8 MiB via `ulimit -l`), so this normally requires
+no operator action. If it's been lowered (some container base images, some
+hardened systemd units with `LimitMEMLOCK=0`), startup fails immediately
+with a clear error rather than falling back silently:
+
+```
+Error: refusing to start: mlock failed (1); raise RLIMIT_MEMLOCK or set
+[server] allow_unprotected_memory = true. Core dumps and swap would
+expose session identity keys; set [server] allow_unprotected_memory =
+true to override.
+```
+
+Fix it by raising the limit rather than disabling the protection:
+
+```sh
+# systemd unit
+[Service]
+LimitMEMLOCK=infinity
+
+# ulimit, for a shell-launched daemon
+ulimit -l unlimited
+```
+
+`[server] allow_unprotected_memory = true` is the escape hatch for local
+development or environments where raising the limit genuinely isn't
+possible - it downgrades to best-effort (a one-time warning logged, secrets
+may be written to swap) instead of refusing to start. Not recommended for
+production.
+
+To confirm hardening is actually in effect on a running daemon:
+
+```sh
+# /proc/<pid>/maps and /proc/<pid>/mem ownership flips to root while the
+# daemon runs unprivileged - same-uid reads are denied
+stat -c %U /proc/$(pgrep -n y2qd)/maps
+cat /proc/$(pgrep -n y2qd)/mem              # Operation not permitted
+
+# core dumps and debugger attach are refused
+gcore $(pgrep -n y2qd)                      # ptrace: Operation not permitted
+
+# VmLck should be small (a handful of pages) and nonzero - the guarded
+# keys are locked, not the whole heap
+grep VmLck /proc/$(pgrep -n y2qd)/status
+```
+
 ## TLS
 
 `y2qd` can terminate TLS natively with rustls. Enable it and point at a PEM cert/key:
@@ -525,6 +583,7 @@ location / {
 | Symptom | Likely cause | What to do |
 |---|---|---|
 | Daemon refuses to start: `acquire keystore lock` | Another `y2qd` is already running against the same `keystore_dir` | Check `ps` / systemd. If stale, the flock is released by the OS - investigate why the daemon didn't exit cleanly. |
+| Daemon refuses to start: `mlock failed` / `refusing to start: ... guarded memory` | `RLIMIT_MEMLOCK` too low to lock session key pages (Linux only) | Raise the limit (see [Memory hardening](#memory-hardening-linux-only)), or set `[server] allow_unprotected_memory = true` if raising it genuinely isn't possible. |
 | `503` on any object op | `KeystoreNotFound` - `keystore.json`/`users.redb` missing at the configured `keystore_dir` (misconfiguration, or a copy that left the keystore behind) | Confirm `[crypto] keystore_dir` and the node key are correct. On a genuine first boot this doesn't happen - first-run setup runs automatically and prints the root password. |
 | `409 Conflict` on PUT | Active in-flight write lock for that key (same key PUT in two concurrent requests) | Normally self-resolves; if stuck, use `GET /api/v1/locks` to check and `DELETE /api/v1/locks` to force-release. |
 | `500` on any op against an old object | The object or its metadata predates the current v3 per-bucket envelope (magic bytes aren't `Y2Q3` - e.g. leftover v1/v2 data from before this deployment adopted per-bucket keys). There is no unauthenticated passthrough or legacy decode - such objects are unreadable | If you have an out-of-band copy of the original plaintext, re-PUT it so it is stored as v3. Otherwise the object is unrecoverable through the API. |
@@ -537,5 +596,6 @@ location / {
 - [crates/y2qd/src/main.rs](../crates/y2qd/src/main.rs) - startup, first-run, lifecycle
 - [crates/y2qd/src/handlers/locks.rs](../crates/y2qd/src/handlers/locks.rs) - stale-lock endpoints
 - [crates/y2qd/src/handlers/rebuild.rs](../crates/y2qd/src/handlers/rebuild.rs) - index rebuild endpoints
+- [crates/y2q-core/src/secmem.rs](../crates/y2q-core/src/secmem.rs) - guarded memory, process hardening
 - [crates/y2qd/src/tls.rs](../crates/y2qd/src/tls.rs) - native TLS listener
 - [crates/y2q-core/src/crypto/keystore.rs](../crates/y2q-core/src/crypto/keystore.rs) - keystore on-disk layout

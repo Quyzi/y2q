@@ -62,6 +62,7 @@ CLI values are coerced as integer first, then `true`/`false`, then string.
 | `max_body_bytes` | usize | `268435456` (256 MiB) | Maximum PUT request body size |
 | `unauthenticated_metrics` | bool | `false` | When `true`, `/metrics/prometheus`, `/metrics/dashboard`, `/swagger-ui/`, and `/api-docs/openapi.json` are exposed without a Bearer token. When `false` (default) they are **not registered at all** - there is no auth-gated variant; the daemon logs that they are disabled. |
 | `allow_insecure_bind` | bool | `false` | Permit binding a non-loopback `host` while `[server.tls] enabled = false`. Defaults to `false`: the daemon refuses to start rather than silently serve session tokens, passwords, and object plaintext unencrypted. Loopback (`127.0.0.1`/`::1`/`localhost`) is always permitted regardless of this flag. |
+| `allow_unprotected_memory` | bool | `false` | Permit starting when guarded memory is unavailable (Linux only - e.g. `RLIMIT_MEMLOCK` too low to lock session key pages out of swap; see [SECURITY.md](../SECURITY.md#guarded-memory-linux-only) for the full mechanism). Defaults to `false`: the daemon refuses to start rather than hold session identity keys in swappable, dumpable, core-dumpable memory. Has no effect on non-Linux builds, where guarded memory is unconditionally unavailable and startup never refuses on this basis. |
 
 ### `[server.actix]`
 
