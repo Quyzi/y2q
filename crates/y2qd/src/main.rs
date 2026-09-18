@@ -77,7 +77,7 @@ use crate::span::Y2qRootSpanBuilder;
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 use y2q_core::crypto::{Argon2Params, keystore as keystore_mod, node_key};
-use y2q_core::{AnyStorage, FilesystemStorage, StorageExt};
+use y2q_core::{AnyStorage, FilesystemStorage, StorageExt, secmem};
 
 #[cfg(target_os = "linux")]
 use y2q_core::{UringStorage, storage::uring::UringConfig};
@@ -94,6 +94,8 @@ mod node_key_rotation;
 pub(crate) mod observability;
 mod rate_limit;
 mod request_id;
+#[cfg(test)]
+mod session_residency_test;
 mod span;
 mod tls;
 mod trace;
@@ -259,6 +261,23 @@ async fn main() -> std::io::Result<()> {
 
     tracing::info!(host = %cfg.server.host, port = cfg.server.port, "starting y2qd");
 
+    // Harden the process before any secret is loaded — including node-key
+    // rotation below, which loads key material too. Refusing to start here
+    // (rather than warning) means an operator finds out about a too-low
+    // RLIMIT_MEMLOCK at boot, not the first time a session identity key
+    // would otherwise land in swappable, dumpable memory.
+    let mem_policy = if cfg.server.allow_unprotected_memory {
+        secmem::Policy::BestEffort
+    } else {
+        secmem::Policy::Require
+    };
+    secmem::harden_process(mem_policy).map_err(|e| {
+        std::io::Error::other(format!(
+            "refusing to start: {e}. Core dumps and swap would expose session \
+             identity keys; set [server] allow_unprotected_memory = true to override."
+        ))
+    })?;
+
     // Offline node-key rotation short-circuits the entire normal boot
     // sequence: it acquires its own flock, walks the storage tree, and exits.
     if cli.rotate_node_key {
@@ -303,7 +322,7 @@ async fn main() -> std::io::Result<()> {
                 ("backend", backend_label),
             ]);
             if let (Some(user), Some(pass)) = (&pcfg.basic_auth_user, &pcfg.basic_auth_password) {
-                builder = builder.basic_auth(user.as_str(), pass.as_str());
+                builder = builder.basic_auth(user.as_str(), pass.expose());
             }
             let agent = builder
                 .build()
@@ -360,7 +379,7 @@ async fn main() -> std::io::Result<()> {
             );
             let outcome = keystore_mod::first_run(&keystore_dir, "root", argon2_for_first_run, &nk)
                 .map_err(|e| std::io::Error::other(format!("first-run setup: {e}")))?;
-            print_first_run_password(&outcome.root_username, &outcome.root_password);
+            print_first_run_password(&outcome.root_username, outcome.root_password.expose());
             tracing::info!(dir = %keystore_dir.display(), "keystore initialized");
             outcome.user_store
         }
@@ -443,11 +462,10 @@ async fn main() -> std::io::Result<()> {
         });
     }
 
-    let auth_state = web::Data::new(AuthState::new(
-        user_store,
-        cfg.auth.clone(),
-        cfg.crypto.argon2.clone(),
-    ));
+    let auth_state = web::Data::new(
+        AuthState::new(user_store, cfg.auth.clone(), cfg.crypto.argon2.clone())
+            .map_err(|e| std::io::Error::other(format!("failed to initialize auth state: {e}")))?,
+    );
 
     // Background sweeper for expired sessions.
     {

@@ -31,16 +31,23 @@ pub struct AuthState {
 }
 
 impl AuthState {
-    pub fn new(user_store: UserStore, config: AuthConfig, argon2_config: Argon2Config) -> Self {
+    /// Build a fresh `AuthState`, allocating the session store's
+    /// process-ephemeral wrapping key. Fails only if guarded-memory
+    /// allocation fails (see [`y2q_core::secmem`]).
+    pub fn new(
+        user_store: UserStore,
+        config: AuthConfig,
+        argon2_config: Argon2Config,
+    ) -> Result<Self, super::error::AuthError> {
         let dummy_record = Self::build_dummy_record(&argon2_config);
-        Self {
+        Ok(Self {
             user_store,
-            sessions: SessionStore::new(),
+            sessions: SessionStore::new()?,
             login_attempts: Arc::new(Mutex::new(LoginAttempts::default())),
             config,
             argon2_config,
             dummy_record,
-        }
+        })
     }
 
     /// Build the throwaway record used to equalize login timing for unknown

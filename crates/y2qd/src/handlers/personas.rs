@@ -196,14 +196,16 @@ async fn share_or_revoke(
             // grantee's row with garbage. If the caller has no real grant
             // here, there's nothing of theirs to share/revoke at this
             // epoch — skip it rather than error.
-            let Ok(bwk) = bucket_keys::open_verified_bwk(
-                &cfg,
-                bucket,
-                epoch,
-                &auth.username,
-                auth.session.persona as usize,
-                &auth.session.identity_sk,
-            ) else {
+            let Ok(Ok(bwk)) = auth.session.with_identity_sk(|sk| {
+                bucket_keys::open_verified_bwk(
+                    &cfg,
+                    bucket,
+                    epoch,
+                    &auth.username,
+                    auth.session.persona as usize,
+                    sk,
+                )
+            }) else {
                 continue;
             };
             let mut authorized = vec![false; CREDENTIAL_SLOTS];

@@ -12,6 +12,7 @@ use figment::{
 };
 use serde::Deserialize;
 use y2q_core::SyncLevel;
+use y2q_core::secmem::SecretString;
 
 /// Top-level daemon configuration.
 #[derive(Debug, Deserialize)]
@@ -79,7 +80,7 @@ impl Default for ObservabilityConfig {
 /// Disabled by default. Enable by setting `enabled = true` and pointing
 /// `server_url` at a Pyroscope server or Grafana Cloud profiling endpoint.
 /// Compile the daemon with `--features pyroscope` for this section to take effect.
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[cfg_attr(not(feature = "pyroscope"), allow(dead_code))]
 pub struct PyroscopeConfig {
     /// Whether to start the Pyroscope agent. Default: false.
@@ -94,7 +95,25 @@ pub struct PyroscopeConfig {
     /// HTTP Basic auth username (Grafana Cloud: numeric user ID).
     pub basic_auth_user: Option<String>,
     /// HTTP Basic auth password (Grafana Cloud: API token).
-    pub basic_auth_password: Option<String>,
+    pub basic_auth_password: Option<SecretString>,
+}
+
+// A derived `Debug` would forward to `SecretString`'s own redacting impl
+// for the `Some` case, but spell it out explicitly so a future field
+// addition doesn't silently start printing secret material.
+impl std::fmt::Debug for PyroscopeConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PyroscopeConfig")
+            .field("enabled", &self.enabled)
+            .field("server_url", &self.server_url)
+            .field("sample_rate", &self.sample_rate)
+            .field("basic_auth_user", &self.basic_auth_user)
+            .field(
+                "basic_auth_password",
+                &self.basic_auth_password.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
 }
 
 fn default_pyroscope_url() -> String {
@@ -220,6 +239,12 @@ pub struct ServerConfig {
     /// trusted network, or for local development.
     #[serde(default)]
     pub allow_insecure_bind: bool,
+    /// Permit starting when guarded memory is unavailable (for example
+    /// `RLIMIT_MEMLOCK` too low to lock secret pages). Defaults to `false`:
+    /// y2qd refuses to start rather than hold identity keys in swappable,
+    /// dumpable memory.
+    #[serde(default)]
+    pub allow_unprotected_memory: bool,
 }
 
 /// TLS settings. When `enabled` is true, the daemon binds HTTPS at

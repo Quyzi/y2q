@@ -30,6 +30,7 @@ use super::node_keys::derive_node_key_verifier;
 use super::user_store::{
     Role, UserRecord, UserStore, is_plaintext_user_store, migrate_plaintext_user_store,
 };
+use crate::secmem::SecretString;
 
 /// On-disk format version written to `keystore.json`.
 pub const KEYSTORE_FORMAT_VERSION: u16 = 3;
@@ -76,7 +77,7 @@ pub struct FirstRunOutcome {
     /// User store with the freshly-created `root` user.
     pub user_store: UserStore,
     /// The randomly-generated root password — print exactly once, then drop.
-    pub root_password: String,
+    pub root_password: SecretString,
     /// Username assigned to the initial user (currently always `"root"`).
     pub root_username: String,
 }
@@ -197,7 +198,7 @@ pub fn first_run(
         )));
     }
 
-    let root_password = generate_root_password();
+    let root_password = generate_root_password()?;
     let (slots, primary_slot) = kdf::new_slots_random(
         root_username,
         root_password.as_bytes(),
@@ -452,12 +453,17 @@ pub fn rewrite_verifier(dir: &Path, new_nk: &[u8; 32]) -> Result<(), CryptoError
     Ok(())
 }
 
-fn generate_root_password() -> String {
+fn generate_root_password() -> Result<SecretString, CryptoError> {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use rand::Rng;
+    use zeroize::Zeroize;
     let mut buf = [0u8; 24];
     rand::rng().fill_bytes(&mut buf);
-    URL_SAFE_NO_PAD.encode(buf)
+    let mut encoded = URL_SAFE_NO_PAD.encode(buf);
+    buf.zeroize();
+    let out = SecretString::from_str(&encoded)?;
+    encoded.zeroize();
+    Ok(out)
 }
 
 fn now_ns() -> u64 {
@@ -516,7 +522,7 @@ mod tests {
                 &k,
             )
             .unwrap();
-            assert!(!outcome.root_password.is_empty());
+            assert!(!outcome.root_password.expose().is_empty());
             outcome.root_password
         };
 

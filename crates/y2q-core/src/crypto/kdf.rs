@@ -27,6 +27,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 use super::CryptoError;
 use super::user_store::{CREDENTIAL_SLOTS, CredentialSlot, Role, SlotPayload};
+use crate::secmem::{SecretVec, scrub_pod};
 
 /// Argon2id parameters, persisted per user record.
 ///
@@ -154,9 +155,13 @@ pub fn new_slot(
     role: Role,
     revoke_other_sessions: bool,
 ) -> Result<CredentialSlot, CryptoError> {
-    let (pk, sk) = mlkem768::keypair();
+    let (pk, mut sk) = mlkem768::keypair();
+    let identity_sk = SecretVec::from_slice(sk.as_bytes())?;
+    // SAFETY: `mlkem768::SecretKey` is a `Copy` newtype over `[u8; N]` with
+    // no `Drop`; an all-zero bit pattern is a valid value to leave behind.
+    unsafe { scrub_pod(&mut sk) };
     let payload = SlotPayload {
-        identity_sk_b64: STANDARD.encode(sk.as_bytes()),
+        identity_sk,
         role,
         revoke_other_sessions,
     };
@@ -180,9 +185,12 @@ pub fn decoy_slot(
     slot: usize,
     params: &Argon2Params,
 ) -> Result<CredentialSlot, CryptoError> {
-    let (pk, sk) = mlkem768::keypair();
+    let (pk, mut sk) = mlkem768::keypair();
+    let identity_sk = SecretVec::from_slice(sk.as_bytes())?;
+    // SAFETY: see `new_slot`.
+    unsafe { scrub_pod(&mut sk) };
     let payload = SlotPayload {
-        identity_sk_b64: STANDARD.encode(sk.as_bytes()),
+        identity_sk,
         role: Role::User,
         revoke_other_sessions: false,
     };

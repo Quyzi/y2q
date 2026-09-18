@@ -23,8 +23,9 @@ use y2q_core::crypto::{
     CREDENTIAL_SLOTS, bucket_grant_aad, bucket_sk_wrap_aad, open_sealed, seal_to, unwrap_with_key,
     wrap_with_key,
 };
+use y2q_core::secmem::{SecretVec, scrub_pod};
 use y2q_core::{BucketConfig, BucketKeyVersion, Error};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 /// Hard cap on retained [`BucketConfig::keys`] epochs. `rotate-key` refuses
 /// with [`Error::TooManyBucketKeyEpochs`] at this count; `rekey` prunes every
@@ -58,13 +59,16 @@ pub fn new_bucket_key_version(
     bucket: &str,
     grantees: &[(String, GranteeSlots)],
 ) -> Result<(BucketKeyVersion, Zeroizing<[u8; 32]>), Error> {
-    let (pk, sk) = mlkem768::keypair();
+    let (pk, mut sk) = mlkem768::keypair();
     let mut bwk = Zeroizing::new([0u8; 32]);
     rand::rng().fill_bytes(&mut *bwk);
 
     let sk_aad = bucket_sk_wrap_aad(bucket, epoch);
     let sk_blob = wrap_with_key(sk.as_bytes(), &bwk, &sk_aad)
         .map_err(|e| crypto_err(bucket, "new_bucket_key", e))?;
+    // SAFETY: `mlkem768::SecretKey` is a `Copy` newtype over `[u8; N]` with
+    // no `Drop`; an all-zero bit pattern is a valid value to leave behind.
+    unsafe { scrub_pod(&mut sk) };
 
     let mut grants = BTreeMap::new();
     for (username, slots) in grantees {
@@ -291,7 +295,10 @@ pub fn open_verified_bwk(
     // confirm `bwk` actually opens `sk_blob`, i.e. that it's real. Every
     // failure here collapses to the same `Forbidden` as every other
     // failure mode, matching `read_key`'s no-distinguishing-oracle property.
-    unwrap_with_key(&kv.sk_blob, &bwk, &sk_aad).map_err(|_| forbidden(bucket))?;
+    // Scrubbed immediately rather than left for the allocator to reuse
+    // unzeroed.
+    let mut discard = unwrap_with_key(&kv.sk_blob, &bwk, &sk_aad).map_err(|_| forbidden(bucket))?;
+    discard.zeroize();
     Ok(bwk)
 }
 
@@ -316,7 +323,7 @@ pub fn read_key(
     username: &str,
     slot: usize,
     identity_sk: &[u8],
-) -> Result<Zeroizing<Vec<u8>>, Error> {
+) -> Result<SecretVec, Error> {
     let kv = config
         .keys
         .iter()
@@ -324,8 +331,12 @@ pub fn read_key(
         .ok_or_else(|| forbidden(bucket))?;
     let bwk = open_bwk(config, bucket, epoch, username, slot, identity_sk)?;
     let sk_aad = bucket_sk_wrap_aad(bucket, epoch);
-    let sk_bytes = unwrap_with_key(&kv.sk_blob, &bwk, &sk_aad).map_err(|_| forbidden(bucket))?;
-    Ok(Zeroizing::new(sk_bytes))
+    let mut sk_bytes =
+        unwrap_with_key(&kv.sk_blob, &bwk, &sk_aad).map_err(|_| forbidden(bucket))?;
+    let guarded = SecretVec::from_slice(&sk_bytes)
+        .map_err(|e| crypto_err(bucket, "bucket-key-guard", e.into()))?;
+    sk_bytes.zeroize();
+    Ok(guarded)
 }
 
 /// Return the newest (highest-epoch) key version, if any exist.
@@ -344,20 +355,25 @@ pub fn resolve_read_key(
     config: &BucketConfig,
     bucket: &str,
     epoch: u32,
-) -> Result<std::sync::Arc<Zeroizing<Vec<u8>>>, Error> {
+) -> Result<SecretVec, Error> {
     if let Some(cached) = session.cached_bucket_key(bucket, epoch) {
-        return Ok(cached);
+        return cached.map_err(|e| auth_err(bucket, "bucket-key-cache", e));
     }
-    let sk = read_key(
-        config,
-        bucket,
-        epoch,
-        &session.username,
-        session.persona as usize,
-        &session.identity_sk,
-    )?;
-    let sk = std::sync::Arc::new(sk);
-    session.cache_bucket_key(bucket.to_owned(), epoch, std::sync::Arc::clone(&sk));
+    let sk = session
+        .with_identity_sk(|sk| {
+            read_key(
+                config,
+                bucket,
+                epoch,
+                &session.username,
+                session.persona as usize,
+                sk,
+            )
+        })
+        .map_err(|e| auth_err(bucket, "resolve-read-key", e))??;
+    session
+        .cache_bucket_key(bucket.to_owned(), epoch, &sk)
+        .map_err(|e| auth_err(bucket, "bucket-key-cache", e))?;
     Ok(sk)
 }
 
@@ -457,6 +473,15 @@ fn crypto_decode_err(bucket: &str, what: &'static str) -> Error {
         key: String::new(),
         operation: "bucket-key-grant".to_owned(),
         message: format!("malformed {what}"),
+    }
+}
+
+fn auth_err(bucket: &str, operation: &str, e: crate::auth::AuthError) -> Error {
+    Error::InternalError {
+        bucket: bucket.to_owned(),
+        key: String::new(),
+        operation: operation.to_owned(),
+        message: e.to_string(),
     }
 }
 
