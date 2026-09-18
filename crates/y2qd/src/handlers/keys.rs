@@ -18,11 +18,11 @@ use actix_web::{HttpResponse, web};
 use bytes::BytesMut;
 use serde::Serialize;
 use utoipa::ToSchema;
+use y2q_core::secmem::SecretBuf;
 use y2q_core::{
     AnyStorage, BucketConfig, BucketPermission, ListOptions, Listing, PutOptions, Storage,
     SyncLevel,
 };
-use zeroize::Zeroizing;
 
 use crate::auth::{AuthState, Authenticated};
 use crate::authz::authorize_bucket;
@@ -164,19 +164,19 @@ pub async fn rotate_key(
     // only a real grantee's own persona can recover. A global admin with no
     // grant on this bucket cannot conjure one here either (see `set_acl`'s
     // matching comment on the strict-admin-exclusion property).
-    bucket_keys::open_verified_bwk(
-        &cfg,
-        &bucket,
-        newest.epoch,
-        &auth.username,
-        auth.session.persona as usize,
-        &auth.session.identity_sk,
-    )
-    .map_err(|_| {
-        AppError(y2q_core::Error::Forbidden {
-            bucket: bucket.clone(),
+    auth.session
+        .with_identity_sk(|sk| {
+            bucket_keys::open_verified_bwk(
+                &cfg,
+                &bucket,
+                newest.epoch,
+                &auth.username,
+                auth.session.persona as usize,
+                sk,
+            )
         })
-    })?;
+        .map_err(AppError::from)?
+        .map_err(AppError)?;
 
     let grantees = bucket_keys::current_grantees(
         &state.user_store,
@@ -258,19 +258,19 @@ pub async fn start_rekey(
             message: "bucket has no key material yet".to_owned(),
         })
     })?;
-    bucket_keys::open_verified_bwk(
-        &cfg,
-        &bucket,
-        newest.epoch,
-        &auth.username,
-        auth.session.persona as usize,
-        &auth.session.identity_sk,
-    )
-    .map_err(|_| {
-        AppError(y2q_core::Error::Forbidden {
-            bucket: bucket.clone(),
+    auth.session
+        .with_identity_sk(|sk| {
+            bucket_keys::open_verified_bwk(
+                &cfg,
+                &bucket,
+                newest.epoch,
+                &auth.username,
+                auth.session.persona as usize,
+                sk,
+            )
         })
-    })?;
+        .map_err(AppError::from)?
+        .map_err(AppError)?;
 
     registry.try_start(&bucket)?;
 
@@ -280,19 +280,34 @@ pub async fn start_rekey(
     // bucket epoch keys it resolved here, not the caller's broader identity
     // key, so a session revocation racing the job's completion cannot widen
     // what the job still holds beyond keys for the very epochs it's already
-    // committed to migrating away from.
-    let mut epoch_sks: BTreeMap<u32, Zeroizing<Vec<u8>>> = BTreeMap::new();
+    // committed to migrating away from. Held as `SecretBuf`s (`PROT_NONE`
+    // between objects) for the job's whole run rather than plaintext, since
+    // that run can take minutes for a large bucket.
+    let mut epoch_sks: BTreeMap<u32, SecretBuf> = BTreeMap::new();
     for kv in &cfg.keys {
         if kv.epoch < newest.epoch {
-            let sk = bucket_keys::read_key(
-                &cfg,
-                &bucket,
-                kv.epoch,
-                &auth.username,
-                auth.session.persona as usize,
-                &auth.session.identity_sk,
-            )
-            .map_err(AppError)?;
+            let sk = auth
+                .session
+                .with_identity_sk(|sk| {
+                    bucket_keys::read_key(
+                        &cfg,
+                        &bucket,
+                        kv.epoch,
+                        &auth.username,
+                        auth.session.persona as usize,
+                        sk,
+                    )
+                })
+                .map_err(AppError::from)?
+                .map_err(AppError)?;
+            let sk = SecretBuf::from_slice(&sk).map_err(|e| {
+                AppError(y2q_core::Error::InternalError {
+                    bucket: bucket.clone(),
+                    key: String::new(),
+                    operation: "rekey".to_owned(),
+                    message: e.to_string(),
+                })
+            })?;
             epoch_sks.insert(kv.epoch, sk);
         }
     }
@@ -326,7 +341,7 @@ pub async fn start_rekey(
 async fn run_rekey(
     storage: &AnyStorage,
     bucket: &str,
-    epoch_sks: &BTreeMap<u32, Zeroizing<Vec<u8>>>,
+    epoch_sks: &BTreeMap<u32, SecretBuf>,
     chunk_size: usize,
     registry: &RekeyRegistry,
 ) -> Result<(), String> {
@@ -348,7 +363,7 @@ async fn run_rekey(
         let old_sk = epoch_sks
             .get(old_epoch)
             .ok_or_else(|| format!("no cached key for epoch {old_epoch} (object {key})"))?;
-
+        let old_sk = old_sk.unlock().map_err(|e| e.to_string())?;
         let obj = storage.get(bucket, key).await.map_err(|e| e.to_string())?;
         let existing = storage
             .describe(bucket, key)
@@ -358,7 +373,7 @@ async fn run_rekey(
         // size and rejects anything shorter, so the re-encrypted object cannot
         // gain trailing null padding or silently shrink on a rekey.
         let plaintext = cipher::decrypt_after_get(
-            old_sk,
+            &old_sk,
             bucket,
             key,
             BytesMut::from(obj.into_inner().as_ref()),

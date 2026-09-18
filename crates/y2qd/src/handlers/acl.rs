@@ -179,19 +179,20 @@ pub async fn set_acl(
         // rules out. Their ACL edit still applies below for write-only
         // grants; a read-implying change from such a caller is rejected
         // outright rather than silently landing as crypto-inert.
-        let bwk = bucket_keys::open_verified_bwk(
-            &cfg,
-            &bucket,
-            kv.epoch,
-            &auth.username,
-            auth.session.persona as usize,
-            &auth.session.identity_sk,
-        )
-        .map_err(|_| {
-            AppError(y2q_core::Error::Forbidden {
-                bucket: bucket.clone(),
+        let bwk = auth
+            .session
+            .with_identity_sk(|sk| {
+                bucket_keys::open_verified_bwk(
+                    &cfg,
+                    &bucket,
+                    kv.epoch,
+                    &auth.username,
+                    auth.session.persona as usize,
+                    sk,
+                )
             })
-        })?;
+            .map_err(AppError::from)?
+            .map_err(AppError)?;
 
         let mut new_kv = kv;
         for user in new_read_grantees.difference(&old_read_grantees) {
