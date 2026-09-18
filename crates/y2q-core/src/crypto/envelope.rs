@@ -86,6 +86,7 @@ use sha2::Sha256;
 use zeroize::Zeroize;
 
 use super::CryptoError;
+use crate::secmem::scrub_pod;
 
 // ── v3 constants ─────────────────────────────────────────────────────────────
 
@@ -298,15 +299,22 @@ fn decrypt_v3(
     let kem_ct_bytes = &envelope[ENVELOPE_V3_HEADER_FIXED_LEN..preamble_len];
     let aad = build_v3_aad(&envelope[..ENVELOPE_V3_HEADER_FIXED_LEN]);
 
-    let sk = mlkem768::SecretKey::from_bytes(sk_bytes)
+    let mut sk = mlkem768::SecretKey::from_bytes(sk_bytes)
         .map_err(|_| CryptoError::KemDecode("secret key"))?;
     let kem_ct = mlkem768::Ciphertext::from_bytes(kem_ct_bytes)
         .map_err(|_| CryptoError::KemDecode("kem ciphertext"))?;
-    let ss = mlkem768::decapsulate(&kem_ct, &sk);
+    let mut ss = mlkem768::decapsulate(&kem_ct, &sk);
 
     let mut key_bytes = derive_content_key(ss.as_bytes(), kem_ct_bytes, bucket, key)?;
     let cipher = aes_key(&key_bytes);
     key_bytes.zeroize();
+    // SAFETY: `mlkem768::SecretKey`/`SharedSecret` are `Copy` newtypes over
+    // `[u8; N]` with no `Drop`; an all-zero bit pattern is a valid value to
+    // leave behind.
+    unsafe {
+        scrub_pod(&mut sk);
+        scrub_pod(&mut ss);
+    }
 
     // `plaintext_len` is read from the header before any AEAD chunk has been
     // verified, so it isn't trustworthy yet — cap the pre-allocation at the
@@ -372,15 +380,22 @@ fn decrypt_v4(
     let kem_ct_bytes = &envelope[ENVELOPE_V3_HEADER_FIXED_LEN..preamble_len];
     let aad_base = build_v3_aad(&envelope[..ENVELOPE_V3_HEADER_FIXED_LEN]);
 
-    let sk = mlkem768::SecretKey::from_bytes(sk_bytes)
+    let mut sk = mlkem768::SecretKey::from_bytes(sk_bytes)
         .map_err(|_| CryptoError::KemDecode("secret key"))?;
     let kem_ct = mlkem768::Ciphertext::from_bytes(kem_ct_bytes)
         .map_err(|_| CryptoError::KemDecode("kem ciphertext"))?;
-    let ss = mlkem768::decapsulate(&kem_ct, &sk);
+    let mut ss = mlkem768::decapsulate(&kem_ct, &sk);
 
     let mut key_bytes = derive_content_key(ss.as_bytes(), kem_ct_bytes, bucket, key)?;
     let cipher = aes_key(&key_bytes);
     key_bytes.zeroize();
+    // SAFETY: `mlkem768::SecretKey`/`SharedSecret` are `Copy` newtypes over
+    // `[u8; N]` with no `Drop`; an all-zero bit pattern is a valid value to
+    // leave behind.
+    unsafe {
+        scrub_pod(&mut sk);
+        scrub_pod(&mut ss);
+    }
 
     // `plaintext_len` is read from the header before any AEAD chunk has been
     // verified, so it isn't trustworthy yet — cap the pre-allocation at the
@@ -483,15 +498,22 @@ fn decrypt_v3_owned(
     let aad = build_v3_aad(&envelope[..ENVELOPE_V3_HEADER_FIXED_LEN]);
     let kem_ct_owned: Vec<u8> = envelope[ENVELOPE_V3_HEADER_FIXED_LEN..preamble_len].to_vec();
 
-    let sk = mlkem768::SecretKey::from_bytes(sk_bytes)
+    let mut sk = mlkem768::SecretKey::from_bytes(sk_bytes)
         .map_err(|_| CryptoError::KemDecode("secret key"))?;
     let kem_ct = mlkem768::Ciphertext::from_bytes(&kem_ct_owned)
         .map_err(|_| CryptoError::KemDecode("kem ciphertext"))?;
-    let ss = mlkem768::decapsulate(&kem_ct, &sk);
+    let mut ss = mlkem768::decapsulate(&kem_ct, &sk);
 
     let mut key_bytes = derive_content_key(ss.as_bytes(), &kem_ct_owned, bucket, key)?;
     let cipher = aes_key(&key_bytes);
     key_bytes.zeroize();
+    // SAFETY: `mlkem768::SecretKey`/`SharedSecret` are `Copy` newtypes over
+    // `[u8; N]` with no `Drop`; an all-zero bit pattern is a valid value to
+    // leave behind.
+    unsafe {
+        scrub_pod(&mut sk);
+        scrub_pod(&mut ss);
+    }
 
     // Drop the preamble; `body` retains the chunked ciphertext region.
     let mut body = envelope.split_off(preamble_len);
@@ -559,15 +581,22 @@ fn decrypt_v4_owned(
     let aad_base = build_v3_aad(&envelope[..ENVELOPE_V3_HEADER_FIXED_LEN]);
     let kem_ct_owned: Vec<u8> = envelope[ENVELOPE_V3_HEADER_FIXED_LEN..preamble_len].to_vec();
 
-    let sk = mlkem768::SecretKey::from_bytes(sk_bytes)
+    let mut sk = mlkem768::SecretKey::from_bytes(sk_bytes)
         .map_err(|_| CryptoError::KemDecode("secret key"))?;
     let kem_ct = mlkem768::Ciphertext::from_bytes(&kem_ct_owned)
         .map_err(|_| CryptoError::KemDecode("kem ciphertext"))?;
-    let ss = mlkem768::decapsulate(&kem_ct, &sk);
+    let mut ss = mlkem768::decapsulate(&kem_ct, &sk);
 
     let mut key_bytes = derive_content_key(ss.as_bytes(), &kem_ct_owned, bucket, key)?;
     let cipher = aes_key(&key_bytes);
     key_bytes.zeroize();
+    // SAFETY: `mlkem768::SecretKey`/`SharedSecret` are `Copy` newtypes over
+    // `[u8; N]` with no `Drop`; an all-zero bit pattern is a valid value to
+    // leave behind.
+    unsafe {
+        scrub_pod(&mut sk);
+        scrub_pod(&mut ss);
+    }
 
     // Total envelope length known up front (unlike streaming feed), so the
     // final chunk's on-disk end offset can be determined before the loop.
@@ -716,15 +745,22 @@ pub fn decrypt_v3_chunks(
 
     let kem_ct_bytes = &preamble[ENVELOPE_V3_HEADER_FIXED_LEN..preamble_len];
 
-    let sk = mlkem768::SecretKey::from_bytes(sk_bytes)
+    let mut sk = mlkem768::SecretKey::from_bytes(sk_bytes)
         .map_err(|_| CryptoError::KemDecode("secret key"))?;
     let kem_ct = mlkem768::Ciphertext::from_bytes(kem_ct_bytes)
         .map_err(|_| CryptoError::KemDecode("kem ciphertext"))?;
-    let ss = mlkem768::decapsulate(&kem_ct, &sk);
+    let mut ss = mlkem768::decapsulate(&kem_ct, &sk);
 
     let mut key_bytes = derive_content_key(ss.as_bytes(), kem_ct_bytes, bucket, key)?;
     let cipher = aes_key(&key_bytes);
     key_bytes.zeroize();
+    // SAFETY: `mlkem768::SecretKey`/`SharedSecret` are `Copy` newtypes over
+    // `[u8; N]` with no `Drop`; an all-zero bit pattern is a valid value to
+    // leave behind.
+    unsafe {
+        scrub_pod(&mut sk);
+        scrub_pod(&mut ss);
+    }
 
     let mut plaintext = Vec::with_capacity(chunks_ct.len());
     let mut pos = 0usize;
@@ -782,15 +818,22 @@ pub fn decrypt_v4_chunks(
 
     let kem_ct_bytes = &preamble[ENVELOPE_V3_HEADER_FIXED_LEN..preamble_len];
 
-    let sk = mlkem768::SecretKey::from_bytes(sk_bytes)
+    let mut sk = mlkem768::SecretKey::from_bytes(sk_bytes)
         .map_err(|_| CryptoError::KemDecode("secret key"))?;
     let kem_ct = mlkem768::Ciphertext::from_bytes(kem_ct_bytes)
         .map_err(|_| CryptoError::KemDecode("kem ciphertext"))?;
-    let ss = mlkem768::decapsulate(&kem_ct, &sk);
+    let mut ss = mlkem768::decapsulate(&kem_ct, &sk);
 
     let mut key_bytes = derive_content_key(ss.as_bytes(), kem_ct_bytes, bucket, key)?;
     let cipher = aes_key(&key_bytes);
     key_bytes.zeroize();
+    // SAFETY: `mlkem768::SecretKey`/`SharedSecret` are `Copy` newtypes over
+    // `[u8; N]` with no `Drop`; an all-zero bit pattern is a valid value to
+    // leave behind.
+    unsafe {
+        scrub_pod(&mut sk);
+        scrub_pod(&mut ss);
+    }
 
     let mut plaintext = Vec::with_capacity(chunks_ct.len());
     let mut pos = 0usize;
@@ -927,7 +970,7 @@ impl EncryptSession {
         }
         let pk = mlkem768::PublicKey::from_bytes(pk_bytes)
             .map_err(|_| CryptoError::KemDecode("public key"))?;
-        let (ss, kem_ct) = mlkem768::encapsulate(&pk);
+        let (mut ss, kem_ct) = mlkem768::encapsulate(&pk);
         let kem_ct_bytes = kem_ct.as_bytes();
 
         let mut nonce_base = [0u8; 12];
@@ -954,6 +997,10 @@ impl EncryptSession {
         let mut key_bytes = derive_content_key(ss.as_bytes(), kem_ct_bytes, bucket, key)?;
         let cipher = aes_key(&key_bytes);
         key_bytes.zeroize();
+        // SAFETY: `mlkem768::SharedSecret` is a `Copy` newtype over `[u8; N]`
+        // with no `Drop`; an all-zero bit pattern is a valid value to leave
+        // behind.
+        unsafe { scrub_pod(&mut ss) };
 
         let bytes_written = (header.len() + kem_ct_bytes.len()) as u64;
 

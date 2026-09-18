@@ -13,6 +13,7 @@
 
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
+use zeroize::Zeroizing;
 
 /// Envelope encryption for object payloads.
 ///
@@ -256,7 +257,7 @@ pub trait MetadataCipher {
         key: &[u8; 32],
         blob: &[u8],
         object_id: &str,
-    ) -> Result<Vec<u8>, Self::Error>;
+    ) -> Result<Zeroizing<Vec<u8>>, Self::Error>;
 }
 
 /// Shared, in-memory holder for the node-derived structural keys (Index Key,

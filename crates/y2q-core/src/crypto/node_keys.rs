@@ -64,7 +64,7 @@ use rand::Rng;
 use zeroize::Zeroizing;
 
 use super::CryptoError;
-
+use crate::secmem::SecretBuf;
 type HmacSha256 = Hmac<Sha256>;
 use sha2::Sha256;
 
@@ -177,13 +177,19 @@ pub struct NodeKeySlot {
     inner: RwLock<Option<NodeKeys>>,
 }
 
+/// Every hot node-derived key concatenated into one 160-byte guarded
+/// buffer, in this fixed order: index key, path key, object metadata key,
+/// bucket config key, container header key.
 struct NodeKeys {
-    index_key: Zeroizing<[u8; 32]>,
-    path_key: Zeroizing<[u8; 32]>,
-    object_metadata_key: Zeroizing<[u8; 32]>,
-    bucket_config_key: Zeroizing<[u8; 32]>,
-    container_header_key: Zeroizing<[u8; 32]>,
+    buf: SecretBuf,
 }
+
+/// Byte offset of each 32-byte key within [`NodeKeys::buf`].
+const IDX_INDEX_KEY: usize = 0;
+const IDX_PATH_KEY: usize = 32;
+const IDX_OBJECT_METADATA_KEY: usize = 64;
+const IDX_BUCKET_CONFIG_KEY: usize = 96;
+const IDX_CONTAINER_HEADER_KEY: usize = 128;
 
 impl NodeKeySlot {
     /// An empty slot.
@@ -195,60 +201,63 @@ impl NodeKeySlot {
 
     /// Install the node key, deriving and storing the hot keys.
     /// Replaces any prior value. Called exactly once, at boot.
+    ///
+    /// Guarded allocation failure here is a condition [`crate::secmem::harden_process`]'s
+    /// boot probe has already ruled out (it allocates and drops a guarded
+    /// buffer before anything else runs) — this only fails on a genuine bug,
+    /// so it panics rather than threading a fallible signature through the
+    /// ~40 storage-backend call sites that call the accessors below.
     pub fn install(&self, nk: [u8; 32]) {
-        *self.inner.write().expect("NodeKeySlot poisoned") = Some(NodeKeys {
-            index_key: Zeroizing::new(derive_index_key(&nk)),
-            path_key: Zeroizing::new(derive_path_key(&nk)),
-            object_metadata_key: Zeroizing::new(derive_object_metadata_key(&nk)),
-            bucket_config_key: Zeroizing::new(derive_bucket_config_key(&nk)),
-            container_header_key: Zeroizing::new(derive_container_header_key(&nk)),
-        });
+        let mut concat = Zeroizing::new([0u8; 160]);
+        concat[IDX_INDEX_KEY..IDX_INDEX_KEY + 32].copy_from_slice(&derive_index_key(&nk));
+        concat[IDX_PATH_KEY..IDX_PATH_KEY + 32].copy_from_slice(&derive_path_key(&nk));
+        concat[IDX_OBJECT_METADATA_KEY..IDX_OBJECT_METADATA_KEY + 32]
+            .copy_from_slice(&derive_object_metadata_key(&nk));
+        concat[IDX_BUCKET_CONFIG_KEY..IDX_BUCKET_CONFIG_KEY + 32]
+            .copy_from_slice(&derive_bucket_config_key(&nk));
+        concat[IDX_CONTAINER_HEADER_KEY..IDX_CONTAINER_HEADER_KEY + 32]
+            .copy_from_slice(&derive_container_header_key(&nk));
+        let buf =
+            SecretBuf::from_slice(&concat[..]).expect("node key slot: guarded allocation failed");
+        *self.inner.write().expect("NodeKeySlot poisoned") = Some(NodeKeys { buf });
+    }
+
+    /// Unlock the guarded buffer and copy out the 32-byte key at `offset`.
+    /// `None` if the slot isn't installed, or (best-effort policy only) if
+    /// the guarded buffer failed to unlock.
+    fn key_at(&self, offset: usize) -> Option<[u8; 32]> {
+        let guard = self.inner.read().expect("NodeKeySlot poisoned");
+        let keys = guard.as_ref()?;
+        let read = keys.buf.unlock().ok()?;
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&read[offset..offset + 32]);
+        Some(out)
     }
 
     /// A copy of the Index Key, if installed.
     pub fn index_key(&self) -> Option<[u8; 32]> {
-        self.inner
-            .read()
-            .expect("NodeKeySlot poisoned")
-            .as_ref()
-            .map(|k| *k.index_key)
+        self.key_at(IDX_INDEX_KEY)
     }
 
     /// A copy of the Path Key, if installed. Used to keyed-hash on-disk
     /// bucket and object names.
     pub fn path_key(&self) -> Option<[u8; 32]> {
-        self.inner
-            .read()
-            .expect("NodeKeySlot poisoned")
-            .as_ref()
-            .map(|k| *k.path_key)
+        self.key_at(IDX_PATH_KEY)
     }
 
     /// A copy of the Object Metadata Key, if installed.
     pub fn object_metadata_key(&self) -> Option<[u8; 32]> {
-        self.inner
-            .read()
-            .expect("NodeKeySlot poisoned")
-            .as_ref()
-            .map(|k| *k.object_metadata_key)
+        self.key_at(IDX_OBJECT_METADATA_KEY)
     }
 
     /// A copy of the Bucket Config Key, if installed.
     pub fn bucket_config_key(&self) -> Option<[u8; 32]> {
-        self.inner
-            .read()
-            .expect("NodeKeySlot poisoned")
-            .as_ref()
-            .map(|k| *k.bucket_config_key)
+        self.key_at(IDX_BUCKET_CONFIG_KEY)
     }
 
     /// A copy of the Container Header Key, if installed.
     pub fn container_header_key(&self) -> Option<[u8; 32]> {
-        self.inner
-            .read()
-            .expect("NodeKeySlot poisoned")
-            .as_ref()
-            .map(|k| *k.container_header_key)
+        self.key_at(IDX_CONTAINER_HEADER_KEY)
     }
 
     /// Whether the node key has been installed.
@@ -343,7 +352,11 @@ pub fn encrypt_meta(
 /// through unauthenticated. A blob relocated from a different object's storage
 /// location fails with [`CryptoError::AuthFailed`], the same as a corrupted
 /// or tampered blob.
-pub fn decrypt_meta(omk: &[u8; 32], blob: &[u8], object_id: &str) -> Result<Vec<u8>, CryptoError> {
+pub fn decrypt_meta(
+    omk: &[u8; 32],
+    blob: &[u8],
+    object_id: &str,
+) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
     let padded = match blob.first() {
         Some(&VERSION_BYTE) => false,
         Some(&VERSION_BYTE_PADDED) => true,
@@ -363,15 +376,17 @@ pub fn decrypt_meta(omk: &[u8; 32], blob: &[u8], object_id: &str) -> Result<Vec<
         .expect("length checked against the format minimum above");
     let ct = &blob[1 + NONCE_LEN..];
     let cipher = Aes256Gcm::new(omk.into());
-    let plain = cipher
-        .decrypt(
-            nonce,
-            Payload {
-                msg: ct,
-                aad: object_id.as_bytes(),
-            },
-        )
-        .map_err(|_| CryptoError::AuthFailed)?;
+    let plain = Zeroizing::new(
+        cipher
+            .decrypt(
+                nonce,
+                Payload {
+                    msg: ct,
+                    aad: object_id.as_bytes(),
+                },
+            )
+            .map_err(|_| CryptoError::AuthFailed)?,
+    );
 
     if !padded {
         return Ok(plain);
@@ -385,7 +400,7 @@ pub fn decrypt_meta(omk: &[u8; 32], blob: &[u8], object_id: &str) -> Result<Vec<
     if declared > plain.len() - 4 {
         return Err(CryptoError::Envelope("metadata length prefix out of range"));
     }
-    Ok(plain[4..4 + declared].to_vec())
+    Ok(Zeroizing::new(plain[4..4 + declared].to_vec()))
 }
 
 #[cfg(test)]
@@ -433,7 +448,7 @@ mod tests {
         let blob = encrypt_meta(&omk, b"{\"hello\":\"world\"}", "obj-id-a", 0).unwrap();
         assert_eq!(blob[0], VERSION_BYTE_PADDED);
         assert_eq!(
-            decrypt_meta(&omk, &blob, "obj-id-a").unwrap(),
+            &decrypt_meta(&omk, &blob, "obj-id-a").unwrap()[..],
             b"{\"hello\":\"world\"}"
         );
     }
@@ -453,8 +468,8 @@ mod tests {
         assert_eq!(a.len(), 1 + 12 + 4096 + 16);
         assert_eq!(a.len(), b.len(), "blob length must not track metadata size");
 
-        assert_eq!(decrypt_meta(&omk, &a, "obj-id-a").unwrap(), short);
-        assert_eq!(decrypt_meta(&omk, &b, "obj-id-a").unwrap(), long);
+        assert_eq!(&decrypt_meta(&omk, &a, "obj-id-a").unwrap()[..], &short[..]);
+        assert_eq!(&decrypt_meta(&omk, &b, "obj-id-a").unwrap()[..], &long[..]);
     }
 
     #[test]
@@ -464,7 +479,10 @@ mod tests {
         let json = vec![b'z'; 4093];
         let blob = encrypt_meta(&omk, &json, "obj-id-a", META_PAD_BLOCK).unwrap();
         assert_eq!(blob.len(), 1 + 12 + 8192 + 16);
-        assert_eq!(decrypt_meta(&omk, &blob, "obj-id-a").unwrap(), json);
+        assert_eq!(
+            &decrypt_meta(&omk, &blob, "obj-id-a").unwrap()[..],
+            &json[..]
+        );
     }
 
     #[test]
@@ -488,7 +506,7 @@ mod tests {
         blob.extend_from_slice(&nonce_bytes);
         blob.extend_from_slice(&ct);
 
-        assert_eq!(decrypt_meta(&omk, &blob, "obj-id-a").unwrap(), json);
+        assert_eq!(&decrypt_meta(&omk, &blob, "obj-id-a").unwrap()[..], json);
     }
 
     #[test]
@@ -518,7 +536,7 @@ mod tests {
         ));
         // Genuine address still opens it.
         assert_eq!(
-            decrypt_meta(&omk, &blob, "obj-id-a").unwrap(),
+            &decrypt_meta(&omk, &blob, "obj-id-a").unwrap()[..],
             b"{\"secret\":true}"
         );
     }
