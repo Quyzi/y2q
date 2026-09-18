@@ -30,6 +30,7 @@ use sha2::Sha256;
 use zeroize::{Zeroize, Zeroizing};
 
 use super::CryptoError;
+use crate::secmem::scrub_pod;
 
 type Nonce = aes_gcm::aead::Nonce<Aes256Gcm>;
 
@@ -127,12 +128,16 @@ pub fn seal_to(
 ) -> Result<SealedKey, CryptoError> {
     let pk = mlkem768::PublicKey::from_bytes(recipient_pk)
         .map_err(|_| CryptoError::KemDecode("public key"))?;
-    let (ss, kem_ct) = mlkem768::encapsulate(&pk);
+    let (mut ss, kem_ct) = mlkem768::encapsulate(&pk);
     let kem_ct_bytes = kem_ct.as_bytes();
 
     let mut key_bytes = derive_seal_key(ss.as_bytes(), kem_ct_bytes)?;
     let cipher = Aes256Gcm::new((&key_bytes).into());
     key_bytes.zeroize();
+    // SAFETY: `mlkem768::SharedSecret` is a `Copy` newtype over `[u8; N]`
+    // with no `Drop`; an all-zero bit pattern is a valid value to leave
+    // behind.
+    unsafe { scrub_pod(&mut ss) };
     let mut nonce_bytes = [0u8; 12];
     rand::rng().fill_bytes(&mut nonce_bytes);
     let mut buf = plaintext.to_vec();
@@ -172,15 +177,22 @@ pub fn open_sealed(
         .try_into()
         .map_err(|_| CryptoError::KemDecode("nonce"))?;
 
-    let sk = mlkem768::SecretKey::from_bytes(recipient_sk)
+    let mut sk = mlkem768::SecretKey::from_bytes(recipient_sk)
         .map_err(|_| CryptoError::KemDecode("secret key"))?;
     let kem_ct = mlkem768::Ciphertext::from_bytes(&kem_ct_bytes)
         .map_err(|_| CryptoError::KemDecode("kem ciphertext"))?;
-    let ss = mlkem768::decapsulate(&kem_ct, &sk);
+    let mut ss = mlkem768::decapsulate(&kem_ct, &sk);
 
     let mut key_bytes = derive_seal_key(ss.as_bytes(), &kem_ct_bytes)?;
     let cipher = Aes256Gcm::new((&key_bytes).into());
     key_bytes.zeroize();
+    // SAFETY: `mlkem768::SecretKey`/`SharedSecret` are `Copy` newtypes over
+    // `[u8; N]` with no `Drop`; an all-zero bit pattern is a valid value to
+    // leave behind.
+    unsafe {
+        scrub_pod(&mut sk);
+        scrub_pod(&mut ss);
+    }
 
     let mut buf = ct_bytes;
     cipher
