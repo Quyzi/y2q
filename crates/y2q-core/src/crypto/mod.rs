@@ -118,6 +118,10 @@ pub enum CryptoError {
         "keystore at {0} predates the per-bucket key hierarchy; re-initialize the deployment (this build cannot read it)"
     )]
     LegacyKeystore(String),
+
+    /// A guarded-memory allocation or protection operation failed.
+    #[error(transparent)]
+    SecMem(#[from] crate::secmem::SecMemError),
 }
 
 impl CryptoError {
@@ -170,6 +174,12 @@ impl CryptoError {
             CryptoError::LegacyKeystore(path) => Error::KeystoreCorrupt {
                 path,
                 reason: "legacy pre-hierarchy keystore; re-initialize the deployment".to_owned(),
+            },
+            CryptoError::SecMem(e) => Error::InternalError {
+                bucket: bucket.to_owned(),
+                key: key.to_owned(),
+                operation: "secmem".to_owned(),
+                message: e.to_string(),
             },
         }
     }

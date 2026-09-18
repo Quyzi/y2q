@@ -18,7 +18,7 @@ version = "0.2.0"
 actix-governor              = "0.10"
 actix-web                   = "4"
 aead                        = "0.6"
-aes-gcm                     = "0.11"
+aes-gcm                     = { version = "0.11", features = ["zeroize"] }
 aligned-vec                 = "0.6"
 argon2                      = "0.6"
 async-channel               = "2"
