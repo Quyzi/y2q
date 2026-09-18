@@ -5850,7 +5850,7 @@ checksum = "4d93c89cdc2d3a63c3ec48ffe926931bdc069eafa8e4402fe6d8f790c9d1e576"
 
 [[package]]
 name = "y2q-behavior"
-version = "0.2.0"
+version = "1.0.8"
 dependencies = [
  "async-trait",
  "bytes",
@@ -5859,7 +5859,7 @@ dependencies = [
 
 [[package]]
 name = "y2q-cli"
-version = "0.2.0"
+version = "1.0.8"
 dependencies = [
  "base64 0.23.1",
  "bytes",
@@ -5893,7 +5893,7 @@ dependencies = [
 
 [[package]]
 name = "y2q-client"
-version = "0.2.0"
+version = "1.0.8"
 dependencies = [
  "bytes",
  "futures",
@@ -5912,7 +5912,7 @@ dependencies = [
 
 [[package]]
 name = "y2q-config"
-version = "0.2.0"
+version = "1.0.8"
 dependencies = [
  "directories",
  "indexmap",
@@ -5924,7 +5924,7 @@ dependencies = [
 
 [[package]]
 name = "y2q-core"
-version = "0.2.0"
+version = "1.0.8"
 dependencies = [
  "aead",
  "aes-gcm",
@@ -5965,7 +5965,7 @@ dependencies = [
 
 [[package]]
 name = "y2q-fuse"
-version = "0.2.0"
+version = "1.0.8"
 dependencies = [
  "clap",
  "fuser",
@@ -5983,7 +5983,7 @@ dependencies = [
 
 [[package]]
 name = "y2q-warp"
-version = "0.2.0"
+version = "1.0.8"
 dependencies = [
  "bytes",
  "chrono",
@@ -6012,7 +6012,7 @@ dependencies = [
 
 [[package]]
 name = "y2qd"
-version = "0.2.0"
+version = "1.0.8"
 dependencies = [
  "actix-governor",
  "actix-web",
