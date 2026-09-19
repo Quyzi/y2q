@@ -151,8 +151,9 @@ mod tests {
 
     fn body_text(err: &AppError) -> String {
         let resp = err.error_response();
-        let bytes =
-            futures::executor::block_on(actix_web::body::to_bytes(resp.into_body())).unwrap();
+        let bytes = actix_web::rt::System::new()
+            .block_on(actix_web::body::to_bytes(resp.into_body()))
+            .unwrap();
         String::from_utf8(bytes.to_vec()).unwrap()
     }
 

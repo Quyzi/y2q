@@ -478,7 +478,6 @@ fn now_ns() -> u64 {
 /// [`File`] must be kept alive for the duration the lock should be held —
 /// dropping it (or process exit) releases the lock.
 pub fn acquire_lock(dir: &Path) -> Result<File, CryptoError> {
-    use fs2::FileExt;
     fs::create_dir_all(dir)
         .map_err(|e| CryptoError::KeystoreIo(format!("mkdir {}: {e}", dir.display())))?;
     let lock_path = dir.join(".lock");
@@ -489,12 +488,21 @@ pub fn acquire_lock(dir: &Path) -> Result<File, CryptoError> {
         .write(true)
         .open(&lock_path)
         .map_err(|e| CryptoError::KeystoreIo(format!("open lock {}: {e}", lock_path.display())))?;
-    f.try_lock_exclusive().map_err(|e| {
-        CryptoError::KeystoreIo(format!(
-            "another y2qd already holds {}: {e}",
-            lock_path.display()
-        ))
-    })?;
+    match f.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => {
+            return Err(CryptoError::KeystoreIo(format!(
+                "another y2qd already holds {}",
+                lock_path.display()
+            )));
+        }
+        Err(std::fs::TryLockError::Error(e)) => {
+            return Err(CryptoError::KeystoreIo(format!(
+                "lock {}: {e}",
+                lock_path.display()
+            )));
+        }
+    }
     Ok(f)
 }
 

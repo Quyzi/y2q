@@ -19,17 +19,13 @@
 use aes_gcm::{Aes256Gcm, KeyInit, aead::AeadInOut};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use hkdf::Hkdf;
-use pqcrypto::kem::mlkem768;
-use pqcrypto_traits::kem::{
-    Ciphertext as KemCiphertextTrait, PublicKey as KemPublicKeyTrait,
-    SecretKey as KemSecretKeyTrait, SharedSecret as KemSharedSecretTrait,
-};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use zeroize::{Zeroize, Zeroizing};
 
 use super::CryptoError;
+use super::kem;
 use crate::secmem::scrub_pod;
 
 type Nonce = aes_gcm::aead::Nonce<Aes256Gcm>;
@@ -126,17 +122,15 @@ pub fn seal_to(
     plaintext: &[u8],
     aad: &[u8],
 ) -> Result<SealedKey, CryptoError> {
-    let pk = mlkem768::PublicKey::from_bytes(recipient_pk)
-        .map_err(|_| CryptoError::KemDecode("public key"))?;
-    let (mut ss, kem_ct) = mlkem768::encapsulate(&pk);
-    let kem_ct_bytes = kem_ct.as_bytes();
+    let pk = kem::PublicKey::from_bytes(recipient_pk)?;
+    let (mut ss, kem_ct) = kem::encapsulate(&pk);
+    let kem_ct_bytes = kem_ct.as_slice();
 
-    let mut key_bytes = derive_seal_key(ss.as_bytes(), kem_ct_bytes)?;
+    let mut key_bytes = derive_seal_key(ss.as_slice(), kem_ct_bytes)?;
     let cipher = Aes256Gcm::new((&key_bytes).into());
     key_bytes.zeroize();
-    // SAFETY: `mlkem768::SharedSecret` is a `Copy` newtype over `[u8; N]`
-    // with no `Drop`; an all-zero bit pattern is a valid value to leave
-    // behind.
+    // SAFETY: `kem::SharedSecret` is a `Copy` newtype over `[u8; N]` with no
+    // `Drop`; an all-zero bit pattern is a valid value to leave behind.
     unsafe { scrub_pod(&mut ss) };
     let mut nonce_bytes = [0u8; 12];
     rand::rng().fill_bytes(&mut nonce_bytes);
@@ -177,20 +171,16 @@ pub fn open_sealed(
         .try_into()
         .map_err(|_| CryptoError::KemDecode("nonce"))?;
 
-    let mut sk = mlkem768::SecretKey::from_bytes(recipient_sk)
-        .map_err(|_| CryptoError::KemDecode("secret key"))?;
-    let kem_ct = mlkem768::Ciphertext::from_bytes(&kem_ct_bytes)
-        .map_err(|_| CryptoError::KemDecode("kem ciphertext"))?;
-    let mut ss = mlkem768::decapsulate(&kem_ct, &sk);
+    let sk = kem::SecretKey::from_bytes(recipient_sk)?;
+    let kem_ct = kem::ciphertext_from_bytes(&kem_ct_bytes)?;
+    let mut ss = kem::decapsulate(&kem_ct, &sk);
 
-    let mut key_bytes = derive_seal_key(ss.as_bytes(), &kem_ct_bytes)?;
+    let mut key_bytes = derive_seal_key(ss.as_slice(), &kem_ct_bytes)?;
     let cipher = Aes256Gcm::new((&key_bytes).into());
     key_bytes.zeroize();
-    // SAFETY: `mlkem768::SecretKey`/`SharedSecret` are `Copy` newtypes over
-    // `[u8; N]` with no `Drop`; an all-zero bit pattern is a valid value to
-    // leave behind.
+    // SAFETY: `kem::SharedSecret` is a `Copy` newtype over `[u8; N]` with no
+    // `Drop`; an all-zero bit pattern is a valid value to leave behind.
     unsafe {
-        scrub_pod(&mut sk);
         scrub_pod(&mut ss);
     }
 
@@ -215,36 +205,36 @@ mod tests {
 
     #[test]
     fn round_trip() {
-        let (pk, sk) = mlkem768::keypair();
+        let (pk, sk) = kem::keypair();
         let aad = b"y2q/v3/bucket-grant test";
         let secret = b"a 32 byte bucket wrap key value";
-        let sealed = seal_to(pk.as_bytes(), secret, aad).unwrap();
-        let opened = open_sealed(sk.as_bytes(), &sealed, aad).unwrap();
+        let sealed = seal_to(&pk.to_bytes(), secret, aad).unwrap();
+        let opened = open_sealed(&sk.to_bytes()[..], &sealed, aad).unwrap();
         assert_eq!(&opened[..], secret);
     }
 
     #[test]
     fn wrong_aad_fails() {
-        let (pk, sk) = mlkem768::keypair();
-        let sealed = seal_to(pk.as_bytes(), b"secret", b"aad-a").unwrap();
-        let err = open_sealed(sk.as_bytes(), &sealed, b"aad-b").unwrap_err();
+        let (pk, sk) = kem::keypair();
+        let sealed = seal_to(&pk.to_bytes(), b"secret", b"aad-a").unwrap();
+        let err = open_sealed(&sk.to_bytes()[..], &sealed, b"aad-b").unwrap_err();
         assert!(matches!(err, CryptoError::AuthFailed));
     }
 
     #[test]
     fn wrong_secret_key_fails() {
-        let (pk, _sk1) = mlkem768::keypair();
-        let (_pk2, sk2) = mlkem768::keypair();
-        let sealed = seal_to(pk.as_bytes(), b"secret", b"aad").unwrap();
-        let err = open_sealed(sk2.as_bytes(), &sealed, b"aad").unwrap_err();
+        let (pk, _sk1) = kem::keypair();
+        let (_pk2, sk2) = kem::keypair();
+        let sealed = seal_to(&pk.to_bytes(), b"secret", b"aad").unwrap();
+        let err = open_sealed(&sk2.to_bytes()[..], &sealed, b"aad").unwrap_err();
         assert!(matches!(err, CryptoError::AuthFailed));
     }
 
     #[test]
     fn fresh_kem_per_call() {
-        let (pk, _sk) = mlkem768::keypair();
-        let a = seal_to(pk.as_bytes(), b"secret", b"aad").unwrap();
-        let b = seal_to(pk.as_bytes(), b"secret", b"aad").unwrap();
+        let (pk, _sk) = kem::keypair();
+        let a = seal_to(&pk.to_bytes(), b"secret", b"aad").unwrap();
+        let b = seal_to(&pk.to_bytes(), b"secret", b"aad").unwrap();
         assert_ne!(a.kem_ct_b64, b.kem_ct_b64);
         assert_ne!(a.ct_b64, b.ct_b64);
     }
@@ -260,10 +250,10 @@ mod tests {
         // A variable-width secret (unlike a fixed 32-byte bucket wrap key)
         // must still get length-matched padding, or the real slot would be
         // identifiable by its ciphertext length alone.
-        let keypairs: Vec<_> = (0..4).map(|_| mlkem768::keypair()).collect();
+        let keypairs: Vec<_> = (0..4).map(|_| kem::keypair()).collect();
         let pks: Vec<String> = keypairs
             .iter()
-            .map(|(pk, _)| STANDARD.encode(pk.as_bytes()))
+            .map(|(pk, _)| STANDARD.encode(pk.to_bytes()))
             .collect();
         let secret = vec![0xABu8; 2400]; // variable-width, e.g. an ML-KEM-768 secret key
         let real_idx = 1;
@@ -276,13 +266,18 @@ mod tests {
         );
 
         // Only the real slot's secret key recovers the genuine secret.
-        let opened =
-            open_sealed(keypairs[real_idx].1.as_bytes(), &grants[real_idx], b"aad").unwrap();
+        let opened = open_sealed(
+            &keypairs[real_idx].1.to_bytes()[..],
+            &grants[real_idx],
+            b"aad",
+        )
+        .unwrap();
         assert_eq!(&opened[..], &secret[..]);
 
         // A padding slot's own secret key opens to random bytes of the same
         // length, never the real secret.
-        let padding_opened = open_sealed(keypairs[0].1.as_bytes(), &grants[0], b"aad").unwrap();
+        let padding_opened =
+            open_sealed(&keypairs[0].1.to_bytes()[..], &grants[0], b"aad").unwrap();
         assert_ne!(&padding_opened[..], &secret[..]);
         assert_eq!(padding_opened.len(), secret.len());
     }

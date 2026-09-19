@@ -19,15 +19,14 @@ use aes_gcm::{
 };
 use argon2::{Algorithm, Argon2, Params, Version};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use pqcrypto::kem::mlkem768;
-use pqcrypto_traits::kem::{PublicKey as KemPublicKeyTrait, SecretKey as KemSecretKeyTrait};
 use rand::{Rng, RngExt};
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, Zeroizing};
 
 use super::CryptoError;
+use super::kem;
 use super::user_store::{CREDENTIAL_SLOTS, CredentialSlot, Role, SlotPayload};
-use crate::secmem::{SecretVec, scrub_pod};
+use crate::secmem::SecretVec;
 
 /// Argon2id parameters, persisted per user record.
 ///
@@ -155,11 +154,8 @@ pub fn new_slot(
     role: Role,
     revoke_other_sessions: bool,
 ) -> Result<CredentialSlot, CryptoError> {
-    let (pk, mut sk) = mlkem768::keypair();
-    let identity_sk = SecretVec::from_slice(sk.as_bytes())?;
-    // SAFETY: `mlkem768::SecretKey` is a `Copy` newtype over `[u8; N]` with
-    // no `Drop`; an all-zero bit pattern is a valid value to leave behind.
-    unsafe { scrub_pod(&mut sk) };
+    let (pk, sk) = kem::keypair();
+    let identity_sk = SecretVec::from_slice(&sk.to_bytes()[..])?;
     let payload = SlotPayload {
         identity_sk,
         role,
@@ -169,7 +165,7 @@ pub fn new_slot(
     let aad = slot_wrap_aad(username, slot);
     let wrapped = wrap_slot(&payload_bytes, password, params, &aad)?;
     Ok(CredentialSlot {
-        identity_pk_b64: STANDARD.encode(pk.as_bytes()),
+        identity_pk_b64: STANDARD.encode(pk.to_bytes()),
         wrapped,
     })
 }
@@ -185,10 +181,8 @@ pub fn decoy_slot(
     slot: usize,
     params: &Argon2Params,
 ) -> Result<CredentialSlot, CryptoError> {
-    let (pk, mut sk) = mlkem768::keypair();
-    let identity_sk = SecretVec::from_slice(sk.as_bytes())?;
-    // SAFETY: see `new_slot`.
-    unsafe { scrub_pod(&mut sk) };
+    let (pk, sk) = kem::keypair();
+    let identity_sk = SecretVec::from_slice(&sk.to_bytes()[..])?;
     let payload = SlotPayload {
         identity_sk,
         role: Role::User,
@@ -201,7 +195,7 @@ pub fn decoy_slot(
     let wrapped = wrap_slot(&payload_bytes, &discarded_password, params, &aad)?;
     discarded_password.zeroize();
     Ok(CredentialSlot {
-        identity_pk_b64: STANDARD.encode(pk.as_bytes()),
+        identity_pk_b64: STANDARD.encode(pk.to_bytes()),
         wrapped,
     })
 }

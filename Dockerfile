@@ -23,23 +23,6 @@
 # Override config file:
 #   podman run ... -v /host/config.toml:/etc/y2q/config.toml:ro y2q:latest
 
-ARG PYROSCOPE=0
-
-# ---------------------------------------------------------------------------
-# Download Swagger UI zip
-# utoipa-swagger-ui's build.rs fetches this at compile time. Pre-fetching in
-# a separate stage keeps the download cached independently of the Rust build,
-# and avoids needing curl in the build image (build.rs handles file:// natively).
-#
-# cgr.dev/chainguard/curl is distroless (no shell); use exec-form RUN.
-# v5.17.14 is the version bundled by utoipa-swagger-ui 9.0.2 -- update if
-# the crate is upgraded.
-# ---------------------------------------------------------------------------
-FROM cgr.dev/chainguard/curl:latest AS swagger-dl
-RUN ["/usr/bin/curl", "-fsSL", \
-     "https://github.com/swagger-api/swagger-ui/archive/refs/tags/v5.17.14.zip", \
-     "-o", "/tmp/swagger-ui.zip"]
-
 # ---------------------------------------------------------------------------
 # Build stage
 # ---------------------------------------------------------------------------
@@ -47,22 +30,11 @@ FROM cgr.dev/chainguard/rust:latest AS builder
 
 WORKDIR /work
 
-# Point utoipa-swagger-ui's build.rs at the pre-fetched zip; build.rs handles
-# file:// URLs natively without invoking curl.
-COPY --from=swagger-dl /tmp/swagger-ui.zip /tmp/swagger-ui.zip
-ENV SWAGGER_UI_DOWNLOAD_URL=file:///tmp/swagger-ui.zip
-
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ ./crates/
 COPY config.default.toml ./
 
-ARG PYROSCOPE
-
-RUN if [ "$PYROSCOPE" = "1" ]; then \
-        cargo build --release -p y2qd --features pyroscope; \
-    else \
-        cargo build --release -p y2qd; \
-    fi && \
+RUN cargo build --release -p y2qd && \
     cargo build --release -p y2q-cli && \
     cargo build --release -p y2q-warp
 

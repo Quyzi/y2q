@@ -9,6 +9,9 @@
 //! Submodules:
 //! - [`envelope`] — on-disk format and whole-object AEAD.
 //! - [`kdf`] — Argon2id wrap/unwrap of credential-slot payloads.
+//! - [`kem`] — ML-KEM-768 keypair, encapsulate, decapsulate over RustCrypto
+//!   `ml-kem`, plus the legacy 2400-byte expanded secret-key encoding every
+//!   on-disk keystore and bucket-key blob uses.
 //! - [`keystore`] — keystore manifest (`keystore.json`) plus first-run
 //!   generation.
 //! - [`node_key`] — resolves the operator-supplied node key at boot.
@@ -20,6 +23,7 @@
 
 pub mod envelope;
 pub mod kdf;
+pub mod kem;
 pub mod keystore;
 pub mod node_key;
 pub mod node_keys;
@@ -56,8 +60,8 @@ pub enum CryptoError {
     #[error("kdf failure: {0}")]
     Kdf(String),
 
-    /// A `pqcrypto` key, ciphertext, or shared-secret blob could not be
-    /// decoded back into its typed representation.
+    /// A KEM key, ciphertext, or shared-secret blob could not be decoded
+    /// back into its typed representation.
     #[error("kem decode: {0}")]
     KemDecode(&'static str),
 

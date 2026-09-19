@@ -234,7 +234,7 @@ The metadata blob embedded in each `.obj` is **encrypted at rest** under the tie
 
 ### Write locks (in-memory)
 
-PUT operations are serialized per object by an in-memory `LockRegistry` backed by a lock-free `papaya::HashMap`. `try_acquire(bucket, key)` is atomic: it inserts `(bucket, key) → SystemTime::now()` via `try_insert` and returns `Error::Locked` if the entry already exists. A `LockGuard` removes the entry on drop.
+PUT operations are serialized per object by an in-memory `LockRegistry` backed by a sharded `dashmap::DashMap`. `try_acquire(bucket, key)` is atomic: it inserts `(bucket, key) → SystemTime::now()` via the vacant-entry API and returns `Error::Locked` if the entry already exists. A `LockGuard` removes the entry on drop.
 
 Because locks are in-memory, they vanish on process exit - there are no orphaned lock files after a SIGKILL. `GET /api/v1/locks?older_than=...` lists currently-held locks whose acquisition timestamp exceeds the cutoff (these are stuck in-flight PUTs, not filesystem artifacts). `DELETE /api/v1/locks?older_than=...` force-releases them.
 
@@ -419,7 +419,7 @@ The `RUST_LOG` environment variable takes precedence over `log_filter`.
 
 ### Metrics
 
-Storage and auth metrics are exposed at `/metrics/prometheus` (Prometheus format) and `/metrics/dashboard` (in-browser) - but only when `server.unauthenticated_metrics = true`; otherwise neither endpoint (nor `/swagger-ui/`) is registered. Core series:
+Storage and auth metrics are exposed at `/metrics/prometheus` (Prometheus format) - but only when `server.unauthenticated_metrics = true`; otherwise the endpoint is not registered. Core series:
 
 - `y2q_storage_ops_total{op,backend,result}` - operation counters
 - `y2q_storage_duration_seconds{op,backend}` - latency histograms

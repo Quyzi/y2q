@@ -15,9 +15,9 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
 use clap::Parser;
+use rand::RngExt;
 use tokio::sync::{mpsc, watch};
 use tracing_subscriber::{EnvFilter, fmt};
-use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use auth::{build_client, build_tls_options, login_node, resolve_token, spawn_refresh_task};
@@ -73,7 +73,7 @@ async fn run(cli: Cli) -> Result<(), WarpError> {
                 args.obj_size_min.as_deref(),
                 args.obj_size_max.as_deref(),
             )?;
-            let run_id = Uuid::new_v4().to_string();
+            let run_id = format!("{:032x}", rand::rng().random::<u128>());
             prepare(
                 &client,
                 &args.bucket,
@@ -171,7 +171,7 @@ async fn bench(
         args.obj_size_max.as_deref(),
     )?;
 
-    let run_id = Uuid::new_v4().to_string();
+    let run_id = format!("{:032x}", rand::rng().random::<u128>());
     let op_label = if mixed_weights.is_some() {
         "mixed".to_owned()
     } else {

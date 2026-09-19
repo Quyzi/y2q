@@ -3,9 +3,9 @@
 //!
 //! The pool is constructed once at backend startup. Each worker owns its own
 //! `tokio_uring::start` runtime on a dedicated OS thread and consumes one
-//! [`async_channel`] of typed [`UringOp`] values. Callers on the actix side
-//! pick a worker via [`WorkerPool::dispatch_for_key`], `send().await` an op,
-//! and `await` a [`tokio::sync::oneshot`] reply.
+//! [`flume`] channel of typed [`UringOp`] values. Callers on the actix side
+//! pick a worker via [`WorkerPool::dispatch_for_key`], `send()` an op, and
+//! `await` a [`tokio::sync::oneshot`] reply.
 //!
 //! Workers are picked by a stable hash of `(bucket, key)` so concurrent ops
 //! on the same object serialize on the same worker. This keeps per-object
@@ -23,14 +23,16 @@ use std::{
     thread::JoinHandle,
 };
 
-use async_channel::{Receiver, Sender};
+use flume::{Receiver, Sender};
 
 use super::{ops::UringOp, storage::UringConfig};
 
 /// A pool of dedicated `tokio-uring` worker threads.
 pub(super) struct WorkerPool {
-    /// One sender per worker. Each is the *unique* sender for its channel
-    /// (we never clone these), so dropping the `Vec` closes every channel.
+    /// One sender per worker. Dropping every clone of a worker's channel
+    /// (this `Vec` plus any outstanding `dispatch_for_key`/`dispatch_for_path`
+    /// clone held by in-flight streaming writes) disconnects it, waking the
+    /// worker's blocking `recv()`.
     senders: Vec<Sender<UringOp>>,
     handles: Mutex<Vec<JoinHandle<()>>>,
 }
@@ -47,7 +49,7 @@ impl WorkerPool {
         let mut senders = Vec::with_capacity(n);
         let mut handles = Vec::with_capacity(n);
         for i in 0..n {
-            let (tx, rx) = async_channel::unbounded::<UringOp>();
+            let (tx, rx) = flume::unbounded::<UringOp>();
             let (probe_tx, probe_rx) = std::sync::mpsc::channel::<Result<(), String>>();
             senders.push(tx);
             let config_clone = config.clone();
@@ -119,12 +121,11 @@ impl WorkerPool {
 
 impl Drop for WorkerPool {
     fn drop(&mut self) {
-        // Closing each sender wakes the worker's `recv().await` with an Err,
-        // which causes the worker future to return and tokio_uring::start to
-        // exit. Then we join to make sure the OS threads have actually gone.
-        for s in self.senders.iter() {
-            s.close();
-        }
+        // Dropping every sender disconnects each worker's channel, waking
+        // the worker's blocking `recv()` with an Err, which causes the
+        // worker function to return and tokio_uring::start to exit. Then we
+        // join to make sure the OS threads have actually gone.
+        self.senders.clear();
         if let Ok(mut h) = self.handles.lock() {
             for handle in std::mem::take(&mut *h) {
                 let _ = handle.join();
@@ -175,7 +176,7 @@ fn build_ring(config: &UringConfig) -> tokio_uring::Builder {
 /// returns immediately, producing a tight spin loop even on an idle worker.
 /// Keeping the blocking wait outside the uring runtime avoids this entirely.
 fn worker_main(rx: Receiver<UringOp>, config: UringConfig) {
-    while let Ok(op) = rx.recv_blocking() {
+    while let Ok(op) = rx.recv() {
         let r = &rx;
         build_ring(&config).start(async move {
             super::ops::handle(op).await;

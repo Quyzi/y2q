@@ -60,7 +60,7 @@ CLI values are coerced as integer first, then `true`/`false`, then string.
 | `host` | string | *required* | Bind address - `127.0.0.1` for local-only, `0.0.0.0` for all interfaces |
 | `port` | u16 | *required* | TCP port |
 | `max_body_bytes` | usize | `268435456` (256 MiB) | Maximum PUT request body size |
-| `unauthenticated_metrics` | bool | `false` | When `true`, `/metrics/prometheus`, `/metrics/dashboard`, `/swagger-ui/`, and `/api-docs/openapi.json` are exposed without a Bearer token. When `false` (default) they are **not registered at all** - there is no auth-gated variant; the daemon logs that they are disabled. |
+| `unauthenticated_metrics` | bool | `false` | When `true`, `/metrics/prometheus` and `/api-docs/openapi.json` are exposed without a Bearer token. When `false` (default) they are **not registered at all** - there is no auth-gated variant; the daemon logs that they are disabled. |
 | `allow_insecure_bind` | bool | `false` | Permit binding a non-loopback `host` while `[server.tls] enabled = false`. Defaults to `false`: the daemon refuses to start rather than silently serve session tokens, passwords, and object plaintext unencrypted. Loopback (`127.0.0.1`/`::1`/`localhost`) is always permitted regardless of this flag. |
 | `allow_unprotected_memory` | bool | `false` | Permit starting when guarded memory is unavailable (Linux only - e.g. `RLIMIT_MEMLOCK` too low to lock session key pages out of swap; see [SECURITY.md](../SECURITY.md#guarded-memory-linux-only) for the full mechanism). Defaults to `false`: the daemon refuses to start rather than hold session identity keys in swappable, dumpable, core-dumpable memory. Has no effect on non-Linux builds, where guarded memory is unconditionally unavailable and startup never refuses on this basis. |
 
@@ -153,22 +153,6 @@ Changing these only affects newly written records. Existing user records carry t
 | `log_filter` | string | `"info"` | Log level directive in RUST_LOG syntax. Examples: `"info"`, `"y2qd=debug,actix_web=info"`, `"y2q_core::storage::filesystem=trace"`. The `RUST_LOG` environment variable takes precedence when set. |
 | `log_format` | enum | `"text"` | `"text"` - human-readable coloured output. `"json"` - structured JSON, one object per line; suited for aggregators like Grafana Loki, Elasticsearch, or Datadog. |
 
-### `[observability.pyroscope]`
-
-Continuous CPU profiling via pprof-rs shipped to a Pyroscope server or Grafana Cloud. Requires building with `--features pyroscope`. All fields have safe defaults; the section can be omitted entirely.
-
-| Field | Type | Default | Notes |
-|---|---|---|---|
-| `enabled` | bool | `false` | Start the Pyroscope agent on daemon startup. Must be `true` to collect profiles. |
-| `server_url` | string | `"http://localhost:4040"` | Pyroscope server URL. For Grafana Cloud use the profiling push endpoint shown in your stack settings. |
-| `sample_rate` | u32 | `100` | pprof CPU sampling rate in Hz. Higher rates give finer resolution at the cost of overhead. 100 Hz is a good default. |
-| `basic_auth_user` | string | *(none)* | HTTP Basic auth username. Grafana Cloud uses a numeric user ID. Omit for unauthenticated servers. |
-| `basic_auth_password` | string | *(none)* | HTTP Basic auth password. Grafana Cloud uses an API token with profiling write scope. Omit for unauthenticated servers. |
-
-Tags attached to every profile: `version` (daemon version), `backend` (`"filesystem"` or `"uring"`).
-
-The agent runs a background OS thread using SIGPROF; it does not interact with the tokio runtime and has negligible impact on request latency.
-
 ## Worked example
 
 ```toml
@@ -218,13 +202,6 @@ enforce_authorization = true           # bucket ownership/ACLs + admin role
 [observability]
 log_filter = "y2qd=info,actix_web=warn"
 log_format = "json"                    # ship to a log aggregator
-
-[observability.pyroscope]
-enabled     = false
-server_url  = "http://localhost:4040"
-sample_rate = 100
-# basic_auth_user     = "123456"
-# basic_auth_password = "glc_..."
 ```
 
 ## Logging
@@ -243,7 +220,7 @@ log_filter = "y2qd=debug,actix_web=info"
 log_format = "json"    # structured output for log aggregators
 ```
 
-Per-request spans flow through `tracing-actix-web`. Each HTTP request gets a span with method, path, status, elapsed time, and a UUID `X-Request-ID`. Override verbosity with `RUST_LOG=tracing_actix_web=warn` if it's too noisy.
+Per-request spans flow through `tracing-actix-web`. Each HTTP request gets a span with method, path, status, elapsed time, and a 32-character hex `X-Request-ID`. Override verbosity with `RUST_LOG=tracing_actix_web=warn` if it's too noisy.
 
 The other binaries have no `[observability]` config section - they log to stderr and are controlled by `RUST_LOG` alone:
 

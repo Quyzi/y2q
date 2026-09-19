@@ -100,7 +100,7 @@ pub async fn trace_middleware<B: MessageBody>(
 /// `GET /api/v1/trace` — streams live trace events as Server-Sent Events.
 pub async fn stream(hub: web::Data<Arc<TraceHub>>, _auth: AdminReadAuthenticated) -> HttpResponse {
     let rx = hub.subscribe();
-    let event_stream = futures::stream::unfold(rx, |mut rx| async move {
+    let event_stream = futures_util::stream::unfold(rx, |mut rx| async move {
         loop {
             match rx.recv().await {
                 Ok(event) => {

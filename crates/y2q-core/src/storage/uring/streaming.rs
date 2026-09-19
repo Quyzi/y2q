@@ -17,8 +17,8 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use async_channel::Sender;
 use bytes::Bytes;
+use flume::Sender;
 use tokio::sync::oneshot;
 
 use crate::storage::{filesystem::object_id_from_path, locks::LockGuard};
@@ -289,7 +289,6 @@ impl UringStreamingWriter {
                 bytes: payload,
                 reply,
             })
-            .await
             .map_err(|_| io::Error::other("uring worker channel closed"))?;
         match reply_rx.await {
             Ok(Ok(())) => {
@@ -313,7 +312,6 @@ impl UringStreamingWriter {
                 path: self.path.clone(),
                 reply,
             })
-            .await
             .map_err(|_| io::Error::other("uring worker channel closed"))?;
         match reply_rx.await {
             Ok(Ok(())) => Ok(()),
@@ -333,7 +331,6 @@ impl UringStreamingWriter {
                 sync,
                 reply,
             })
-            .await
             .map_err(|_| Error::InternalError {
                 bucket: String::new(),
                 key: String::new(),

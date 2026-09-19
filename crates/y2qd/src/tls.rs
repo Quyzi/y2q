@@ -10,6 +10,7 @@ use rustls::RootCertStore;
 use rustls::ServerConfig;
 use rustls::crypto::CryptoProvider;
 use rustls::crypto::aws_lc_rs;
+use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::WebPkiClientVerifier;
 
@@ -101,7 +102,9 @@ fn load_certs(path: &Path) -> io::Result<Vec<CertificateDer<'static>>> {
         File::open(path)
             .map_err(|e| io::Error::new(e.kind(), format!("open cert {}: {e}", path.display())))?,
     );
-    rustls_pemfile::certs(&mut reader).collect::<Result<Vec<_>, _>>()
+    CertificateDer::pem_reader_iter(&mut reader)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(io::Error::other)
 }
 
 fn load_private_key(path: &Path) -> io::Result<PrivateKeyDer<'static>> {
@@ -109,10 +112,11 @@ fn load_private_key(path: &Path) -> io::Result<PrivateKeyDer<'static>> {
         File::open(path)
             .map_err(|e| io::Error::new(e.kind(), format!("open key {}: {e}", path.display())))?,
     );
-    rustls_pemfile::private_key(&mut reader)?.ok_or_else(|| {
-        io::Error::other(format!(
+    PrivateKeyDer::from_pem_reader(&mut reader).map_err(|e| match e {
+        rustls::pki_types::pem::Error::NoItemsFound => io::Error::other(format!(
             "no PKCS#8, PKCS#1, or SEC1 private key found in {}",
             path.display()
-        ))
+        )),
+        other => io::Error::other(other),
     })
 }

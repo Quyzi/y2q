@@ -5,7 +5,7 @@
 
 use std::collections::HashSet;
 
-use futures::StreamExt;
+use futures_util::StreamExt;
 
 use crate::cmd::objects::make_client;
 use crate::error::CliError;

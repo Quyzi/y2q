@@ -2,7 +2,6 @@ CARGO   ?= cargo
 PODMAN  ?= podman
 
 IMAGE         ?= y2q:latest
-IMAGE_DEV     ?= y2q:dev
 
 .PHONY: all \
         build build-y2qd build-y2q build-y2q-warp \
@@ -12,7 +11,7 @@ IMAGE_DEV     ?= y2q:dev
         clippy \
         fmt fmt-check \
         check \
-        image image-dev \
+        image \
 		install-local \
         clean help
 
@@ -86,9 +85,6 @@ check: fmt-check clippy test ## Full CI gate: fmt-check + clippy + test
 
 image: ## Build container image -- y2q:latest
 	$(PODMAN) build -t $(IMAGE) .
-
-image-dev: ## Build dev image -- y2q:dev (Pyroscope enabled)
-	$(PODMAN) build --build-arg PYROSCOPE=1 -t $(IMAGE_DEV) .
 
 # ---------------------------------------------------------------------------
 # Install local binaries
