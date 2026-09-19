@@ -7,6 +7,46 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use y2q_client::{ClientError, ListOptions, MetadataView, SearchOptions, Y2qClient};
 
+/// Recursively collect every regular file under `root`, depth-first.
+///
+/// Symlinks are never followed (matching the previous `walkdir` default), so
+/// symlink cycles cannot cause unbounded recursion. Entries that cannot be
+/// read are passed to `on_error` and skipped. A `root` that is itself a file
+/// yields just that file.
+pub fn walk_files(root: &Path, on_error: &mut dyn FnMut(std::io::Error)) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if root.is_file() {
+        out.push(root.to_path_buf());
+        return out;
+    }
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let rd = match std::fs::read_dir(&dir) {
+            Ok(rd) => rd,
+            Err(e) => {
+                on_error(e);
+                continue;
+            }
+        };
+        for entry in rd {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(e) => {
+                    on_error(e);
+                    continue;
+                }
+            };
+            match entry.file_type() {
+                Ok(ft) if ft.is_dir() => stack.push(entry.path()),
+                Ok(ft) if ft.is_file() => out.push(entry.path()),
+                Ok(_) => {}
+                Err(e) => on_error(e),
+            }
+        }
+    }
+    out
+}
+
 /// Run a server-side label query, following pagination to completion.
 /// `bucket`/`prefix` scope the search (both optional).
 pub async fn search(
@@ -421,20 +461,10 @@ pub fn collect_local_entries(root: &Path) -> Result<DiffEntries, String> {
         );
         return Ok(entries);
     }
-    for entry in walkdir::WalkDir::new(root)
-        .into_iter()
-        .filter_map(Result::ok)
-    {
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        let rel: PathBuf = entry
-            .path()
-            .strip_prefix(root)
-            .unwrap_or(entry.path())
-            .to_owned();
+    for path in walk_files(root, &mut |_| {}) {
+        let rel: PathBuf = path.strip_prefix(root).unwrap_or(&path).to_owned();
         let key = rel.to_string_lossy().replace('\\', "/");
-        let meta = entry.metadata().map_err(|e| format!("metadata: {e}"))?;
+        let meta = std::fs::metadata(&path).map_err(|e| format!("metadata: {e}"))?;
         entries.insert(
             key,
             DiffEntry {

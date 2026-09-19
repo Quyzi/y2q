@@ -4,22 +4,19 @@ version.workspace = true
 edition = "2024"
 
 [dependencies]
-aead            = { workspace = true }
 aes-gcm         = { workspace = true }
 argon2          = { workspace = true }
 base64          = { workspace = true }
 bytes           = { workspace = true }
 crc32fast       = { workspace = true }
+dashmap         = { workspace = true }
 flume           = { workspace = true }
-fs2             = { workspace = true }
 hkdf            = { workspace = true }
 hmac            = { workspace = true }
 metrics         = { workspace = true }
-papaya          = { workspace = true }
+ml-kem          = { workspace = true }
 pest            = { workspace = true }
 pest_derive     = { workspace = true }
-pqcrypto        = { workspace = true }
-pqcrypto-traits = { workspace = true }
 rand            = { workspace = true }
 redb            = { workspace = true }
 regex           = { workspace = true }
@@ -30,7 +27,6 @@ subtle          = { workspace = true }
 thiserror       = { workspace = true }
 tokio           = { workspace = true }
 tracing         = { workspace = true }
-uuid            = { workspace = true }
 xxhash-rust     = { workspace = true }
 zeroize         = { workspace = true }
 
@@ -39,7 +35,6 @@ zeroize         = { workspace = true }
 # selecting it at runtime returns an error.
 [target.'cfg(target_os = "linux")'.dependencies]
 aligned-vec   = { workspace = true }
-async-channel = { workspace = true }
 libc          = { workspace = true }
 tokio-uring   = { workspace = true }
 

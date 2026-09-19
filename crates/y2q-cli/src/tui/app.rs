@@ -358,7 +358,7 @@ impl App {
         }
     }
 
-    fn handle_key(&mut self, key: crossterm::event::KeyEvent) -> Action {
+    fn handle_key(&mut self, key: ratatui::crossterm::event::KeyEvent) -> Action {
         match self.mode.clone() {
             Mode::Input { value, action, .. } => self.handle_input_key(key, value, action),
             Mode::Confirm(action) => self.handle_confirm_key(key, action),
@@ -378,11 +378,11 @@ impl App {
 
     fn handle_input_key(
         &mut self,
-        key: crossterm::event::KeyEvent,
+        key: ratatui::crossterm::event::KeyEvent,
         value: String,
         action: InputAction,
     ) -> Action {
-        use crossterm::event::KeyCode;
+        use ratatui::crossterm::event::KeyCode;
         match key.code {
             KeyCode::Esc => {
                 self.mode = match action {
@@ -417,10 +417,10 @@ impl App {
 
     fn handle_confirm_key(
         &mut self,
-        key: crossterm::event::KeyEvent,
+        key: ratatui::crossterm::event::KeyEvent,
         action: ConfirmAction,
     ) -> Action {
-        use crossterm::event::KeyCode;
+        use ratatui::crossterm::event::KeyCode;
         let mode_after = match action {
             ConfirmAction::DeleteUser { .. } => Mode::Admin(AdminTab::Users),
             ConfirmAction::ClearLocks { .. } => Mode::Admin(AdminTab::Locks),
@@ -439,8 +439,12 @@ impl App {
         }
     }
 
-    fn handle_admin_key(&mut self, key: crossterm::event::KeyEvent, tab: AdminTab) -> Action {
-        use crossterm::event::KeyCode;
+    fn handle_admin_key(
+        &mut self,
+        key: ratatui::crossterm::event::KeyEvent,
+        tab: AdminTab,
+    ) -> Action {
+        use ratatui::crossterm::event::KeyCode;
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => {
                 self.mode = Mode::Browse;
@@ -540,8 +544,8 @@ impl App {
         }
     }
 
-    fn handle_browse_key(&mut self, key: crossterm::event::KeyEvent) -> Action {
-        use crossterm::event::KeyCode;
+    fn handle_browse_key(&mut self, key: ratatui::crossterm::event::KeyEvent) -> Action {
+        use ratatui::crossterm::event::KeyCode;
         match key.code {
             KeyCode::Char('q') => {
                 self.should_quit = true;
@@ -730,8 +734,8 @@ impl App {
         self.mode = Mode::Help { lines, selected: 0 };
     }
 
-    fn handle_help_key(&mut self, key: crossterm::event::KeyEvent) -> Action {
-        use crossterm::event::KeyCode;
+    fn handle_help_key(&mut self, key: ratatui::crossterm::event::KeyEvent) -> Action {
+        use ratatui::crossterm::event::KeyCode;
         let (len, selected) = match &self.mode {
             Mode::Help { lines, selected } => (lines.len(), *selected),
             _ => return Action::None,
@@ -930,15 +934,10 @@ impl App {
                             .file_name()
                             .map(|n| n.to_string_lossy().into_owned())
                             .unwrap_or_default();
-                        for entry in walkdir::WalkDir::new(&local_path)
-                            .into_iter()
-                            .filter_map(Result::ok)
-                            .filter(|e| e.file_type().is_file())
-                        {
-                            let rel = entry
-                                .path()
+                        for path in crate::ops::listing::walk_files(&local_path, &mut |_| {}) {
+                            let rel = path
                                 .strip_prefix(&local_path)
-                                .unwrap_or(entry.path())
+                                .unwrap_or(&path)
                                 .to_string_lossy()
                                 .replace('\\', "/");
                             let key = if base.is_empty() {
@@ -947,17 +946,10 @@ impl App {
                                 format!("{base}/{rel}")
                             };
                             let id = TRANSFER_ID.fetch_add(1, Ordering::Relaxed);
-                            let label =
-                                format!("{} → {alias}/{bucket}/{key}", entry.path().display());
-                            let size = entry.metadata().ok().map(|m| m.len());
+                            let label = format!("{} → {alias}/{bucket}/{key}", path.display());
+                            let size = std::fs::metadata(&path).ok().map(|m| m.len());
                             self.push_transfer(TransferEntry::new(id, label, size));
-                            self.spawn_upload(
-                                alias.clone(),
-                                bucket.clone(),
-                                key,
-                                entry.path().to_path_buf(),
-                                id,
-                            );
+                            self.spawn_upload(alias.clone(), bucket.clone(), key, path, id);
                         }
                     } else {
                         let key = local_path
@@ -1442,8 +1434,8 @@ impl App {
         });
     }
 
-    fn handle_labels_key(&mut self, key: crossterm::event::KeyEvent) -> Action {
-        use crossterm::event::KeyCode;
+    fn handle_labels_key(&mut self, key: ratatui::crossterm::event::KeyEvent) -> Action {
+        use ratatui::crossterm::event::KeyCode;
         let (alias, bucket, okey, labels, selected) = match &self.mode {
             Mode::Labels {
                 alias,
@@ -1588,8 +1580,8 @@ impl App {
         });
     }
 
-    fn handle_bucketconfig_key(&mut self, key: crossterm::event::KeyEvent) -> Action {
-        use crossterm::event::KeyCode;
+    fn handle_bucketconfig_key(&mut self, key: ratatui::crossterm::event::KeyEvent) -> Action {
+        use ratatui::crossterm::event::KeyCode;
         let (alias, bucket, selected) = match &self.mode {
             Mode::BucketConfig {
                 alias,
@@ -1774,8 +1766,8 @@ impl App {
         });
     }
 
-    fn handle_results_key(&mut self, key: crossterm::event::KeyEvent) -> Action {
-        use crossterm::event::KeyCode;
+    fn handle_results_key(&mut self, key: ratatui::crossterm::event::KeyEvent) -> Action {
+        use ratatui::crossterm::event::KeyCode;
         let (len, selected) = match &self.mode {
             Mode::Results {
                 lines, selected, ..
@@ -2407,7 +2399,7 @@ impl App {
 
             match client.connect_trace().await {
                 Ok(mut stream) => {
-                    use futures::StreamExt;
+                    use futures_util::StreamExt;
                     while let Some(event) = stream.next().await {
                         if tx
                             .send(super::events::Event::TraceEventArrived {
@@ -2790,7 +2782,7 @@ impl App {
 mod tests {
     use super::*;
     use crate::config::Alias;
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::time::Duration;
     use tokio::sync::mpsc::UnboundedReceiver;
     use y2q_client::{MetadataView, ObjectHead, StaleLockEntry, TraceEvent, UserView};

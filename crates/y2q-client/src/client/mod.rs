@@ -11,6 +11,7 @@ use std::sync::Arc;
 use reqwest::{RequestBuilder, Response, Url};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{CryptoProvider, aws_lc_rs};
+use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use rustls::{ClientConfig as RustlsClientConfig, DigitallySignedStruct, RootCertStore};
 use zeroize::Zeroizing;
@@ -182,8 +183,7 @@ fn build_rustls_client_config(tls: &TlsOptions) -> Result<RustlsClientConfig, Cl
         let mut roots = RootCertStore::empty();
         roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         if let Some(pem) = &tls.ca_cert_pem {
-            let mut cursor: &[u8] = pem;
-            for cert in rustls_pemfile::certs(&mut cursor) {
+            for cert in CertificateDer::pem_slice_iter(pem) {
                 let cert = cert.map_err(|e| ClientError::BadRequest {
                     message: format!("invalid CA bundle: {e}"),
                 })?;
@@ -213,28 +213,18 @@ fn build_rustls_client_config(tls: &TlsOptions) -> Result<RustlsClientConfig, Cl
 fn parse_client_identity(
     pem: &[u8],
 ) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), ClientError> {
-    let mut cursor: &[u8] = pem;
-    let mut chain: Vec<CertificateDer<'static>> = Vec::new();
-    let mut key: Option<PrivateKeyDer<'static>> = None;
-    for item in rustls_pemfile::read_all(&mut cursor) {
-        let item = item.map_err(|e| ClientError::BadRequest {
+    let chain: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(pem)
+        .collect::<Result<_, _>>()
+        .map_err(|e| ClientError::BadRequest {
             message: format!("invalid client identity: {e}"),
         })?;
-        match item {
-            rustls_pemfile::Item::X509Certificate(der) => chain.push(der),
-            rustls_pemfile::Item::Pkcs1Key(k) => key = Some(PrivateKeyDer::Pkcs1(k)),
-            rustls_pemfile::Item::Pkcs8Key(k) => key = Some(PrivateKeyDer::Pkcs8(k)),
-            rustls_pemfile::Item::Sec1Key(k) => key = Some(PrivateKeyDer::Sec1(k)),
-            _ => {}
-        }
-    }
     if chain.is_empty() {
         return Err(ClientError::BadRequest {
             message: "client identity: no certificate found".into(),
         });
     }
-    let key = key.ok_or_else(|| ClientError::BadRequest {
-        message: "client identity: no private key found".into(),
+    let key = PrivateKeyDer::from_pem_slice(pem).map_err(|e| ClientError::BadRequest {
+        message: format!("invalid client identity: {e}"),
     })?;
     Ok((chain, key))
 }

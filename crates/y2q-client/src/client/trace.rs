@@ -1,6 +1,6 @@
 use std::pin::Pin;
 
-use futures::{Stream, StreamExt};
+use futures_util::{Stream, StreamExt};
 use tokio_util::codec::{FramedRead, LinesCodec};
 use tokio_util::io::StreamReader;
 

@@ -166,7 +166,7 @@ pub async fn stream_encrypt_for_put(
     chunk_size: usize,
     max_bytes: Option<u64>,
 ) -> Result<(StreamingSink, PlaintextMetrics, CipherMetadata), AppError> {
-    use futures::StreamExt;
+    use futures_util::StreamExt;
 
     let mut session = envelope::EncryptSession::new(
         sink,
@@ -315,8 +315,7 @@ pub async fn encrypt_bytes_for_put(
 mod tests {
     use super::*;
     use actix_web::{App, HttpResponse, test, web};
-    use pqcrypto::kem::mlkem768;
-    use pqcrypto_traits::kem::PublicKey as _;
+    use y2q_core::crypto::kem;
 
     async fn tempfile_sink() -> StreamingSink {
         let path = std::env::temp_dir().join(format!(
@@ -367,8 +366,8 @@ mod tests {
 
     #[actix_web::test]
     async fn mid_stream_cap_rejects_oversized_body_with_no_content_length_reliance() {
-        let (pk, _sk) = mlkem768::keypair();
-        let pk_bytes = pk.as_bytes().to_vec();
+        let (pk, _sk) = kem::keypair();
+        let pk_bytes = pk.to_bytes().to_vec();
 
         let app = test::init_service(
             App::new()

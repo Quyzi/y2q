@@ -19,15 +19,11 @@ use aes_gcm::{
 };
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use hkdf::Hkdf;
-use pqcrypto::kem::mlkem768;
-use pqcrypto_traits::kem::{
-    Ciphertext as KemCiphertextTrait, PublicKey as KemPublicKeyTrait,
-    SecretKey as KemSecretKeyTrait,
-};
 use rand::Rng;
 use sha2::Sha256;
 use std::hint::black_box;
 use y2q_core::crypto::envelope::{DEFAULT_CHUNK_SIZE_BYTES, EncryptSession, decrypt};
+use y2q_core::crypto::kem;
 use y2q_core::storage::streaming_sink::StreamingSink;
 
 const KIB: usize = 1024;
@@ -35,29 +31,29 @@ const MIB: usize = 1024 * KIB;
 const HKDF_INFO: &[u8] = b"y2q/v1/content-key";
 
 fn bench_kem_encap(c: &mut Criterion) {
-    let (pk, _sk) = mlkem768::keypair();
-    let pk_bytes = pk.as_bytes().to_vec();
+    let (pk, _sk) = kem::keypair();
+    let pk_bytes = pk.to_bytes().to_vec();
 
     c.bench_function("kem_encap", |b| {
         b.iter(|| {
-            let pk = mlkem768::PublicKey::from_bytes(black_box(&pk_bytes)).unwrap();
-            let (ss, ct) = mlkem768::encapsulate(&pk);
+            let pk = kem::PublicKey::from_bytes(black_box(&pk_bytes)).unwrap();
+            let (ss, ct) = kem::encapsulate(&pk);
             black_box((ss, ct));
         });
     });
 }
 
 fn bench_kem_decap(c: &mut Criterion) {
-    let (pk, sk) = mlkem768::keypair();
-    let sk_bytes = sk.as_bytes().to_vec();
-    let (_ss, kem_ct) = mlkem768::encapsulate(&pk);
-    let kem_ct_bytes = kem_ct.as_bytes().to_vec();
+    let (pk, sk) = kem::keypair();
+    let sk_bytes = sk.to_bytes().to_vec();
+    let (_ss, kem_ct) = kem::encapsulate(&pk);
+    let kem_ct_bytes = kem_ct.as_slice().to_vec();
 
     c.bench_function("kem_decap", |b| {
         b.iter(|| {
-            let sk = mlkem768::SecretKey::from_bytes(black_box(&sk_bytes)).unwrap();
-            let ct = mlkem768::Ciphertext::from_bytes(black_box(&kem_ct_bytes)).unwrap();
-            let ss = mlkem768::decapsulate(&ct, &sk);
+            let sk = kem::SecretKey::from_bytes(black_box(&sk_bytes)).unwrap();
+            let ct = kem::ciphertext_from_bytes(black_box(&kem_ct_bytes)).unwrap();
+            let ss = kem::decapsulate(&ct, &sk);
             black_box(ss);
         });
     });
@@ -190,8 +186,8 @@ async fn read_and_remove(path: &std::path::Path, sink: StreamingSink) -> Vec<u8>
 }
 
 fn bench_envelope_v2_encrypt(c: &mut Criterion) {
-    let (pk, _sk) = mlkem768::keypair();
-    let pk_bytes = pk.as_bytes().to_vec();
+    let (pk, _sk) = kem::keypair();
+    let pk_bytes = pk.to_bytes().to_vec();
     let rt = tokio::runtime::Runtime::new().unwrap();
 
     let mut group = c.benchmark_group("envelope_v2_encrypt");
@@ -228,9 +224,9 @@ fn bench_envelope_v2_encrypt(c: &mut Criterion) {
 }
 
 fn bench_envelope_v2_decrypt(c: &mut Criterion) {
-    let (pk, sk) = mlkem768::keypair();
-    let pk_bytes = pk.as_bytes().to_vec();
-    let sk_bytes = sk.as_bytes().to_vec();
+    let (pk, sk) = kem::keypair();
+    let pk_bytes = pk.to_bytes().to_vec();
+    let sk_bytes = sk.to_bytes().to_vec();
     let rt = tokio::runtime::Runtime::new().unwrap();
 
     let mut group = c.benchmark_group("envelope_v2_decrypt");

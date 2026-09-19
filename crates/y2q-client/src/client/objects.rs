@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use futures::TryStreamExt;
+use futures_util::TryStreamExt;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::io::{ReaderStream, StreamReader};
 

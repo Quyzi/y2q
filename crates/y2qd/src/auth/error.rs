@@ -234,7 +234,7 @@ mod tests {
         let err = AuthError::Backend("open /var/lib/y2q/users.redb: permission denied".into());
         let resp = err.error_response();
         let body = actix_web::body::to_bytes(resp.into_body());
-        let body = futures::executor::block_on(body).unwrap();
+        let body = actix_web::rt::System::new().block_on(body).unwrap();
         let text = String::from_utf8(body.to_vec()).unwrap();
         assert!(!text.contains("/var/lib/y2q"));
         assert!(text.contains("internal error"));

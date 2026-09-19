@@ -117,8 +117,8 @@ pub enum SecMemError {
 /// # Safety
 /// `T` must be POD with no validity invariants (an all-zero bit pattern must
 /// be a legal value of `T`) and no `Drop` implementation that depends on its
-/// prior content. Intended for `pqcrypto`'s `Copy` key newtypes over
-/// `[u8; N]`, which have no `Drop` of their own.
+/// prior content. Intended for the KEM `SharedSecret`'s `Copy` newtype over
+/// `[u8; N]`, which has no `Drop` of its own.
 pub unsafe fn scrub_pod<T: Copy>(value: &mut T) {
     let len = std::mem::size_of::<T>();
     let ptr = (value as *mut T).cast::<u8>();
@@ -711,9 +711,9 @@ impl AsMut<[u8]> for SecretVec {
     }
 }
 
-impl aead::Buffer for SecretVec {
-    fn extend_from_slice(&mut self, other: &[u8]) -> aead::Result<()> {
-        self.push_slice(other).map_err(|_| aead::Error)
+impl aes_gcm::aead::Buffer for SecretVec {
+    fn extend_from_slice(&mut self, other: &[u8]) -> aes_gcm::aead::Result<()> {
+        self.push_slice(other).map_err(|_| aes_gcm::aead::Error)
     }
 
     fn truncate(&mut self, new_len: usize) {

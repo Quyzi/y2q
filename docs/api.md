@@ -2,7 +2,7 @@
 
 `y2qd` speaks HTTP, or HTTPS when `[server.tls]` is enabled (rustls, optionally restricted to the X25519MLKEM768 post-quantum hybrid key exchange, with optional mutual TLS). All routes use `application/json` for structured request and response bodies. Object PUT/GET payloads are raw bytes with `application/octet-stream`. Errors are JSON.
 
-For machine-readable schemas: `/api-docs/openapi.json`. Interactive UI: `/swagger-ui/`. (Both require `server.unauthenticated_metrics = true`; see [Observability endpoints](#observability-endpoints).)
+For machine-readable schemas: `/api-docs/openapi.json`. (Requires `server.unauthenticated_metrics = true`; see [Observability endpoints](#observability-endpoints).)
 
 ## Authentication
 
@@ -698,8 +698,6 @@ Server-sent-events stream of every request the daemon handles, in real time. **A
 | Route | Purpose |
 |---|---|
 | `GET /metrics/prometheus` | Prometheus scrape format |
-| `GET /metrics/dashboard` | Interactive in-browser metrics dashboard |
-| `GET /swagger-ui/` | Interactive API documentation |
 | `GET /api-docs/openapi.json` | Raw OpenAPI 3 document |
 
 These are served **only** when `[server] unauthenticated_metrics = true`, and then without a Bearer token. With the default `false` they are not registered at all (no auth-gated variant) - the daemon logs that they are disabled at startup.

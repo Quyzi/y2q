@@ -15,15 +15,13 @@
 //! which of a user's personas hold access, nor how many personas are real.
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use pqcrypto::kem::mlkem768;
-use pqcrypto_traits::kem::{PublicKey as KemPublicKeyTrait, SecretKey as KemSecretKeyTrait};
 use rand::Rng;
 use std::collections::BTreeMap;
 use y2q_core::crypto::{
-    CREDENTIAL_SLOTS, bucket_grant_aad, bucket_sk_wrap_aad, open_sealed, seal_to, unwrap_with_key,
-    wrap_with_key,
+    CREDENTIAL_SLOTS, bucket_grant_aad, bucket_sk_wrap_aad, kem, open_sealed, seal_to,
+    unwrap_with_key, wrap_with_key,
 };
-use y2q_core::secmem::{SecretVec, scrub_pod};
+use y2q_core::secmem::SecretVec;
 use y2q_core::{BucketConfig, BucketKeyVersion, Error};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -59,16 +57,13 @@ pub fn new_bucket_key_version(
     bucket: &str,
     grantees: &[(String, GranteeSlots)],
 ) -> Result<(BucketKeyVersion, Zeroizing<[u8; 32]>), Error> {
-    let (pk, mut sk) = mlkem768::keypair();
+    let (pk, sk) = kem::keypair();
     let mut bwk = Zeroizing::new([0u8; 32]);
     rand::rng().fill_bytes(&mut *bwk);
 
     let sk_aad = bucket_sk_wrap_aad(bucket, epoch);
-    let sk_blob = wrap_with_key(sk.as_bytes(), &bwk, &sk_aad)
+    let sk_blob = wrap_with_key(&sk.to_bytes()[..], &bwk, &sk_aad)
         .map_err(|e| crypto_err(bucket, "new_bucket_key", e))?;
-    // SAFETY: `mlkem768::SecretKey` is a `Copy` newtype over `[u8; N]` with
-    // no `Drop`; an all-zero bit pattern is a valid value to leave behind.
-    unsafe { scrub_pod(&mut sk) };
 
     let mut grants = BTreeMap::new();
     for (username, slots) in grantees {
@@ -79,7 +74,7 @@ pub fn new_bucket_key_version(
     Ok((
         BucketKeyVersion {
             epoch,
-            public_key_b64: STANDARD.encode(pk.as_bytes()),
+            public_key_b64: STANDARD.encode(pk.to_bytes()),
             sk_blob,
             grants,
         },
@@ -499,8 +494,8 @@ mod tests {
     }
 
     fn identity(_seed: u8) -> (String, Vec<u8>) {
-        let (pk, sk) = mlkem768::keypair();
-        (STANDARD.encode(pk.as_bytes()), sk.as_bytes().to_vec())
+        let (pk, sk) = kem::keypair();
+        (STANDARD.encode(pk.to_bytes()), sk.to_bytes().to_vec())
     }
 
     #[test]
@@ -522,7 +517,7 @@ mod tests {
         let recovered = read_key(&cfg, "b", 0, "alice", 0, &alice_sk0).unwrap();
         // Decodes as a real ML-KEM-768 secret key — the round trip through
         // seal/wrap/unwrap/open preserved the exact bytes.
-        assert!(mlkem768::SecretKey::from_bytes(&recovered).is_ok());
+        assert!(kem::SecretKey::from_bytes(&recovered).is_ok());
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use crossterm::event::{KeyEvent, MouseEvent};
+use ratatui::crossterm::event::{KeyEvent, MouseEvent};
 use y2q_client::{MetadataView, ObjectHead, StaleLockEntry, TraceEvent, UserView};
 
 #[derive(Debug, Clone)]
