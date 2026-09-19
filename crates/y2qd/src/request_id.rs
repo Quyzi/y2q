@@ -5,6 +5,7 @@ use actix_web::{
     http::header::{HeaderName, HeaderValue},
     middleware::Next,
 };
+use rand::RngExt;
 
 /// Request-scoped extension holding the assigned request ID.
 #[derive(Clone)]
@@ -13,9 +14,9 @@ pub struct RequestIdExt(pub String);
 /// Middleware that assigns a `request_id` to every request.
 ///
 /// Reads `X-Request-ID` from the incoming headers and reuses it if present;
-/// otherwise generates a UUID v4. The ID is stored as a request extension so
-/// downstream middleware and handlers can retrieve it, and echoed back on the
-/// response via the `X-Request-ID` header.
+/// otherwise generates a random 32-character lowercase-hex id. The ID is
+/// stored as a request extension so downstream middleware and handlers can
+/// retrieve it, and echoed back on the response via the `X-Request-ID` header.
 pub async fn request_id_middleware<B: MessageBody>(
     req: ServiceRequest,
     next: Next<B>,
@@ -25,7 +26,7 @@ pub async fn request_id_middleware<B: MessageBody>(
         .get("x-request-id")
         .and_then(|v| v.to_str().ok())
         .map(String::from)
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        .unwrap_or_else(|| format!("{:032x}", rand::rng().random::<u128>()));
 
     req.extensions_mut().insert(RequestIdExt(id.clone()));
 

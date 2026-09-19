@@ -1,6 +1,6 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use futures::StreamExt;
+use futures_util::StreamExt;
 
 use crate::metrics::OpRecord;
 

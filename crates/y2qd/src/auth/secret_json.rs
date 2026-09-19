@@ -11,7 +11,7 @@ use std::ops::Deref;
 use std::pin::Pin;
 
 use actix_web::{FromRequest, HttpRequest, dev::Payload, http::header};
-use futures::StreamExt;
+use futures_util::StreamExt;
 use serde::de::DeserializeOwned;
 use y2q_core::secmem::SecretVec;
 

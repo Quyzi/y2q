@@ -11,12 +11,12 @@ mod widgets;
 use std::io::stdout;
 use std::time::Duration;
 
-use crossterm::{
+use futures_util::StreamExt;
+use ratatui::crossterm::{
     event::{DisableMouseCapture, EnableMouseCapture, EventStream},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use futures::StreamExt;
 use ratatui::{Terminal, backend::CrosstermBackend};
 use tokio::sync::mpsc;
 use tokio::time::interval;
@@ -63,7 +63,7 @@ pub async fn run_tui(config: CliConfig) -> Result<(), CliError> {
                 }
                 maybe = stream.next() => {
                     let Some(Ok(ev)) = maybe else { break };
-                    use crossterm::event::Event as CEvent;
+                    use ratatui::crossterm::event::Event as CEvent;
                     let mapped = match ev {
                         CEvent::Key(k)       => Event::Key(k),
                         CEvent::Mouse(m)     => Event::Mouse(m),

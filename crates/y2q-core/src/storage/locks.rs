@@ -5,26 +5,27 @@
 //! create orphan-lock risk on `SIGKILL`. With an in-memory registry, all
 //! locks vanish on process exit — no orphan recovery needed.
 //!
-//! Mutual exclusion is provided by [`papaya::HashMap::try_insert`], which is
+//! Mutual exclusion is provided by [`dashmap::DashMap::entry`], which is
 //! atomic across concurrent callers. Each entry maps
 //! `(bucket, key) -> SystemTime` (acquisition time).
 
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use papaya::HashMap;
+use dashmap::DashMap;
+use dashmap::mapref::entry::Entry;
 
 use crate::Error;
 
 /// RAII guard that removes the registry entry on drop, releasing the lock.
 pub(crate) struct LockGuard {
-    map: Arc<HashMap<(String, String), SystemTime>>,
+    map: Arc<DashMap<(String, String), SystemTime>>,
     key: (String, String),
 }
 
 impl Drop for LockGuard {
     fn drop(&mut self) {
-        self.map.pin().remove(&self.key);
+        self.map.remove(&self.key);
     }
 }
 
@@ -33,13 +34,13 @@ impl Drop for LockGuard {
 /// Cheaply cloneable — the underlying map is reference-counted.
 #[derive(Clone)]
 pub(crate) struct LockRegistry {
-    inner: Arc<HashMap<(String, String), SystemTime>>,
+    inner: Arc<DashMap<(String, String), SystemTime>>,
 }
 
 impl LockRegistry {
     pub(crate) fn new() -> Self {
         Self {
-            inner: Arc::new(HashMap::new()),
+            inner: Arc::new(DashMap::new()),
         }
     }
 
@@ -49,15 +50,18 @@ impl LockRegistry {
     pub(crate) fn try_acquire(&self, bucket: &str, key: &str) -> Result<LockGuard, Error> {
         let k = (bucket.to_owned(), key.to_owned());
         let now = SystemTime::now();
-        match self.inner.pin().try_insert(k.clone(), now) {
-            Ok(_) => Ok(LockGuard {
-                map: Arc::clone(&self.inner),
-                key: k,
-            }),
-            Err(e) => Err(Error::Locked {
+        match self.inner.entry(k.clone()) {
+            Entry::Vacant(v) => {
+                v.insert(now);
+                Ok(LockGuard {
+                    map: Arc::clone(&self.inner),
+                    key: k,
+                })
+            }
+            Entry::Occupied(o) => Err(Error::Locked {
                 bucket: bucket.to_owned(),
                 key: key.to_owned(),
-                since: *e.current,
+                since: *o.get(),
             }),
         }
     }
@@ -65,7 +69,7 @@ impl LockRegistry {
     /// Return [`Error::Locked`] if `(bucket, key)` is currently locked.
     pub(crate) fn check_not_locked(&self, bucket: &str, key: &str) -> Result<(), Error> {
         let k = (bucket.to_owned(), key.to_owned());
-        if let Some(&since) = self.inner.pin().get(&k) {
+        if let Some(since) = self.inner.get(&k).map(|r| *r.value()) {
             return Err(Error::Locked {
                 bucket: bucket.to_owned(),
                 key: key.to_owned(),
@@ -77,14 +81,13 @@ impl LockRegistry {
 
     /// List all locks acquired before `older_than` (stuck in-flight PUTs).
     pub(crate) fn list_stale(&self, older_than: SystemTime) -> Vec<StaleLock> {
-        let guard = self.inner.pin();
-        guard
+        self.inner
             .iter()
-            .filter(|(_, since)| **since < older_than)
-            .map(|(k, since)| StaleLock {
-                bucket: k.0.clone(),
-                key: k.1.clone(),
-                locked_since: *since,
+            .filter(|r| *r.value() < older_than)
+            .map(|r| StaleLock {
+                bucket: r.key().0.clone(),
+                key: r.key().1.clone(),
+                locked_since: *r.value(),
             })
             .collect()
     }
@@ -95,15 +98,15 @@ impl LockRegistry {
     /// in-flight operation is not cancelled, but subsequent readers and writers
     /// will no longer see the lock.
     pub(crate) fn clear_stale(&self, older_than: SystemTime) -> u64 {
-        let guard = self.inner.pin();
-        let stale: Vec<(String, String)> = guard
+        let stale: Vec<(String, String)> = self
+            .inner
             .iter()
-            .filter(|(_, since)| **since < older_than)
-            .map(|(k, _)| k.clone())
+            .filter(|r| *r.value() < older_than)
+            .map(|r| r.key().clone())
             .collect();
         let mut removed = 0u64;
         for k in stale {
-            if guard.remove(&k).is_some() {
+            if self.inner.remove(&k).is_some() {
                 removed += 1;
             }
         }
@@ -168,11 +171,8 @@ mod tests {
         let now = SystemTime::now();
         let old_time = now - Duration::from_secs(60);
         reg.inner
-            .pin()
             .insert(("b".to_owned(), "old".to_owned()), old_time);
-        reg.inner
-            .pin()
-            .insert(("b".to_owned(), "fresh".to_owned()), now);
+        reg.inner.insert(("b".to_owned(), "fresh".to_owned()), now);
 
         let cutoff = now - Duration::from_secs(30);
         let stale = reg.list_stale(cutoff);
@@ -181,15 +181,9 @@ mod tests {
 
         let removed = reg.clear_stale(cutoff);
         assert_eq!(removed, 1);
+        assert!(reg.inner.get(&("b".to_owned(), "old".to_owned())).is_none());
         assert!(
             reg.inner
-                .pin()
-                .get(&("b".to_owned(), "old".to_owned()))
-                .is_none()
-        );
-        assert!(
-            reg.inner
-                .pin()
                 .get(&("b".to_owned(), "fresh".to_owned()))
                 .is_some()
         );
@@ -199,9 +193,7 @@ mod tests {
     fn cutoff_boundary_is_strict_less_than() {
         let reg = LockRegistry::new();
         let now = SystemTime::now();
-        reg.inner
-            .pin()
-            .insert(("b".to_owned(), "k".to_owned()), now);
+        reg.inner.insert(("b".to_owned(), "k".to_owned()), now);
         let stale = reg.list_stale(now);
         assert!(stale.is_empty(), "stamp == cutoff must not be reported");
     }

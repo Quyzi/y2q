@@ -2,14 +2,14 @@ use std::collections::{HashMap, VecDeque};
 use std::io::stdout;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind};
-use crossterm::execute;
-use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-};
-use futures::StreamExt;
+use futures_util::StreamExt;
 use ratatui::Frame;
 use ratatui::backend::CrosstermBackend;
+use ratatui::crossterm::event::{Event, EventStream, KeyCode, KeyEventKind};
+use ratatui::crossterm::execute;
+use ratatui::crossterm::terminal::{
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};

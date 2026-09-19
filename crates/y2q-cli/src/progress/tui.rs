@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::io::Write;
 
-use crossterm::{
+use ratatui::crossterm::{
     cursor, execute,
     style::{Color, Print, ResetColor, SetForegroundColor},
     terminal::{Clear, ClearType},
@@ -66,7 +66,7 @@ impl TuiProgressReporter {
 
     fn render(&self, bytes_done: u64, speed_bps: u64) {
         let mut stderr = std::io::stderr();
-        let term_width = crossterm::terminal::size()
+        let term_width = ratatui::crossterm::terminal::size()
             .map(|(w, _)| w as usize)
             .unwrap_or(80)
             .max(30);

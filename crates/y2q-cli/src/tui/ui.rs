@@ -441,10 +441,10 @@ fn render_remote_pane(frame: &mut Frame, area: Rect, app: &mut App) {
     frame.render_widget(block, area);
 
     if app.remote_throbber.active {
-        let throbber = throbber_widgets_tui::Throbber::default()
-            .label(" Connecting…")
-            .style(Style::default().fg(NEON_CYAN));
-        frame.render_stateful_widget(throbber, inner, &mut app.remote_throbber.state);
+        let line = app
+            .remote_throbber
+            .line(" Connecting…", Style::default().fg(NEON_CYAN));
+        frame.render_widget(line, inner);
         return;
     }
 

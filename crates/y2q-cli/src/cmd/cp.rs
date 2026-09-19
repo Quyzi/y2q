@@ -276,27 +276,18 @@ async fn upload_recursive(
 
 /// Walk `dir`, uploading each file with a key relative to `root`.
 async fn upload_dir_files(root: &Path, dir: &Path, ctx: &UploadCtx<'_>) -> Result<(), CliError> {
-    for entry in walkdir::WalkDir::new(dir)
-        .into_iter()
-        .filter_map(|e| match e {
-            Ok(e) => Some(e),
-            Err(err) => {
-                eprintln!("warning: skipping unreadable entry: {err}");
-                None
-            }
-        })
-    {
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        let rel = entry.path().strip_prefix(root).unwrap_or(entry.path());
+    let paths = crate::ops::listing::walk_files(dir, &mut |err| {
+        eprintln!("warning: skipping unreadable entry: {err}");
+    });
+    for path in paths {
+        let rel = path.strip_prefix(root).unwrap_or(&path);
         let rel_str = rel.to_string_lossy().replace('\\', "/");
         let key = if ctx.dst_prefix.is_empty() {
             rel_str.to_owned()
         } else {
             format!("{}/{}", ctx.dst_prefix.trim_end_matches('/'), rel_str)
         };
-        upload_file(entry.path(), &key, ctx).await?;
+        upload_file(&path, &key, ctx).await?;
     }
     Ok(())
 }

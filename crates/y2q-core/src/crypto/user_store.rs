@@ -12,13 +12,13 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use pqcrypto::kem::mlkem768;
 use redb::{Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
 use super::CryptoError;
 use super::kdf::{Argon2Params, WrappedSk};
+use super::kem;
 use crate::secmem::SecretVec;
 
 /// `username` (UTF-8) → JSON-serialized [`UserRecord`].
@@ -106,14 +106,14 @@ impl SlotPayload {
     /// (`"admin"` vs `"readonly"`, `true` vs `false`), which would leak
     /// which role or duress flag a slot carries via its wrapped ciphertext
     /// length even though the payload itself stays encrypted. This encoding
-    /// is exactly `mlkem768::secret_key_bytes() + 2` bytes for every slot,
+    /// is exactly `kem::SECRET_KEY_BYTES + 2` bytes for every slot,
     /// occupied or decoy, real role or not.
     pub fn to_bytes(&self) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
-        if self.identity_sk.len() != mlkem768::secret_key_bytes() {
+        if self.identity_sk.len() != kem::SECRET_KEY_BYTES {
             return Err(CryptoError::Kdf(format!(
                 "identity secret key wrong size: {} (expected {})",
                 self.identity_sk.len(),
-                mlkem768::secret_key_bytes()
+                kem::SECRET_KEY_BYTES
             )));
         }
         let mut out = Zeroizing::new(Vec::with_capacity(self.identity_sk.len() + 2));
@@ -125,14 +125,14 @@ impl SlotPayload {
 
     /// Inverse of [`Self::to_bytes`].
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, CryptoError> {
-        let expected = mlkem768::secret_key_bytes() + 2;
+        let expected = kem::SECRET_KEY_BYTES + 2;
         if bytes.len() != expected {
             return Err(CryptoError::Kdf(format!(
                 "slot payload wrong size: {} (expected {expected})",
                 bytes.len()
             )));
         }
-        let (sk, tail) = bytes.split_at(mlkem768::secret_key_bytes());
+        let (sk, tail) = bytes.split_at(kem::SECRET_KEY_BYTES);
         let role = role_from_byte(tail[0])
             .ok_or_else(|| CryptoError::Kdf(format!("invalid role byte: {}", tail[0])))?;
         Ok(Self {

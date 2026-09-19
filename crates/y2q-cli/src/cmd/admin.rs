@@ -1,6 +1,6 @@
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
-use futures::StreamExt;
+use futures_util::StreamExt;
 use y2q_client::Y2qClient;
 
 use crate::cli::{LocksCmd, RebuildCmd, RekeyCmd};

@@ -169,9 +169,9 @@ in plaintext. The same gap covered:
 - Passwords and bearer tokens in login/refresh request and response
   buffers.
 - The base64 copy of each identity key inside a wrapped credential slot.
-- ML-KEM-768 secret keys and shared secrets `pqcrypto`'s `Copy` key
-  newtypes leave behind after every encapsulate/decapsulate (no `Drop`
-  impl of their own).
+- ML-KEM-768 shared secrets `ml-kem`'s `Copy` `SharedSecret` newtype leaves
+  behind after every encapsulate/decapsulate (no `Drop` impl of its own;
+  the `DecapsulationKey` itself zeroizes automatically on drop).
 - The five node-derived (tier-0) keys, resident for the daemon's entire
   process lifetime.
 
@@ -221,11 +221,12 @@ returned via `Bytes::from_owner`, so the serialized token is scrubbed once
 actix has written it to the socket, rather than left in an unscrubbed
 response buffer.
 
-**`scrub_pod()`** volatile-zeroes `pqcrypto`'s `Copy` key newtypes
-(`mlkem768::SecretKey`, `SharedSecret`) after their last use in every
-encapsulate/decapsulate call site — those types have no `Drop` of their
-own, so without this they're ordinary stack/heap bytes left behind after
-the call returns.
+**`scrub_pod()`** volatile-zeroes `ml-kem`'s `Copy` `SharedSecret` newtype
+after its last use in every encapsulate/decapsulate call site — that type
+has no `Drop` of its own, so without this it's ordinary stack/heap bytes
+left behind after the call returns. The KEM secret key itself
+(`DecapsulationKey`) needs no such treatment: it zeroizes automatically on
+drop.
 
 **`harden_process()`** runs once at boot, before any secret is loaded
 (including the node key): sets `PR_SET_DUMPABLE=0` (blocks same-uid

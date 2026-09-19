@@ -8,10 +8,7 @@ How to run, manage, and recover a `y2qd` deployment. Read this before putting an
    ```sh
    cargo build --release -p y2qd
    ```
-   The io_uring backend is included by default. To build with Pyroscope profiling:
-   ```sh
-   cargo build --release -p y2qd --features pyroscope
-   ```
+   The io_uring backend is included by default.
 
    The workspace `.cargo/config.toml` sets `RUSTFLAGS = -C target-cpu=native`
    and `[profile.release]` enables thin LTO with one codegen unit. This pulls
@@ -85,13 +82,11 @@ Both storage backends are compiled into one image; pick the backend at runtime w
 | Image | Target | Notes |
 |---|---|---|
 | `y2q:latest` | `make image` | Distroless runtime; filesystem + io_uring both compiled in |
-| `y2q:dev` | `make image-dev` | Same, built with `--features pyroscope` for profiling |
 
 Build locally:
 
 ```sh
 make image          # y2q:latest
-make image-dev      # y2q:dev (Pyroscope enabled)
 ```
 
 ### First container run
@@ -356,7 +351,7 @@ It walks the whole storage tree once - re-encrypting every object's metadata sid
 
 ## Write locks
 
-`y2qd` holds an in-memory per-object write lock for the duration of each PUT. Locks live in a `LockRegistry` (a lock-free in-memory hash map). Because locks are in-memory, they vanish on process exit - a SIGKILL or daemon crash leaves no orphaned lock files.
+`y2qd` holds an in-memory per-object write lock for the duration of each PUT. Locks live in a `LockRegistry` (a sharded in-memory hash map). Because locks are in-memory, they vanish on process exit - a SIGKILL or daemon crash leaves no orphaned lock files.
 
 `GET /api/v1/locks?older_than=...` shows locks that are *currently held* and whose acquisition timestamp is older than the cutoff. A lock appearing here means a PUT is actively running and taking longer than expected - this is unusual.
 
@@ -428,20 +423,14 @@ Prometheus scrape endpoint:
 curl https://y2qd.example/metrics/prometheus -H "Authorization: Bearer $TOKEN"
 ```
 
-Interactive dashboard (in-browser):
-
-```
-https://y2qd.example/metrics/dashboard
-```
-
-By default these endpoints are **not served at all** - there is no auth-gated variant. To expose them (without a Bearer token; e.g. for an internal Prometheus scraper):
+By default this endpoint is **not served at all** - there is no auth-gated variant. To expose it (without a Bearer token; e.g. for an internal Prometheus scraper):
 
 ```toml
 [server]
 unauthenticated_metrics = true
 ```
 
-When enabled, `/metrics/prometheus`, `/metrics/dashboard`, `/swagger-ui/`, and `/api-docs/openapi.json` are all reachable unauthenticated. Restrict access at the network layer (or behind your TLS/proxy) if you turn this on. With it `false` (default) the daemon logs that they are disabled at startup.
+When enabled, `/metrics/prometheus` and `/api-docs/openapi.json` are both reachable unauthenticated. Restrict access at the network layer (or behind your TLS/proxy) if you turn this on. With it `false` (default) the daemon logs that they are disabled at startup.
 
 ### Tracing
 
@@ -454,28 +443,6 @@ RUST_LOG=y2qd=trace,y2q_core=trace y2qd          # very loud
 ```
 
 Per-request spans flow through `tracing-actix-web`, so each HTTP request gets a span with method, path, status, and elapsed time. Override via `RUST_LOG=tracing_actix_web=warn` if it's too noisy.
-
-### Continuous profiling (Pyroscope)
-
-Requires building with `--features pyroscope`. Enable in config:
-
-```toml
-[observability.pyroscope]
-enabled    = true
-server_url = "http://localhost:4040"   # or Grafana Cloud endpoint
-sample_rate = 100                       # Hz
-```
-
-For Grafana Cloud add credentials:
-
-```toml
-basic_auth_user     = "123456"   # numeric user ID
-basic_auth_password = "glc_..."  # API token with profiling write scope
-```
-
-The agent starts a background OS thread using SIGPROF before the HTTP server begins accepting connections. On shutdown (SIGTERM / graceful stop) the agent flushes and stops cleanly. Tags `version` and `backend` are attached to every profile.
-
-To profile a running deployment without restarting, rebuild with `--features pyroscope`, set `enabled = true`, and restart. The agent has no effect when `enabled = false` even if the feature is compiled in.
 
 ### Daemon flock
 

@@ -39,17 +39,15 @@
 //! All routes (objects, listing, admin) require a Bearer token. Obtain one
 //! via `POST /api/v1/auth/login` with `{"username": "...", "password": "..."}`.
 //!
-//! # Swagger UI
+//! # OpenAPI document
 //!
-//! Available at `/swagger-ui/` when the server is running. The raw OpenAPI
-//! JSON is served at `/api-docs/openapi.json`. By default both require
-//! authentication; set `[server] unauthenticated_metrics = true` to expose
-//! them without a token.
+//! The raw OpenAPI JSON is served at `/api-docs/openapi.json`. By default it
+//! requires authentication; set `[server] unauthenticated_metrics = true` to
+//! expose it without a token.
 //!
 //! # Metrics
 //!
-//! An interactive dashboard is served at `/metrics/dashboard`. Prometheus
-//! scrape endpoint: `/metrics/prometheus`. Auth-gated by default.
+//! Prometheus scrape endpoint: `/metrics/prometheus`. Auth-gated by default.
 //!
 //! # Logging
 //!
@@ -60,22 +58,15 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-#[cfg(feature = "pyroscope")]
-use pyroscope::backend::{BackendConfig, PprofConfig, pprof_backend};
-#[cfg(feature = "pyroscope")]
-use pyroscope::pyroscope::PyroscopeAgentBuilder;
-
 use actix_web::{App, HttpServer, http::KeepAlive, middleware::from_fn, web};
 use clap::Parser;
 use metrics_exporter_prometheus::Matcher;
-use metrics_rs_dashboard_actix::{DashboardInput, create_metrics_actx_scope};
 use tracing_actix_web::TracingLogger;
 use tracing_subscriber::EnvFilter;
 
 use crate::config::LogFormat;
 use crate::span::Y2qRootSpanBuilder;
 use utoipa::OpenApi;
-use utoipa_swagger_ui::SwaggerUi;
 use y2q_core::crypto::{Argon2Params, keystore as keystore_mod, node_key};
 use y2q_core::{AnyStorage, FilesystemStorage, StorageExt, secmem};
 
@@ -240,12 +231,8 @@ async fn main() -> std::io::Result<()> {
         .expect("failed to load config (config.toml, Y2QD_* env vars, or --set)");
 
     // RUST_LOG takes precedence; fall back to the config-file filter.
-    let log_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        EnvFilter::new(format!(
-            "{},metrics_rs_dashboard_actix=warn",
-            cfg.observability.log_filter
-        ))
-    });
+    let log_filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(cfg.observability.log_filter.clone()));
 
     match cfg.observability.log_format {
         LogFormat::Text => tracing_subscriber::fmt()
@@ -299,43 +286,6 @@ async fn main() -> std::io::Result<()> {
     if cli.upgrade_container_headers {
         return node_key_rotation::upgrade_headers(&cfg).await;
     }
-
-    #[cfg(feature = "pyroscope")]
-    let _pyroscope_agent = {
-        let pcfg = &cfg.observability.pyroscope;
-        if pcfg.enabled {
-            let sample_rate = pcfg.sample_rate;
-            let backend_label = match cfg.storage.backend {
-                config::StorageBackend::Filesystem => "filesystem",
-                config::StorageBackend::Uring => "uring",
-            };
-            let mut builder = PyroscopeAgentBuilder::new(
-                &pcfg.server_url,
-                "y2qd",
-                sample_rate,
-                "pyroscope-rs",
-                env!("CARGO_PKG_VERSION"),
-                pprof_backend(PprofConfig { sample_rate }, BackendConfig::default()),
-            )
-            .tags(vec![
-                ("version", env!("CARGO_PKG_VERSION")),
-                ("backend", backend_label),
-            ]);
-            if let (Some(user), Some(pass)) = (&pcfg.basic_auth_user, &pcfg.basic_auth_password) {
-                builder = builder.basic_auth(user.as_str(), pass.expose());
-            }
-            let agent = builder
-                .build()
-                .map_err(|e| std::io::Error::other(format!("pyroscope build: {e}")))?;
-            let agent_running = agent
-                .start()
-                .map_err(|e| std::io::Error::other(format!("pyroscope start: {e}")))?;
-            tracing::info!(server_url = %pcfg.server_url, sample_rate, "pyroscope profiling started");
-            Some(agent_running)
-        } else {
-            None
-        }
-    };
 
     // Acquire daemon-wide flock on the keystore directory before doing
     // anything else — prevents two y2qd processes from racing over the
@@ -520,6 +470,11 @@ async fn main() -> std::io::Result<()> {
     }
 
     let openapi = ApiDoc::openapi();
+    let openapi_json = web::Data::new(
+        openapi
+            .to_json()
+            .expect("generated OpenAPI document serializes"),
+    );
 
     let trace_hub = web::Data::new(Arc::new(TraceHub::new()));
 
@@ -527,10 +482,31 @@ async fn main() -> std::io::Result<()> {
     let expose_unauthed = cfg.server.unauthenticated_metrics;
     if !expose_unauthed {
         tracing::info!(
-            "metrics dashboard, prometheus scrape, and swagger UI are NOT exposed; \
+            "prometheus scrape and the OpenAPI document are NOT exposed; \
              set [server] unauthenticated_metrics = true to enable them"
         );
     }
+
+    let prometheus = metrics_exporter_prometheus::PrometheusBuilder::new()
+        .set_buckets_for_metric(
+            Matcher::Suffix(observability::PAYLOAD_METRIC_SUFFIX.to_string()),
+            observability::PAYLOAD_BUCKETS_BYTES,
+        )
+        .expect("payload histogram buckets are non-empty and finite")
+        .set_buckets_for_metric(
+            Matcher::Full(observability::DURATION_METRIC_NAME.to_string()),
+            observability::DURATION_BUCKETS_MILLIS,
+        )
+        .expect("duration histogram buckets are non-empty and finite")
+        .set_buckets_for_metric(
+            Matcher::Suffix(observability::STORAGE_DURATION_METRIC_SUFFIX.to_string()),
+            observability::STORAGE_DURATION_BUCKETS_MILLIS,
+        )
+        .expect("storage duration histogram buckets are non-empty and finite")
+        .install_recorder()
+        .expect("failed to install the Prometheus recorder");
+    observability::describe_metrics();
+    let prometheus = web::Data::new(prometheus);
 
     // Extract actix knobs before the move closure captures `cfg`.
     let actix_workers = cfg.server.actix.workers;
@@ -546,32 +522,6 @@ async fn main() -> std::io::Result<()> {
     let actix_shutdown = cfg.server.actix.shutdown_timeout_secs;
 
     let mut server = HttpServer::new(move || {
-        // The dashboard crate installs its own Prometheus recorder on first
-        // call (once per process via once_cell). Custom histogram buckets are
-        // threaded through DashboardInput so the recorder is configured
-        // identically across all worker threads.
-        let dashboard_input = DashboardInput {
-            buckets_for_metrics: vec![
-                (
-                    Matcher::Suffix(observability::PAYLOAD_METRIC_SUFFIX.to_string()),
-                    observability::PAYLOAD_BUCKETS_BYTES,
-                ),
-                (
-                    Matcher::Full(observability::DURATION_METRIC_NAME.to_string()),
-                    observability::DURATION_BUCKETS_MILLIS,
-                ),
-                (
-                    Matcher::Suffix(observability::STORAGE_DURATION_METRIC_SUFFIX.to_string()),
-                    observability::STORAGE_DURATION_BUCKETS_MILLIS,
-                ),
-            ],
-        };
-        let dashboard_scope = create_metrics_actx_scope(&dashboard_input)
-            .expect("failed to create metrics dashboard scope");
-        // describe_* is idempotent; call it here so HELP/TYPE lines appear
-        // in the output as soon as the recorder is installed.
-        observability::describe_metrics();
-
         let mut app = App::new()
             .wrap(from_fn(request_id::request_id_middleware))
             .wrap(TracingLogger::<Y2qRootSpanBuilder>::new())
@@ -585,19 +535,30 @@ async fn main() -> std::io::Result<()> {
             .app_data(rekey_registry.clone())
             .app_data(auth_state.clone())
             .app_data(web::PayloadConfig::new(max_body_bytes));
-        // Swagger UI and metrics dashboard are unauthenticated (actix doesn't
-        // make it easy to wrap third-party scopes with our extractor). Only
-        // register them when the operator has explicitly opted in.
+        // The OpenAPI JSON document and the Prometheus scrape endpoint are
+        // unauthenticated. Only register them when the operator has
+        // explicitly opted in.
         if expose_unauthed {
             app = app
-                .service(
-                    SwaggerUi::new("/swagger-ui/{_:.*}")
-                        .url("/api-docs/openapi.json", openapi.clone()),
-                )
-                // Dashboard scope must be registered before handlers::configure,
-                // which contains the greedy /{bucket}/{tail}* pattern that would
-                // otherwise capture /metrics/dashboard.
-                .service(dashboard_scope);
+                .app_data(prometheus.clone())
+                .app_data(openapi_json.clone())
+                .service(web::resource("/api-docs/openapi.json").route(web::get().to(
+                    |doc: web::Data<String>| async move {
+                        actix_web::HttpResponse::Ok()
+                            .content_type("application/json")
+                            .body(doc.get_ref().clone())
+                    },
+                )))
+                // Must be registered before handlers::configure, which
+                // contains the greedy /{bucket}/{tail}* pattern that would
+                // otherwise capture /metrics/prometheus.
+                .service(web::resource("/metrics/prometheus").route(web::get().to(
+                    |h: web::Data<metrics_exporter_prometheus::PrometheusHandle>| async move {
+                        actix_web::HttpResponse::Ok()
+                            .content_type("text/plain; version=0.0.4; charset=utf-8")
+                            .body(h.render())
+                    },
+                )));
         }
         app.configure(handlers::configure)
     });
@@ -669,17 +630,7 @@ async fn main() -> std::io::Result<()> {
         server.bind(bind_addr)?
     };
 
-    let result = server.run().await;
-
-    #[cfg(feature = "pyroscope")]
-    if let Some(agent_running) = _pyroscope_agent {
-        match agent_running.stop() {
-            Ok(agent_ready) => agent_ready.shutdown(),
-            Err(e) => tracing::warn!(error = %e, "pyroscope stop failed"),
-        }
-    }
-
-    result
+    server.run().await
 }
 
 /// Guarantee at least one administrator exists after loading the user store.

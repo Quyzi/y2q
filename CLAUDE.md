@@ -35,7 +35,6 @@ binaries. Do not use it to read, search, or mutate source.
 ```bash
 cargo build -p y2qd                           # debug build
 cargo build --release -p y2qd                 # release build
-cargo build -p y2qd --features pyroscope      # with Pyroscope continuous profiling
 cargo run -p y2qd -- --config config.toml     # run daemon
 cargo test                                     # run all tests
 cargo test <name>                              # run by name or module path
@@ -47,12 +46,6 @@ make check                                     # fmt-check + clippy + test (CI g
 The io_uring storage backend is always compiled on Linux (no feature flag). On
 non-Linux targets it is absent and selecting `storage.backend = "uring"` returns
 a runtime error.
-
-## Cargo features (`y2qd`)
-
-| Feature | Default | Notes |
-|---|---|---|
-| `pyroscope` | no | Pyroscope continuous profiling via pprof-rs. Enable for profiling sessions. |
 
 ## Required checks after any code change
 
@@ -74,8 +67,8 @@ Rules:
 
 - Daemon entry: `crates/y2qd/src/main.rs`
 - Config: `figment` (TOML + `Y2QD_*` env vars + `--set` flags); reference: `config.default.toml`
-- Crypto: `pqcrypto` for ML-KEM-768; `aes-gcm` (RustCrypto) for AES-256-GCM
+- Crypto: `ml-kem` (RustCrypto) for ML-KEM-768; `aes-gcm` (RustCrypto) for AES-256-GCM
 - Storage: `FilesystemStorage` (default) or `UringStorage` (Linux only, always compiled in)
 - Errors: `thiserror` typed enums — no `anyhow` or `Box<dyn Error>`
-- Observability: `tracing` spans/events, Prometheus via `metrics` crate, optional Pyroscope profiling
+- Observability: `tracing` spans/events, Prometheus via `metrics` crate
 - Full docs: `docs/` (architecture.md, configuration.md, operations.md, api.md)

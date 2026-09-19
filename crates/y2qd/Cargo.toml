@@ -5,10 +5,6 @@ edition = "2024"
 
 [features]
 default = []
-# Continuous profiling via Grafana Pyroscope / pprof-rs. Opt-in — enable with
-# `--features pyroscope` for profiling sessions. Requires a running Pyroscope
-# server or Grafana Cloud endpoint.
-pyroscope = ["dep:pyroscope"]
 
 [dependencies]
 actix-governor              = { workspace = true }
@@ -19,30 +15,20 @@ clap                        = { workspace = true }
 dashmap                     = { workspace = true }
 figment                     = { workspace = true }
 flume                       = { workspace = true }
-futures                     = { workspace = true }
-governor                    = { workspace = true }
+futures-util                = { workspace = true }
 metrics                     = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
-metrics-rs-dashboard-actix  = { workspace = true }
-parking_lot                 = { workspace = true }
-pqcrypto                    = { workspace = true }
-pqcrypto-traits             = { workspace = true }
-pyroscope                   = { version = "2.0.0", features = ["backend-pprof-rs"], optional = true }
 rand                        = { workspace = true }
 rustls                      = { workspace = true }
-rustls-pemfile              = { workspace = true }
 serde                       = { workspace = true }
 serde_json                  = { workspace = true }
 sha2                        = { workspace = true }
-subtle                      = { workspace = true }
 thiserror                   = { workspace = true }
 tokio                       = { workspace = true }
 tracing                     = { workspace = true }
 tracing-actix-web           = { workspace = true }
 tracing-subscriber          = { workspace = true }
 utoipa                      = { workspace = true }
-utoipa-swagger-ui           = { workspace = true }
-uuid                        = { workspace = true }
 y2q-core                    = { path = "../y2q-core" }
 zeroize                     = { workspace = true }
 

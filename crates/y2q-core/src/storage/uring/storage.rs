@@ -210,7 +210,6 @@ impl UringStorage {
         self.pool
             .dispatch_for_key(bucket, key)
             .send(op)
-            .await
             .map_err(|_| Error::InternalError {
                 bucket: bucket.to_owned(),
                 key: key.to_owned(),
@@ -277,7 +276,6 @@ impl UringStorage {
                 self.pool
                     .dispatch_for_key(bucket, key)
                     .send(op)
-                    .await
                     .map_err(|_| Error::InternalError {
                         bucket: bucket.to_owned(),
                         key: key.to_owned(),
@@ -315,7 +313,6 @@ impl UringStorage {
             placeholder,
             reply,
         })
-        .await
         .map_err(|_| Error::InternalError {
             bucket: bucket.to_owned(),
             key: key.to_owned(),
@@ -800,7 +797,7 @@ async fn run_rebuild(
                 chk,
                 reply,
             };
-            if let Err(e) = sender.send(op).await {
+            if let Err(e) = sender.send(op) {
                 return Err(format!("worker pool closed mid-rebuild: {e}"));
             }
             receivers.push(reply_rx);
