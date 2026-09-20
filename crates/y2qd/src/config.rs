@@ -27,6 +27,9 @@ pub struct Config {
     /// Logging and metrics settings.
     #[serde(default)]
     pub observability: ObservabilityConfig,
+    /// S3-compatible gateway listener settings. Disabled by default.
+    #[serde(default)]
+    pub s3: S3Config,
 }
 
 /// Log output format.
@@ -187,7 +190,7 @@ pub struct ServerConfig {
 /// When `client_ca_path` is set, the daemon requires every client to present
 /// a certificate chained to the bundled CA(s) — mutual TLS. Otherwise the
 /// daemon accepts any client without certificate verification.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct TlsConfig {
     /// Whether to bind HTTPS instead of plain HTTP. Default: false.
     #[serde(default)]
@@ -225,6 +228,107 @@ impl Default for TlsConfig {
             key_path: None,
             client_ca_path: None,
             require_pq_kex: default_require_pq_kex(),
+        }
+    }
+}
+
+/// S3-compatible gateway listener. Disabled by default.
+///
+/// Each S3 request resolves through the same [`crate::auth`] session store as
+/// the REST listener: minted credentials are bound to a live session and can
+/// never outlive it. See `crates/y2qd/src/s3/mod.rs` for the gateway itself.
+#[derive(Debug, Deserialize, Clone)]
+pub struct S3Config {
+    /// Whether the second S3 listener binds at all. Default: false.
+    #[serde(default)]
+    pub enabled: bool,
+    /// IP address for the S3 listener to bind.
+    #[serde(default = "default_s3_host")]
+    pub host: String,
+    /// TCP port for the S3 listener.
+    #[serde(default = "default_s3_port")]
+    pub port: u16,
+    /// SigV4 credential-scope region. Must match what clients configure.
+    #[serde(default = "default_s3_region")]
+    pub region: String,
+    /// Base domain for virtual-hosted-style addressing (`<bucket>.<domain>`).
+    /// Empty (default) accepts path-style addressing only.
+    #[serde(default)]
+    pub virtual_host_domain: String,
+    /// Default lifetime for a minted S3 credential when the mint request
+    /// omits `ttl_seconds`. Always clamped to the owning session's own
+    /// expiry, whichever is sooner.
+    #[serde(default = "default_s3_credential_ttl_seconds")]
+    pub default_credential_ttl_seconds: u64,
+    /// Maximum number of live S3 credentials a single session may hold;
+    /// minting past this FIFO-evicts the session's oldest credential.
+    #[serde(default = "default_s3_max_credentials_per_session")]
+    pub max_credentials_per_session: usize,
+    /// Re-validate the session after this many transferred bytes.
+    #[serde(default = "default_s3_session_recheck_bytes")]
+    pub session_recheck_bytes: u64,
+    /// Re-validate the session at least this often during a transfer.
+    #[serde(default = "default_s3_session_recheck_interval_secs")]
+    pub session_recheck_interval_secs: u64,
+    /// Maximum accepted `X-Amz-Date` deviation from server time, in seconds.
+    #[serde(default = "default_s3_max_clock_skew_secs")]
+    pub max_clock_skew_secs: u64,
+    /// Maximum bytes accepted for a single multipart upload part.
+    #[serde(default = "default_s3_max_part_bytes")]
+    pub max_part_bytes: u64,
+    /// Permit binding a non-loopback address while `[s3.tls] enabled` is
+    /// false. Same rationale as [`ServerConfig::allow_insecure_bind`].
+    #[serde(default)]
+    pub allow_insecure_bind: bool,
+    /// TLS (HTTPS) settings for the S3 listener. Disabled by default.
+    #[serde(default)]
+    pub tls: TlsConfig,
+}
+
+fn default_s3_host() -> String {
+    "127.0.0.1".to_string()
+}
+fn default_s3_port() -> u16 {
+    9000
+}
+fn default_s3_region() -> String {
+    "y2q".to_string()
+}
+fn default_s3_credential_ttl_seconds() -> u64 {
+    3600
+}
+fn default_s3_max_credentials_per_session() -> usize {
+    4
+}
+fn default_s3_session_recheck_bytes() -> u64 {
+    8 * 1024 * 1024
+}
+fn default_s3_session_recheck_interval_secs() -> u64 {
+    5
+}
+fn default_s3_max_clock_skew_secs() -> u64 {
+    900
+}
+fn default_s3_max_part_bytes() -> u64 {
+    64 * 1024 * 1024
+}
+
+impl Default for S3Config {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            host: default_s3_host(),
+            port: default_s3_port(),
+            region: default_s3_region(),
+            virtual_host_domain: String::new(),
+            default_credential_ttl_seconds: default_s3_credential_ttl_seconds(),
+            max_credentials_per_session: default_s3_max_credentials_per_session(),
+            session_recheck_bytes: default_s3_session_recheck_bytes(),
+            session_recheck_interval_secs: default_s3_session_recheck_interval_secs(),
+            max_clock_skew_secs: default_s3_max_clock_skew_secs(),
+            max_part_bytes: default_s3_max_part_bytes(),
+            allow_insecure_bind: false,
+            tls: TlsConfig::default(),
         }
     }
 }
@@ -319,6 +423,9 @@ fn default_lockout_seconds() -> u64 {
 fn default_enforce_authorization() -> bool {
     true
 }
+fn default_max_refreshes() -> u32 {
+    0
+}
 
 /// User authentication / session settings.
 #[derive(Debug, Deserialize, Clone)]
@@ -351,6 +458,15 @@ pub struct AuthConfig {
     /// migration deployments only.
     #[serde(default = "default_enforce_authorization")]
     pub enforce_authorization: bool,
+    /// Maximum number of times a session's token may be refreshed via `POST
+    /// /api/v1/auth/refresh` before the refresh operation is rejected with
+    /// 403. `0` (the default) disables refresh entirely — the first refresh
+    /// attempt on any token is rejected. Rejection only denies further
+    /// refreshing; a token that has hit its limit keeps authenticating
+    /// normally for every other endpoint until it naturally expires, so
+    /// extending access indefinitely always requires a fresh login.
+    #[serde(default = "default_max_refreshes")]
+    pub max_refreshes: u32,
 }
 
 fn default_max_labels() -> usize {
@@ -560,6 +676,9 @@ impl Config {
         validate_envelope_chunk_size(cfg.crypto.envelope_chunk_size_bytes)
             .map_err(|msg| Box::new(figment::Error::from(msg)))?;
 
+        validate_s3(&cfg.s3, cfg.server.max_body_bytes)
+            .map_err(|msg| Box::new(figment::Error::from(msg)))?;
+
         if cfg.crypto.node_key_file.trim().is_empty() && std::env::var("Y2QD_NODE_KEY").is_err() {
             return Err(Box::new(figment::Error::from(
                 "[crypto] node_key_file or Y2QD_NODE_KEY is required; generate one with \
@@ -582,6 +701,43 @@ fn validate_envelope_chunk_size(chunk: usize) -> Result<(), String> {
              must be between {ENVELOPE_CHUNK_SIZE_MIN} and {ENVELOPE_CHUNK_SIZE_MAX} bytes"
         ))
     }
+}
+
+/// Enforce `[s3]` configuration invariants.
+///
+/// `region` and `max_part_bytes` are checked unconditionally (cheap, and
+/// wrong either way regardless of whether the gateway is enabled); every
+/// other knob is only checked when `[s3] enabled = true`, so a deployment
+/// that never sets `[s3]` at all never fails to start over defaults it
+/// doesn't use.
+fn validate_s3(cfg: &S3Config, server_max_body_bytes: usize) -> Result<(), String> {
+    if cfg.region.trim().is_empty() {
+        return Err("[s3] region must not be empty".to_string());
+    }
+    if cfg.max_part_bytes < 5 * 1024 * 1024 {
+        return Err(
+            "[s3] max_part_bytes must be at least 5242880 (S3 minimum part size)".to_string(),
+        );
+    }
+    if cfg.max_part_bytes > server_max_body_bytes as u64 {
+        return Err("[s3] max_part_bytes must not exceed [server] max_body_bytes".to_string());
+    }
+    if !cfg.enabled {
+        return Ok(());
+    }
+    if cfg.session_recheck_bytes < 64 * 1024 {
+        return Err("[s3] session_recheck_bytes must be at least 65536".to_string());
+    }
+    if cfg.session_recheck_interval_secs == 0 {
+        return Err("[s3] session_recheck_interval_secs must be at least 1".to_string());
+    }
+    if cfg.max_clock_skew_secs == 0 {
+        return Err("[s3] max_clock_skew_secs must be at least 1".to_string());
+    }
+    if !cfg.virtual_host_domain.is_empty() && cfg.virtual_host_domain.starts_with('.') {
+        return Err("[s3] virtual_host_domain must not start with a dot".to_string());
+    }
+    Ok(())
 }
 
 /// Encryption parameters registered as actix `web::Data` so the PUT handler can

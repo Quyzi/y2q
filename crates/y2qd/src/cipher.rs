@@ -133,7 +133,9 @@ pub fn decrypt_v4_chunks(
 /// Stream-encrypt a PUT payload directly to `file` using the v3 chunked
 /// envelope format, computing plaintext checksums along the way.
 ///
-/// Consumes chunks from `stream` (an `actix_web::web::Payload`), feeds them
+/// Consumes chunks from `stream` — an `actix_web::web::Payload` for a plain
+/// PUT, or an S3 upload adapter chain (`aws-chunked` decoding, checksum
+/// verification, session-leash re-checks) for the S3 gateway — feeds them
 /// through AES-256-GCM in `chunk_size`-byte plaintext chunks, and writes each
 /// encrypted chunk to `file`. Returns the file handle (for the caller to pass to
 /// [`AnyStreamingPutGuard::commit`]), plus the plaintext metrics and cipher
@@ -158,7 +160,7 @@ pub fn decrypt_v4_chunks(
 pub async fn stream_encrypt_for_put(
     bucket_pk: &[u8],
     key_epoch: u32,
-    mut stream: actix_web::web::Payload,
+    mut stream: impl futures_util::Stream<Item = Result<Bytes, AppError>> + Unpin,
     sink: StreamingSink,
     bucket: &str,
     key: &str,
@@ -189,14 +191,7 @@ pub async fn stream_encrypt_for_put(
     let mut plaintext_size: u64 = 0;
 
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| {
-            AppError(y2q_core::Error::InternalError {
-                bucket: bucket.to_owned(),
-                key: key.to_owned(),
-                operation: "read body".to_owned(),
-                message: e.to_string(),
-            })
-        })?;
+        let chunk = chunk?;
         hasher.update(&chunk);
         plaintext_size += chunk.len() as u64;
         if let Some(limit) = max_bytes
@@ -311,6 +306,191 @@ pub async fn encrypt_bytes_for_put(
     Ok((sink, plaintext_metrics, cipher_metadata))
 }
 
+/// AES-256-GCM authentication tag length appended to each v3/v4 chunk on disk.
+const CHUNK_TAG_LEN: u64 = 16;
+
+/// Geometry parsed from an object's envelope preamble, shared by every chunk
+/// [`plaintext_stream`] fetches.
+struct StreamGeometry {
+    preamble: Bytes,
+    chunk_size: u64,
+    /// `Some(total_chunks)` for a v4 envelope (needed for the final-chunk AAD
+    /// marker), `None` for legacy v3.
+    v4_total_chunks: Option<u64>,
+}
+
+/// State machine driving [`plaintext_stream`]'s [`futures_util::stream::try_unfold`].
+struct StreamState {
+    storage: std::sync::Arc<y2q_core::AnyStorage>,
+    bucket: String,
+    key: String,
+    md: y2q_core::Metadata,
+    bucket_sk: y2q_core::secmem::SecretVec,
+    start: u64,
+    end: u64,
+    /// `None` until the preamble has been fetched and geometry parsed.
+    geometry: Option<StreamGeometry>,
+    /// Next chunk index to fetch. Meaningless until `geometry` is `Some`.
+    cur: u64,
+}
+
+/// Stream the plaintext of `[start, end]` (inclusive, plaintext byte offsets)
+/// of an object, decrypting one envelope chunk at a time so peak memory is
+/// one chunk rather than the whole object.
+///
+/// `md` must be the object's trusted metadata (it supplies the authenticated
+/// plaintext size and `cipher_size`); `bucket_sk` must already be resolved
+/// for `md.key_epoch`. Callers must validate `start <= end < md.size`
+/// themselves (e.g. as `handlers::get::handle` already does) — this function
+/// does not re-derive the 416 Range Not Satisfiable decision.
+///
+/// Handles v4 (current) and v3 (legacy, read-only) envelopes with the same
+/// chunk arithmetic `handlers::get` uses; any other version yields
+/// [`y2q_core::Error::UnsupportedEnvelopeVersion`].
+pub fn plaintext_stream(
+    storage: std::sync::Arc<y2q_core::AnyStorage>,
+    bucket: String,
+    key: String,
+    md: y2q_core::Metadata,
+    bucket_sk: y2q_core::secmem::SecretVec,
+    start: u64,
+    end: u64,
+) -> impl futures_util::Stream<Item = Result<Bytes, AppError>> + Unpin {
+    use y2q_core::Storage;
+
+    let state = StreamState {
+        storage,
+        bucket,
+        key,
+        md,
+        bucket_sk,
+        start,
+        end,
+        geometry: None,
+        cur: 0,
+    };
+    Box::pin(futures_util::stream::try_unfold(
+        state,
+        move |mut state| async move {
+            // Lazily fetch the preamble and parse geometry on the first poll.
+            if state.geometry.is_none() {
+                let preamble_len = envelope::v3_preamble_len() as u64;
+                let preamble = state
+                    .storage
+                    .get_range(&state.bucket, &state.key, (0..=preamble_len - 1).into())
+                    .await
+                    .map_err(AppError::from)?;
+                let (chunk_size, v4_total_chunks) = match state.md.envelope_version {
+                    Some(3) => {
+                        let (_epoch, chunk_size_u32, _) = envelope::parse_v3_geometry(&preamble)
+                            .map_err(|_| {
+                                AppError(y2q_core::Error::EnvelopeMalformed {
+                                    bucket: state.bucket.clone(),
+                                    key: state.key.clone(),
+                                    reason: "bad v3 header".to_owned(),
+                                })
+                            })?;
+                        (chunk_size_u32 as u64, None)
+                    }
+                    Some(4) => {
+                        let (_epoch, chunk_size_u32, _) = envelope::parse_v4_geometry(&preamble)
+                            .map_err(|_| {
+                                AppError(y2q_core::Error::EnvelopeMalformed {
+                                    bucket: state.bucket.clone(),
+                                    key: state.key.clone(),
+                                    reason: "bad v4 header".to_owned(),
+                                })
+                            })?;
+                        let chunk_size = chunk_size_u32 as u64;
+                        let total_chunks = envelope::padme_len(state.md.size).div_ceil(chunk_size);
+                        (chunk_size, Some(total_chunks))
+                    }
+                    other => {
+                        return Err(AppError(y2q_core::Error::UnsupportedEnvelopeVersion {
+                            version: other.unwrap_or(0),
+                        }));
+                    }
+                };
+                state.cur = state.start / chunk_size;
+                state.geometry = Some(StreamGeometry {
+                    preamble,
+                    chunk_size,
+                    v4_total_chunks,
+                });
+            }
+
+            let geometry = state.geometry.as_ref().expect("just initialized above");
+            let chunk_size = geometry.chunk_size;
+            let last = state.end / chunk_size;
+            if state.cur > last {
+                return Ok(None);
+            }
+
+            let preamble_len = geometry.preamble.len() as u64;
+            let stride = chunk_size + CHUNK_TAG_LEN;
+            let cipher_start = preamble_len + state.cur * stride;
+            let cipher_end_calc = preamble_len + (state.cur + 1) * stride - 1;
+            let cipher_end = match state.md.cipher_size {
+                Some(cs) => cipher_end_calc.min(cs - 1),
+                None => cipher_end_calc,
+            };
+            let window = state
+                .storage
+                .get_range(
+                    &state.bucket,
+                    &state.key,
+                    (cipher_start..=cipher_end).into(),
+                )
+                .await
+                .map_err(AppError::from)?;
+            // The backend must return exactly the requested range; a short read
+            // means the on-disk object is smaller than the trusted metadata says
+            // it should be (truncated after the fact) — never surface that as a
+            // silently short body.
+            if window.len() as u64 != cipher_end - cipher_start + 1 {
+                return Err(AppError(y2q_core::Error::EnvelopeMalformed {
+                    bucket: state.bucket.clone(),
+                    key: state.key.clone(),
+                    reason: "on-disk object shorter than recorded metadata".to_owned(),
+                }));
+            }
+
+            let chunk_pt = match geometry.v4_total_chunks {
+                Some(total_chunks) => decrypt_v4_chunks(
+                    &state.bucket_sk,
+                    &state.bucket,
+                    &state.key,
+                    &geometry.preamble,
+                    &window,
+                    state.cur,
+                    total_chunks,
+                )?,
+                None => decrypt_v3_chunks(
+                    &state.bucket_sk,
+                    &state.bucket,
+                    &state.key,
+                    &geometry.preamble,
+                    &window,
+                    state.cur,
+                )?,
+            };
+
+            let chunk_pt_start_abs = state.cur * chunk_size;
+            let trim_front = state.start.saturating_sub(chunk_pt_start_abs) as usize;
+            let last_valid_idx = chunk_pt.len().saturating_sub(1);
+            let trim_back_idx = if state.cur == last {
+                ((state.end - chunk_pt_start_abs) as usize).min(last_valid_idx)
+            } else {
+                last_valid_idx
+            };
+            let out = Bytes::from(chunk_pt).slice(trim_front..=trim_back_idx);
+
+            state.cur += 1;
+            Ok(Some((out, state)))
+        },
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -349,10 +529,18 @@ mod tests {
         pk: web::Data<Vec<u8>>,
     ) -> Result<HttpResponse, AppError> {
         let sink = tempfile_sink().await;
+        let mapped = futures_util::TryStreamExt::map_err(payload, |e| {
+            AppError(y2q_core::Error::InternalError {
+                bucket: "bucket".to_owned(),
+                key: "key".to_owned(),
+                operation: "read body".to_owned(),
+                message: e.to_string(),
+            })
+        });
         let (_, _, _) = stream_encrypt_for_put(
             &pk,
             0,
-            payload,
+            mapped,
             sink,
             "bucket",
             "key",

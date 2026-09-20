@@ -146,6 +146,13 @@ pub struct SessionInfo {
     /// sealed under `keyring` and bound to `token_hash`. Never plaintext at
     /// rest; see [`SessionInfo::with_identity_sk`].
     identity_sk: SealedSecret,
+    /// Number of times this session's token has been refreshed via `POST
+    /// /api/v1/auth/refresh`, carried forward across reissues (and
+    /// preserved, not reset, by a duress `switch_user_to_persona`). Checked
+    /// against `[auth] max_refreshes` in `reissue`; a token that has hit
+    /// the limit keeps working for every other endpoint until it naturally
+    /// expires, it just can't be extended further.
+    pub refresh_count: u32,
     /// SHA-256 of this session's bearer token. Part of the AAD binding
     /// `identity_sk` (and every entry in `bucket_keys`) to this exact row —
     /// a sealed blob copied onto a different session's row fails to open.
@@ -169,6 +176,7 @@ impl std::fmt::Debug for SessionInfo {
             .field("persona", &self.persona)
             .field("revoke_other_sessions", &self.revoke_other_sessions)
             .field("identity_sk", &"<redacted>")
+            .field("refresh_count", &self.refresh_count)
             .finish_non_exhaustive()
     }
 }
@@ -246,6 +254,13 @@ impl SessionStore {
         })
     }
 
+    /// The store's process-ephemeral wrapping key, shared with the S3
+    /// credential store so an S3 secret is sealed under the same key as the
+    /// session's identity key.
+    pub fn keyring(&self) -> Arc<SessionKeyring> {
+        Arc::clone(&self.keyring)
+    }
+
     /// Seal `s`'s identity secret key and insert a fresh session, returning
     /// the wire-form token to hand to the client.
     pub fn insert(&self, s: NewSession) -> Result<SessionToken, AuthError> {
@@ -262,6 +277,7 @@ impl SessionStore {
             persona: s.persona,
             revoke_other_sessions: s.revoke_other_sessions,
             identity_sk,
+            refresh_count: 0,
             token_hash,
             keyring: Arc::clone(&self.keyring),
             bucket_keys: Mutex::new(BucketKeyCache::default()),
@@ -274,16 +290,27 @@ impl SessionStore {
     /// identity key (re-sealed under the new token hash) and role/persona
     /// forward, with a new `expires_at`. Revokes the old token. Never
     /// materializes the identity key outside guarded memory.
+    ///
+    /// Rejects with [`AuthError::RefreshLimitExceeded`] once the token has
+    /// already been refreshed `max_refreshes` times (so `max_refreshes = 0`,
+    /// the default, disables refresh entirely: the very first attempt is
+    /// rejected). Rejection only denies the refresh operation itself — the
+    /// old token is left exactly as it was and keeps working for every
+    /// other endpoint until it naturally expires.
     pub fn reissue(
         &self,
         old_hash: &[u8; 32],
         expires_at: SystemTime,
+        max_refreshes: u32,
     ) -> Result<SessionToken, AuthError> {
         let old = self
             .inner
             .get(old_hash)
             .map(|r| r.value().clone())
             .ok_or(AuthError::TokenInvalid)?;
+        if old.refresh_count >= max_refreshes {
+            return Err(AuthError::RefreshLimitExceeded);
+        }
         let sk = old.open_identity_sk()?;
 
         let token = SessionToken::random();
@@ -299,6 +326,7 @@ impl SessionStore {
             persona: old.persona,
             revoke_other_sessions: old.revoke_other_sessions,
             identity_sk,
+            refresh_count: old.refresh_count + 1,
             token_hash: new_hash,
             keyring: Arc::clone(&self.keyring),
             bucket_keys: Mutex::new(BucketKeyCache::default()),
@@ -399,6 +427,7 @@ impl SessionStore {
                 persona: new_persona,
                 revoke_other_sessions: new_revoke_other_sessions,
                 identity_sk: sealed,
+                refresh_count: old.refresh_count,
                 token_hash: k,
                 keyring: Arc::clone(&self.keyring),
                 bucket_keys: Mutex::new(BucketKeyCache::default()),
@@ -521,6 +550,58 @@ mod tests {
             s.get_active(&token.hash()),
             Err(AuthError::TokenInvalid)
         ));
+    }
+
+    #[test]
+    fn reissue_enforces_refresh_limit() {
+        let s = SessionStore::new().unwrap();
+        let future = SystemTime::now() + Duration::from_secs(60);
+        let token = s
+            .insert(new_session("alice", 0, future, &[0u8; 8]))
+            .unwrap();
+        let hash = token.hash();
+
+        // max_refreshes = 0 (the default) rejects the very first attempt,
+        // and the rejected attempt does not disturb the original token.
+        assert!(matches!(
+            s.reissue(&hash, future, 0),
+            Err(AuthError::RefreshLimitExceeded)
+        ));
+        assert!(s.get_active(&hash).is_ok());
+
+        // max_refreshes = 2 allows exactly two successful refreshes, then
+        // rejects the third attempt while leaving the still-live token
+        // from the second refresh untouched.
+        let token2 = s.reissue(&hash, future, 2).unwrap();
+        assert!(matches!(s.get_active(&hash), Err(AuthError::TokenInvalid)));
+        let hash2 = token2.hash();
+        let token3 = s.reissue(&hash2, future, 2).unwrap();
+        let hash3 = token3.hash();
+        assert!(matches!(
+            s.reissue(&hash3, future, 2),
+            Err(AuthError::RefreshLimitExceeded)
+        ));
+        assert!(s.get_active(&hash3).is_ok());
+    }
+
+    #[test]
+    fn switch_user_to_persona_preserves_refresh_count() {
+        let s = SessionStore::new().unwrap();
+        let future = SystemTime::now() + Duration::from_secs(60);
+        let token = s
+            .insert(new_session("alice", 0, future, &[0u8; 8]))
+            .unwrap();
+        let refreshed = s.reissue(&token.hash(), future, 5).unwrap();
+        let hash = refreshed.hash();
+        assert_eq!(s.get_active(&hash).unwrap().refresh_count, 1);
+
+        let duress_sk = SecretVec::from_slice(&[9u8; 8]).unwrap();
+        s.switch_user_to_persona("alice", 1, Role::ReadOnly, true, &duress_sk);
+
+        // The duress swap replaced the row in place (same token still
+        // authenticates) but must not reset the refresh budget: it isn't a
+        // refresh, so it shouldn't grant a free one back.
+        assert_eq!(s.get_active(&hash).unwrap().refresh_count, 1);
     }
 
     #[test]

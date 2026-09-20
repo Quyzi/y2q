@@ -112,6 +112,21 @@ pub enum AuthError {
     /// `web::Data<AuthState>` was not registered. Programmer error.
     #[error("internal: auth state not configured")]
     InternalState,
+
+    /// `DELETE /api/v1/s3/credentials/{id}` for an access key id that does
+    /// not exist or is not owned by the caller's session. Identical message
+    /// for both cases so the endpoint cannot be used to enumerate other
+    /// sessions' access key ids.
+    #[error("invalid credential")]
+    S3CredentialUnknown,
+
+    /// `POST /api/v1/auth/refresh` for a token that has already been
+    /// refreshed `[auth] max_refreshes` times. The token itself is
+    /// otherwise still live and keeps working for every other endpoint
+    /// until it naturally expires; only the refresh operation is denied,
+    /// forcing a fresh login (full password re-auth) to extend further.
+    #[error("refresh limit exceeded; log in again to continue")]
+    RefreshLimitExceeded,
 }
 
 impl ResponseError for AuthError {
@@ -121,7 +136,10 @@ impl ResponseError for AuthError {
             | AuthError::TokenMissing
             | AuthError::TokenInvalid
             | AuthError::TokenExpired => StatusCode::UNAUTHORIZED,
-            AuthError::Forbidden | AuthError::AccountDisabled => StatusCode::FORBIDDEN,
+            AuthError::Forbidden
+            | AuthError::AccountDisabled
+            | AuthError::S3CredentialUnknown
+            | AuthError::RefreshLimitExceeded => StatusCode::FORBIDDEN,
             AuthError::LockedOut { .. } => StatusCode::TOO_MANY_REQUESTS,
             AuthError::TtlOutOfRange { .. }
             | AuthError::InvalidUsername { .. }
@@ -222,6 +240,7 @@ mod tests {
                 S::BAD_REQUEST,
             ),
             (AuthError::RoleExceedsAccount, S::BAD_REQUEST),
+            (AuthError::RefreshLimitExceeded, S::FORBIDDEN),
             (AuthError::PasswordReused, S::CONFLICT),
         ];
         for (err, code) in cases {

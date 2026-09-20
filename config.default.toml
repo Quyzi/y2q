@@ -253,6 +253,86 @@ lockout_seconds = 900  # 15 minutes
 # deployment where every authenticated user should have full access.
 enforce_authorization = true
 
+# Maximum number of times a session's token may be refreshed via
+# POST /api/v1/auth/refresh before the refresh operation itself starts
+# being rejected with 403. 0 (default) disables refresh entirely: the very
+# first refresh attempt on any token is rejected. A token that has hit its
+# limit is NOT revoked — it keeps authenticating normally for every other
+# endpoint until it naturally expires; only further refreshing is denied,
+# so a session's total lifetime can never be extended past
+# default_ttl_seconds * (max_refreshes + 1) without a fresh login (each
+# refresh grants a fresh default_ttl_seconds window, not ttl_seconds — the
+# refresh endpoint takes no body).
+max_refreshes = 0
+
+# ---------------------------------------------------------------------------
+# [s3] — optional S3-compatible gateway (second listener, disabled by default)
+#
+# When enabled, y2qd binds a second listener speaking AWS S3 REST semantics
+# (SigV4 auth, XML bodies, ranged GET, multipart upload, tagging, delimiter
+# listings) in addition to the native REST API on [server]. Every S3 request
+# still resolves to a live session through the same SessionStore as the REST
+# listener, so logout, expiry, revocation, and duress persona switches all
+# take effect on the S3 surface immediately, mid-transfer included.
+#
+# There is no password authentication on this listener at all: S3 access
+# uses temporary credentials (access key id / secret access key) minted over
+# the authenticated REST API via POST /api/v1/s3/credentials. A minted
+# credential's expiry is always clamped to its owning session's expiry — it
+# can never outlive the session that minted it.
+#
+# region must match what S3 clients are configured with; a mismatch fails
+# the request rather than silently accepting it. virtual_host_domain = ""
+# (default) accepts only path-style addressing (http://host:port/bucket/key);
+# set it to a base domain (e.g. "s3.example.com") to also accept
+# virtual-hosted addressing (http://bucket.s3.example.com/key).
+#
+# Only CRC32 and SHA256 are supported for x-amz-checksum-* / aws-chunked
+# trailer checksums; other algorithms are rejected with 400 rather than
+# silently unverified (set AWS_REQUEST_CHECKSUM_CALCULATION=when_required on
+# aws-cli/boto3 clients that default to an unsupported one). Content-MD5 is
+# accepted but not verified — the body is already covered by TLS in transit
+# and per-chunk AEAD tags at rest, and MD5 is not a workspace dependency.
+# ---------------------------------------------------------------------------
+[s3]
+enabled = false
+host    = "127.0.0.1"
+port    = 9000
+region  = "y2q"
+
+# virtual_host_domain = "s3.example.com"
+
+# Default lifetime (seconds) for a minted S3 credential when the mint
+# request omits ttl_seconds. Always clamped to the owning session's expiry.
+default_credential_ttl_seconds = 3600
+
+# Maximum live S3 credentials per session. Minting past this FIFO-evicts
+# the session's oldest credential.
+max_credentials_per_session = 4
+
+# Re-validate the owning session during a transfer after this many bytes,
+# and at least this often regardless of byte count. A revoked, expired, or
+# duress-switched session aborts the transfer at the next check.
+session_recheck_bytes         = 8388608  # 8 MiB
+session_recheck_interval_secs = 5
+
+# Maximum accepted X-Amz-Date deviation from server time, in seconds.
+max_clock_skew_secs = 900
+
+# Maximum bytes accepted for a single multipart upload part. Must be at
+# least 5242880 (S3's own minimum part size) and at most [server] max_body_bytes.
+max_part_bytes = 67108864  # 64 MiB
+
+# Same override as [server] allow_insecure_bind, scoped to this listener.
+allow_insecure_bind = false
+
+[s3.tls]
+enabled   = false
+# cert_path = "/etc/y2q/tls/fullchain.pem"
+# key_path  = "/etc/y2q/tls/privkey.pem"
+# client_ca_path = "/etc/y2q/tls/client-ca.pem"
+require_pq_kex = true
+
 # ── Observability ─────────────────────────────────────────────────────────────
 [observability]
 

@@ -81,6 +81,30 @@ impl SessionKeyring {
             .open(sealed, &bucket_key_aad(token_hash, bucket, epoch))
             .map_err(|e| AuthError::Backend(e.to_string()))
     }
+
+    /// Seal an S3 temporary credential's secret access key.
+    pub fn seal_s3_secret(
+        &self,
+        token_hash: &[u8; 32],
+        access_key_id: &str,
+        secret: &[u8],
+    ) -> Result<SealedSecret, AuthError> {
+        self.key
+            .seal(secret, &s3_secret_aad(token_hash, access_key_id))
+            .map_err(|e| AuthError::Backend(e.to_string()))
+    }
+
+    /// Open a sealed S3 secret access key.
+    pub fn open_s3_secret(
+        &self,
+        token_hash: &[u8; 32],
+        access_key_id: &str,
+        sealed: &SealedSecret,
+    ) -> Result<SecretVec, AuthError> {
+        self.key
+            .open(sealed, &s3_secret_aad(token_hash, access_key_id))
+            .map_err(|e| AuthError::Backend(e.to_string()))
+    }
 }
 
 /// Build the AAD binding a sealed identity secret key to the session token
@@ -106,5 +130,17 @@ fn bucket_key_aad(token_hash: &[u8; 32], bucket: &str, epoch: u32) -> Vec<u8> {
     aad.extend_from_slice(&epoch.to_be_bytes());
     aad.extend_from_slice(&(bucket.len() as u32).to_be_bytes());
     aad.extend_from_slice(bucket.as_bytes());
+    aad
+}
+
+/// Build the AAD binding a sealed S3 secret access key to the session token
+/// that holds it, plus the access key id it belongs to:
+/// `b"y2q/v1/s3-secret" || token_hash || u32_be(akid.len()) || akid`.
+fn s3_secret_aad(token_hash: &[u8; 32], access_key_id: &str) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(16 + 32 + 4 + access_key_id.len());
+    aad.extend_from_slice(b"y2q/v1/s3-secret");
+    aad.extend_from_slice(token_hash);
+    aad.extend_from_slice(&(access_key_id.len() as u32).to_be_bytes());
+    aad.extend_from_slice(access_key_id.as_bytes());
     aad
 }
