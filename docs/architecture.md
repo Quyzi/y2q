@@ -57,15 +57,15 @@ AES-256-GCM is implemented via the pure-Rust [aes-gcm](https://github.com/RustCr
 
 ### Envelope format
 
-There is a single on-disk envelope format (v3, chunked), identified by its magic bytes. It wraps one ML-KEM-768 ciphertext and a sequence of AES-256-GCM-sealed chunks behind a fixed header, most of which doubles as additional authenticated data (AAD) so tampering with it invalidates the tag - see [AAD coverage](#aad-coverage) below for the one field that's deliberately excluded. An envelope with an unrecognized magic - including the retired v1 whole-object format and the retired v2 single-deployment-key format - is rejected outright; there is no unauthenticated passthrough for unrecognized or legacy data.
+There is a single on-disk wire layout (magic bytes `Y2Q3`) shared by two format versions: **v3** (legacy, read-only — objects written by earlier deployments) and **v4** (current — every new write). Both wrap one ML-KEM-768 ciphertext and a sequence of AES-256-GCM-sealed chunks behind a fixed header, most of which doubles as additional authenticated data (AAD) so tampering with it invalidates the tag - see [AAD coverage](#aad-coverage) below for the one field that's deliberately excluded, and [v4: authenticated final-chunk marker](#v4-authenticated-final-chunk-marker) for the one field v4 adds on top of v3. An envelope with an unrecognized magic - including the retired v1 whole-object format and the retired v2 single-deployment-key format - is rejected outright; there is no unauthenticated passthrough for unrecognized or legacy data.
 
-#### v3 - chunked, per-bucket-epoch
+#### v3/v4 - chunked, per-bucket-epoch
 
 ```mermaid
 %%{init: {"packet": {"showBits": false}}}%%
 packet-beta
 0-3: "magic b'Y2Q3' (4 B)"
-4-5: "format_ver = 3 (2 B)"
+4-5: "format_ver = 3 (legacy) or 4 (current) (2 B)"
 6-6: "kem_alg (1)"
 7-7: "aead_alg (1)"
 8-11: "key_epoch (4 B, BE)"
@@ -76,11 +76,15 @@ packet-beta
 1124-1203: "aead_ct chunks - [chunk_pt + 16 tag] × N"
 ```
 
-The 36-byte fixed header plus the 1088-byte KEM ciphertext form a 1124-byte **preamble**, followed by `N` independently sealed chunks of `chunk_size` plaintext each (default 4 MiB, `crypto.envelope_chunk_size_bytes`). Chunk `i` uses `nonce_i = nonce_base XOR (i as u64 BE)`. Because each chunk is its own frame at a deterministic offset, a `Range` GET reads and decrypts only the covering chunks (206), and a multi-GiB PUT streams chunk-by-chunk without buffering the whole object. `chunk_size` is recorded per object, so changing the config knob only affects future writes. `key_epoch` names which of the bucket's retained [`BucketKeyVersion`](#key-hierarchy-and-identity-protection-at-rest)s the `kem_ct` was encapsulated to, so a decryptor knows which epoch's bucket secret key to unwrap before decapsulating.
+The 36-byte fixed header plus the 1088-byte KEM ciphertext form a 1124-byte **preamble**, followed by `N` independently sealed chunks of `chunk_size` plaintext each (default 4 MiB, `crypto.envelope_chunk_size_bytes`). Chunk `i` uses `nonce_i = nonce_base XOR (i as u64 BE)`. Because each chunk is its own frame at a deterministic offset, a `Range` GET reads and decrypts only the covering chunks (206), and a multi-GiB PUT streams chunk-by-chunk without buffering the whole object. `chunk_size` is recorded per object, so changing the config knob only affects future writes. `key_epoch` names which of the bucket's retained [`BucketKeyVersion`](#key-hierarchy-and-identity-protection-at-rest)s the `kem_ct` was encapsulated to, so a decryptor knows which epoch's bucket secret key to use.
 
 #### AAD coverage
 
 The AAD for every chunk is `magic || format_ver || kem_alg || aead_alg || key_epoch || nonce_base || chunk_size` (28 of the header's 36 bytes) - every fixed-header field *except* `plaintext_len`. `plaintext_len` is the one field genuinely unknown until streaming finishes (it's patched in via a seek after the last chunk is written), so a placeholder bound into the AAD at encrypt time could never match what's read back at decrypt time. `chunk_size` and `key_epoch`, by contrast, are fixed before the first byte is written and have no such excuse, so they *are* authenticated.
+
+#### v4: authenticated final-chunk marker
+
+v3's AAD (above) covers every fixed-header field except `plaintext_len`, which means `plaintext_len` - and by extension the object's apparent length - is not authenticated: a filesystem-write attacker can drop trailing whole chunks from an on-disk v3 envelope and patch `plaintext_len` down to match the truncated ciphertext, and every surviving chunk still authenticates under its unchanged nonce/AAD. v4 closes this by appending a 1-byte `is_final` flag to every chunk's AAD: the object's true last chunk is sealed with `is_final = 1`, every other chunk with `is_final = 0`. On decrypt, the last chunk *presented* is always checked against `is_final = 1`; if the true final chunk was truncated away, the new (shorter) last chunk was originally sealed with `is_final = 0` and fails to authenticate instead of silently producing a truncated-but-valid object. v3 envelopes already on disk remain readable; every new write produces v4 and there is no way to opt back into writing v3. See [`crates/y2q-core/src/crypto/envelope.rs`](../crates/y2q-core/src/crypto/envelope.rs) (`build_v3_aad`/`build_v4_aad`) for the exact construction.
 
 ### Per-object key derivation
 
@@ -224,13 +228,13 @@ The metadata blob embedded in each `.obj` is **encrypted at rest** under the tie
   "cipher_checksum": "<b64 8-byte XXH3-64, 12 chars>",
   "kem_alg":         "ml-kem-768",
   "aead_alg":        "aes-256-gcm",
-  "envelope_version": 3,
+  "envelope_version": 4,
   "version":         null,
   "committed_at":    null
 }
 ```
 
-`size` is the plaintext length. `checksum_gxhash` is a non-cryptographic XXH3-64 digest of the plaintext (corruption detection, not tamper detection). The `cipher_*` fields and algorithm names are always populated in current builds. `version` and `committed_at` are reserved fields, always `null` in this build (objects read as clean v0). The list/HEAD API surface (`MetadataView`) exposes the same fields except `disk_path`, `version`, and `committed_at`, which stay server-internal.
+`size` is the plaintext length. `checksum_gxhash` is a non-cryptographic XXH3-64 digest of the plaintext (corruption detection, not tamper detection). The `cipher_*` fields and algorithm names are always populated in current builds. `envelope_version` is `4` for every object written by the current daemon, or `3` for a legacy object written before the v4 authenticated-final-chunk-marker change (see [v4: authenticated final-chunk marker](#v4-authenticated-final-chunk-marker)) - both remain fully readable. `version` and `committed_at` are reserved fields, always `null` in this build (objects read as clean v0). The list/HEAD API surface (`MetadataView`) exposes the same fields except `disk_path`, `version`, and `committed_at`, which stay server-internal.
 
 ### Write locks (in-memory)
 
@@ -242,7 +246,7 @@ Because locks are in-memory, they vanish on process exit - there are no orphaned
 flowchart LR
     PUT["PUT handler"] -->|"try_acquire(bucket, key)"| LR
     subgraph LR["LockRegistry"]
-        MAP["papaya::HashMap\n(bucket, key) → SystemTime"]
+        MAP["dashmap::DashMap\n(bucket, key) → SystemTime"]
         MAP -->|"entry absent: insert"| GUARD["LockGuard (RAII)"]
         MAP -->|"entry present"| ERR["Error::Locked"]
     end
@@ -357,6 +361,10 @@ Per-username failed login attempts are tracked in memory. Once `auth.max_failed_
 
 A floor of `auth.min_login_response_ms` (default 250 ms) is applied to both success and failure responses on login to smooth out timing differences between "user not found" and "wrong password".
 
+### Refresh limit
+
+`POST /api/v1/auth/refresh` mints a new token carrying a fresh `default_ttl_seconds` window and revokes the old one, but only up to `auth.max_refreshes` times per token (default `0`: the first refresh attempt on any token is rejected). `SessionInfo::refresh_count` is carried forward and incremented on each successful `reissue`, and checked (`old.refresh_count >= max_refreshes`) before minting the next token. A token that has hit its limit is not revoked - it keeps authenticating normally for every other endpoint until its own `expires_at` - only the refresh operation itself returns 403. A duress `switch_user_to_persona` swap preserves `refresh_count` rather than resetting it, since replacing the row in place isn't a refresh.
+
 ### Session-scoped identity keys
 
 There is no process-wide keystore slot to idle-drop anymore. Tier 0 (node key) is resident for the daemon's whole lifetime once boot completes - the daemon cannot serve anything without it, but is itself held in guarded memory (Linux; see [SECURITY.md](../SECURITY.md#guarded-memory-linux-only)), unlocked only for the duration of each derived-key read. Tier 1 (a persona's identity secret key) lives only inside that login's `SessionInfo`, bounded by `[auth] max_ttl_seconds`/`default_ttl_seconds`; at rest it is AES-256-GCM ciphertext (`SealedSecret`) under a process-ephemeral `SessionKeyring` key, bound via AAD to that session's token hash so a sealed blob copied onto a different session's row fails to open. Plaintext exists only transiently, inside a locked, non-swappable buffer, for the duration of a single `with_identity_sk` call — not for the session's whole lifetime. A compromised request handler observes exactly one session's key material, never every user's, and a memory dump taken between requests recovers nothing. Operators who want a shorter exposure window should still shorten the session TTL - there is no idle-drop knob - but the window itself is now measured in single crypto operations, not the whole session lifetime.
@@ -378,6 +386,29 @@ The effective capability for an action is the intersection of the role ceiling a
 ### Duress personas
 
 Every `UserRecord` carries four credential slots (see [Key hierarchy](#key-hierarchy-and-identity-protection-at-rest)); each account's real identity is placed at a slot chosen uniformly at random on creation - there is no privileged slot number a caller or a coercer can rely on - and the other three are self-service alternates a user can populate via `POST /api/v1/personas` (`y2q persona add`). Each persona is a fully separate identity with its own bucket grants - there is no shared-access, silent-alarm design. A persona created with `revoke_other_sessions: true` silently switches every other live session of the account over to itself on login, in place - same tokens, same expiry, no revocation and nothing observably interrupted, just narrower access from that point on. This is the only side effect of a duress login, and it is not observable as one: no alert, no log line, and no metric distinguishes it from an ordinary one (`y2q_auth_logins_total{result}` never gains a duress label; `GET /api/v1/personas/me` never reports the duress flag, even for the caller's own session). A bucket the duress persona wasn't granted is 404, not 403, to it - identical to any bucket that genuinely doesn't exist. So a 403 can never be used to confirm a real bucket's existence and betray the primary password. Granting reaches only the grantee's real identity (`UserRecord::primary_slot`, resolved server-side, never returned by any API) from a third party; sharing access with one of your own alternate personas is self-service (`POST /api/v1/personas/{slot}/grant`), because a third party granting a *named* alternate persona would first have to know it exists.
+
+## S3 gateway
+
+`y2qd` optionally binds a **second listener** (`[s3] enabled = true`, off by default, default port 9000) speaking AWS SigV4/S3 REST semantics, implemented entirely inside `y2qd` at `crates/y2qd/src/s3/` - no new workspace crate, no independent credential system. It shares the same `web::Data` app state (storage, auth, config) as the REST listener on `[server]`, and calls the same `authz::authorize_bucket`, `bucket_keys::resolve_read_key`/`resolve_write_key`, and `cipher::*` code paths, so authorization and encryption cannot diverge between the two surfaces.
+
+### Session-bound credentials, not a key pair
+
+SigV4 needs a symmetric secret the server can recompute an HMAC with, which rules out reusing the caller's session token directly. Rather than a persistent access-key/secret pair (a credential that would outlive sessions), the gateway issues **temporary credentials bound to a live session**:
+
+- `POST /api/v1/s3/credentials` (on either listener) mints an access key id (`crates/y2qd/src/s3/state.rs::generate_access_key_id` - 20 chars, `"Y2Q"` prefix + 17 CSPRNG bytes over a 32-symbol alphabet) and a secret access key (`generate_secret_bytes` - 30 CSPRNG bytes, 40-char base64), bound to the caller's `token_hash`. The access key id is only a `DashMap` lookup handle; it carries no authority of its own.
+- `expires_at = min(requested_ttl, session.expires_at)` at mint time (`s3/credentials.rs::mint`) - a credential can never outlive the session that minted it.
+- The secret is sealed under the same process-ephemeral `SessionKeyring` used for identity/bucket keys (`keyring::seal_s3_secret`/`open_s3_secret`, AAD-bound to `(token_hash, access_key_id)`), opened into guarded memory only for the duration of a signature check.
+- Every S3 request calls `SessionStore::get_active(&cred.token_hash)` - the exact call the REST `Authenticated` extractor uses - before trusting the credential. Logout, expiry, `revoke_user`, `revoke_user_persona`, and duress `switch_user_to_persona` therefore all take effect on the S3 surface with zero extra code (`crates/y2qd/src/s3/auth.rs::S3Authenticated`).
+- `SessionLeash` (`s3/auth.rs`) re-checks `get_active` every `[s3] session_recheck_bytes` transferred and at least every `session_recheck_interval_secs`, and compares `Arc::ptr_eq` against the session row captured at request start so a duress persona switch aborts an in-flight transfer instead of continuing under revoked authority.
+- Presigned URLs clamp effective expiry to `min(X-Amz-Expires, credential.expires_at, session.expires_at)`.
+
+Full security properties: [SECURITY.md#s3-gateway](../SECURITY.md#s3-gateway). Full protocol reference: [api.md#s3-gateway](api.md#s3-gateway).
+
+### Protocol surface
+
+SigV4 request signing (header and presigned, including `aws-chunked` streaming payloads with per-chunk signature verification - `s3/sigv4.rs`), path- and virtual-hosted-style addressing (`[s3] virtual_host_domain`), ranged GET, conditional requests, `PutObject`/`GetObject`/`HeadObject`/`DeleteObject`/`CopyObject`, bucket create/delete/head/location, `ListObjectsV2`/`ListObjects` with delimiter roll-up, `DeleteObjects`, object tagging, and full multipart upload. Multipart parts are stored as ordinary encrypted objects under a reserved key prefix and assembled by streaming each part's plaintext (`cipher::plaintext_stream`) directly into the destination's `EncryptSession` - never buffered whole and never written to a temp file. S3 sub-resources with no faithful mapping onto y2q's persona-keyed cryptographic grants (ACLs, bucket policy, SSE-C, lifecycle, and others) return `501 NotImplemented`.
+
+`cipher::stream_encrypt_for_put` (the REST PUT path's encryptor) was generalized to accept any byte stream rather than only an actix `Payload`, and a new `cipher::plaintext_stream` lifts the v3/v4 chunk-range arithmetic out of `handlers::get` so both the REST `Range` handler and the S3 GET/CopyObject/multipart-assembly paths share one implementation instead of a second copy that could drift.
 
 ## Threat model (brief)
 
@@ -425,10 +456,6 @@ Storage and auth metrics are exposed at `/metrics/prometheus` (Prometheus format
 - `y2q_storage_duration_seconds{op,backend}` - latency histograms
 - `y2q_auth_logins_total{result}` - login outcomes
 - `y2q_active_sessions` - current session gauge
-
-### Continuous profiling
-
-When built with `--features pyroscope` and `[observability.pyroscope] enabled = true`, the daemon starts a Pyroscope agent before the HTTP server and stops it on graceful shutdown. The agent runs a background OS thread using SIGPROF (pprof-rs) and pushes CPU profiles to the configured server on each sample interval. It is fully independent of the tokio runtime. Tags `version` and `backend` are attached to every profile so flame graphs can be filtered by deployment variant.
 
 ## Platform support
 

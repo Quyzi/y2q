@@ -21,6 +21,7 @@ instead of repeating it.
 - [Guarded memory (Linux only)](#guarded-memory-linux-only)
 - [Authentication and sessions](#authentication-and-sessions)
 - [Authorization](#authorization)
+- [S3 gateway](#s3-gateway)
 - [Duress personas](#duress-personas)
 - [Transport security (TLS)](#transport-security-tls)
 - [Node key and keystore](#node-key-and-keystore)
@@ -305,6 +306,17 @@ you. A daemon restart invalidates every session (no persistence).
   request specifies `ttl_seconds`, capped by `auth.max_ttl_seconds` (24h
   default). A background sweeper purges expired sessions from memory every
   `auth.session_sweep_interval_seconds`.
+- **Refresh limit** — `POST /api/v1/auth/refresh` trades a live token for a
+  new one carrying a fresh `default_ttl_seconds` window, but only up to
+  `auth.max_refreshes` times per token (default `0`: refresh is disabled
+  entirely, so the very first attempt on any token is rejected). A token
+  that has hit its limit is not revoked — it keeps authenticating normally
+  for every other endpoint until it naturally expires; only the refresh
+  operation itself is denied, so a session's *extendable* lifetime is
+  bounded even if the bearer token is never otherwise compromised. The
+  counter is carried forward across refreshes and preserved (not reset) by
+  a duress persona switch, since that isn't a refresh and shouldn't grant
+  a free one back.
 - **Per-username lockout** — `auth.max_failed_logins` consecutive failures
   locks the username for `auth.lockout_seconds`. Applies identically to
   malformed and valid usernames, so failed-login behavior cannot be used to
@@ -367,6 +379,74 @@ physically encrypted under.
 
 Full model, capability table, and status codes:
 [docs/api.md#authorization](docs/api.md#authorization).
+
+## S3 gateway
+
+Optional second listener (`[s3] enabled = true`, off by default) speaking
+AWS SigV4/S3 REST semantics. It layers entirely on top of the mechanisms
+above rather than introducing an independent credential system — that was
+the literal design requirement: the S3 surface must respect every guarantee
+above, especially session expiry.
+
+- **No password authentication on this listener at all.** S3 access uses
+  temporary credentials — an access key id (an opaque lookup handle, not a
+  secret) and a secret access key — minted over the *already-authenticated*
+  REST API via `POST /api/v1/s3/credentials`. There is no way to obtain an
+  S3 credential without first holding a live Bearer token.
+- **A credential cannot outlive its session.** `expires_at =
+  min(requested_ttl, session.expires_at)` at mint time — asking for
+  `[s3] default_credential_ttl_seconds` (or any longer TTL) one second
+  before the session ends still yields a credential that dies with the
+  session, never later.
+- **Every S3 request re-resolves the owning session — no cached
+  authority.** The SigV4 extractor calls the exact same
+  `SessionStore::get_active(&token_hash)` the REST `Authenticated`
+  extractor uses, on every request. Logout, natural expiry, admin
+  revocation, and a role change all evict the credential and fail the next
+  S3 request identically (`ExpiredToken`/`InvalidAccessKeyId`) to how they
+  fail a REST request with the same dead token.
+- **Mid-transfer session death aborts the transfer.** A `SessionLeash`
+  re-checks `get_active` every `[s3] session_recheck_bytes` transferred and
+  at least every `session_recheck_interval_secs`, on both upload and
+  download streams and between parts/objects in multipart and batch-delete
+  operations. It also compares `Arc::ptr_eq` against the exact session row
+  captured at request start — `switch_user_to_persona` (the duress
+  mechanism, see [Duress personas](#duress-personas) below) replaces that
+  row in place under the same token hash, so the pointers diverge and an
+  in-flight transfer aborts instead of continuing under the just-revoked
+  persona's bucket key. **Caveat, stated plainly:** the recheck is
+  threshold-based, not per-byte, so a bounded window of already-in-flight
+  bytes (up to `session_recheck_bytes`, or up to
+  `session_recheck_interval_secs` of wall-clock time) can be delivered
+  after the session actually died before the next check catches it. This
+  is a deliberate throughput/latency trade-off, not an oversight — lower
+  both values to shrink the window at the cost of more `get_active` calls
+  per transfer.
+- **Presigned URLs cannot outlive the session either.** Effective expiry is
+  `min(X-Amz-Expires, credential.expires_at, session.expires_at)` — a
+  presigned link generated with a one-hour `X-Amz-Expires` still dies the
+  moment the session does.
+- **The secret access key is sealed, never plaintext at rest**, under the
+  same process-ephemeral `SessionKeyring` and the same AAD-binding pattern
+  (here to `(token_hash, access_key_id)`) as every other secret in
+  [Guarded memory](#guarded-memory-linux-only) — opened into guarded memory
+  only for the duration of a signature check.
+- **Same TLS bind refusal as the REST listener.** `[s3.tls]` is
+  independent of `[server.tls]`; binding a non-loopback `[s3] host` with
+  `[s3.tls] enabled = false` is refused unless `[s3] allow_insecure_bind =
+  true`, for the same reason as [Transport security](#transport-security-tls)
+  below.
+- **No admin back-door, no policy surface this project can't back with a
+  real cryptographic grant.** The S3 layer never resolves bucket keys
+  itself — it calls the same `authz::authorize_bucket` and
+  `bucket_keys::resolve_read_key`/`resolve_write_key` the REST handlers
+  call, so [Authorization](#authorization)'s strict admin exclusion and
+  404-vs-403 existence hiding apply identically. S3 sub-resources with no
+  faithful mapping onto y2q's persona-keyed grants (ACLs, bucket policy,
+  SSE-C, lifecycle, and others) return `501 NotImplemented` rather than
+  silently accepting and ignoring them.
+
+Full protocol reference: [docs/api.md#s3-gateway](docs/api.md#s3-gateway).
 
 ## Duress personas
 
@@ -541,6 +621,10 @@ claims is in one place:
 - A leaked, valid Bearer token works until it expires or is explicitly
   revoked; there is no additional binding (e.g. to a TLS client
   certificate or source IP) today.
+- The S3 gateway's mid-transfer session recheck (`SessionLeash`) is
+  threshold-based, not continuous — a bounded window of already-in-flight
+  bytes can be delivered after a session actually died before the next
+  check catches it. See [S3 gateway](#s3-gateway) above.
 - Cross-architecture data portability is explicitly unsupported — see
   [docs/architecture.md#platform-support](docs/architecture.md#platform-support).
   This is a compatibility statement, not a security one, but is included

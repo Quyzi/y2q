@@ -21,7 +21,7 @@ Post-quantum secure object storage. `y2qd` is a REST daemon that encrypts every 
 ## Documentation
 
 - [SECURITY.md](SECURITY.md) - every security mechanism in one place: encryption at rest, key hierarchy, auth/authorization, TLS, and guarded memory (with platform differences called out explicitly)
-- [docs/architecture.md](docs/architecture.md) - system design, encryption envelope (v2 chunked), storage backends, metadata index, sessions, authorization
+- [docs/architecture.md](docs/architecture.md) - system design, encryption envelope (v4 chunked, v3 read-only legacy), storage backends, metadata index, sessions, authorization, S3 gateway
 - [docs/configuration.md](docs/configuration.md) - full config reference: every field, default, TLS, and override syntax
 - [docs/operations.md](docs/operations.md) - first run, user/role/ACL management, TLS, backup/recovery, runbook
 - [docs/api.md](docs/api.md) - complete HTTP API reference: routes, authorization model, schemas, error codes, examples
@@ -34,16 +34,16 @@ Post-quantum secure object storage. `y2qd` is a REST daemon that encrypts every 
 - **Post-quantum TLS (optional)** - native rustls listener offering the X25519MLKEM768 hybrid key exchange; `require_pq_kex` can refuse any client that won't negotiate it; optional mutual TLS via a client CA bundle
 - **Argon2id-protected secret key** - the ML-KEM private key is never stored in plaintext; it is wrapped under each user's password and, at rest during an active session, held as sealed ciphertext in guarded memory (Linux; see [SECURITY.md](SECURITY.md#guarded-memory-linux-only))
 - **Guarded session memory (Linux only)** - session identity keys, bucket keys, passwords, and bearer tokens are never plaintext at rest: they're AES-256-GCM ciphertext under a process-ephemeral key living in a locked, non-dumpable page; the daemon also refuses core dumps and same-uid debugger attach. Falls back to a much weaker `Zeroizing`-only scheme on macOS/Windows - see [SECURITY.md](SECURITY.md#guarded-memory-linux-only)
-- **Token-based session auth** - Bearer tokens with configurable TTL, per-account lockout after repeated failures
+- **Token-based session auth** - Bearer tokens with configurable TTL, per-account lockout after repeated failures, and a bounded number of refreshes per token (`auth.max_refreshes`, default 0 = refresh disabled) so a leaked token can't be extended indefinitely
 - **Bucket ownership, ACLs, and global roles** - new buckets are private to their creator; per-bucket grants (read/write/writeonly/admin) plus account-wide roles (admin/user/readonly/writeonly/auditor/disabled). Disable with `auth.enforce_authorization = false` for single-user deployments
 - **Dual storage backends** - portable filesystem backend (all platforms); optional Linux io_uring fast path (kernel >= 5.6); both use the same on-disk `.obj` format and are fully cross-compatible
 - **Encrypted, fast listing** - embedded [redb](https://github.com/cberner/redb) metadata index, itself encrypted at rest under a key derived from the operator-supplied node key; auto-rebuilt on startup; can be triggered manually
 - **Best-effort mode with background flusher** - skip per-PUT fsyncs for throughput; a background task drains the dirty queue on a configurable interval
 - **Custom object labels** - attach arbitrary key/value metadata to objects via `X-Y2Q-<label>` request headers on PUT; query them with the label search language
-- **Prometheus metrics + live trace** - Prometheus scrape and an interactive dashboard (auth-gated by default); a server-sent-events trace stream (`y2q admin trace`) of every request
+- **S3-compatible gateway (optional)** - a second listener (`[s3] enabled = true`) speaking AWS SigV4/S3 REST semantics (multipart upload, ranged GET, tagging, delimiter listings). Access uses temporary credentials minted over the authenticated REST API; every S3 request re-resolves the owning session, so logout/expiry/revocation take effect on the S3 surface immediately, mid-transfer included - see [docs/api.md#s3-gateway](docs/api.md#s3-gateway)
+- **Prometheus metrics + live trace** - Prometheus scrape endpoint; a server-sent-events trace stream (`y2q admin trace`) of every request
 - **Structured observability** - per-request IDs (`X-Request-ID`), INFO/ERROR log events on every request, configurable log format (`text` or `json`)
-- **Continuous profiling** - optional Pyroscope/pprof-rs integration; opt-in with `--features pyroscope`
-- **OpenAPI / Swagger UI** - interactive docs at `/swagger-ui/` (when metrics are exposed)
+- **OpenAPI reference** - raw OpenAPI 3 document at `/api-docs/openapi.json` (when metrics are exposed)
 
 ## Workspace
 
@@ -74,12 +74,6 @@ cargo build --release -p y2qd
 The io_uring backend is always compiled on Linux (no feature flag). On non-Linux
 targets it is simply absent, and selecting `storage.backend = "uring"` at runtime
 returns an error - a standard `cargo build` works everywhere.
-
-To enable continuous profiling (Pyroscope/pprof-rs):
-
-```sh
-cargo build --release -p y2qd --features pyroscope
-```
 
 ### First Run
 
@@ -113,8 +107,7 @@ CLI flags:
 Build images locally with `make`:
 
 ```sh
-make image          # y2q:latest         - distroless runtime (filesystem + uring both compiled in)
-make image-dev      # y2q:dev            - same, with Pyroscope profiling enabled
+make image          # y2q:latest         - minimal Chainguard runtime (filesystem + uring both compiled in)
 ```
 
 Run with rootless podman:
@@ -420,7 +413,7 @@ Unmount with Ctrl+C, SIGTERM, or manually: `fusermount3 -u /mnt/y2q` on Linux, `
 host = "127.0.0.1"
 port = 8080
 max_body_bytes = 268435456        # 256 MiB upload limit
-unauthenticated_metrics = false   # expose /metrics/* and /swagger-ui/ without auth (else NOT served)
+unauthenticated_metrics = false   # expose /metrics/prometheus and /api-docs/openapi.json without auth (else NOT served)
 
 [server.tls]
 enabled        = false
@@ -439,7 +432,7 @@ sync_flush_limit = 64
 [crypto]
 keystore_dir = "/var/lib/y2q/keys"     # required; keep separate from base_path
 node_key_file = "/run/secrets/y2q-node-key"  # or set Y2QD_NODE_KEY; required, never auto-generated
-envelope_chunk_size_bytes = 4194304    # 4 MiB plaintext chunks (v3 envelope)
+envelope_chunk_size_bytes = 4194304    # 4 MiB plaintext chunks (current write format: v4)
 [crypto.argon2]
 m_cost_kib = 65536   # 64 MiB
 t_cost = 3
@@ -451,6 +444,13 @@ max_ttl_seconds = 86400
 max_failed_logins = 10
 lockout_seconds = 900
 enforce_authorization = true           # bucket ownership/ACLs + global admin role
+max_refreshes = 0                      # times a token may be refreshed; 0 (default) disables refresh entirely
+
+[s3]                                   # optional S3-compatible gateway; disabled by default
+enabled = false
+host    = "127.0.0.1"
+port    = 9000
+region  = "y2q"                        # must match what S3 clients are configured with
 
 [observability]
 log_filter = "info"      # RUST_LOG syntax; RUST_LOG env var takes precedence
@@ -468,7 +468,7 @@ All authenticated routes require `Authorization: Bearer <token>`. Authorization 
 | Method | Path | Auth | Purpose |
 |---|---|---|---|
 | `POST` | `/api/v1/auth/login` | No | Obtain a Bearer token |
-| `POST` | `/api/v1/auth/refresh` | Yes | Extend session TTL (old token revoked) |
+| `POST` | `/api/v1/auth/refresh` | Yes | Extend session TTL (old token revoked); rejected with 403 past `auth.max_refreshes` (default 0 = disabled) |
 | `POST` | `/api/v1/auth/logout` | Yes | Revoke the current token |
 | `POST` | `/api/v1/auth/password` | Yes | Change password |
 | `PUT` | `/api/v1/users/add` | Admin | Create a user (optional `role`) |
@@ -480,6 +480,9 @@ All authenticated routes require `Authorization: Bearer <token>`. Authorization 
 | `DELETE` | `/api/v1/personas/{slot}` | Yes | Overwrite a persona slot with a fresh decoy |
 | `GET` | `/api/v1/personas/me` | Yes | The calling session's own slot/role (never the duress flag) |
 | `POST`/`DELETE` | `/api/v1/personas/{slot}/grant` | Yes | Share/revoke your current bucket access with your own other persona |
+| `POST` | `/api/v1/s3/credentials` | Yes | Mint a temporary S3 SigV4 credential bound to the caller's session |
+| `GET` | `/api/v1/s3/credentials` | Yes | List the caller's own live S3 credentials (never returns a secret) |
+| `DELETE` | `/api/v1/s3/credentials/{access_key_id}` | Yes | Revoke one of the caller's own S3 credentials |
 
 ### Objects and buckets
 
@@ -497,7 +500,7 @@ Object keys may contain `/`. Use `/{bucket}/{key}` where `{key}` is the full pat
 | `GET`/`PUT` | `/api/v1/buckets/{bucket}/config` | read/admin | Read or set bucket config (quota, default-SSE marker) |
 | `GET`/`PUT` | `/api/v1/buckets/{bucket}/acl` | owner/admin | Read or set bucket owner + grants |
 
-**Custom labels on PUT:** include `X-Y2Q-<label>: <value>` headers (repeatable). `X-Y2Q-Sync: best-effort` overrides per-request durability. `Range: bytes=N-M` on GET returns 206 for v2-chunked and plaintext objects.
+**Custom labels on PUT:** include `X-Y2Q-<label>: <value>` headers (repeatable). `X-Y2Q-Sync: best-effort` overrides per-request durability. `Range: bytes=N-M` on GET returns 206 for chunked and plaintext objects.
 
 ### Listing and search
 
@@ -507,6 +510,10 @@ Object keys may contain `/`. Use `/{bucket}/{key}` where `{key}` is the full pat
 | `GET` | `/{bucket}/` | read | List objects in a bucket (`?prefix=`, `?after=`, `?limit=`) |
 | `GET` | `/api/v1/search` | read | Find objects by a label query (`?q=` required, `?bucket=`) |
 
+### S3 gateway (optional)
+
+A second listener (`[s3] enabled = true`, off by default, default port 9000) speaks AWS SigV4/S3 REST semantics - `PutObject`/`GetObject`/`HeadObject`/`DeleteObject`/`CopyObject`, bucket create/delete/list, `ListObjectsV2`, `DeleteObjects`, object tagging, and full multipart upload - on top of the same storage/crypto/authorization stack as the native API above. There is no password auth on this listener: mint a temporary access key id / secret access key pair via `POST /api/v1/s3/credentials` (table above) on either listener, then sign requests with SigV4 against `[s3] region`. Every S3 request re-resolves the owning session (`SessionStore::get_active`), and a credential's expiry is always clamped to its session's - logout, expiry, and revocation kill S3 access immediately, including mid-transfer. Full reference: [docs/api.md#s3-gateway](docs/api.md#s3-gateway).
+
 ### Admin and observability
 
 | Method | Path | Auth | Purpose |
@@ -515,10 +522,9 @@ Object keys may contain `/`. Use `/{bucket}/{key}` where `{key}` is the full pat
 | `GET`/`DELETE` | `/api/v1/locks` | admin+auditor / admin | List / force-release stale in-flight write locks |
 | `GET` | `/api/v1/trace` | admin+auditor | Server-sent-events stream of every request |
 | `GET` | `/metrics/prometheus` | Gated | Prometheus scrape endpoint |
-| `GET` | `/metrics/dashboard` | Gated | Interactive metrics dashboard |
-| `GET` | `/swagger-ui/` | Gated | Interactive API documentation |
+| `GET` | `/api-docs/openapi.json` | Gated | Raw OpenAPI 3 document |
 
-`/metrics/*`, `/swagger-ui/`, and `/api-docs/openapi.json` are served **only** when `server.unauthenticated_metrics = true`, and then without auth. With the default `false` they are not registered at all.
+Both are served **only** when `server.unauthenticated_metrics = true`, and then without auth. With the default `false` neither is registered at all.
 
 ## Object Data Security
 
@@ -537,6 +543,7 @@ Object keys may contain `/`. Use `/{bucket}/{key}` where `{key}` is the full pat
 | **Data in transit** | Optional native TLS (`[server.tls]`) via rustls, restrictable to the X25519MLKEM768 post-quantum hybrid group (`require_pq_kex`), with optional mutual TLS. | [tls.rs](crates/y2qd/src/tls.rs) |
 | **Access** | Bucket ownership + per-bucket ACLs + global roles (when `auth.enforce_authorization = true`); a bucket you have no relationship to is hidden (404, never 403) so existence cannot be probed. | [authz.rs](crates/y2qd/src/authz.rs) |
 | **Session tokens** | Only `SHA-256(token)` is held in memory - the plaintext token itself is guarded-memory ciphertext, never persisted, and a daemon restart invalidates every session. Repeated failed logins lock the account behind a response-time floor. | [auth/session.rs](crates/y2qd/src/auth/session.rs) |
+| **S3 gateway credentials** | Temporary access-key/secret pairs (`POST /api/v1/s3/credentials`) bound to `token_hash` at mint time, expiry clamped to `min(requested, session.expires_at)`, secret sealed the same way as identity keys. Every S3 request re-resolves the owning session before trusting the credential, so logout/expiry/revocation apply on the S3 surface too, including mid-transfer. | [s3/state.rs](crates/y2qd/src/s3/state.rs), [s3/auth.rs](crates/y2qd/src/s3/auth.rs) |
 | **Memory disclosure (Linux only)\*** | A core dump, swap page, same-uid `ptrace`/`/proc/<pid>/mem` read, or an idle VM snapshot yields no session identity keys, bucket keys, passwords, or bearer tokens - they're sealed ciphertext under a process-ephemeral key in locked, non-dumpable pages; the daemon also sets `PR_SET_DUMPABLE=0`/`RLIMIT_CORE=0` and refuses to start if guarded memory itself is unavailable (override: `[server] allow_unprotected_memory`). | [secmem.rs](crates/y2q-core/src/secmem.rs), [SECURITY.md](SECURITY.md#guarded-memory-linux-only) |
 | **Duress passwords** | Up to three additional passwords per account (`POST /api/v1/personas`), each unlocking a fully separate identity with its own bucket grants and an optional flag that silently switches every other live session on the account over to this persona on login, in place - deniable under coercion, no revocation, no silent alarm. | [docs/operations.md#duress-personas](docs/operations.md#duress-personas) |
 

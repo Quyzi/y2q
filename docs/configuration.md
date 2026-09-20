@@ -112,7 +112,7 @@ The reserved bucket name `"api"` (case-insensitive) is rejected - it would colli
 |---|---|---|---|
 | `keystore_dir` | string | *required* | Directory holding `keystore.json`, `users.redb`, and the daemon's `.lock`. Should be on a path you back up; should *not* live under `storage.base_path` so a `cp -r` of the storage tree can't accidentally copy authentication state. |
 | `node_key_file` | string | *(none)* | Path to a file holding the operator-supplied node key (raw binary, hex, or base64; at least 32 bytes). Alternatively set `Y2QD_NODE_KEY`. One of the two is required - the daemon refuses to start without it and never auto-generates one. Must not live inside `storage.base_path` or `crypto.keystore_dir` (enforced at startup). |
-| `envelope_chunk_size_bytes` | usize | `4194304` (4 MiB) | Plaintext chunk size for v3 streaming encryption. Bounds: `65536` (64 KiB) .. `268435456` (256 MiB); out-of-range values are rejected at startup. Smaller chunks make ranged GETs finer-grained but add per-chunk AEAD overhead. **Recorded per-object in the envelope header** - see note below. |
+| `envelope_chunk_size_bytes` | usize | `4194304` (4 MiB) | Plaintext chunk size for the v3/v4 chunked streaming envelope (current writes are v4; see [architecture.md#envelope-format](architecture.md#envelope-format)). Bounds: `65536` (64 KiB) .. `268435456` (256 MiB); out-of-range values are rejected at startup. Smaller chunks make ranged GETs finer-grained but add per-chunk AEAD overhead. **Recorded per-object in the envelope header** - see note below. |
 | `argon2` | table | *(see below)* | Argon2id parameters used when writing *new* credential slots (existing slots keep their stored parameters). |
 
 The chunk size is stored in each object's envelope header, and decryption always
@@ -145,6 +145,30 @@ Changing these only affects newly written records. Existing user records carry t
 | `max_failed_logins` | u32 | `10` | Consecutive failed logins per username before lockout. Set to `0` to disable lockout. |
 | `lockout_seconds` | u64 | `900` (15 min) | Lockout duration once `max_failed_logins` is hit. |
 | `enforce_authorization` | bool | `true` | Enforce per-bucket ownership/ACLs and the global admin role. New buckets are private to their creator; admin endpoints (user management, rebuild, locks, trace) require an admin account. Set `false` for a single-user or migration deployment where every authenticated user should have full access. See the [API authorization model](api.md#authorization). |
+| `max_refreshes` | u32 | `0` | Maximum times a token may be refreshed via `POST /api/v1/auth/refresh` before it's rejected with 403. `0` (default) disables refresh entirely - the first attempt on any token fails. A token past its limit is not revoked; it keeps authenticating normally elsewhere until it naturally expires. |
+
+### `[s3]`
+
+Optional S3-compatible gateway: a second HTTP(S) listener speaking AWS SigV4/S3 REST semantics. Entirely disabled by default; every field below is inert unless `enabled = true`. Full protocol/security model: [api.md#s3-gateway](api.md#s3-gateway), [../SECURITY.md#s3-gateway](../SECURITY.md#s3-gateway).
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `enabled` | bool | `false` | Whether the second listener binds at all. |
+| `host` | string | `"127.0.0.1"` | Bind address for the S3 listener. |
+| `port` | u16 | `9000` | TCP port for the S3 listener. |
+| `region` | string | `"y2q"` | SigV4 credential-scope region. Must match what S3 clients are configured with; a mismatch fails the request with `AuthorizationHeaderMalformed` rather than silently accepting it. Must not be empty (checked unconditionally, even when `enabled = false`). |
+| `virtual_host_domain` | string | `""` | Base domain for virtual-hosted-style addressing (`<bucket>.<domain>`). Empty (default) accepts path-style addressing only (`http://host:port/bucket/key`). Must not start with `.` when set. |
+| `default_credential_ttl_seconds` | u64 | `3600` (1 hour) | Default lifetime for a minted S3 credential when `POST /api/v1/s3/credentials` omits `ttl_seconds`. Always clamped to `min(requested, session.expires_at)` regardless of this value. |
+| `max_credentials_per_session` | usize | `4` | Maximum live S3 credentials one session may hold. Minting past this FIFO-evicts the session's oldest credential. |
+| `session_recheck_bytes` | u64 | `8388608` (8 MiB) | Re-validate the owning session after this many bytes transferred on an S3 upload/download stream. Minimum `65536` when `enabled = true`. |
+| `session_recheck_interval_secs` | u64 | `5` | Re-validate the owning session at least this often during a transfer, regardless of byte count. Minimum `1` when `enabled = true`. |
+| `max_clock_skew_secs` | u64 | `900` | Maximum accepted deviation between a request's `X-Amz-Date` and server time before it's rejected with `RequestTimeTooSkewed`. |
+| `max_part_bytes` | u64 | `67108864` (64 MiB) | Maximum bytes accepted for a single multipart upload part. Must be at least `5242880` (S3's own minimum part size, checked unconditionally) and must not exceed `[server] max_body_bytes`. |
+| `allow_insecure_bind` | bool | `false` | Permit binding a non-loopback `[s3] host` while `[s3.tls] enabled = false`. Same rationale and loopback exemption as `[server] allow_insecure_bind`. |
+
+### `[s3.tls]`
+
+TLS settings for the S3 listener, completely independent of `[server.tls]` - the two listeners can run with different TLS configurations (or one with TLS and one without). Same field shapes and semantics as `[server.tls]` above: `enabled`, `cert_path`, `key_path`, `client_ca_path` (mutual TLS), `require_pq_kex` (default `true`).
 
 ### `[observability]`
 
@@ -198,6 +222,18 @@ min_login_response_ms = 500
 max_failed_logins = 5
 lockout_seconds = 1800                 # 30 min
 enforce_authorization = true           # bucket ownership/ACLs + admin role
+max_refreshes = 3                      # allow a handful of refreshes before requiring a fresh login
+
+[s3]
+enabled = true
+host    = "0.0.0.0"
+port    = 9000
+region  = "us-east-1"                  # match whatever region S3 clients are configured with
+
+[s3.tls]
+enabled   = true
+cert_path = "/etc/y2qd/tls/fullchain.pem"
+key_path  = "/etc/y2qd/tls/privkey.pem"
 
 [observability]
 log_filter = "y2qd=info,actix_web=warn"

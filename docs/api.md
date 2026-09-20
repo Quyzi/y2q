@@ -118,7 +118,7 @@ curl -s -X POST https://y2qd.example/api/v1/auth/login \
 
 ### `POST /api/v1/auth/refresh`
 
-Trade a valid token for a fresh one with the default TTL. The old token is revoked.
+Trade a valid token for a fresh one with the default TTL. The old token is revoked. Only up to `auth.max_refreshes` times per token - `0` (default) disables refresh entirely, so the first attempt on any token is rejected. A token past its limit is not revoked; it keeps authenticating normally for every other endpoint until it naturally expires.
 
 **Request:** none (uses the Bearer token).
 
@@ -130,6 +130,7 @@ Trade a valid token for a fresh one with the default TTL. The old token is revok
 |---|---|
 | 200 | New token issued |
 | 401 | Token missing, invalid, or expired |
+| 403 | Refresh limit (`auth.max_refreshes`) exceeded for this token |
 
 ### `POST /api/v1/auth/logout`
 
@@ -256,6 +257,66 @@ Change a user's global role. **Admin only.** Takes effect immediately - the targ
 | 404 | User not found |
 | 409 | Would demote the last remaining admin |
 
+### `POST /api/v1/s3/credentials`
+
+Mint a temporary S3 SigV4 credential bound to the caller's current session. Reachable on both the native listener (`[server]`) and the S3 listener (`[s3]`) - registered identically on each. See [S3 gateway](#s3-gateway) below for how the credential is used.
+
+**Request:**
+```json
+{ "ttl_seconds": 3600 }
+```
+
+`ttl_seconds` is optional (defaults to `[s3] default_credential_ttl_seconds`) and is always clamped to `min(requested, session.expires_at)` - a credential can never outlive the session that minted it.
+
+**Response (200):**
+```json
+{
+  "access_key_id": "Y2Q...",
+  "secret_access_key": "...",
+  "region": "y2q",
+  "expires_at": 1715003600,
+  "session_expires_at": 1715003600
+}
+```
+
+`secret_access_key` is returned exactly once and is not recoverable afterwards - losing it means minting a new credential. `expires_at` and `session_expires_at` are Unix seconds; `expires_at` is never later than `session_expires_at`.
+
+| Code | Meaning |
+|---|---|
+| 200 | Credential minted |
+| 400 | `ttl_seconds` out of range |
+| 401 | Token missing or invalid |
+
+### `GET /api/v1/s3/credentials`
+
+List the caller's own live S3 credentials. Never returns a secret.
+
+**Response (200):**
+```json
+{
+  "credentials": [
+    { "access_key_id": "Y2Q...", "created_at": 1715000000, "expires_at": 1715003600 }
+  ]
+}
+```
+
+| Code | Meaning |
+|---|---|
+| 200 | Credential list (possibly empty) |
+| 401 | Token missing or invalid |
+
+### `DELETE /api/v1/s3/credentials/{access_key_id}`
+
+Revoke one of the caller's own S3 credentials.
+
+**Response (204):** empty.
+
+| Code | Meaning |
+|---|---|
+| 204 | Credential revoked |
+| 401 | Token missing or invalid |
+| 403 | Unknown access key id, or one owned by a different session - identical response for both, so the endpoint cannot be used to enumerate other sessions' access key ids |
+
 ## Objects
 
 Object paths take the form `/{bucket}/{key}`. Keys may contain `/` characters and are matched by a greedy tail pattern - `/photos/2024/05/cat.jpg` is bucket `photos`, key `2024/05/cat.jpg`.
@@ -342,7 +403,7 @@ Metadata only - no body.
 | `X-Y2Q-Cipher-Checksum` | yes | 8-byte XXH3-64 checksum of the on-disk envelope, base64 (12 chars). Non-cryptographic, same as `X-Y2Q-Checksum-GxHash` above - for corruption/replica-divergence detection, not tamper detection (the per-chunk AEAD tag is what authenticates the envelope) |
 | `X-Y2Q-Kem-Alg` | yes | `ml-kem-768` |
 | `X-Y2Q-Aead-Alg` | yes | `aes-256-gcm` |
-| `X-Y2Q-Envelope-Version` | yes | `2` (chunked; the only supported format) |
+| `X-Y2Q-Envelope-Version` | yes | `4` for any object written by the current daemon, or `3` for a legacy object written before the authenticated-final-chunk-marker change (both remain readable) - see [architecture.md#v4-authenticated-final-chunk-marker](architecture.md#v4-authenticated-final-chunk-marker) |
 | `X-Y2Q-<label>` | per-object | Each custom label attached on PUT, echoed back lowercased |
 
 | Code | Meaning |
@@ -459,7 +520,7 @@ List objects in a bucket, paginated.
       "cipher_checksum":  "<b64>",
       "kem_alg":          "ml-kem-768",
       "aead_alg":         "aes-256-gcm",
-      "envelope_version": 2
+      "envelope_version": 4
     }
   ],
   "next": "2024/05/cat.jpg"
@@ -693,6 +754,74 @@ Server-sent-events stream of every request the daemon handles, in real time. **A
 | 401 | Token missing or invalid |
 | 403 | Caller is not an admin or auditor |
 
+## S3 gateway
+
+Optional **second listener** (`[s3] enabled = true`, off by default, default port 9000) speaking AWS SigV4/S3 REST semantics, running alongside the native API documented above. It shares the same storage/authorization/encryption stack - `authz::authorize_bucket`, `bucket_keys::resolve_read_key`/`resolve_write_key`, `cipher::*` - so a bucket's grants, existence-hiding, and encryption are identical on both surfaces. Full design and security properties: [architecture.md#s3-gateway](architecture.md#s3-gateway), [../SECURITY.md#s3-gateway](../SECURITY.md#s3-gateway).
+
+### Getting a credential
+
+There is no password authentication on this listener at all. Mint a temporary access key id / secret access key pair via `POST /api/v1/s3/credentials` (documented under [Auth and users](#post-apiv1s3credentials) above; reachable on either listener) using an existing Bearer token, then sign S3 requests with AWS Signature Version 4 against `[s3] region` and the access key id / secret access key pair. A credential's expiry is always clamped to its owning session's expiry, and every S3 request re-resolves that session live - logout, expiry, and revocation on the native API kill S3 access immediately, mid-transfer included.
+
+```sh
+# 1. Log in on the native listener, mint an S3 credential
+TOKEN=$(curl -s -X POST https://y2qd.example:8080/api/v1/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"alice","password":"hunter2"}' | jq -r .token)
+CRED=$(curl -s -X POST https://y2qd.example:8080/api/v1/s3/credentials \
+  -H "Authorization: Bearer $TOKEN")
+
+# 2. Point any SigV4-capable S3 client at the S3 listener
+aws --endpoint-url https://y2qd.example:9000 --region y2q \
+  s3 cp report.pdf s3://archive/report.pdf
+```
+
+### Addressing
+
+**Path-style** (`http://host:port/bucket/key`) always works. **Virtual-hosted-style** (`http://bucket.domain/key`) additionally works when `[s3] virtual_host_domain` is set to a base domain the bucket name is a subdomain of.
+
+### Supported operations
+
+| Category | Operations |
+|---|---|
+| Service | `ListBuckets` (`GET /`) |
+| Bucket | `CreateBucket`, `DeleteBucket`, `HeadBucket`, `GetBucketLocation`, `GetBucketVersioning` (reports "never enabled"; `PUT` is `501`) |
+| Object | `PutObject`, `GetObject` (ranged, conditional requests), `HeadObject`, `DeleteObject`, `CopyObject` |
+| Listing | `ListObjectsV2`, `ListObjects` (with delimiter/common-prefix roll-up), `DeleteObjects` (batch) |
+| Tagging | `GetObjectTagging`, `PutObjectTagging`, `DeleteObjectTagging` |
+| Multipart | `CreateMultipartUpload`, `UploadPart`, `ListParts`, `ListMultipartUploads`, `CompleteMultipartUpload`, `AbortMultipartUpload` |
+
+Object metadata maps to y2q labels: system headers (`Content-Type`, `Content-Encoding`, `Cache-Control`, ...) and `x-amz-meta-*` round-trip through GET/HEAD; every non-`amz-`-prefixed label is exposed as an S3 object tag. `x-amz-checksum-crc32`/`x-amz-checksum-sha256` are verified; other checksum algorithms are rejected with `400 InvalidRequest` rather than silently accepted unverified. `Content-MD5` is accepted but not verified.
+
+S3 sub-resources with no faithful mapping onto y2q's persona-keyed cryptographic grants - `?acl`, `?policy`, `?lifecycle`, `?cors`, `?encryption` (SSE-C), `?replication`, `?object-lock`, and others - return `501 NotImplemented` rather than silently accepting and ignoring them. Bucket access control continues to go through `PUT /api/v1/buckets/{bucket}/acl` on the native listener.
+
+### Authentication and errors
+
+Every request must carry a valid SigV4 signature (header `Authorization: AWS4-HMAC-SHA256 ...` or a presigned `X-Amz-*` query string) - there is no anonymous or public-bucket access. Errors are XML (`Content-Type: application/xml`), matching the shape of a real S3 error response:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<Error><Code>NoSuchKey</Code><Message>...</Message><Resource>/bucket/key</Resource><RequestId>...</RequestId></Error>
+```
+
+| S3 `Code` | Status | Cause |
+|---|---|---|
+| `NoSuchBucket` / `NoSuchKey` | 404 | Bucket or object not found, or not visible to the caller (existence hidden, same as the native API) |
+| `AccessDenied` | 403 | No credentials at all, `Role::Disabled`, or a presigned URL past its effective expiry |
+| `InvalidAccessKeyId` | 403 | Access key id unknown |
+| `SignatureDoesNotMatch` | 403 | Signature mismatch, or an `aws-chunked` chunk/trailer signature failed to verify |
+| `ExpiredToken` | 400 | Credential expired, or its owning session expired/was revoked |
+| `RequestTimeTooSkewed` | 403 | `X-Amz-Date` outside `[s3] max_clock_skew_secs` of server time |
+| `AuthorizationHeaderMalformed` | 400 | Malformed signature/scope, or the scope's region doesn't match `[s3] region` |
+| `XAmzContentSHA256Mismatch` | 400 | Declared payload SHA-256 doesn't match the actual body |
+| `EntityTooLarge` | 413 | Body exceeds `server.max_body_bytes`/bucket quota, or a multipart part exceeds `[s3] max_part_bytes` |
+| `InvalidRequest` | 400 | Unsupported checksum algorithm, or other malformed input |
+| `NotImplemented` | 501 | A recognized but unimplemented S3 sub-resource |
+| `InternalError` | 500 | Internal failure (deliberately generic, same suppression as the native API's 500s) |
+
+### Configuration
+
+Full field reference: [configuration.md#s3](configuration.md#s3). Disabled by default; when enabled, the same non-loopback-without-TLS bind refusal as `[server]` applies to `[s3] host`/`[s3.tls]`.
+
 ## Observability endpoints
 
 | Route | Purpose |
@@ -728,3 +857,5 @@ These are served **only** when `[server] unauthenticated_metrics = true`, and th
 - [crates/y2qd/src/auth/handlers.rs](../crates/y2qd/src/auth/handlers.rs) - auth and user handlers
 - [crates/y2qd/src/error.rs](../crates/y2qd/src/error.rs) - AppError → status mapping
 - [crates/y2qd/src/auth/error.rs](../crates/y2qd/src/auth/error.rs) - AuthError → status mapping
+- [crates/y2qd/src/s3/](../crates/y2qd/src/s3/) - S3 gateway: routes, SigV4, credentials, multipart, XML codec
+- [crates/y2qd/src/s3/error.rs](../crates/y2qd/src/s3/error.rs) - S3Error → XML/status mapping
