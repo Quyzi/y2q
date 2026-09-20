@@ -423,6 +423,9 @@ fn default_lockout_seconds() -> u64 {
 fn default_enforce_authorization() -> bool {
     true
 }
+fn default_max_refreshes() -> u32 {
+    0
+}
 
 /// User authentication / session settings.
 #[derive(Debug, Deserialize, Clone)]
@@ -455,6 +458,15 @@ pub struct AuthConfig {
     /// migration deployments only.
     #[serde(default = "default_enforce_authorization")]
     pub enforce_authorization: bool,
+    /// Maximum number of times a session's token may be refreshed via `POST
+    /// /api/v1/auth/refresh` before the refresh operation is rejected with
+    /// 403. `0` (the default) disables refresh entirely — the first refresh
+    /// attempt on any token is rejected. Rejection only denies further
+    /// refreshing; a token that has hit its limit keeps authenticating
+    /// normally for every other endpoint until it naturally expires, so
+    /// extending access indefinitely always requires a fresh login.
+    #[serde(default = "default_max_refreshes")]
+    pub max_refreshes: u32,
 }
 
 fn default_max_labels() -> usize {

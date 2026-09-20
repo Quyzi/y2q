@@ -329,13 +329,15 @@ pub async fn login(
 }
 
 /// `POST /api/v1/auth/refresh` — present a valid token, get a fresh one.
-/// The old token is revoked.
+/// The old token is revoked. Rejected with 403 once the token has already
+/// been refreshed `[auth] max_refreshes` times.
 #[utoipa::path(
     post,
     path = "/api/v1/auth/refresh",
     responses(
         (status = 200, description = "Fresh token", body = TokenResponse, content_type = "application/json"),
         (status = 401, description = "Token missing/invalid/expired"),
+        (status = 403, description = "Refresh limit exceeded"),
     ),
     tag = "auth",
 )]
@@ -349,7 +351,9 @@ pub async fn refresh(
         state.config.default_ttl_seconds,
         state.config.max_ttl_seconds,
     )?;
-    let token = state.sessions.reissue(&auth.token_hash, expires_at)?;
+    let token = state
+        .sessions
+        .reissue(&auth.token_hash, expires_at, state.config.max_refreshes)?;
     token_response(TokenResponse {
         token: token.0,
         expires_at: expires_at

@@ -253,6 +253,18 @@ lockout_seconds = 900  # 15 minutes
 # deployment where every authenticated user should have full access.
 enforce_authorization = true
 
+# Maximum number of times a session's token may be refreshed via
+# POST /api/v1/auth/refresh before the refresh operation itself starts
+# being rejected with 403. 0 (default) disables refresh entirely: the very
+# first refresh attempt on any token is rejected. A token that has hit its
+# limit is NOT revoked — it keeps authenticating normally for every other
+# endpoint until it naturally expires; only further refreshing is denied,
+# so a session's total lifetime can never be extended past
+# default_ttl_seconds * (max_refreshes + 1) without a fresh login (each
+# refresh grants a fresh default_ttl_seconds window, not ttl_seconds — the
+# refresh endpoint takes no body).
+max_refreshes = 0
+
 # ---------------------------------------------------------------------------
 # [s3] — optional S3-compatible gateway (second listener, disabled by default)
 #
