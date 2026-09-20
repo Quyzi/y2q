@@ -85,6 +85,7 @@ mod node_key_rotation;
 pub(crate) mod observability;
 mod rate_limit;
 mod request_id;
+mod s3;
 #[cfg(test)]
 mod session_residency_test;
 mod span;
@@ -155,6 +156,9 @@ impl<W: std::io::Write> std::io::Write for IgnoreBrokenPipe<W> {
         auth::handlers::whoami_persona,
         handlers::personas::grant_persona,
         handlers::personas::revoke_persona_grant,
+        s3::credentials::mint,
+        s3::credentials::list,
+        s3::credentials::revoke,
     ),
     components(schemas(
         error::ErrorBody,
@@ -186,6 +190,10 @@ impl<W: std::io::Write> std::io::Write for IgnoreBrokenPipe<W> {
         auth::handlers::PersonaCreateResponse,
         auth::handlers::PersonaView,
         handlers::personas::PersonaGrantBody,
+        s3::credentials::MintRequest,
+        s3::credentials::MintResponse,
+        s3::credentials::ListCredentialsResponse,
+        s3::credentials::CredentialView,
     )),
     modifiers(&SecurityAddon),
     tags(
@@ -197,6 +205,7 @@ impl<W: std::io::Write> std::io::Write for IgnoreBrokenPipe<W> {
         (name = "auth", description = "Session login/refresh/logout and password change"),
         (name = "users", description = "Add, list, and delete users authorized to log in"),
         (name = "personas", description = "Multiple passwords per user (duress personas) and self-service bucket sharing between them"),
+        (name = "s3", description = "Temporary SigV4 credentials for the S3-compatible gateway"),
     ),
 )]
 struct ApiDoc;
@@ -417,9 +426,20 @@ async fn main() -> std::io::Result<()> {
             .map_err(|e| std::io::Error::other(format!("failed to initialize auth state: {e}")))?,
     );
 
-    // Background sweeper for expired sessions.
+    let s3_state = web::Data::new(s3::state::S3State {
+        credentials: s3::state::S3CredentialStore::new(
+            auth_state.sessions.keyring(),
+            cfg.s3.max_credentials_per_session,
+        ),
+        uploads: s3::state::MultipartRegistry::new(),
+        config: cfg.s3.clone(),
+    });
+    // Background sweeper for expired sessions, stale S3 credentials, and
+    // orphaned multipart uploads (owning session gone).
     {
         let auth_state = auth_state.clone();
+        let s3_state = s3_state.clone();
+        let storage_for_sweep = Arc::clone(storage_data.get_ref());
         let interval = Duration::from_secs(cfg.auth.session_sweep_interval_seconds.max(1));
         tokio::spawn(async move {
             loop {
@@ -428,6 +448,16 @@ async fn main() -> std::io::Result<()> {
                 if removed > 0 {
                     tracing::debug!(removed, "swept expired sessions");
                 }
+                let removed_creds = s3_state.credentials.sweep(&auth_state.sessions);
+                if removed_creds > 0 {
+                    tracing::debug!(removed = removed_creds, "swept expired S3 credentials");
+                }
+                s3::multipart::sweep_orphaned_uploads(
+                    &storage_for_sweep,
+                    &s3_state.uploads,
+                    &auth_state.sessions,
+                )
+                .await;
             }
         });
     }
@@ -521,6 +551,16 @@ async fn main() -> std::io::Result<()> {
     let actix_disc_timeout = Duration::from_secs(cfg.server.actix.client_disconnect_timeout_secs);
     let actix_shutdown = cfg.server.actix.shutdown_timeout_secs;
 
+    // Cloned before the REST `HttpServer::new` closure below moves the
+    // originals in — the S3 listener (built further down, only when
+    // `[s3] enabled`) shares the same underlying storage/auth/config state.
+    let storage_data_s3 = storage_data.clone();
+    let label_limits_s3 = label_limits.clone();
+    let default_sync_s3 = default_sync.clone();
+    let encryption_params_s3 = encryption_params.clone();
+    let auth_state_s3 = auth_state.clone();
+    let s3_state_s3 = s3_state.clone();
+
     let mut server = HttpServer::new(move || {
         let mut app = App::new()
             .wrap(from_fn(request_id::request_id_middleware))
@@ -534,6 +574,7 @@ async fn main() -> std::io::Result<()> {
             .app_data(encryption_params.clone())
             .app_data(rekey_registry.clone())
             .app_data(auth_state.clone())
+            .app_data(s3_state.clone())
             .app_data(web::PayloadConfig::new(max_body_bytes));
         // The OpenAPI JSON document and the Prometheus scrape endpoint are
         // unauthenticated. Only register them when the operator has
@@ -630,7 +671,88 @@ async fn main() -> std::io::Result<()> {
         server.bind(bind_addr)?
     };
 
-    server.run().await
+    if !cfg.s3.enabled {
+        tracing::debug!("[s3] gateway disabled");
+        return server.run().await;
+    }
+
+    let s3_bind_addr = (cfg.s3.host.as_str(), cfg.s3.port);
+    if !cfg.s3.tls.enabled {
+        if !config::host_is_loopback(&cfg.s3.host) && !cfg.s3.allow_insecure_bind {
+            return Err(std::io::Error::other(format!(
+                "refusing to bind {}:{} for the S3 gateway without TLS ([s3.tls] enabled = \
+                 false) on a non-loopback address — SigV4 protects the request signature but \
+                 object plaintext and minted secret access keys would cross the network \
+                 unencrypted. Enable TLS, bind a loopback address, or set [s3] \
+                 allow_insecure_bind = true to override.",
+                cfg.s3.host, cfg.s3.port
+            )));
+        }
+        tracing::warn!(
+            "[s3] TLS disabled — the S3 gateway is serving plaintext HTTP. Set [s3.tls] enabled = true for production."
+        );
+    }
+
+    let s3_max_body_bytes = max_body_bytes;
+    let mut s3_server = HttpServer::new(move || {
+        App::new()
+            .wrap(from_fn(request_id::request_id_middleware))
+            .wrap(TracingLogger::<Y2qRootSpanBuilder>::new())
+            .wrap(from_fn(observability::metrics_middleware))
+            .wrap(from_fn(trace::trace_middleware))
+            .wrap(from_fn(s3::routes::vhost_middleware))
+            .app_data(storage_data_s3.clone())
+            .app_data(label_limits_s3.clone())
+            .app_data(default_sync_s3.clone())
+            .app_data(encryption_params_s3.clone())
+            .app_data(auth_state_s3.clone())
+            .app_data(s3_state_s3.clone())
+            .app_data(web::PayloadConfig::new(s3_max_body_bytes))
+            .configure(s3::routes::configure)
+    });
+    if let Some(w) = actix_workers {
+        s3_server = s3_server.workers(w);
+    }
+    s3_server = s3_server
+        .backlog(actix_backlog)
+        .max_connections(actix_max_connections)
+        .keep_alive(actix_keep_alive)
+        .client_request_timeout(actix_req_timeout)
+        .client_disconnect_timeout(actix_disc_timeout)
+        .shutdown_timeout(actix_shutdown);
+
+    let s3_server = if cfg.s3.tls.enabled {
+        let cert_path = cfg.s3.tls.cert_path.as_deref().ok_or_else(|| {
+            std::io::Error::other("s3.tls.enabled = true but s3.tls.cert_path is unset")
+        })?;
+        let key_path = cfg.s3.tls.key_path.as_deref().ok_or_else(|| {
+            std::io::Error::other("s3.tls.enabled = true but s3.tls.key_path is unset")
+        })?;
+        let client_ca = cfg.s3.tls.client_ca_path.as_deref();
+        let require_pq = cfg.s3.tls.require_pq_kex;
+        let tls_cfg = tls::build_server_config(
+            std::path::Path::new(cert_path),
+            std::path::Path::new(key_path),
+            client_ca.map(std::path::Path::new),
+            require_pq,
+        )?;
+        tracing::info!(
+            host = %cfg.s3.host, port = cfg.s3.port, region = %cfg.s3.region, tls = true,
+            "S3 gateway listening"
+        );
+        s3_server.bind_rustls_0_23(s3_bind_addr, tls_cfg)?
+    } else {
+        tracing::info!(
+            host = %cfg.s3.host, port = cfg.s3.port, region = %cfg.s3.region, tls = false,
+            "S3 gateway listening"
+        );
+        s3_server.bind(s3_bind_addr)?
+    };
+
+    let (rest_result, s3_result) =
+        futures_util::future::try_join(server.run(), s3_server.run()).await?;
+    let _: ((), ()) = (rest_result, s3_result);
+    Ok(())
 }
 
 /// Guarantee at least one administrator exists after loading the user store.
