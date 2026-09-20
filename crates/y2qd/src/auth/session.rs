@@ -246,6 +246,13 @@ impl SessionStore {
         })
     }
 
+    /// The store's process-ephemeral wrapping key, shared with the S3
+    /// credential store so an S3 secret is sealed under the same key as the
+    /// session's identity key.
+    pub fn keyring(&self) -> Arc<SessionKeyring> {
+        Arc::clone(&self.keyring)
+    }
+
     /// Seal `s`'s identity secret key and insert a fresh session, returning
     /// the wire-form token to hand to the client.
     pub fn insert(&self, s: NewSession) -> Result<SessionToken, AuthError> {

@@ -79,6 +79,18 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             .route(web::post().to(personas::grant_persona))
             .route(web::delete().to(personas::revoke_persona_grant)),
     );
+    cfg.service(
+        web::resource("/api/v1/s3/credentials")
+            .wrap(Governor::new(
+                &crate::rate_limit::S3_CREDENTIAL_GOVERNOR_CONFIG,
+            ))
+            .route(web::post().to(crate::s3::credentials::mint))
+            .route(web::get().to(crate::s3::credentials::list)),
+    );
+    cfg.service(
+        web::resource("/api/v1/s3/credentials/{access_key_id}")
+            .route(web::delete().to(crate::s3::credentials::revoke)),
+    );
 
     // Object store + admin endpoints.
     cfg.service(web::resource("/").route(web::get().to(list_buckets::handle)));

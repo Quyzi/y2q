@@ -125,10 +125,20 @@ pub async fn handle(
         .await
         .map_err(AppError::from)?;
 
+    let bucket_for_err = bucket.clone();
+    let key_for_err = key.clone();
+    let mapped_payload = futures_util::TryStreamExt::map_err(payload, move |e| {
+        AppError(y2q_core::Error::InternalError {
+            bucket: bucket_for_err.clone(),
+            key: key_for_err.clone(),
+            operation: "read body".to_owned(),
+            message: e.to_string(),
+        })
+    });
     let (sink, plaintext_metrics, cipher_metadata) = cipher::stream_encrypt_for_put(
         &bucket_pk,
         bucket_epoch,
-        payload,
+        mapped_payload,
         sink,
         &bucket,
         &key,

@@ -112,6 +112,13 @@ pub enum AuthError {
     /// `web::Data<AuthState>` was not registered. Programmer error.
     #[error("internal: auth state not configured")]
     InternalState,
+
+    /// `DELETE /api/v1/s3/credentials/{id}` for an access key id that does
+    /// not exist or is not owned by the caller's session. Identical message
+    /// for both cases so the endpoint cannot be used to enumerate other
+    /// sessions' access key ids.
+    #[error("invalid credential")]
+    S3CredentialUnknown,
 }
 
 impl ResponseError for AuthError {
@@ -121,7 +128,9 @@ impl ResponseError for AuthError {
             | AuthError::TokenMissing
             | AuthError::TokenInvalid
             | AuthError::TokenExpired => StatusCode::UNAUTHORIZED,
-            AuthError::Forbidden | AuthError::AccountDisabled => StatusCode::FORBIDDEN,
+            AuthError::Forbidden | AuthError::AccountDisabled | AuthError::S3CredentialUnknown => {
+                StatusCode::FORBIDDEN
+            }
             AuthError::LockedOut { .. } => StatusCode::TOO_MANY_REQUESTS,
             AuthError::TtlOutOfRange { .. }
             | AuthError::InvalidUsername { .. }

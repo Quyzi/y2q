@@ -68,6 +68,19 @@ pub static PERSONA_GOVERNOR_CONFIG: LazyLock<GovernorConfig<RealIpKeyExtractor, 
         builder.finish().expect("valid governor config")
     });
 
+/// Rate-limit config for `POST /api/v1/s3/credentials`: bursts of up to 5
+/// requests per source IP, replenishing one every 10 seconds thereafter.
+/// Minting an S3 credential is a credential-issuing operation like persona
+/// creation, so it gets the same treatment.
+pub static S3_CREDENTIAL_GOVERNOR_CONFIG: LazyLock<
+    GovernorConfig<RealIpKeyExtractor, NoOpMiddleware>,
+> = LazyLock::new(|| {
+    let mut builder = GovernorConfigBuilder::default();
+    let mut builder = builder.key_extractor(RealIpKeyExtractor);
+    builder.burst_size(5).seconds_per_request(10);
+    builder.finish().expect("valid governor config")
+});
+
 #[cfg(test)]
 mod tests {
     use super::*;
