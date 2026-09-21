@@ -346,6 +346,28 @@ pub async fn claim_ownership(
     Ok((cfg, created))
 }
 
+/// Resolve the bucket config a write needs, claiming ownership (and seeding
+/// epoch-0 key material) first when the bucket does not exist yet. Every
+/// write path must go through this: `resolve_write_key` fails with a 500 on
+/// a bucket whose key material was never seeded.
+pub async fn resolve_bucket_config(
+    decision: Decision,
+    storage: &AnyStorage,
+    user_store: &y2q_core::crypto::UserStore,
+    bucket: &str,
+    session: &std::sync::Arc<crate::auth::session::SessionInfo>,
+) -> Result<BucketConfig, AppError> {
+    match decision {
+        Decision::ClaimOwnership => Ok(claim_ownership(storage, user_store, bucket, session)
+            .await?
+            .0),
+        Decision::Allowed => storage
+            .get_bucket_config(bucket)
+            .await
+            .map_err(AppError::from),
+    }
+}
+
 /// Whether `auth` may at least read `bucket`. Used to filter listings and
 /// search results without erroring.
 pub async fn bucket_readable(

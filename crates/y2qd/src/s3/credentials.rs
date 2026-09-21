@@ -15,6 +15,7 @@ use utoipa::ToSchema;
 use y2q_core::secmem::SecretString;
 use zeroize::Zeroizing;
 
+use crate::auth::handlers::ScrubbedBody;
 use crate::auth::session::compute_expiry;
 use crate::auth::{AuthError, AuthState, Authenticated};
 use crate::s3::state::S3State;
@@ -63,18 +64,6 @@ fn to_unix(t: std::time::SystemTime) -> u64 {
         .unwrap_or(0)
 }
 
-/// Owner passed to `Bytes::from_owner` so the mint response (the only one
-/// here carrying a fresh secret) is zeroized once actix drops it after
-/// writing the socket. Mirrors `auth::handlers::ScrubbedBody`, which does
-/// the same for `POST /api/v1/auth/login`'s bearer token.
-struct ScrubbedBody(Zeroizing<Vec<u8>>);
-
-impl AsRef<[u8]> for ScrubbedBody {
-    fn as_ref(&self) -> &[u8] {
-        &self.0
-    }
-}
-
 /// `POST /api/v1/s3/credentials` — mint a temporary S3 credential bound to
 /// the caller's current session.
 #[utoipa::path(
@@ -96,16 +85,19 @@ pub async fn mint(
     auth: Authenticated,
 ) -> Result<HttpResponse, AuthError> {
     let requested = body.and_then(|b| b.into_inner().ttl_seconds);
-    let expires_at = compute_expiry(
+    let requested_expires_at = compute_expiry(
         requested,
         s3.config.default_credential_ttl_seconds,
         state.config.max_ttl_seconds,
-    )?
-    .min(auth.session.expires_at);
+    )?;
 
-    let (access_key_id, secret_access_key) =
-        s3.credentials
-            .mint(auth.token_hash, &auth.username, expires_at)?;
+    let (access_key_id, secret_access_key) = s3.credentials.mint(
+        auth.token_hash,
+        &auth.username,
+        requested_expires_at,
+        auth.session.expires_at,
+    )?;
+    let expires_at = requested_expires_at.min(auth.session.expires_at);
 
     let resp = MintResponse {
         access_key_id,

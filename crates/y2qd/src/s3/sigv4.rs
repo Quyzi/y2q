@@ -5,6 +5,13 @@
 //! extractor in `crate::s3::auth` drives these functions against a live
 //! request; getting any of the canonicalisation rules below wrong makes
 //! every real S3 client fail with `SignatureDoesNotMatch`.
+//!
+//! This module also owns the gateway's one percent-decode/percent-encode
+//! implementation (`percent_decode`, `percent_encode`,
+//! `percent_encode_path`), not only SigV4-specific primitives —
+//! `percent_decode` alone has three non-SigV4 consumers elsewhere in the
+//! gateway. A separate `urlenc` module for three functions would be more
+//! indirection than the code it replaces.
 
 use actix_web::http::header::HeaderMap;
 use hmac::{Hmac, KeyInit, Mac};
@@ -49,6 +56,18 @@ pub struct CredentialScope {
     pub date: String,
     pub region: String,
     pub service: String,
+}
+
+impl CredentialScope {
+    /// Re-render `date/region/service/aws4_request`, the trailing three
+    /// segments of the SigV4 credential scope string (everything after the
+    /// access key id).
+    pub fn scope_string(&self) -> String {
+        format!(
+            "{}/{}/{}/aws4_request",
+            self.date, self.region, self.service
+        )
+    }
 }
 
 /// What the request declares about its payload.
@@ -282,16 +301,33 @@ fn parse_query_params(query: &str) -> std::collections::HashMap<String, String> 
 
 /// RFC 3986 unreserved characters: never percent-encoded anywhere in a
 /// SigV4 canonical request.
-fn is_unreserved(b: u8) -> bool {
+pub(crate) fn is_unreserved(b: u8) -> bool {
     b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~')
 }
 
 /// Percent-encode every byte of `s` except the unreserved set, uppercase
 /// hex, one `%XX` triplet per byte (never double-encoded).
-fn percent_encode(s: &str) -> String {
+pub(crate) fn percent_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.as_bytes() {
         if is_unreserved(*b) {
+            out.push(*b as char);
+        } else {
+            out.push('%');
+            out.push_str(&format!("{b:02X}"));
+        }
+    }
+    out
+}
+
+/// Percent-encode every byte of `s` except the unreserved set and `/`,
+/// which passes through unescaped. Used for a whole path (SigV4 canonical
+/// URI, one path segment at a time) and for `EncodingType=url` listing
+/// responses (a whole key/prefix at once).
+pub(crate) fn percent_encode_path(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.as_bytes() {
+        if is_unreserved(*b) || *b == b'/' {
             out.push(*b as char);
         } else {
             out.push('%');
@@ -341,11 +377,15 @@ pub fn canonical_query_string(query: &str) -> String {
         .join("&")
 }
 
-/// Build the canonical headers block (each line `name:value\n`, folded
-/// whitespace, sorted+deduplicated by `signed_headers`' order) and confirm
-/// every named header is actually present. Returns the block (ending in a
-/// trailing `\n` after the last header, per the SigV4 spec) and the
-/// semicolon-joined signed-headers string.
+/// Build the canonical headers block: for each name in `signed_headers`,
+/// in the client's declared order (not sorted, not deduplicated), emit
+/// `name:value\n` with internal whitespace folded to a single space. A
+/// name the request doesn't actually carry gets an empty value, not an
+/// error — the return type has no way to report a missing header, and
+/// this function doesn't try; a signature computed over a wrongly-absent
+/// header simply won't match, which is caught downstream. Returns the
+/// block (ending in a trailing `\n` after the last header, per the SigV4
+/// spec) and the semicolon-joined signed-headers string.
 pub fn canonical_headers(
     headers: &HeaderMap,
     host: &str,
@@ -399,7 +439,7 @@ pub fn canonical_request(
     )
 }
 
-fn hex_encode(bytes: &[u8]) -> String {
+pub(crate) fn hex_encode(bytes: &[u8]) -> String {
     use std::fmt::Write;
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
@@ -408,14 +448,13 @@ fn hex_encode(bytes: &[u8]) -> String {
     s
 }
 
-fn sha256_hex(data: &[u8]) -> String {
+pub(crate) fn sha256_hex(data: &[u8]) -> String {
     hex_encode(&Sha256::digest(data))
 }
 
 /// `HexEncode(Hash(""))`, needed by the `aws-chunked` chunk string-to-sign.
-pub fn empty_payload_hash() -> String {
-    sha256_hex(b"")
-}
+pub(crate) const EMPTY_PAYLOAD_SHA256: &str =
+    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
 fn hmac_raw(key: &[u8], msg: &[u8]) -> [u8; 32] {
     let mut mac = HmacSha256::new_from_slice(key).expect("HMAC-SHA256 accepts any key length");
@@ -481,7 +520,7 @@ pub fn parse_amz_date(s: &str) -> Result<std::time::SystemTime, SigV4Error> {
     {
         return Err(SigV4Error::MalformedDate);
     }
-    let days = days_from_civil(year, month as u32, day as u32);
+    let days = crate::s3::httpdate::days_from_civil(year, month as u32, day as u32);
     let secs = days
         .checked_mul(86_400)
         .and_then(|d| d.checked_add(hour * 3600 + minute * 60 + second))
@@ -490,19 +529,6 @@ pub fn parse_amz_date(s: &str) -> Result<std::time::SystemTime, SigV4Error> {
         return Err(SigV4Error::MalformedDate);
     }
     Ok(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs as u64))
-}
-
-/// Days since the Unix epoch (1970-01-01) for a proleptic-Gregorian civil
-/// date. Howard Hinnant's `days_from_civil` algorithm — see
-/// <https://howardhinnant.github.io/date_algorithms.html>.
-fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400; // [0, 399]
-    let mp = (m as i64 + 9) % 12; // [0, 11]
-    let doy = (153 * mp + 2) / 5 + d as i64 - 1; // [0, 365]
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
-    era * 146_097 + doe - 719_468
 }
 
 /// Per-chunk string-to-sign for `aws-chunked` signed payloads:
@@ -516,7 +542,7 @@ pub fn chunk_string_to_sign(
 ) -> String {
     format!(
         "AWS4-HMAC-SHA256-PAYLOAD\n{amz_date}\n{scope}\n{prev_signature}\n{}\n{chunk_sha256_hex}",
-        empty_payload_hash()
+        EMPTY_PAYLOAD_SHA256
     )
 }
 
@@ -531,12 +557,6 @@ pub fn trailer_string_to_sign(
     trailer_sha256_hex: &str,
 ) -> String {
     format!("AWS4-HMAC-SHA256-TRAILER\n{amz_date}\n{scope}\n{prev_signature}\n{trailer_sha256_hex}")
-}
-
-/// SHA-256 of `data`, lowercase hex — exposed for the `aws-chunked` decoder
-/// (`crate::s3::body`) to hash each chunk/trailer it reads off the wire.
-pub fn sha256_hex_of(data: &[u8]) -> String {
-    sha256_hex(data)
 }
 
 #[cfg(test)]
