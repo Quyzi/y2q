@@ -129,6 +129,19 @@ fn extract_authenticated(req: &HttpRequest) -> Result<Authenticated, AuthError> 
 
     let token = parse_bearer(req)?;
     let token_hash = session::hash_token(token.expose());
+    authenticate_token_hash(state, token_hash)
+}
+
+/// Resolve `token_hash` to an `Authenticated` identity: the session must be
+/// active, and (when authorization is enforced) not `Disabled`. Shared by
+/// the REST listener's `extract_authenticated` and the S3 gateway's
+/// `crate::s3::auth::verify` — any gate added here applies identically to
+/// both surfaces, rather than needing to be duplicated into the S3
+/// extractor by hand.
+pub(crate) fn authenticate_token_hash(
+    state: &AuthState,
+    token_hash: [u8; 32],
+) -> Result<Authenticated, AuthError> {
     let session = state.sessions.get_active(&token_hash)?;
     // A user disabled mid-session is rejected immediately (a role change also
     // revokes their sessions, so this is belt-and-suspenders).

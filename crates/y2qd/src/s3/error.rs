@@ -34,7 +34,7 @@ impl S3Error {
             status,
             message: message.into(),
             resource: String::new(),
-            request_id: generate_request_id(),
+            request_id: String::new(),
         }
     }
 
@@ -43,14 +43,23 @@ impl S3Error {
         self
     }
 
+    pub fn with_resource(mut self, resource: impl Into<String>) -> Self {
+        self.resource = resource.into();
+        self
+    }
+
     /// Read the daemon's own per-request id (set by
     /// `request_id::request_id_middleware`, shared with the REST listener)
-    /// off `req`'s extensions, falling back to a fresh one if absent.
+    /// off `req`'s extensions. Empty if absent — every S3-listener request
+    /// passes through `request_id_middleware` first, so absence only
+    /// happens in a unit test building an `S3Error` with no live request;
+    /// `routes::error_detail_middleware` overwrites this with the
+    /// response's own `x-request-id` regardless.
     pub fn request_id_from(req: &HttpRequest) -> String {
         req.extensions()
             .get::<RequestIdExt>()
             .map(|r| r.0.clone())
-            .unwrap_or_else(generate_request_id)
+            .unwrap_or_default()
     }
 
     pub fn no_such_bucket() -> Self {
@@ -141,6 +150,14 @@ impl S3Error {
         Self::new("NotImplemented", StatusCode::NOT_IMPLEMENTED, message)
     }
 
+    pub fn entity_too_large(message: impl Into<String>) -> Self {
+        Self::new("EntityTooLarge", StatusCode::PAYLOAD_TOO_LARGE, message)
+    }
+
+    pub fn slow_down(message: impl Into<String>) -> Self {
+        Self::new("SlowDown", StatusCode::SERVICE_UNAVAILABLE, message)
+    }
+
     pub fn internal_error() -> Self {
         Self::new(
             "InternalError",
@@ -148,13 +165,6 @@ impl S3Error {
             "We encountered an internal error. Please try again.",
         )
     }
-}
-
-/// 32-character lowercase-hex id, matching
-/// `request_id::request_id_middleware`'s own fallback shape.
-fn generate_request_id() -> String {
-    use rand::RngExt;
-    format!("{:032x}", rand::rng().random::<u128>())
 }
 
 impl std::fmt::Display for S3Error {
@@ -261,7 +271,7 @@ impl From<AppError> for S3Error {
             CoreError::KeystoreNotFound { .. } => S3Error::new(
                 "ServiceUnavailable",
                 StatusCode::SERVICE_UNAVAILABLE,
-                "Please reduce your request rate.",
+                "The service is temporarily unable to handle this request.",
             ),
             other @ (CoreError::Index { .. }
             | CoreError::InternalError { .. }
@@ -315,6 +325,20 @@ impl From<SigV4Error> for S3Error {
             }
             SigV4Error::MalformedDate | SigV4Error::MalformedExpires => {
                 S3Error::authorization_header_malformed(err.to_string())
+            }
+        }
+    }
+}
+
+/// Maps an XML tag-scanner parse failure onto its S3 wire equivalent. All
+/// XML request bodies the gateway parses (`DeleteObjects`,
+/// `CompleteMultipartUpload`, `PutObjectTagging`) share this mapping.
+impl From<xml::XmlError> for S3Error {
+    fn from(err: xml::XmlError) -> Self {
+        match err {
+            xml::XmlError::TooLarge => S3Error::malformed_xml("request body too large"),
+            xml::XmlError::Unterminated(tag) => {
+                S3Error::malformed_xml(format!("malformed XML: unterminated <{tag}>"))
             }
         }
     }

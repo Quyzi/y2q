@@ -12,6 +12,8 @@ pub(crate) mod auth;
 pub(crate) mod body;
 pub(crate) mod bucket;
 pub(crate) mod credentials;
+pub(crate) mod ctx;
+
 pub(crate) mod error;
 pub(crate) mod httpdate;
 pub(crate) mod meta;

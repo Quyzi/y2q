@@ -1,186 +1,104 @@
-//! Streaming body adapters shared by the S3 gateway's read and write paths.
-//!
-//! [`LeashedDownload`] is the download half: it wraps a plaintext stream and
-//! re-validates the owning session as bytes flow, so a session that expires,
-//! is revoked, or is duress-switched mid-download aborts the transfer
-//! instead of silently completing under authority that's gone. The upload
-//! half (`aws-chunked` decoding, payload/checksum verification,
-//! `LeashedUpload`) is added alongside `PutObject` support.
-
-use std::pin::Pin;
-use std::task::{Context, Poll};
-
-use bytes::Bytes;
-use futures_util::Stream;
-
-use crate::error::AppError;
-use crate::s3::auth::SessionLeash;
-use crate::s3::error::S3Error;
-
-/// Boxed, type-erased byte stream feeding `cipher::stream_encrypt_for_put`
-/// or `cipher::plaintext_stream`'s consumers. Named to avoid repeating (and
-/// `clippy::type_complexity`-tripping on) the full `Pin<Box<dyn Stream<...>>>`
-/// spelling at every upload/copy/multipart-assembly call site.
-pub(crate) type AppByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, AppError>>>>;
-
-/// Wraps a plaintext stream and re-validates the session as bytes flow.
-/// Yields [`S3Error`] (not [`AppError`]) so a mid-transfer session death is
-/// distinguishable in logs from a storage fault.
-pub struct LeashedDownload<S> {
-    inner: S,
-    leash: SessionLeash,
-}
-
-impl<S> LeashedDownload<S> {
-    pub fn new(inner: S, leash: SessionLeash) -> Self {
-        Self { inner, leash }
-    }
-}
-
-impl<S> Stream for LeashedDownload<S>
-where
-    S: Stream<Item = Result<Bytes, AppError>> + Unpin,
-{
-    type Item = Result<Bytes, S3Error>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        match Pin::new(&mut self.inner).poll_next(cx) {
-            Poll::Ready(Some(Ok(chunk))) => match self.leash.note(chunk.len() as u64) {
-                Ok(()) => Poll::Ready(Some(Ok(chunk))),
-                Err(e) => {
-                    tracing::warn!(
-                        reason = %e,
-                        "aborting S3 download: session leash tripped mid-transfer"
-                    );
-                    Poll::Ready(Some(Err(e)))
-                }
-            },
-            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(S3Error::from(e)))),
-            Poll::Ready(None) => Poll::Ready(None),
-            Poll::Pending => Poll::Pending,
-        }
-    }
-}
-
-/// A body that declares a real size but carries no bytes to poll.
-///
-/// `HttpResponse::finish()` attaches a genuinely-zero-length body, and
-/// actix's h1 encoder writes `Content-Length` from the body's *actual*
-/// `BodySize` — overriding any `Content-Length` header the handler
-/// inserted manually — so a `HeadObject` response built with `.finish()`
-/// always reports `Content-Length: 0` regardless of the object's real
-/// size. Attaching this body instead reports the true size; actix's HEAD
-/// handling already skips writing body bytes to the wire for any body
-/// type, so `poll_next` is never actually reached for a HEAD request.
-pub struct SizedEmptyBody(pub u64);
-
-impl actix_web::body::MessageBody for SizedEmptyBody {
-    type Error = std::convert::Infallible;
-
-    fn size(&self) -> actix_web::body::BodySize {
-        actix_web::body::BodySize::Sized(self.0)
-    }
-
-    fn poll_next(
-        self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Bytes, Self::Error>>> {
-        Poll::Ready(None)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Upload path: aws-chunked decoding, payload/checksum verification, leash.
-// ---------------------------------------------------------------------------
-
-use std::sync::{Arc, Mutex};
+//! Upload-side body adapters: `aws-chunked` decoding, whole-body
+//! payload/checksum verification, and the session-leashed upload stream.
 
 use actix_web::http::header::HeaderMap;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use futures_util::StreamExt;
+use bytes::Bytes;
+use futures_util::{Stream, StreamExt};
 use sha2::{Digest, Sha256};
 
-use crate::s3::auth::{ChunkSigning, S3Authenticated};
+use crate::error::AppError;
+use crate::s3::auth::{ChunkSigning, S3Authenticated, SessionLeash};
+use crate::s3::error::S3Error;
 use crate::s3::sigv4::{self, PayloadHash};
 
-/// Shared slot an upload-stream adapter uses to smuggle the precise
-/// [`S3Error`] a generic [`AppError`] abort actually represents.
-/// `cipher::stream_encrypt_for_put` is generic over `AppError` (shared with
-/// the plain REST PUT path) and cannot carry S3-specific error codes
-/// itself, so an adapter that rejects a request (bad signature, checksum
-/// mismatch, malformed framing) records the real error here before
-/// yielding a throwaway `AppError` to unwind the stream. The PUT/CopyObject
-/// handlers call [`ErrorSideband::take`] after a stream error and fall back
-/// to `S3Error::from(app_error)` only when it's empty (a genuine
-/// storage/crypto fault, not an upload-adapter rejection).
-#[derive(Clone, Default)]
-pub struct ErrorSideband(Arc<Mutex<Option<S3Error>>>);
+use super::{AppByteStream, ErrorSideband, sideband_abort};
 
-impl ErrorSideband {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub(crate) fn set(&self, err: S3Error) {
-        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(err);
-    }
-
-    pub fn take(&self) -> Option<S3Error> {
-        self.0.lock().unwrap_or_else(|e| e.into_inner()).take()
-    }
+/// Digest accumulated over a whole upload body and checked at end of
+/// stream — after every byte has been forwarded downstream, but before the
+/// caller's `commit`, so a mismatched body is never persisted.
+trait EofVerifier {
+    fn update(&mut self, chunk: &[u8]);
+    fn finish(self) -> Result<(), S3Error>;
 }
 
-/// Generic placeholder abort used once the real reason has been recorded in
-/// an [`ErrorSideband`]. `key` isn't part of `Error::Forbidden` but is
-/// accepted for symmetry with every other error-construction call site
-/// here, all of which need both address components.
-fn sideband_abort(bucket: &str, _key: &str) -> AppError {
-    AppError(y2q_core::Error::Forbidden {
-        bucket: bucket.to_owned(),
-    })
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    use std::fmt::Write;
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        let _ = write!(s, "{b:02x}");
-    }
-    s
-}
-
-/// Verify the running SHA-256 of a stream against `expected_hex`
-/// (`x-amz-content-sha256`'s declared value), failing at end-of-stream on
-/// mismatch — after every byte has already been forwarded downstream, but
-/// before the caller's `session.finish()`/`commit()` ever runs, so a
-/// mismatched body is never actually persisted.
-pub fn verify_payload_sha256<S>(
-    inner: S,
+/// `x-amz-content-sha256`'s declared value, verified against a running
+/// SHA-256 of the whole body.
+struct PayloadSha256 {
+    hasher: Sha256,
     expected_hex: String,
+}
+
+impl EofVerifier for PayloadSha256 {
+    fn update(&mut self, chunk: &[u8]) {
+        self.hasher.update(chunk);
+    }
+
+    fn finish(self) -> Result<(), S3Error> {
+        let digest = sigv4::hex_encode(&self.hasher.finalize());
+        if digest != self.expected_hex {
+            Err(S3Error::x_amz_content_sha256_mismatch())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// A plain (not `aws-chunked`-trailer) `x-amz-checksum-<algo>` header
+/// value, verified against a running digest of the whole body.
+struct ChecksumHeader {
+    hasher: ChecksumHasher,
+    expected_b64: String,
+}
+
+impl EofVerifier for ChecksumHeader {
+    fn update(&mut self, chunk: &[u8]) {
+        self.hasher.update(chunk);
+    }
+
+    fn finish(self) -> Result<(), S3Error> {
+        let actual = self.hasher.finish_b64();
+        if actual != self.expected_b64 {
+            Err(S3Error::invalid_request(format!(
+                "checksum mismatch: computed {actual}, declared {}",
+                self.expected_b64
+            )))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// Verify `verifier` against every byte of `inner`, failing at end-of-stream
+/// on mismatch — after every byte has already been forwarded downstream,
+/// but before the caller's `session.finish()`/`commit()` ever runs, so a
+/// mismatched body is never actually persisted. Replaces two formerly
+/// hand-duplicated adapters (`x-amz-content-sha256` and a plain
+/// `x-amz-checksum-<algo>` header); [`PayloadSha256`] and [`ChecksumHeader`]
+/// are the two [`EofVerifier`] impls.
+fn verify_at_eof<S, V>(
+    inner: S,
+    verifier: V,
     sideband: ErrorSideband,
     bucket: String,
-    key: String,
 ) -> impl Stream<Item = Result<Bytes, AppError>> + Unpin
 where
     S: Stream<Item = Result<Bytes, AppError>> + Unpin,
+    V: EofVerifier + 'static,
 {
-    struct St<S> {
+    struct St<S, V> {
         inner: S,
-        hasher: Sha256,
-        expected_hex: String,
+        verifier: Option<V>,
         sideband: ErrorSideband,
         bucket: String,
-        key: String,
         done: bool,
     }
     let state = St {
         inner,
-        hasher: Sha256::new(),
-        expected_hex,
+        verifier: Some(verifier),
         sideband,
         bucket,
-        key,
         done: false,
     };
     Box::pin(futures_util::stream::try_unfold(
@@ -191,16 +109,18 @@ where
             }
             match st.inner.next().await {
                 Some(Ok(chunk)) => {
-                    st.hasher.update(&chunk);
+                    if let Some(v) = st.verifier.as_mut() {
+                        v.update(&chunk);
+                    }
                     Ok(Some((chunk, st)))
                 }
                 Some(Err(e)) => Err(e),
                 None => {
                     st.done = true;
-                    let digest = hex_encode(&st.hasher.clone().finalize());
-                    if digest != st.expected_hex {
-                        st.sideband.set(S3Error::x_amz_content_sha256_mismatch());
-                        return Err(sideband_abort(&st.bucket, &st.key));
+                    let verifier = st.verifier.take().expect("verifier present until finish");
+                    if let Err(e) = verifier.finish() {
+                        st.sideband.set(e);
+                        return Err(sideband_abort(&st.bucket));
                     }
                     Ok(None)
                 }
@@ -212,22 +132,28 @@ where
 /// Which whole-body checksum algorithm a client declared via
 /// `x-amz-checksum-*` (header form) or an `aws-chunked` trailer.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub enum ChecksumAlgo {
+pub(crate) enum ChecksumAlgo {
     Crc32,
     Sha256,
 }
 
+/// What an `x-amz-checksum-<name>` header or trailer name means here.
+enum ChecksumDecl {
+    Supported(ChecksumAlgo),
+    /// crc32c / crc64nvme / sha1: recognized, deliberately unimplemented.
+    Unsupported,
+    NotAChecksum,
+}
+
 impl ChecksumAlgo {
-    /// Parse the `x-amz-sdk-checksum-algorithm` value or an
-    /// `x-amz-checksum-<algo>` header name suffix. `None` means present but
-    /// unsupported (crc32c, crc64nvme, sha1) — callers must reject the
-    /// request rather than silently skip verification.
-    fn from_name(name: &str) -> Option<Option<Self>> {
+    /// Classify the `x-amz-sdk-checksum-algorithm` value or an
+    /// `x-amz-checksum-<algo>` header/trailer name suffix.
+    fn classify(name: &str) -> ChecksumDecl {
         match name.to_ascii_lowercase().as_str() {
-            "crc32" => Some(Some(Self::Crc32)),
-            "sha256" => Some(Some(Self::Sha256)),
-            "crc32c" | "crc64nvme" | "sha1" => Some(None),
-            _ => None,
+            "crc32" => ChecksumDecl::Supported(Self::Crc32),
+            "sha256" => ChecksumDecl::Supported(Self::Sha256),
+            "crc32c" | "crc64nvme" | "sha1" => ChecksumDecl::Unsupported,
+            _ => ChecksumDecl::NotAChecksum,
         }
     }
 }
@@ -258,84 +184,16 @@ impl ChecksumHasher {
     }
 }
 
-/// Verify a whole-body `x-amz-checksum-<algo>` header value, failing at
-/// end-of-stream on mismatch (same "already forwarded, never committed"
-/// property as [`verify_payload_sha256`]). Used only for the plain (not
-/// `aws-chunked`-trailer) declaration form.
-pub fn verify_checksum_header<S>(
-    inner: S,
-    algo: ChecksumAlgo,
-    expected_b64: String,
-    sideband: ErrorSideband,
-    bucket: String,
-    key: String,
-) -> impl Stream<Item = Result<Bytes, AppError>> + Unpin
-where
-    S: Stream<Item = Result<Bytes, AppError>> + Unpin,
-{
-    struct St<S> {
-        inner: S,
-        hasher: Option<ChecksumHasher>,
-        expected_b64: String,
-        sideband: ErrorSideband,
-        bucket: String,
-        key: String,
-        done: bool,
-    }
-    let state = St {
-        inner,
-        hasher: Some(ChecksumHasher::new(algo)),
-        expected_b64,
-        sideband,
-        bucket,
-        key,
-        done: false,
-    };
-    Box::pin(futures_util::stream::try_unfold(
-        state,
-        |mut st| async move {
-            if st.done {
-                return Ok(None);
-            }
-            match st.inner.next().await {
-                Some(Ok(chunk)) => {
-                    if let Some(h) = st.hasher.as_mut() {
-                        h.update(&chunk);
-                    }
-                    Ok(Some((chunk, st)))
-                }
-                Some(Err(e)) => Err(e),
-                None => {
-                    st.done = true;
-                    let actual = st
-                        .hasher
-                        .take()
-                        .expect("hasher present until finish")
-                        .finish_b64();
-                    if actual != st.expected_b64 {
-                        st.sideband.set(S3Error::invalid_request(format!(
-                            "checksum mismatch: computed {actual}, declared {}",
-                            st.expected_b64
-                        )));
-                        return Err(sideband_abort(&st.bucket, &st.key));
-                    }
-                    Ok(None)
-                }
-            }
-        },
-    ))
-}
-
 /// Re-validates the session as upload bytes arrive. Mirrors
-/// [`LeashedDownload`]; the item type stays `AppError` (not `S3Error`)
-/// because it feeds `cipher::stream_encrypt_for_put` directly — the real
-/// reason is recorded in `sideband` before the generic abort is yielded.
+/// [`super::LeashedDownload`]; the item type stays `AppError` (not
+/// `S3Error`) because it feeds `cipher::stream_encrypt_for_put` directly —
+/// the real reason is recorded in `sideband` before the generic abort is
+/// yielded.
 pub fn leashed_upload<S>(
     inner: S,
     leash: SessionLeash,
     sideband: ErrorSideband,
     bucket: String,
-    key: String,
 ) -> impl Stream<Item = Result<Bytes, AppError>> + Unpin
 where
     S: Stream<Item = Result<Bytes, AppError>> + Unpin,
@@ -345,14 +203,12 @@ where
         leash: SessionLeash,
         sideband: ErrorSideband,
         bucket: String,
-        key: String,
     }
     let state = St {
         inner,
         leash,
         sideband,
         bucket,
-        key,
     };
     Box::pin(futures_util::stream::try_unfold(
         state,
@@ -366,7 +222,7 @@ where
                             "aborting S3 upload: session leash tripped mid-transfer"
                         );
                         st.sideband.set(e);
-                        Err(sideband_abort(&st.bucket, &st.key))
+                        Err(sideband_abort(&st.bucket))
                     }
                 },
                 Some(Err(e)) => Err(e),
@@ -388,6 +244,16 @@ struct ChunkSigningState {
     prev_signature: String,
 }
 
+/// Bundled parameters for [`decode_aws_chunked`]: everything but the
+/// generic `inner` stream itself.
+pub(crate) struct ChunkedOptions {
+    pub chunk_signing: Option<ChunkSigning>,
+    pub trailer_checksum: Option<ChecksumAlgo>,
+    pub max_frame_bytes: u64,
+    pub sideband: ErrorSideband,
+    pub bucket: String,
+}
+
 struct ChunkedState<S> {
     inner: S,
     buf: bytes::BytesMut,
@@ -401,7 +267,6 @@ struct ChunkedState<S> {
     checksum_hasher: Option<ChecksumHasher>,
     sideband: ErrorSideband,
     bucket: String,
-    key: String,
     finished: bool,
 }
 
@@ -411,7 +276,7 @@ fn find_crlf(buf: &[u8]) -> Option<usize> {
 
 fn framing_abort<S>(state: &ChunkedState<S>, err: S3Error) -> AppError {
     state.sideband.set(err);
-    sideband_abort(&state.bucket, &state.key)
+    sideband_abort(&state.bucket)
 }
 
 async fn read_line<S>(state: &mut ChunkedState<S>) -> Result<String, AppError>
@@ -481,7 +346,7 @@ fn verify_chunk_signature<S>(
     };
     let Some(declared) = declared_sig else {
         state.sideband.set(S3Error::signature_does_not_match());
-        return Err(sideband_abort(&state.bucket, &state.key));
+        return Err(sideband_abort(&state.bucket));
     };
     let sts = sigv4::chunk_string_to_sign(
         &signing.amz_date,
@@ -492,7 +357,7 @@ fn verify_chunk_signature<S>(
     let computed = sigv4::hex_hmac_sha256(&signing.signing_key, sts.as_bytes());
     if !sigv4::signatures_match(&computed, &declared) {
         state.sideband.set(S3Error::signature_does_not_match());
-        return Err(sideband_abort(&state.bucket, &state.key));
+        return Err(sideband_abort(&state.bucket));
     }
     signing.prev_signature = declared;
     Ok(())
@@ -536,7 +401,7 @@ where
         let Some(sig) = trailer_sig else {
             return Err(framing_abort(state, S3Error::signature_does_not_match()));
         };
-        let trailer_hash = sigv4::sha256_hex_of(content.as_bytes());
+        let trailer_hash = sigv4::sha256_hex(content.as_bytes());
         let sts = sigv4::trailer_string_to_sign(
             &signing.amz_date,
             &signing.scope,
@@ -586,7 +451,7 @@ where
     }
 
     if frame_size == 0 {
-        verify_chunk_signature(&mut state, declared_sig, &sigv4::empty_payload_hash())?;
+        verify_chunk_signature(&mut state, declared_sig, sigv4::EMPTY_PAYLOAD_SHA256)?;
         let trailer_values = if state.expect_trailer {
             read_trailer(&mut state).await?
         } else {
@@ -630,7 +495,7 @@ where
             S3Error::invalid_argument("malformed aws-chunked frame terminator"),
         ));
     }
-    verify_chunk_signature(&mut state, declared_sig, &sigv4::sha256_hex_of(&data))?;
+    verify_chunk_signature(&mut state, declared_sig, &sigv4::sha256_hex(&data))?;
     if let Some(h) = state.checksum_hasher.as_mut() {
         h.update(&data);
     }
@@ -639,41 +504,34 @@ where
 
 /// Decode `aws-chunked` framing (see the module docs' grammar) into plain
 /// payload bytes, verifying the per-chunk and trailer signature chain when
-/// `chunk_signing` is present. `trailer_checksum`, when set, is verified
-/// against a running digest of the decoded payload once the trailer block
-/// (parsed regardless of signing mode) is read.
-#[allow(clippy::too_many_arguments)]
-pub fn decode_aws_chunked<S>(
+/// `options.chunk_signing` is present. `options.trailer_checksum`, when
+/// set, is verified against a running digest of the decoded payload once
+/// the trailer block (parsed regardless of signing mode) is read.
+fn decode_aws_chunked<S>(
     inner: S,
-    chunk_signing: Option<ChunkSigning>,
-    trailer_checksum: Option<ChecksumAlgo>,
-    max_frame_bytes: u64,
-    sideband: ErrorSideband,
-    bucket: String,
-    key: String,
+    options: ChunkedOptions,
 ) -> impl Stream<Item = Result<Bytes, AppError>> + Unpin
 where
     S: Stream<Item = Result<Bytes, AppError>> + Unpin,
 {
-    let signing = chunk_signing.map(|c| ChunkSigningState {
-        signing_key: c.signing_key,
+    let signing = options.chunk_signing.map(|c| ChunkSigningState {
+        signing_key: *c.signing_key,
         scope: c.scope,
         amz_date: c.amz_date,
         prev_signature: c.seed_signature,
     });
-    let checksum_hasher = trailer_checksum.map(ChecksumHasher::new);
+    let checksum_hasher = options.trailer_checksum.map(ChecksumHasher::new);
     let state = ChunkedState {
         inner,
         buf: bytes::BytesMut::new(),
         inner_done: false,
         signing,
         expect_trailer: true,
-        max_frame_bytes,
-        trailer_checksum,
+        max_frame_bytes: options.max_frame_bytes,
+        trailer_checksum: options.trailer_checksum,
         checksum_hasher,
-        sideband,
-        bucket,
-        key,
+        sideband: options.sideband,
+        bucket: options.bucket,
         finished: false,
     };
     Box::pin(futures_util::stream::try_unfold(state, next_chunked_frame))
@@ -697,7 +555,7 @@ pub fn upload_stream(
     key: String,
 ) -> Result<AppByteStream, S3Error> {
     let bucket_for_err = bucket.clone();
-    let key_for_err = key.clone();
+    let key_for_err = key;
     let base = futures_util::TryStreamExt::map_err(payload, move |e| {
         AppError(y2q_core::Error::InternalError {
             bucket: bucket_for_err.clone(),
@@ -718,9 +576,9 @@ pub fn upload_stream(
         ("x-amz-checksum-sha1", "sha1"),
     ] {
         if let Some(v) = headers.get(header_name).and_then(|v| v.to_str().ok()) {
-            match ChecksumAlgo::from_name(algo_name) {
-                Some(Some(algo)) => header_checksum = Some((algo, v.to_owned())),
-                _ => {
+            match ChecksumAlgo::classify(algo_name) {
+                ChecksumDecl::Supported(algo) => header_checksum = Some((algo, v.to_owned())),
+                ChecksumDecl::Unsupported | ChecksumDecl::NotAChecksum => {
                     return Err(S3Error::invalid_request(format!(
                         "unsupported checksum algorithm {algo_name}; y2q supports CRC32 and SHA256"
                     )));
@@ -729,49 +587,66 @@ pub fn upload_stream(
         }
     }
     // A trailer-declared checksum (`x-amz-trailer: x-amz-checksum-crc32`)
-    // only applies to the two `…-TRAILER` streaming payload modes.
-    let trailer_checksum = headers
-        .get("x-amz-trailer")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| {
-            v.split(',').find_map(|name| {
-                let name = name.trim().to_ascii_lowercase();
-                name.strip_prefix("x-amz-checksum-")
-                    .and_then(ChecksumAlgo::from_name)
-                    .flatten()
-            })
-        });
+    // only applies to the two `…-TRAILER` streaming payload modes. An
+    // unsupported algorithm named here must reject the request outright —
+    // silently treating it as "no checksum declared" would let the client
+    // believe it negotiated integrity verification that never ran.
+    let mut trailer_checksum: Option<ChecksumAlgo> = None;
+    if let Some(v) = headers.get("x-amz-trailer").and_then(|v| v.to_str().ok()) {
+        for name in v.split(',') {
+            let name = name.trim().to_ascii_lowercase();
+            let Some(algo_name) = name.strip_prefix("x-amz-checksum-") else {
+                continue;
+            };
+            match ChecksumAlgo::classify(algo_name) {
+                ChecksumDecl::Supported(algo) => {
+                    trailer_checksum = Some(algo);
+                    break;
+                }
+                ChecksumDecl::Unsupported => {
+                    return Err(S3Error::invalid_request(format!(
+                        "unsupported checksum algorithm: {algo_name}"
+                    )));
+                }
+                ChecksumDecl::NotAChecksum => {}
+            }
+        }
+    }
 
     let decoded: AppByteStream = match &auth.payload {
-        PayloadHash::Exact(hex) => Box::pin(verify_payload_sha256(
+        PayloadHash::Exact(hex) => Box::pin(verify_at_eof(
             base,
-            hex.clone(),
+            PayloadSha256 {
+                hasher: Sha256::new(),
+                expected_hex: hex.clone(),
+            },
             sideband.clone(),
             bucket.clone(),
-            key.clone(),
         )),
         PayloadHash::Unsigned => base,
         PayloadHash::StreamingSigned { .. } | PayloadHash::StreamingUnsigned => {
             Box::pin(decode_aws_chunked(
                 base,
-                auth.chunk_signing.clone(),
-                trailer_checksum,
-                max_frame_bytes,
-                sideband.clone(),
-                bucket.clone(),
-                key.clone(),
+                ChunkedOptions {
+                    chunk_signing: auth.chunk_signing.clone(),
+                    trailer_checksum,
+                    max_frame_bytes,
+                    sideband: sideband.clone(),
+                    bucket: bucket.clone(),
+                },
             ))
         }
     };
 
     let checksummed: AppByteStream = match header_checksum {
-        Some((algo, expected)) => Box::pin(verify_checksum_header(
+        Some((algo, expected)) => Box::pin(verify_at_eof(
             decoded,
-            algo,
-            expected,
+            ChecksumHeader {
+                hasher: ChecksumHasher::new(algo),
+                expected_b64: expected,
+            },
             sideband.clone(),
             bucket.clone(),
-            key.clone(),
         )),
         None => decoded,
     };
@@ -781,6 +656,5 @@ pub fn upload_stream(
         auth.leash,
         sideband,
         bucket,
-        key,
     )))
 }

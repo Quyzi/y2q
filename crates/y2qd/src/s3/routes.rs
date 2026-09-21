@@ -7,11 +7,11 @@
 
 use std::collections::HashMap;
 
-use actix_web::body::MessageBody;
+use actix_web::body::{EitherBody, MessageBody};
 use actix_web::dev::{ServiceRequest, ServiceResponse};
 use actix_web::http::header;
 use actix_web::middleware::Next;
-use actix_web::{HttpMessage, web};
+use actix_web::{HttpMessage, ResponseError, web};
 
 use crate::s3::auth::OriginalUri;
 use crate::s3::object;
@@ -143,4 +143,54 @@ pub async fn vhost_middleware<B: MessageBody>(
 
     req.extensions_mut().insert(OriginalUri(original_path));
     next.call(req).await
+}
+
+/// Funnel every S3-gateway error response through one place that fills in
+/// the daemon's own request id (matching the `X-Request-ID` header every
+/// other middleware already stamps) and the resource path the error
+/// concerns — so almost-every S3 error no longer ships a random,
+/// unlogged `x-amz-request-id` and an empty `<Resource>`.
+///
+/// Registered immediately after `request_id::request_id_middleware`
+/// (order otherwise irrelevant: this reads the response's own
+/// `x-request-id` header *after* `next.call` returns, and that header is
+/// set unconditionally by `request_id_middleware` regardless of relative
+/// wrap order).
+pub async fn error_detail_middleware<B: MessageBody + 'static>(
+    req: ServiceRequest,
+    next: Next<B>,
+) -> Result<ServiceResponse<EitherBody<B>>, actix_web::Error> {
+    let resource = req.path().to_owned();
+    let res = next.call(req).await?;
+
+    let Some(s3_err) = res
+        .response()
+        .error()
+        .and_then(|e| e.as_error::<crate::s3::error::S3Error>())
+    else {
+        return Ok(res.map_into_left_body());
+    };
+    let request_id = res
+        .response()
+        .headers()
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_owned();
+    let filled = s3_err
+        .clone()
+        .with_request_id(request_id.clone())
+        .with_resource(resource);
+    let mut error_resp = filled.error_response();
+    // `into_response` below replaces the whole response, which would
+    // otherwise drop the `X-Request-ID` header `request_id_middleware`
+    // already set — re-stamp it so the response still carries both the
+    // plain and `x-amz-`-prefixed forms, matching.
+    if let Ok(val) = actix_web::http::header::HeaderValue::from_str(&request_id) {
+        error_resp.headers_mut().insert(
+            actix_web::http::header::HeaderName::from_static("x-request-id"),
+            val,
+        );
+    }
+    Ok(res.into_response(error_resp.map_into_right_body()))
 }

@@ -276,6 +276,19 @@ pub struct S3Config {
     /// Maximum bytes accepted for a single multipart upload part.
     #[serde(default = "default_s3_max_part_bytes")]
     pub max_part_bytes: u64,
+    /// Maximum number of in-flight multipart uploads a single session may
+    /// hold; a `CreateMultipartUpload` past this cap is rejected with 503
+    /// `SlowDown` rather than evicting an existing upload (evicting would
+    /// delete a client's already-transferred parts).
+    #[serde(default = "default_s3_max_uploads_per_session")]
+    pub max_uploads_per_session: usize,
+    /// Age past which an in-flight multipart upload is aborted by the
+    /// background sweeper regardless of whether its owning session is
+    /// still live, so a session that never completes or aborts an upload
+    /// cannot pin its parts (and this session's upload-count budget)
+    /// forever.
+    #[serde(default = "default_s3_upload_max_age_secs")]
+    pub upload_max_age_secs: u64,
     /// Permit binding a non-loopback address while `[s3.tls] enabled` is
     /// false. Same rationale as [`ServerConfig::allow_insecure_bind`].
     #[serde(default)]
@@ -312,6 +325,12 @@ fn default_s3_max_clock_skew_secs() -> u64 {
 fn default_s3_max_part_bytes() -> u64 {
     64 * 1024 * 1024
 }
+fn default_s3_max_uploads_per_session() -> usize {
+    16
+}
+fn default_s3_upload_max_age_secs() -> u64 {
+    86_400
+}
 
 impl Default for S3Config {
     fn default() -> Self {
@@ -327,6 +346,8 @@ impl Default for S3Config {
             session_recheck_interval_secs: default_s3_session_recheck_interval_secs(),
             max_clock_skew_secs: default_s3_max_clock_skew_secs(),
             max_part_bytes: default_s3_max_part_bytes(),
+            max_uploads_per_session: default_s3_max_uploads_per_session(),
+            upload_max_age_secs: default_s3_upload_max_age_secs(),
             allow_insecure_bind: false,
             tls: TlsConfig::default(),
         }
@@ -736,6 +757,12 @@ fn validate_s3(cfg: &S3Config, server_max_body_bytes: usize) -> Result<(), Strin
     }
     if !cfg.virtual_host_domain.is_empty() && cfg.virtual_host_domain.starts_with('.') {
         return Err("[s3] virtual_host_domain must not start with a dot".to_string());
+    }
+    if cfg.max_uploads_per_session < 1 {
+        return Err("[s3] max_uploads_per_session must be at least 1".to_string());
+    }
+    if cfg.upload_max_age_secs < 60 {
+        return Err("[s3] upload_max_age_secs must be at least 60".to_string());
     }
     Ok(())
 }

@@ -3,10 +3,10 @@
 use std::sync::Arc;
 
 use actix_web::{HttpRequest, HttpResponse, web};
-use y2q_core::{AnyStorage, BucketPermission, Listing, PutOptions, SyncLevel};
+use y2q_core::{AnyStorage, BucketPermission, PutOptions, SyncLevel};
 
 use crate::auth::{AuthState, Authenticated};
-use crate::authz::{Decision, authorize_bucket, claim_ownership};
+use crate::authz::authorize_bucket;
 use crate::cipher;
 use crate::config::LabelLimits;
 use crate::error::{AppError, ErrorBody};
@@ -76,46 +76,28 @@ pub async fn handle(
     // together (see `claim_ownership`'s docs); an existing bucket just needs
     // its config read. Either way `cfg` is what quota enforcement and the
     // bucket-key resolution below both need — a single fetch serves both.
-    let cfg = match decision {
-        Decision::ClaimOwnership => {
-            claim_ownership(&storage, &state.user_store, &bucket, &auth.session)
-                .await?
-                .0
-        }
-        Decision::Allowed => storage
-            .get_bucket_config(&bucket)
-            .await
-            .map_err(AppError::from)?,
-    };
+    let cfg = crate::authz::resolve_bucket_config(
+        decision,
+        &storage,
+        &state.user_store,
+        &bucket,
+        &auth.session,
+    )
+    .await?;
 
     // Quota enforcement: only buckets that actually set a quota pay the usage
-    // scan cost. The Content-Length-based check below is a fast-reject
-    // optimization only (skipped by chunked transfer encoding, which has no
-    // Content-Length) — `max_bytes`, enforced mid-stream in
-    // `stream_encrypt_for_put`, is what actually bounds both the server-wide
-    // cap and any bucket quota regardless of how the body is transferred.
-    let mut max_bytes = encryption.max_body_bytes;
-    if let Some(limit) = cfg.quota_bytes {
-        let incoming = req
-            .headers()
-            .get("content-length")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(0);
-        let used = storage
-            .bucket_usage(&bucket)
-            .await
-            .map_err(AppError::from)?;
-        if used + incoming > limit {
-            return Err(AppError(y2q_core::Error::QuotaExceeded {
-                bucket: bucket.clone(),
-                limit,
-                used,
-                incoming,
-            }));
-        }
-        max_bytes = max_bytes.min(limit.saturating_sub(used));
-    }
+    // scan cost. `max_bytes`, enforced mid-stream in `stream_encrypt_for_put`,
+    // is what actually bounds both the server-wide cap and any bucket quota
+    // regardless of how the body is transferred.
+    let incoming = req
+        .headers()
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0);
+    let max_bytes =
+        crate::quota::write_budget(&storage, &cfg, &bucket, incoming, encryption.max_body_bytes)
+            .await?;
 
     let (bucket_epoch, bucket_pk) =
         crate::bucket_keys::resolve_write_key(&cfg, &bucket).map_err(AppError)?;

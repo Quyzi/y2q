@@ -14,7 +14,7 @@ use crate::error::AppError;
 const HEADER_PREFIX: &str = "x-y2q-";
 /// Server-emitted metadata header names that clients may not supply on PUT.
 /// Used by HEAD to surface object state; sending these on a PUT yields 400.
-const RESERVED: &[&str] = &["created", "modified", "checksum-gxhash"];
+pub(crate) const RESERVED: &[&str] = &["created", "modified", "checksum-gxhash"];
 /// Header names in the `X-Y2Q-` namespace that are consumed by dedicated
 /// handler logic and must not be persisted as user labels. The extractor
 /// silently skips them — the relevant handler parses them separately.

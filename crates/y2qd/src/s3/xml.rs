@@ -32,7 +32,7 @@ pub fn tag(out: &mut String, name: &str, value: &str) {
     out.push('<');
     out.push_str(name);
     out.push('>');
-    out.push_str(&escape(value));
+    escape_into(out, value);
     out.push_str("</");
     out.push_str(name);
     out.push('>');
@@ -41,23 +41,24 @@ pub fn tag(out: &mut String, name: &str, value: &str) {
 /// Append `<name>value</name>` for any `Display` value that needs no
 /// escaping (integers, booleans).
 pub fn tag_num<T: std::fmt::Display>(out: &mut String, name: &str, value: T) {
+    use std::fmt::Write;
     out.push('<');
     out.push_str(name);
     out.push('>');
-    out.push_str(&value.to_string());
+    let _ = write!(out, "{value}");
     out.push_str("</");
     out.push_str(name);
     out.push('>');
 }
 
-/// Escape `& < > " '` for inclusion as XML 1.0 element text. S3 keys are
-/// arbitrary UTF-8 and may contain bytes XML 1.0 cannot represent at all
-/// (C0 control characters other than tab/LF/CR) — those are replaced with
-/// U+FFFD here. A caller whose keys may contain such bytes must instead set
-/// `EncodingType=url` and percent-encode the value rather than relying on
-/// this function.
-pub fn escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
+/// Escape `& < > " '` for inclusion as XML 1.0 element text, appending
+/// directly to `out` rather than allocating an intermediate `String`. S3
+/// keys are arbitrary UTF-8 and may contain bytes XML 1.0 cannot represent
+/// at all (C0 control characters other than tab/LF/CR) — those are
+/// replaced with U+FFFD here. A caller whose keys may contain such bytes
+/// must instead set `EncodingType=url` and percent-encode the value rather
+/// than relying on this function.
+pub fn escape_into(out: &mut String, s: &str) {
     for ch in s.chars() {
         match ch {
             '&' => out.push_str("&amp;"),
@@ -70,7 +71,6 @@ pub fn escape(s: &str) -> String {
             c => out.push(c),
         }
     }
-    out
 }
 
 /// Decode the five predefined XML entities (`&amp; &lt; &gt; &quot; &apos;`)
@@ -119,11 +119,18 @@ fn unescape(s: &str) -> String {
 
 /// Find the next `<name ...>` or `<name>` open tag at or after byte offset
 /// `from`, tolerating (and skipping) attributes and a self-closing `/`
-/// before `>`. Returns `(tag_start, content_start)`: the byte offset of the
-/// leading `<` and the byte offset immediately after the tag's closing `>`.
+/// before `>`. Returns `(tag_start, content_start, self_closing)`:
+/// `tag_start` is the byte offset of the leading `<`, `content_start` the
+/// byte offset immediately after the tag's closing `>`, and `self_closing`
+/// whether the tag closed itself (`<name/>` or `<name attr="v"/>`) rather
+/// than opening an element with separate content and a `</name>` closer.
 /// Does not match `<nameFoo...>` — the character immediately after `name`
 /// must be `>`, whitespace, or `/`.
-fn find_open_tag(xml: &str, name: &str, from: usize) -> Result<Option<(usize, usize)>, XmlError> {
+fn find_open_tag(
+    xml: &str,
+    name: &str,
+    from: usize,
+) -> Result<Option<(usize, usize, bool)>, XmlError> {
     let pat = format!("<{name}");
     let mut search_from = from;
     loop {
@@ -143,17 +150,26 @@ fn find_open_tag(xml: &str, name: &str, from: usize) -> Result<Option<(usize, us
         let Some(gt_rel) = xml[after_name..].find('>') else {
             return Err(XmlError::Unterminated(name.to_owned()));
         };
-        return Ok(Some((start, after_name + gt_rel + 1)));
+        let content_start = after_name + gt_rel + 1;
+        let self_closing = content_start >= 2 && xml.as_bytes()[content_start - 2] == b'/';
+        return Ok(Some((start, content_start, self_closing)));
     }
 }
 
 /// Extract the raw (not-yet-unescaped) inner text of every top-level
-/// `<name>...</name>` occurrence in `xml`, in document order.
+/// `<name>...</name>` occurrence in `xml`, in document order. A
+/// self-closing `<name/>` contributes an empty string — legal XML with no
+/// content, not a malformed element missing its closer.
 fn extract_blocks(xml: &str, name: &str) -> Result<Vec<String>, XmlError> {
     let close = format!("</{name}>");
     let mut out = Vec::new();
     let mut pos = 0;
-    while let Some((_, content_start)) = find_open_tag(xml, name, pos)? {
+    while let Some((_, content_start, self_closing)) = find_open_tag(xml, name, pos)? {
+        if self_closing {
+            out.push(String::new());
+            pos = content_start;
+            continue;
+        }
         let end_rel = xml[content_start..]
             .find(close.as_str())
             .ok_or_else(|| XmlError::Unterminated(name.to_owned()))?;
@@ -266,5 +282,15 @@ mod tests {
         let xml = "<Part><PartNumber>1</PartNumber></Part>";
         let parts = nested_elements(xml, "Part", &["PartNumber", "ETag"]).unwrap();
         assert_eq!(parts, vec![vec![Some("1".to_owned()), None]]);
+    }
+
+    #[test]
+    fn nested_elements_treats_a_self_closing_child_as_empty_not_unterminated() {
+        // Before the fix, a self-closing `<Value/>` (legal XML with no
+        // content) hunted for a `</Value>` closer that never exists and
+        // failed the whole request with `Unterminated`.
+        let xml = "<Tag><Key>k</Key><Value/></Tag>";
+        let parts = nested_elements(xml, "Tag", &["Key", "Value"]).unwrap();
+        assert_eq!(parts, vec![vec![Some("k".to_owned()), Some(String::new())]]);
     }
 }

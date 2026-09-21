@@ -323,6 +323,14 @@ max_clock_skew_secs = 900
 # least 5242880 (S3's own minimum part size) and at most [server] max_body_bytes.
 max_part_bytes = 67108864  # 64 MiB
 
+# Maximum in-flight multipart uploads a single session may hold; a
+# CreateMultipartUpload past this cap is rejected with 503 SlowDown.
+max_uploads_per_session = 16
+
+# Age (seconds) past which an in-flight multipart upload is aborted by the
+# background sweeper regardless of whether its owning session is still live.
+upload_max_age_secs = 86400
+
 # Same override as [server] allow_insecure_bind, scoped to this listener.
 allow_insecure_bind = false
 

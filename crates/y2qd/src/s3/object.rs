@@ -4,34 +4,27 @@
 use std::sync::Arc;
 
 use actix_web::http::StatusCode;
-use actix_web::http::header::{
-    CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_LANGUAGE, CONTENT_TYPE, EXPIRES,
-};
-use actix_web::{HttpRequest, HttpResponse, HttpResponseBuilder, web};
+use actix_web::{HttpRequest, HttpResponse, web};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use futures_util::StreamExt;
-use y2q_core::{AnyStorage, BucketPermission, Listing, Metadata, PutOptions, Storage, SyncLevel};
+use y2q_core::{AnyStorage, BucketPermission, Listing, Metadata, PutOptions, Storage};
 
-use crate::auth::AuthState;
-use crate::authz::{Decision, authorize_bucket, claim_ownership};
+use crate::authz::authorize_bucket;
+
 use crate::bucket_keys;
 use crate::cipher;
 use crate::config::LabelLimits;
 use crate::s3::auth::S3Authenticated;
 use crate::s3::body::{self, ErrorSideband, LeashedDownload};
+use crate::s3::ctx::WriteCtx;
 use crate::s3::error::S3Error;
-use crate::s3::httpdate::{http_date, parse_http_date};
+use crate::s3::httpdate::parse_http_date;
 use crate::s3::meta;
 use crate::s3::routes::SubResource;
 use crate::s3::sigv4::percent_decode;
 use crate::s3::state::S3State;
 use crate::s3::xml;
-
-/// Reserved key prefix for multipart-upload part storage (see
-/// `crate::s3::multipart`). No client request may read, write, or delete a
-/// key under this prefix directly.
-const MULTIPART_PREFIX: &str = ".y2q-mpu/";
 
 /// Compute the S3-shaped ETag for an object: `"<16 lowercase hex>"` (the
 /// standard-base64-decoded gxhash64 checksum, hex-encoded) for a
@@ -41,78 +34,26 @@ const MULTIPART_PREFIX: &str = ".y2q-mpu/";
 /// hex chars) so clients treat it as opaque rather than attempt to verify
 /// it as a content hash.
 pub fn etag(md: &Metadata) -> String {
-    let raw = BASE64_STANDARD
-        .decode(&md.checksum_gxhash)
-        .unwrap_or_default();
-    let mut hex = String::with_capacity(raw.len() * 2);
-    for b in &raw {
-        hex.push_str(&format!("{b:02x}"));
-    }
-    match find_label(md, "amz-mpu-parts") {
-        Some(n) => format!("\"{hex}-{n}\""),
-        None => format!("\"{hex}\""),
-    }
-}
-
-fn find_label<'a>(md: &'a Metadata, name: &str) -> Option<&'a str> {
-    md.labels
-        .iter()
-        .find(|(k, _)| k == name)
-        .map(|(_, v)| v.as_str())
-}
-
-/// Apply the full `amz-*`-labels-plus-system-metadata header set a
-/// GET/HEAD response carries. `sub`'s `response-content-type` etc.
-/// overrides (used by presigned download links) take precedence over the
-/// object's own stored labels.
-fn apply_object_headers(builder: &mut HttpResponseBuilder, md: &Metadata, sub: &SubResource) {
-    let content_type = sub
-        .get("response-content-type")
-        .or_else(|| find_label(md, "amz-content-type"))
-        .unwrap_or("binary/octet-stream");
-    builder.insert_header((CONTENT_TYPE, content_type.to_owned()));
-
-    if let Some(v) = sub
-        .get("response-content-encoding")
-        .or_else(|| find_label(md, "amz-content-encoding"))
-    {
-        builder.insert_header((CONTENT_ENCODING, v.to_owned()));
-    }
-    if let Some(v) = sub
-        .get("response-content-disposition")
-        .or_else(|| find_label(md, "amz-content-disposition"))
-    {
-        builder.insert_header((CONTENT_DISPOSITION, v.to_owned()));
-    }
-    if let Some(v) = sub
-        .get("response-content-language")
-        .or_else(|| find_label(md, "amz-content-language"))
-    {
-        builder.insert_header((CONTENT_LANGUAGE, v.to_owned()));
-    }
-    if let Some(v) = sub
-        .get("response-cache-control")
-        .or_else(|| find_label(md, "amz-cache-control"))
-    {
-        builder.insert_header((CACHE_CONTROL, v.to_owned()));
-    }
-    if let Some(v) = sub
-        .get("response-expires")
-        .or_else(|| find_label(md, "amz-expires"))
-    {
-        builder.insert_header((EXPIRES, v.to_owned()));
-    }
-
-    for (name, value) in &md.labels {
-        if let Some(meta_name) = name.strip_prefix("amz-meta-") {
-            builder.append_header((format!("x-amz-meta-{meta_name}"), value.clone()));
+    match meta::find_label(md, meta::MPU_PARTS_LABEL) {
+        Some(n) => {
+            let raw = BASE64_STANDARD
+                .decode(&md.checksum_gxhash)
+                .unwrap_or_default();
+            format!("\"{}-{n}\"", crate::s3::sigv4::hex_encode(&raw))
         }
+        None => etag_from_checksum_b64(&md.checksum_gxhash),
     }
+}
 
-    builder.insert_header(("ETag", etag(md)));
-    builder.insert_header(("Last-Modified", http_date(md.modified / 1_000_000_000)));
-    builder.insert_header(("Accept-Ranges", "bytes"));
-    builder.insert_header(("x-amz-server-side-encryption", "AES256"));
+/// Build a single-part object's ETag directly from its standard-base64
+/// gxhash64 checksum, without needing the stored [`Metadata`] at all — lets
+/// `put_object` answer from the write it just performed
+/// (`PlaintextMetrics::checksum_gxhash_b64`) instead of a redundant
+/// `describe` round-trip. Never multipart-shaped: a freshly written
+/// single-part object cannot carry [`meta::MPU_PARTS_LABEL`].
+pub(crate) fn etag_from_checksum_b64(b64: &str) -> String {
+    let raw = BASE64_STANDARD.decode(b64).unwrap_or_default();
+    format!("\"{}\"", crate::s3::sigv4::hex_encode(&raw))
 }
 
 /// Evaluate `If-Match` / `If-Unmodified-Since` / `If-None-Match` /
@@ -123,13 +64,11 @@ fn check_conditionals(req: &HttpRequest, md: &Metadata) -> Option<HttpResponse> 
     let last_modified = std::time::UNIX_EPOCH + std::time::Duration::from_nanos(md.modified);
     let header_str = |name: &str| req.headers().get(name).and_then(|v| v.to_str().ok());
 
-    if let Some(v) = header_str("if-match")
-        && v != "*"
-        && !v.split(',').any(|t| t.trim() == current_etag)
-    {
-        return Some(HttpResponse::PreconditionFailed().finish());
-    }
-    if let Some(v) = header_str("if-unmodified-since")
+    if let Some(v) = header_str("if-match") {
+        if v != "*" && !v.split(',').any(|t| t.trim() == current_etag) {
+            return Some(HttpResponse::PreconditionFailed().finish());
+        }
+    } else if let Some(v) = header_str("if-unmodified-since")
         && let Some(t) = parse_http_date(v)
         && last_modified > t
     {
@@ -182,15 +121,6 @@ fn parse_range(req: &HttpRequest, size: u64) -> Option<(u64, u64)> {
     Some((start, end.min(size - 1)))
 }
 
-pub(crate) fn reject_multipart_namespace(key: &str) -> Result<(), S3Error> {
-    if key.starts_with(MULTIPART_PREFIX) {
-        return Err(S3Error::invalid_argument(
-            "keys under .y2q-mpu/ are reserved for multipart upload parts",
-        ));
-    }
-    Ok(())
-}
-
 /// `GetObject`, `GetObjectTagging` when `?tagging` is present, or
 /// `ListParts` when `?uploadId=` is present.
 pub async fn get(
@@ -201,7 +131,7 @@ pub async fn get(
     auth: S3Authenticated,
 ) -> Result<HttpResponse, S3Error> {
     let (bucket, key) = path.into_inner();
-    reject_multipart_namespace(&key)?;
+    crate::s3::multipart::reject_reserved_key(&key)?;
 
     let sub = SubResource::parse(req.query_string());
     if sub.has("tagging") {
@@ -211,7 +141,7 @@ pub async fn get(
         return crate::s3::multipart::list_parts(&bucket, &key, &sub, &storage, &s3_state, &auth)
             .await;
     }
-
+    crate::s3::bucket::reject_unimplemented_subresources(&sub)?;
     authorize_bucket(&auth.auth, &storage, &bucket, BucketPermission::Read).await?;
 
     let md = storage.describe(&bucket, &key).await?;
@@ -247,7 +177,7 @@ pub async fn get(
     let leashed = LeashedDownload::new(plaintext, auth.leash);
 
     let mut builder = HttpResponse::build(status);
-    apply_object_headers(&mut builder, &md, &sub);
+    meta::apply_object_headers(&mut builder, &md, &sub);
     builder.insert_header(("Content-Length", content_len.to_string()));
     if status == StatusCode::PARTIAL_CONTENT {
         builder.insert_header(("Content-Range", format!("bytes {start}-{end}/{}", md.size)));
@@ -264,7 +194,7 @@ pub async fn head(
     auth: S3Authenticated,
 ) -> Result<HttpResponse, S3Error> {
     let (bucket, key) = path.into_inner();
-    reject_multipart_namespace(&key)?;
+    crate::s3::multipart::reject_reserved_key(&key)?;
 
     authorize_bucket(&auth.auth, &storage, &bucket, BucketPermission::Read).await?;
 
@@ -277,7 +207,7 @@ pub async fn head(
     }
     let sub = SubResource::parse(req.query_string());
     let mut builder = HttpResponse::Ok();
-    apply_object_headers(&mut builder, &md, &sub);
+    meta::apply_object_headers(&mut builder, &md, &sub);
     Ok(builder.body(crate::s3::body::SizedEmptyBody(md.size)))
 }
 
@@ -295,23 +225,16 @@ pub async fn delete(
     auth: S3Authenticated,
 ) -> Result<HttpResponse, S3Error> {
     let (bucket, key) = path.into_inner();
-    reject_multipart_namespace(&key)?;
+    crate::s3::multipart::reject_reserved_key(&key)?;
 
     let sub = SubResource::parse(req.query_string());
     if sub.has("tagging") {
         return delete_tagging(&bucket, &key, &storage, limits.get_ref(), &auth).await;
     }
     if sub.has("uploadId") {
-        return crate::s3::multipart::abort(
-            web::Path::from((bucket, key)),
-            req,
-            storage,
-            s3_state,
-            auth,
-        )
-        .await;
+        return crate::s3::multipart::abort(&bucket, &key, &sub, storage, s3_state, auth).await;
     }
-
+    crate::s3::bucket::reject_unimplemented_subresources(&sub)?;
     authorize_bucket(&auth.auth, &storage, &bucket, BucketPermission::Write).await?;
 
     match storage.delete(&bucket, &key).await {
@@ -363,7 +286,7 @@ async fn put_tagging(
     let md = storage.describe(bucket, key).await?;
     let xml_body = std::str::from_utf8(body)
         .map_err(|_| S3Error::malformed_xml("tagging body is not valid UTF-8"))?;
-    let rows = xml::nested_elements(xml_body, "Tag", &["Key", "Value"]).map_err(xml_error_to_s3)?;
+    let rows = xml::nested_elements(xml_body, "Tag", &["Key", "Value"])?;
     let mut tags = Vec::with_capacity(rows.len());
     for row in rows {
         let key_name = row
@@ -395,46 +318,23 @@ async fn delete_tagging(
     Ok(HttpResponse::NoContent().finish())
 }
 
-fn xml_error_to_s3(e: xml::XmlError) -> S3Error {
-    match e {
-        xml::XmlError::TooLarge => S3Error::malformed_xml("request body too large"),
-        xml::XmlError::Unterminated(tag) => {
-            S3Error::malformed_xml(format!("malformed XML: unterminated <{tag}>"))
-        }
-    }
-}
-
 /// `POST /{bucket}/{key}` — `CreateMultipartUpload` (`?uploads`) or
 /// `CompleteMultipartUpload` (`?uploadId=`). S3 defines no other object
 /// POST operation.
-#[allow(clippy::too_many_arguments)]
 pub async fn post(
     path: web::Path<(String, String)>,
     req: HttpRequest,
     body: web::Bytes,
-    storage: web::Data<Arc<AnyStorage>>,
-    limits: web::Data<LabelLimits>,
-    encryption: web::Data<crate::config::EncryptionParams>,
-    default_sync: web::Data<SyncLevel>,
-    s3_state: web::Data<S3State>,
+    ctx: WriteCtx,
     auth: S3Authenticated,
 ) -> Result<HttpResponse, S3Error> {
     let sub = SubResource::parse(req.query_string());
     if sub.has("uploads") {
-        return crate::s3::multipart::create(path, req, storage, limits, s3_state, auth).await;
+        return crate::s3::multipart::create(path, req, ctx.storage, ctx.limits, ctx.s3, auth)
+            .await;
     }
     if sub.has("uploadId") {
-        return crate::s3::multipart::complete(
-            path,
-            req,
-            body,
-            storage,
-            encryption,
-            default_sync,
-            s3_state,
-            auth,
-        )
-        .await;
+        return crate::s3::multipart::complete(path, req, body, ctx, auth).await;
     }
     Err(S3Error::not_implemented(
         "unsupported object POST sub-resource",
@@ -444,34 +344,20 @@ pub async fn post(
 /// `PutObject` (`x-amz-copy-source` absent) or `CopyObject`
 /// (`x-amz-copy-source` present) — S3 dispatches both to `PUT`, not a
 /// separate verb.
-#[allow(clippy::too_many_arguments)]
 pub async fn put(
     path: web::Path<(String, String)>,
     req: HttpRequest,
     payload: web::Payload,
-    storage: web::Data<Arc<AnyStorage>>,
-    auth_state: web::Data<AuthState>,
-    limits: web::Data<LabelLimits>,
-    default_sync: web::Data<SyncLevel>,
-    encryption: web::Data<crate::config::EncryptionParams>,
-    s3_state: web::Data<S3State>,
+    ctx: WriteCtx,
     auth: S3Authenticated,
 ) -> Result<HttpResponse, S3Error> {
     let (bucket, key) = path.into_inner();
-    reject_multipart_namespace(&key)?;
+    crate::s3::multipart::reject_reserved_key(&key)?;
 
     let sub = SubResource::parse(req.query_string());
     if sub.has("uploadId") {
-        return crate::s3::multipart::upload_part(
-            web::Path::from((bucket, key)),
-            req,
-            payload,
-            storage,
-            encryption,
-            s3_state,
-            auth,
-        )
-        .await;
+        return crate::s3::multipart::upload_part(&bucket, &key, &sub, req, payload, ctx, auth)
+            .await;
     }
     if sub.has("tagging") {
         let mut buf = bytes::BytesMut::new();
@@ -480,9 +366,23 @@ pub async fn put(
             let chunk = chunk
                 .map_err(|e| S3Error::invalid_argument(format!("failed to read body: {e}")))?;
             buf.extend_from_slice(&chunk);
+            if buf.len() > xml::MAX_XML_BYTES {
+                return Err(S3Error::entity_too_large(
+                    "tagging document exceeds the maximum XML size (1 MiB)",
+                ));
+            }
         }
-        return put_tagging(&bucket, &key, &buf, &storage, limits.get_ref(), &auth).await;
+        return put_tagging(
+            &bucket,
+            &key,
+            &buf,
+            &ctx.storage,
+            ctx.limits.get_ref(),
+            &auth,
+        )
+        .await;
     }
+    crate::s3::bucket::reject_unimplemented_subresources(&sub)?;
 
     if let Some(copy_source) = req
         .headers()
@@ -490,35 +390,10 @@ pub async fn put(
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned)
     {
-        return copy_object(
-            bucket,
-            key,
-            copy_source,
-            req,
-            storage,
-            auth_state,
-            limits,
-            default_sync,
-            encryption,
-            auth,
-        )
-        .await;
+        return copy_object(bucket, key, copy_source, req, ctx, auth).await;
     }
 
-    put_object(
-        bucket,
-        key,
-        req,
-        payload,
-        storage,
-        auth_state,
-        limits,
-        default_sync,
-        encryption,
-        s3_state,
-        auth,
-    )
-    .await
+    put_object(bucket, key, req, payload, ctx, auth).await
 }
 
 /// `PutObject` proper. Mirrors `handlers::put::handle`'s pipeline —
@@ -526,63 +401,49 @@ pub async fn put(
 /// `begin_streaming_put` → `stream_encrypt_for_put` → `commit` — with S3
 /// header-derived labels and the `aws-chunked`/checksum/leash upload
 /// adapter chain in place of the plain REST payload.
-#[allow(clippy::too_many_arguments)]
 async fn put_object(
     bucket: String,
     key: String,
     req: HttpRequest,
     payload: web::Payload,
-    storage: web::Data<Arc<AnyStorage>>,
-    auth_state: web::Data<AuthState>,
-    limits: web::Data<LabelLimits>,
-    default_sync: web::Data<SyncLevel>,
-    encryption: web::Data<crate::config::EncryptionParams>,
-    s3_state: web::Data<S3State>,
+    ctx: WriteCtx,
     auth: S3Authenticated,
 ) -> Result<HttpResponse, S3Error> {
-    let labels = meta::labels_from_request(&req, limits.get_ref())?;
-    let sync = *default_sync.get_ref();
+    let labels = meta::labels_from_request(&req, ctx.limits.get_ref())?;
+    let sync = *ctx.default_sync.get_ref();
 
-    let decision = authorize_bucket(&auth.auth, &storage, &bucket, BucketPermission::Write).await?;
-    let cfg = match decision {
-        Decision::ClaimOwnership => {
-            claim_ownership(
-                &storage,
-                &auth_state.user_store,
-                &bucket,
-                &auth.auth.session,
-            )
-            .await?
-            .0
-        }
-        Decision::Allowed => storage.get_bucket_config(&bucket).await?,
-    };
+    let decision =
+        authorize_bucket(&auth.auth, &ctx.storage, &bucket, BucketPermission::Write).await?;
+    let cfg = crate::authz::resolve_bucket_config(
+        decision,
+        &ctx.storage,
+        &ctx.auth_state.user_store,
+        &bucket,
+        &auth.auth.session,
+    )
+    .await?;
 
-    let mut max_bytes = encryption.max_body_bytes;
-    if let Some(limit) = cfg.quota_bytes {
-        let incoming = req
-            .headers()
-            .get("x-amz-decoded-content-length")
-            .or_else(|| req.headers().get("content-length"))
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(0);
-        let used = storage.bucket_usage(&bucket).await?;
-        if used + incoming > limit {
-            return Err(S3Error::new(
-                "QuotaExceeded",
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "The bucket quota would be exceeded by this request.",
-            ));
-        }
-        max_bytes = max_bytes.min(limit.saturating_sub(used));
-    }
+    let incoming = req
+        .headers()
+        .get("x-amz-decoded-content-length")
+        .or_else(|| req.headers().get("content-length"))
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0);
+    let max_bytes = crate::quota::write_budget(
+        &ctx.storage,
+        &cfg,
+        &bucket,
+        incoming,
+        ctx.encryption.max_body_bytes,
+    )
+    .await?;
 
     let (bucket_epoch, bucket_pk) = bucket_keys::resolve_write_key(&cfg, &bucket)?;
-    let (guard, sink, write_offset) = storage.begin_streaming_put(&bucket, &key).await?;
+    let (guard, sink, write_offset) = ctx.storage.begin_streaming_put(&bucket, &key).await?;
 
     let sideband = ErrorSideband::new();
-    let max_part_bytes = s3_state.config.max_part_bytes;
+    let max_part_bytes = ctx.s3.config.max_part_bytes;
     let headers = req.headers().clone();
     let stream = body::upload_stream(
         payload,
@@ -602,7 +463,7 @@ async fn put_object(
         &bucket,
         &key,
         write_offset,
-        encryption.chunk_size_bytes,
+        ctx.encryption.chunk_size_bytes,
         Some(max_bytes),
     )
     .await
@@ -611,6 +472,7 @@ async fn put_object(
         Err(app_err) => return Err(sideband.take().unwrap_or_else(|| S3Error::from(app_err))),
     };
 
+    let response_etag = etag_from_checksum_b64(&plaintext_metrics.checksum_gxhash_b64);
     guard
         .commit(
             sink,
@@ -624,9 +486,8 @@ async fn put_object(
         )
         .await?;
 
-    let md = storage.describe(&bucket, &key).await?;
     Ok(HttpResponse::Ok()
-        .insert_header(("ETag", etag(&md)))
+        .insert_header(("ETag", response_etag))
         .insert_header(("x-amz-server-side-encryption", "AES256"))
         .finish())
 }
@@ -635,20 +496,15 @@ async fn put_object(
 /// destination through two independent `authorize_bucket` calls — a
 /// cross-bucket copy needs this persona to hold real grants on both, with
 /// no shortcut through the destination's write access alone.
-#[allow(clippy::too_many_arguments)]
 async fn copy_object(
     dest_bucket: String,
     dest_key: String,
     copy_source: String,
     req: HttpRequest,
-    storage: web::Data<Arc<AnyStorage>>,
-    auth_state: web::Data<AuthState>,
-    limits: web::Data<LabelLimits>,
-    default_sync: web::Data<SyncLevel>,
-    encryption: web::Data<crate::config::EncryptionParams>,
+    ctx: WriteCtx,
     auth: S3Authenticated,
 ) -> Result<HttpResponse, S3Error> {
-    reject_multipart_namespace(&dest_key)?;
+    crate::s3::multipart::reject_reserved_key(&dest_key)?;
 
     let trimmed = copy_source.trim_start_matches('/');
     if trimmed.contains('?') {
@@ -661,7 +517,7 @@ async fn copy_object(
         .split_once('/')
         .ok_or_else(|| S3Error::invalid_argument("malformed x-amz-copy-source"))?;
     let (src_bucket, src_key) = (src_bucket.to_owned(), src_key.to_owned());
-    reject_multipart_namespace(&src_key)?;
+    crate::s3::multipart::reject_reserved_key(&src_key)?;
 
     let metadata_directive = req
         .headers()
@@ -675,39 +531,56 @@ async fn copy_object(
         ));
     }
 
-    authorize_bucket(&auth.auth, &storage, &src_bucket, BucketPermission::Read).await?;
-    let src_md = storage.describe(&src_bucket, &src_key).await?;
-    let src_cfg = storage.get_bucket_config(&src_bucket).await?;
+    authorize_bucket(
+        &auth.auth,
+        &ctx.storage,
+        &src_bucket,
+        BucketPermission::Read,
+    )
+    .await?;
+    let src_md = ctx.storage.describe(&src_bucket, &src_key).await?;
+    let src_cfg = ctx.storage.get_bucket_config(&src_bucket).await?;
     let src_epoch = src_md.key_epoch.unwrap_or(0);
     let src_sk =
         bucket_keys::resolve_read_key(&auth.auth.session, &src_cfg, &src_bucket, src_epoch)?;
 
-    let decision =
-        authorize_bucket(&auth.auth, &storage, &dest_bucket, BucketPermission::Write).await?;
-    let dest_cfg = match decision {
-        Decision::ClaimOwnership => {
-            claim_ownership(
-                &storage,
-                &auth_state.user_store,
-                &dest_bucket,
-                &auth.auth.session,
-            )
-            .await?
-            .0
-        }
-        Decision::Allowed => storage.get_bucket_config(&dest_bucket).await?,
-    };
+    let decision = authorize_bucket(
+        &auth.auth,
+        &ctx.storage,
+        &dest_bucket,
+        BucketPermission::Write,
+    )
+    .await?;
+    let dest_cfg = crate::authz::resolve_bucket_config(
+        decision,
+        &ctx.storage,
+        &ctx.auth_state.user_store,
+        &dest_bucket,
+        &auth.auth.session,
+    )
+    .await?;
+    let max_bytes = crate::quota::write_budget(
+        &ctx.storage,
+        &dest_cfg,
+        &dest_bucket,
+        src_md.size,
+        ctx.encryption.max_body_bytes,
+    )
+    .await?;
     let (dest_epoch, dest_pk) = bucket_keys::resolve_write_key(&dest_cfg, &dest_bucket)?;
 
     let labels = if metadata_directive == "REPLACE" {
-        meta::labels_from_request(&req, limits.get_ref())?
+        meta::labels_from_request(&req, ctx.limits.get_ref())?
     } else {
-        src_md.labels.clone()
+        meta::labels_for_copy(&src_md)
     };
 
-    let (guard, sink, write_offset) = storage.begin_streaming_put(&dest_bucket, &dest_key).await?;
+    let (guard, sink, write_offset) = ctx
+        .storage
+        .begin_streaming_put(&dest_bucket, &dest_key)
+        .await?;
 
-    let storage_arc = Arc::clone(storage.get_ref());
+    let storage_arc = Arc::clone(ctx.storage.get_ref());
     let src_stream: crate::s3::body::AppByteStream = if src_md.size == 0 {
         Box::pin(futures_util::stream::empty())
     } else {
@@ -721,15 +594,15 @@ async fn copy_object(
             src_md.size - 1,
         ))
     };
+    let sideband = ErrorSideband::new();
     let leashed = body::leashed_upload(
         src_stream,
         auth.leash,
-        ErrorSideband::new(),
+        sideband.clone(),
         dest_bucket.clone(),
-        dest_key.clone(),
     );
 
-    let (sink, plaintext_metrics, cipher_metadata) = cipher::stream_encrypt_for_put(
+    let (sink, plaintext_metrics, cipher_metadata) = match cipher::stream_encrypt_for_put(
         &dest_pk,
         dest_epoch,
         leashed,
@@ -737,17 +610,21 @@ async fn copy_object(
         &dest_bucket,
         &dest_key,
         write_offset,
-        encryption.chunk_size_bytes,
-        Some(encryption.max_body_bytes),
+        ctx.encryption.chunk_size_bytes,
+        Some(max_bytes),
     )
-    .await?;
+    .await
+    {
+        Ok(v) => v,
+        Err(app_err) => return Err(sideband.take().unwrap_or_else(|| S3Error::from(app_err))),
+    };
 
     guard
         .commit(
             sink,
             PutOptions {
                 labels,
-                sync: *default_sync.get_ref(),
+                sync: *ctx.default_sync.get_ref(),
                 ..Default::default()
             },
             plaintext_metrics,
@@ -755,7 +632,7 @@ async fn copy_object(
         )
         .await?;
 
-    let dest_md = storage.describe(&dest_bucket, &dest_key).await?;
+    let dest_md = ctx.storage.describe(&dest_bucket, &dest_key).await?;
     let mut body = String::new();
     xml::header(&mut body);
     body.push_str("<CopyObjectResult>");
@@ -769,4 +646,67 @@ async fn copy_object(
     Ok(HttpResponse::Ok()
         .content_type("application/xml")
         .body(body))
+}
+
+#[cfg(test)]
+mod tests {
+    use actix_web::test::TestRequest;
+
+    use super::*;
+
+    fn md_at(modified_secs: u64) -> Metadata {
+        Metadata {
+            created: 0,
+            modified: modified_secs * 1_000_000_000,
+            size: 0,
+            checksum_gxhash: String::new(),
+            bucket: "b".to_owned(),
+            key: "k".to_owned(),
+            disk_path: std::path::PathBuf::new(),
+            url_path: "b/k".to_owned(),
+            labels: Default::default(),
+            cipher_size: None,
+            cipher_checksum: None,
+            kem_alg: None,
+            aead_alg: None,
+            envelope_version: None,
+            version: None,
+            committed_at: None,
+            key_epoch: None,
+        }
+    }
+
+    /// Regression proof for RFC 9110 conditional precedence: a matching
+    /// `If-Match` must make the request proceed even when `If-Unmodified-
+    /// Since` is stale — before the fix, the two were evaluated
+    /// independently and this combination produced a spurious 412.
+    #[test]
+    fn matching_if_match_suppresses_a_stale_if_unmodified_since() {
+        // `etag()` of a zero-length checksum is the two-character quoted
+        // empty string `""`.
+        let md = md_at(2_000_000_000); // ~2033, well after the stale date below.
+        let current_etag = etag(&md);
+        assert_eq!(current_etag, "\"\"");
+
+        let req = TestRequest::default()
+            .insert_header(("if-match", current_etag.as_str()))
+            .insert_header(("if-unmodified-since", "Sat, 01 Jan 2000 00:00:00 GMT"))
+            .to_http_request();
+        assert!(
+            check_conditionals(&req, &md).is_none(),
+            "a matching If-Match must short-circuit If-Unmodified-Since entirely"
+        );
+    }
+
+    /// Negative control: with `If-Match` absent, a stale `If-Unmodified-
+    /// Since` alone still applies and yields 412.
+    #[test]
+    fn stale_if_unmodified_since_alone_still_yields_412() {
+        let md = md_at(2_000_000_000);
+        let req = TestRequest::default()
+            .insert_header(("if-unmodified-since", "Sat, 01 Jan 2000 00:00:00 GMT"))
+            .to_http_request();
+        let resp = check_conditionals(&req, &md).expect("stale If-Unmodified-Since must apply");
+        assert_eq!(resp.status(), StatusCode::PRECONDITION_FAILED);
+    }
 }

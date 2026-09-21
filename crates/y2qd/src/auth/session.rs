@@ -291,6 +291,14 @@ impl SessionStore {
     /// forward, with a new `expires_at`. Revokes the old token. Never
     /// materializes the identity key outside guarded memory.
     ///
+    /// Rotating the token hash invalidates any *session-keyed* side state
+    /// held outside this store — the one such consumer today is
+    /// `crate::s3::state::S3State`, whose credentials and in-flight
+    /// multipart uploads are keyed by `token_hash`. This method does not
+    /// re-key that state itself (it has no reference to it); the caller,
+    /// `auth::handlers::refresh`, calls `S3State::rekey_session` right
+    /// after `reissue` returns the new token.
+    ///
     /// Rejects with [`AuthError::RefreshLimitExceeded`] once the token has
     /// already been refreshed `max_refreshes` times (so `max_refreshes = 0`,
     /// the default, disables refresh entirely: the very first attempt is

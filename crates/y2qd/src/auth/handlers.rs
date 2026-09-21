@@ -93,9 +93,11 @@ fn token_response(resp: TokenResponse) -> Result<HttpResponse, AuthError> {
         .body(Bytes::from_owner(ScrubbedBody(body))))
 }
 
-/// Owner passed to [`Bytes::from_owner`] so the serialized (token-bearing)
-/// response body is zeroized once actix drops it after writing the socket.
-struct ScrubbedBody(Zeroizing<Vec<u8>>);
+/// Owner passed to [`Bytes::from_owner`] so a serialized (token/secret
+/// bearing) response body is zeroized once actix drops it after writing
+/// the socket. Shared by `POST /api/v1/auth/login`/`refresh` and
+/// `POST /api/v1/s3/credentials` (`crate::s3::credentials::mint`).
+pub(crate) struct ScrubbedBody(pub(crate) Zeroizing<Vec<u8>>);
 
 impl AsRef<[u8]> for ScrubbedBody {
     fn as_ref(&self) -> &[u8] {
@@ -341,9 +343,10 @@ pub async fn login(
     ),
     tag = "auth",
 )]
-#[tracing::instrument(skip(state, auth), fields(username = %auth.username))]
+#[tracing::instrument(skip(state, s3_state, auth), fields(username = %auth.username))]
 pub async fn refresh(
     state: web::Data<AuthState>,
+    s3_state: web::Data<crate::s3::state::S3State>,
     auth: Authenticated,
 ) -> Result<HttpResponse, AuthError> {
     let expires_at = compute_expiry(
@@ -354,6 +357,7 @@ pub async fn refresh(
     let token = state
         .sessions
         .reissue(&auth.token_hash, expires_at, state.config.max_refreshes)?;
+    s3_state.rekey_session(&auth.token_hash, &token.hash());
     token_response(TokenResponse {
         token: token.0,
         expires_at: expires_at

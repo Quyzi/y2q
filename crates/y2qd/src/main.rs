@@ -83,9 +83,12 @@ mod error;
 mod handlers;
 mod node_key_rotation;
 pub(crate) mod observability;
+mod quota;
 mod rate_limit;
 mod request_id;
 mod s3;
+#[cfg(test)]
+mod s3_gateway_test;
 #[cfg(test)]
 mod session_residency_test;
 mod span;
@@ -431,7 +434,7 @@ async fn main() -> std::io::Result<()> {
             auth_state.sessions.keyring(),
             cfg.s3.max_credentials_per_session,
         ),
-        uploads: s3::state::MultipartRegistry::new(),
+        uploads: s3::state::MultipartRegistry::new(cfg.s3.max_uploads_per_session),
         config: cfg.s3.clone(),
     });
     // Background sweeper for expired sessions, stale S3 credentials, and
@@ -441,6 +444,7 @@ async fn main() -> std::io::Result<()> {
         let s3_state = s3_state.clone();
         let storage_for_sweep = Arc::clone(storage_data.get_ref());
         let interval = Duration::from_secs(cfg.auth.session_sweep_interval_seconds.max(1));
+        let upload_max_age = Duration::from_secs(cfg.s3.upload_max_age_secs);
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(interval).await;
@@ -456,6 +460,7 @@ async fn main() -> std::io::Result<()> {
                     &storage_for_sweep,
                     &s3_state.uploads,
                     &auth_state.sessions,
+                    upload_max_age,
                 )
                 .await;
             }
@@ -697,6 +702,7 @@ async fn main() -> std::io::Result<()> {
     let mut s3_server = HttpServer::new(move || {
         App::new()
             .wrap(from_fn(request_id::request_id_middleware))
+            .wrap(from_fn(s3::routes::error_detail_middleware))
             .wrap(TracingLogger::<Y2qRootSpanBuilder>::new())
             .wrap(from_fn(observability::metrics_middleware))
             .wrap(from_fn(trace::trace_middleware))
