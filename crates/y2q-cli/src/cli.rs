@@ -51,7 +51,7 @@ pub enum Commands {
     /// Log in to a server alias and cache the session token.
     Login {
         alias: String,
-        #[arg(long, short)]
+        #[arg(long, short, allow_hyphen_values = true)]
         user: Option<String>,
         #[arg(long, short, allow_hyphen_values = true)]
         password: Option<String>,
@@ -146,7 +146,7 @@ pub enum Commands {
         path: Option<String>,
         #[arg(long)]
         limit: Option<u32>,
-        #[arg(long, conflicts_with = "all")]
+        #[arg(long, conflicts_with = "all", allow_hyphen_values = true)]
         after: Option<String>,
         #[arg(long, conflicts_with = "after")]
         all: bool,
@@ -172,10 +172,10 @@ pub enum Commands {
     Find {
         path: String,
         /// Glob pattern matched against the object basename.
-        #[arg(long, value_name = "GLOB")]
+        #[arg(long, value_name = "GLOB", allow_hyphen_values = true)]
         name: Option<String>,
         /// Size filter: `+N` = ≥, `-N` = ≤, `N` = exact. Suffixes: k/K, m/M, g/G (decimal) or ki/Ki, mi/Mi, gi/Gi (binary).
-        #[arg(long, value_name = "EXPR")]
+        #[arg(long, value_name = "EXPR", allow_hyphen_values = true)]
         size: Option<String>,
         /// Only entries older than this duration (e.g. `7d`, `30m`).
         #[arg(long, value_name = "DUR")]
@@ -207,7 +207,12 @@ pub enum Commands {
         #[arg(long)]
         remove: bool,
         /// Glob patterns excluded from the sync.
-        #[arg(long, value_name = "GLOB", number_of_values = 1)]
+        #[arg(
+            long,
+            value_name = "GLOB",
+            number_of_values = 1,
+            allow_hyphen_values = true
+        )]
         exclude: Vec<String>,
     },
     /// Stream live PUT/DELETE/GET/HEAD events matching a remote prefix.
@@ -353,7 +358,7 @@ pub enum AliasCmd {
     Set {
         alias: String,
         url: String,
-        #[arg(long, short)]
+        #[arg(long, short, allow_hyphen_values = true)]
         user: Option<String>,
         /// Skip TLS certificate verification (dangerous - dev/staging only).
         #[arg(long)]
