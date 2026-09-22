@@ -546,6 +546,11 @@ unsafe impl Send for SecretVec {}
 
 #[cfg(target_os = "linux")]
 impl SecretVec {
+    /// Set the number of written bytes without touching capacity.
+    fn set_len(&mut self, new_len: usize) {
+        self.len = new_len;
+    }
+
     /// Allocate `len` zeroed bytes (already the case: `mmap` anonymous
     /// pages are zero-filled).
     pub fn zeroed(len: usize) -> Result<Self, SecMemError> {
@@ -624,6 +629,11 @@ impl SecretVec {
 
 #[cfg(not(target_os = "linux"))]
 impl SecretVec {
+    /// Set the number of written bytes without touching capacity.
+    fn set_len(&mut self, new_len: usize) {
+        self.data.truncate(new_len);
+    }
+
     /// Allocate `len` zeroed bytes.
     pub fn zeroed(len: usize) -> Result<Self, SecMemError> {
         Ok(Self {
@@ -720,7 +730,7 @@ impl aes_gcm::aead::Buffer for SecretVec {
         let cur = self.len();
         if new_len < cur {
             self.as_mut_slice()[new_len..cur].zeroize();
-            self.len = new_len;
+            self.set_len(new_len);
         }
     }
 }

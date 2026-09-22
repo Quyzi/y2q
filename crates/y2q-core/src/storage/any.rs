@@ -221,6 +221,7 @@ impl AnyStreamingPutGuard {
                 g.commit(writer, options, plaintext_metrics, cipher_metadata)
                     .await
             }
+            #[cfg(target_os = "linux")]
             _ => Err(Error::InternalError {
                 bucket: String::new(),
                 key: String::new(),
