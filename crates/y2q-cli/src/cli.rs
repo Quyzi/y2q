@@ -353,7 +353,7 @@ pub enum AliasCmd {
     Set {
         alias: String,
         url: String,
-        #[arg(long, short)]
+        #[arg(long, short, allow_hyphen_values = true)]
         user: Option<String>,
         /// Skip TLS certificate verification (dangerous - dev/staging only).
         #[arg(long)]
