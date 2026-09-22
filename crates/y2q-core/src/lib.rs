@@ -584,10 +584,13 @@ pub trait Storage {
         options: PutOptions,
     ) -> Result<bool, Error>;
 
-    /// Delete the object at `bucket`/`key` and return its contents.
+    /// Delete the object at `bucket`/`key`.
     ///
-    /// Returns [`Error::NotFound`] if no object exists at that address.
-    async fn delete(&self, bucket: &str, key: &str) -> Result<Object, Error>;
+    /// Returns [`Error::NotFound`] if no object exists at that address. The
+    /// object's payload is never read: the `.obj` header is still decoded and
+    /// length-checked, but the data region is not touched, so delete cost does
+    /// not scale with object size.
+    async fn delete(&self, bucket: &str, key: &str) -> Result<(), Error>;
 
     /// Return the [`Metadata`] for the object at `bucket`/`key`.
     ///

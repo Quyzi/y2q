@@ -538,6 +538,11 @@ async fn main() -> std::io::Result<()> {
             observability::STORAGE_DURATION_BUCKETS_MILLIS,
         )
         .expect("storage duration histogram buckets are non-empty and finite")
+        .set_buckets_for_metric(
+            Matcher::Full(observability::STORAGE_PHASE_DURATION.to_string()),
+            observability::STORAGE_PHASE_BUCKETS_MILLIS,
+        )
+        .expect("storage phase histogram buckets are non-empty and finite")
         .install_recorder()
         .expect("failed to install the Prometheus recorder");
     observability::describe_metrics();

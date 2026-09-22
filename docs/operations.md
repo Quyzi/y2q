@@ -432,6 +432,40 @@ unauthenticated_metrics = true
 
 When enabled, `/metrics/prometheus` and `/api-docs/openapi.json` are both reachable unauthenticated. Restrict access at the network layer (or behind your TLS/proxy) if you turn this on. With it `false` (default) the daemon logs that they are disabled at startup.
 
+### Write-path phase metrics
+
+`y2qd_storage_phase_duration_milliseconds{phase, backend}` breaks a PUT or
+DELETE down into its durability barriers and its metadata index commit, in
+milliseconds. `phase` is one of:
+
+- `fdatasync` - flushing the object's data to disk (PUT only, and only when
+  `options.sync` is `Durable`).
+- `dir_fsync` - the atomic rename into place plus the parent-directory fsync
+  that makes the rename durable (PUT only, `Durable` sync). On the `uring`
+  backend this label covers both the rename *and* the directory fsync
+  together, because they happen as one worker round trip - there is no
+  separate sample for the bare rename there.
+- `unlink` - removing the `.obj` file (DELETE only).
+- `index_commit` - the secondary-index upsert or remove. Recorded on every
+  PUT and DELETE regardless of sync level, so a best-effort (non-`Durable`)
+  write emits only `index_commit` while a durable write emits all three
+  relevant phases.
+
+`backend` is `filesystem` or `uring`, matching the `backend` label on
+`y2qd_storage_ops_total`.
+
+These phases do not cover encryption or streaming the request body - that
+time is `y2qd_request_duration_milliseconds` minus the sum of the phases
+above for the same operation.
+
+**Diagnosing a write-throughput regression:** compare phase quantiles from
+either side of the drop. If every phase scales by roughly the same factor
+while GET/STAT latency stays flat, the slowdown is beneath the daemon - the
+filesystem or the underlying device, not `y2qd` itself. If one phase moves
+alone, that phase is the regression: `fdatasync`/`dir_fsync` pointing at
+storage hardware or filesystem journaling, `index_commit` pointing at the
+`redb` metadata index.
+
 ### Tracing
 
 Set `RUST_LOG` before launch. Examples:
@@ -557,6 +591,7 @@ location / {
 | `429 Too Many Requests` on login | Either the per-source-IP rate limit (bursty requests from one client, checked before credentials) or the per-username lockout after repeated failures | For the lockout, wait `lockout_seconds` or use another user - `Retry-After` tells you exactly how long. The IP rate limit clears itself after a few seconds; no body/header details are returned for it. |
 | Listing shows missing or stale objects after restore | Index drift after bulk restore | Run `POST /api/v1/rebuild` (or restart the daemon - startup auto-rebuild handles it). |
 | Data-loss `tracing::error!` messages at startup | `.obj` files referenced in index are gone | Indicates actual data loss (e.g. from a partial restore). Startup rebuild logs the affected keys. |
+| Throughput halves part-way through a sustained write benchmark and never recovers; reads unaffected | Filesystem/device sustained-write cliff (COW filesystem + per-PUT fsync churn, SSD SLC cache exhaustion, or GC) | Compare `y2qd_storage_phase_duration_milliseconds` quantiles either side of the drop: uniform scaling across phases with flat GET latency means the storage stack, not the daemon. Re-test with `base_path` on a different filesystem to confirm. |
 
 ## Source
 

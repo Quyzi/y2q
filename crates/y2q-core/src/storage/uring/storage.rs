@@ -24,6 +24,7 @@ use crate::{
         obj_path_for, require_container_header_key, require_object_metadata_key, require_path_key,
     },
     storage::locks::LockRegistry,
+    storage::record_write_phase,
 };
 
 use super::{ops::UringOp, runtime::WorkerPool, streaming::UringStreamingPutGuard};
@@ -484,6 +485,7 @@ impl Storage for UringStorage {
         // Mirror FilesystemStorage: the on-disk record is authoritative, so a
         // failed index upsert is logged but not surfaced — the index can be
         // rebuilt from the trailer scan in `rebuild_cache`.
+        let phase_start = Instant::now();
         if let Err(e) = self.index.upsert(&metadata, options.sync).await {
             tracing::warn!(
                 bucket = bucket,
@@ -492,10 +494,15 @@ impl Storage for UringStorage {
                 "metadata index upsert failed; on-disk record is authoritative"
             );
         }
+        record_write_phase(
+            "index_commit",
+            "uring",
+            phase_start.elapsed().as_secs_f64() * 1_000.0,
+        );
         Ok(is_overwrite)
     }
 
-    async fn delete(&self, bucket: &str, key: &str) -> Result<Object, Error> {
+    async fn delete(&self, bucket: &str, key: &str) -> Result<(), Error> {
         validate_bucket(bucket)?;
         validate_key(key)?;
         let started = Instant::now();
@@ -511,8 +518,9 @@ impl Storage for UringStorage {
         };
         let result = self.dispatch(op, bucket, key, "delete", reply_rx).await;
         record_storage_op("delete", &result, started.elapsed().as_secs_f64() * 1_000.0);
-        let obj = result?;
+        result?;
 
+        let phase_start = Instant::now();
         if let Err(e) = self.index.remove(bucket, key).await {
             tracing::warn!(
                 bucket = bucket,
@@ -521,7 +529,12 @@ impl Storage for UringStorage {
                 "metadata index remove failed; on-disk record is authoritative"
             );
         }
-        Ok(obj)
+        record_write_phase(
+            "index_commit",
+            "uring",
+            phase_start.elapsed().as_secs_f64() * 1_000.0,
+        );
+        Ok(())
     }
 
     async fn describe(&self, bucket: &str, key: &str) -> Result<Metadata, Error> {
@@ -1093,15 +1106,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delete_returns_object_and_makes_subsequent_get_not_found() {
+    async fn delete_makes_subsequent_get_not_found() {
         let dir = TempDir::new().unwrap();
         let storage = make_storage(&dir, 1);
         storage
             .put("b", "k", payload(b"bye"), PutOptions::default())
             .await
             .unwrap();
-        let got = storage.delete("b", "k").await.unwrap();
-        assert_eq!(&got[..], b"bye");
+        storage.delete("b", "k").await.unwrap();
         let err = storage.get("b", "k").await.unwrap_err();
         assert!(matches!(err, Error::NotFound { .. }));
     }
