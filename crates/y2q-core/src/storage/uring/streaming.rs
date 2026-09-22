@@ -14,14 +14,14 @@ use std::{
     io,
     path::PathBuf,
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use bytes::Bytes;
 use flume::Sender;
 use tokio::sync::oneshot;
 
-use crate::storage::{filesystem::object_id_from_path, locks::LockGuard};
+use crate::storage::{filesystem::object_id_from_path, locks::LockGuard, record_write_phase};
 
 use crate::{
     CipherMetadata, Error, Metadata, MetadataIndex, PlaintextMetrics, PutOptions, SyncLevel,
@@ -196,14 +196,29 @@ impl UringStreamingPutGuard {
             .map_err(|e| map_io("write header", e))?;
 
         if options.sync == SyncLevel::Durable {
+            let phase_start = Instant::now();
             writer
                 .sync_data()
                 .await
                 .map_err(|e| map_io("fdatasync", e))?;
+            record_write_phase(
+                "fdatasync",
+                "uring",
+                phase_start.elapsed().as_secs_f64() * 1_000.0,
+            );
         }
 
+        let phase_start = Instant::now();
         writer.rename(self.obj_path.clone(), options.sync).await?;
+        if options.sync == SyncLevel::Durable {
+            record_write_phase(
+                "dir_fsync",
+                "uring",
+                phase_start.elapsed().as_secs_f64() * 1_000.0,
+            );
+        }
 
+        let phase_start = Instant::now();
         if let Err(e) = self.index.upsert(&metadata, options.sync).await {
             tracing::warn!(
                 bucket = %bucket,
@@ -212,6 +227,11 @@ impl UringStreamingPutGuard {
                 "streaming put: metadata index upsert failed; on-disk record is authoritative"
             );
         }
+        record_write_phase(
+            "index_commit",
+            "uring",
+            phase_start.elapsed().as_secs_f64() * 1_000.0,
+        );
 
         Ok(self.is_overwrite)
     }

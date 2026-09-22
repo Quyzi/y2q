@@ -15,7 +15,7 @@ use core::range::RangeInclusive;
 use std::{
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use bytes::Bytes;
@@ -25,7 +25,7 @@ use tokio_uring::fs::{File, OpenOptions};
 use crate::{
     Error, LabelSet, Metadata, Object, SyncLevel,
     crypto::{decrypt_meta, encrypt_meta, node_keys::META_PAD_BLOCK},
-    storage::{bufpool, filesystem::object_id_from_path, locks::LockRegistry},
+    storage::{bufpool, filesystem::object_id_from_path, locks::LockRegistry, record_write_phase},
 };
 
 use super::{
@@ -89,7 +89,7 @@ pub(super) enum UringOp {
         chk: [u8; 32],
         reply: oneshot::Sender<Result<(bool, Metadata), Error>>,
     },
-    /// Read the object, then unlink it. Returns the deleted bytes.
+    /// Unlink the object after validating its header.
     Delete {
         obj_path: PathBuf,
         locks: LockRegistry,
@@ -97,7 +97,7 @@ pub(super) enum UringOp {
         key: String,
         /// Container Header Key for verifying the object header's MAC.
         chk: [u8; 32],
-        reply: oneshot::Sender<Result<Object, Error>>,
+        reply: oneshot::Sender<Result<(), Error>>,
     },
     /// Read and decode just the metadata blob.
     Describe {
@@ -561,25 +561,21 @@ async fn do_delete(
     bucket: String,
     key: String,
     chk: [u8; 32],
-) -> Result<Object, Error> {
+) -> Result<(), Error> {
     locks.check_not_locked(&bucket, &key)?;
-    let (file, header) = open_and_read_header(&obj_path, &bucket, &key, "delete", &chk).await?;
-
-    let data_len = header.data_len as usize;
-    // SAFETY: read_exact_at writes exactly data_len bytes on Ok.
-    let buf = unsafe { bufpool::acquire_uninit(data_len) };
-    let (res, buf) = file.read_exact_at(buf, header.data_offset as u64).await;
+    let (file, _header) = open_and_read_header(&obj_path, &bucket, &key, "delete", &chk).await?;
     let _ = file.close().await;
-    if let Err(e) = res {
-        bufpool::release(buf);
-        return Err(internal(&bucket, &key, "delete", format!("read data: {e}")));
-    }
 
+    let phase_start = Instant::now();
     if let Err(e) = tokio_uring::fs::remove_file(&obj_path).await {
-        bufpool::release(buf);
         return Err(internal(&bucket, &key, "delete", format!("unlink: {e}")));
     }
-    Ok(Object::new(Bytes::from(buf)))
+    record_write_phase(
+        "unlink",
+        "uring",
+        phase_start.elapsed().as_secs_f64() * 1_000.0,
+    );
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]

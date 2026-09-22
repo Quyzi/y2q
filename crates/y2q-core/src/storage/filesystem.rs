@@ -20,6 +20,7 @@ use crate::{
     storage::{
         format::{self, HEADER_SIZE, Header},
         locks::LockRegistry,
+        record_write_phase,
     },
 };
 
@@ -836,12 +837,18 @@ impl StreamingPutGuard {
             })?;
 
         if options.sync == SyncLevel::Durable {
+            let phase_start = Instant::now();
             file.sync_data().await.map_err(|e| Error::InternalError {
                 bucket: bucket.to_owned(),
                 key: key.to_owned(),
                 operation: "put".to_owned(),
                 message: format!("fdatasync: {e}"),
             })?;
+            record_write_phase(
+                "fdatasync",
+                "filesystem",
+                phase_start.elapsed().as_secs_f64() * 1_000.0,
+            );
         }
         drop(file);
 
@@ -855,11 +862,17 @@ impl StreamingPutGuard {
             })?;
 
         if options.sync == SyncLevel::Durable {
+            let phase_start = Instant::now();
             if let Some(parent) = self.obj_path.parent()
                 && let Ok(dir) = tokio::fs::File::open(parent).await
             {
                 let _ = dir.sync_all().await;
             }
+            record_write_phase(
+                "dir_fsync",
+                "filesystem",
+                phase_start.elapsed().as_secs_f64() * 1_000.0,
+            );
         } else if let Some(ref tx) = self.dirty_tx
             && let Some(parent_dir) = self.obj_path.parent().map(PathBuf::from)
         {
@@ -875,6 +888,7 @@ impl StreamingPutGuard {
             }
         }
 
+        let phase_start = Instant::now();
         if let Err(e) = self.index.upsert(&metadata, options.sync).await {
             tracing::warn!(
                 bucket = bucket,
@@ -883,6 +897,11 @@ impl StreamingPutGuard {
                 "metadata index upsert failed; on-disk record is authoritative"
             );
         }
+        record_write_phase(
+            "index_commit",
+            "filesystem",
+            phase_start.elapsed().as_secs_f64() * 1_000.0,
+        );
 
         Ok(self.is_overwrite)
     }
@@ -1369,6 +1388,7 @@ impl Storage for FilesystemStorage {
                 })?;
 
             if options.sync == SyncLevel::Durable {
+                let phase_start = Instant::now();
                 tmp_file
                     .sync_data()
                     .await
@@ -1378,6 +1398,11 @@ impl Storage for FilesystemStorage {
                         operation: "put".to_owned(),
                         message: format!("fdatasync: {e}"),
                     })?;
+                record_write_phase(
+                    "fdatasync",
+                    "filesystem",
+                    phase_start.elapsed().as_secs_f64() * 1_000.0,
+                );
             }
             drop(tmp_file);
 
@@ -1391,11 +1416,17 @@ impl Storage for FilesystemStorage {
                 })?;
 
             if options.sync == SyncLevel::Durable {
+                let phase_start = Instant::now();
                 if let Some(parent) = obj_path.parent()
                     && let Ok(dir) = tokio::fs::File::open(parent).await
                 {
                     let _ = dir.sync_all().await;
                 }
+                record_write_phase(
+                    "dir_fsync",
+                    "filesystem",
+                    phase_start.elapsed().as_secs_f64() * 1_000.0,
+                );
             } else if let Some(ref tx) = self.dirty_tx
                 && let Some(parent_dir) = obj_path.parent().map(PathBuf::from)
             {
@@ -1411,6 +1442,7 @@ impl Storage for FilesystemStorage {
                 }
             }
 
+            let phase_start = Instant::now();
             if let Err(e) = self.index.upsert(&metadata, options.sync).await {
                 tracing::warn!(
                     bucket = bucket,
@@ -1419,6 +1451,11 @@ impl Storage for FilesystemStorage {
                     "metadata index upsert failed; on-disk record is authoritative"
                 );
             }
+            record_write_phase(
+                "index_commit",
+                "filesystem",
+                phase_start.elapsed().as_secs_f64() * 1_000.0,
+            );
 
             Ok(is_overwrite)
         }
@@ -1427,7 +1464,7 @@ impl Storage for FilesystemStorage {
         result
     }
 
-    async fn delete(&self, bucket: &str, key: &str) -> Result<Object, Error> {
+    async fn delete(&self, bucket: &str, key: &str) -> Result<(), Error> {
         let started = Instant::now();
         let result = async {
             validate_bucket(bucket)?;
@@ -1497,26 +1534,9 @@ impl Storage for FilesystemStorage {
                     message: e.to_string(),
                 })?;
 
-            file.seek(std::io::SeekFrom::Start(header.data_offset as u64))
-                .await
-                .map_err(|e| Error::InternalError {
-                    bucket: bucket.to_owned(),
-                    key: key.to_owned(),
-                    operation: "delete".to_owned(),
-                    message: format!("seek data: {e}"),
-                })?;
-
-            let mut data = vec![0u8; header.data_len as usize];
-            file.read_exact(&mut data)
-                .await
-                .map_err(|e| Error::InternalError {
-                    bucket: bucket.to_owned(),
-                    key: key.to_owned(),
-                    operation: "delete".to_owned(),
-                    message: format!("read data: {e}"),
-                })?;
             drop(file);
 
+            let phase_start = Instant::now();
             if let Err(e) = tokio::fs::remove_file(&obj_path).await
                 && e.kind() != std::io::ErrorKind::NotFound
             {
@@ -1527,7 +1547,13 @@ impl Storage for FilesystemStorage {
                     message: format!("unlink: {e}"),
                 });
             }
+            record_write_phase(
+                "unlink",
+                "filesystem",
+                phase_start.elapsed().as_secs_f64() * 1_000.0,
+            );
 
+            let phase_start = Instant::now();
             if let Err(e) = self.index.remove(bucket, key).await {
                 tracing::warn!(
                     bucket = bucket,
@@ -1536,8 +1562,13 @@ impl Storage for FilesystemStorage {
                     "metadata index remove failed"
                 );
             }
+            record_write_phase(
+                "index_commit",
+                "filesystem",
+                phase_start.elapsed().as_secs_f64() * 1_000.0,
+            );
 
-            Ok(Object::new(Bytes::from(data)))
+            Ok(())
         }
         .await;
         record_storage_op("delete", &result, started.elapsed().as_secs_f64() * 1_000.0);

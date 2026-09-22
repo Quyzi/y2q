@@ -39,6 +39,7 @@ pub const DURATION_METRIC_NAME: &str = "y2qd_request_duration_milliseconds";
 /// Public metric names for storage operations — used in `y2q-core` and
 /// here for Prometheus descriptor registration.
 pub const STORAGE_OPS_TOTAL: &str = "y2qd_storage_ops_total";
+pub const STORAGE_PHASE_DURATION: &str = "y2qd_storage_phase_duration_milliseconds";
 pub const STORAGE_OP_DURATION: &str = "y2qd_storage_op_duration_milliseconds";
 pub const AUTH_LOGINS_TOTAL: &str = "y2qd_auth_logins_total";
 pub const SESSIONS_ACTIVE: &str = "y2qd_sessions_active";
@@ -69,6 +70,13 @@ pub const DURATION_BUCKETS_MILLIS: &[f64] = &[
 /// Spans fast metadata lookups (~0.1 ms) through large-object I/O (~5 s).
 pub const STORAGE_DURATION_BUCKETS_MILLIS: &[f64] = &[
     0.1, 0.5, 1.0, 5.0, 10.0, 50.0, 100.0, 500.0, 1_000.0, 5_000.0,
+];
+
+/// Bucket boundaries for the write-phase histogram, in milliseconds.
+/// Phases are sub-millisecond to tens of milliseconds — much finer than
+/// whole-op durations, so they need their own ladder.
+pub const STORAGE_PHASE_BUCKETS_MILLIS: &[f64] = &[
+    0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 1_000.0,
 ];
 
 /// Matcher suffix used to apply [`STORAGE_DURATION_BUCKETS_MILLIS`] to the
@@ -111,6 +119,11 @@ pub fn describe_metrics() {
         STORAGE_OP_DURATION,
         Unit::Milliseconds,
         "Wall-clock time spent in storage operations, in milliseconds"
+    );
+    describe_histogram!(
+        STORAGE_PHASE_DURATION,
+        Unit::Milliseconds,
+        "Time spent in one phase of a write operation (fdatasync, dir_fsync, unlink, index_commit), in milliseconds"
     );
     describe_counter!(
         AUTH_LOGINS_TOTAL,

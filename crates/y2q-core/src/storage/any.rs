@@ -75,7 +75,7 @@ impl Storage for AnyStorage {
         }
     }
 
-    async fn delete(&self, bucket: &str, key: &str) -> Result<Object, Error> {
+    async fn delete(&self, bucket: &str, key: &str) -> Result<(), Error> {
         match self {
             Self::Filesystem(s) => s.delete(bucket, key).await,
             #[cfg(target_os = "linux")]
