@@ -103,11 +103,7 @@ pub fn parse_http_date(s: &str) -> Option<SystemTime> {
     Some(UNIX_EPOCH + std::time::Duration::from_secs(secs as u64))
 }
 
-/// Duplicated (tiny, `pub(crate)` in both places for locality) from
-/// `crate::s3::sigv4` rather than shared, since the two modules' error
-/// handling needs diverge (this one returns `Option`, that one a
-/// domain-specific `SigV4Error`).
-fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+pub(crate) fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = if y >= 0 { y } else { y - 399 } / 400;
     let yoe = y - era * 400;
