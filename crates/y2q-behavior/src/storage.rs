@@ -44,8 +44,8 @@ pub trait ObjectStore: Send + Sync {
         options: Self::PutOptions,
     ) -> Result<bool, Self::Error>;
 
-    /// Delete an object and return its final contents.
-    async fn delete(&self, bucket: &str, key: &str) -> Result<Self::Object, Self::Error>;
+    /// Delete an object. The payload is not read back.
+    async fn delete(&self, bucket: &str, key: &str) -> Result<(), Self::Error>;
 
     /// Return an object's metadata without fetching its payload.
     async fn describe(&self, bucket: &str, key: &str) -> Result<Self::Metadata, Self::Error>;
