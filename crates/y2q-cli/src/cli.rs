@@ -51,7 +51,7 @@ pub enum Commands {
     /// Log in to a server alias and cache the session token.
     Login {
         alias: String,
-        #[arg(long, short)]
+        #[arg(long, short, allow_hyphen_values = true)]
         user: Option<String>,
         #[arg(long, short, allow_hyphen_values = true)]
         password: Option<String>,
@@ -175,7 +175,7 @@ pub enum Commands {
         #[arg(long, value_name = "GLOB")]
         name: Option<String>,
         /// Size filter: `+N` = ≥, `-N` = ≤, `N` = exact. Suffixes: k/K, m/M, g/G (decimal) or ki/Ki, mi/Mi, gi/Gi (binary).
-        #[arg(long, value_name = "EXPR")]
+        #[arg(long, value_name = "EXPR", allow_hyphen_values = true)]
         size: Option<String>,
         /// Only entries older than this duration (e.g. `7d`, `30m`).
         #[arg(long, value_name = "DUR")]
