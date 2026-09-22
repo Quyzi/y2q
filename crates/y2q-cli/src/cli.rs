@@ -146,7 +146,7 @@ pub enum Commands {
         path: Option<String>,
         #[arg(long)]
         limit: Option<u32>,
-        #[arg(long, conflicts_with = "all")]
+        #[arg(long, conflicts_with = "all", allow_hyphen_values = true)]
         after: Option<String>,
         #[arg(long, conflicts_with = "after")]
         all: bool,
