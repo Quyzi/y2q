@@ -172,7 +172,7 @@ pub enum Commands {
     Find {
         path: String,
         /// Glob pattern matched against the object basename.
-        #[arg(long, value_name = "GLOB")]
+        #[arg(long, value_name = "GLOB", allow_hyphen_values = true)]
         name: Option<String>,
         /// Size filter: `+N` = ≥, `-N` = ≤, `N` = exact. Suffixes: k/K, m/M, g/G (decimal) or ki/Ki, mi/Mi, gi/Gi (binary).
         #[arg(long, value_name = "EXPR", allow_hyphen_values = true)]
