@@ -207,7 +207,12 @@ pub enum Commands {
         #[arg(long)]
         remove: bool,
         /// Glob patterns excluded from the sync.
-        #[arg(long, value_name = "GLOB", number_of_values = 1)]
+        #[arg(
+            long,
+            value_name = "GLOB",
+            number_of_values = 1,
+            allow_hyphen_values = true
+        )]
         exclude: Vec<String>,
     },
     /// Stream live PUT/DELETE/GET/HEAD events matching a remote prefix.
