@@ -216,7 +216,6 @@ pub async fn login(
         .get(&username)
         .map_err(|e| AuthError::Backend(e.to_string()))?;
 
-    let not_found = record.is_none();
     let result = match record {
         Some(rec) => attempt_unwrap(rec, password).await,
         None => {
@@ -313,12 +312,9 @@ pub async fn login(
             })
         }
         Err(e) => {
-            let result_label = if not_found {
-                "not_found"
-            } else {
-                "wrong_password"
-            };
-            record_login(result_label, None);
+            // Unknown usernames and bad passwords share one label so a
+            // Prometheus scrape cannot be used as a username oracle.
+            record_login("wrong_password", None);
             state.login_attempts.lock().unwrap().record_failure(
                 &username,
                 state.config.max_failed_logins,
