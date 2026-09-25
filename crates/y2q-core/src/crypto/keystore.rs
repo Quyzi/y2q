@@ -76,7 +76,8 @@ struct KeystoreManifest {
 pub struct FirstRunOutcome {
     /// User store with the freshly-created `root` user.
     pub user_store: UserStore,
-    /// The randomly-generated root password — print exactly once, then drop.
+    /// The randomly-generated root password. Caller stores it (mode `0600`)
+    /// and drops this value. Do not print or log it.
     pub root_password: SecretString,
     /// Username assigned to the initial user (currently always `"root"`).
     pub root_username: String,
@@ -173,8 +174,9 @@ pub fn verify_node_key(dir: &Path, nk: &[u8; 32]) -> Result<(), CryptoError> {
 }
 
 /// Generate a fresh root persona, write `keystore.json` and `users.redb`,
-/// and return everything the caller needs to print the password and start
-/// serving.
+/// and return the user store plus the bootstrap password. The caller must
+/// store that password itself (mode `0600`); this function does not print
+/// or log it.
 ///
 /// The `params` argument is the Argon2id parameter triple to use for
 /// wrapping the root user's credential slots. Callers should source these

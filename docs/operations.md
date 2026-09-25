@@ -53,15 +53,12 @@ How to run, manage, and recover a `y2qd` deployment. Read this before putting an
    ./target/release/y2qd --config config.toml
    ```
 
-5. **Capture the root password.** First start prints this once on stdout:
+5. **Read the root password from the keystore directory.** First start writes it once to `<keystore_dir>/initial-root-password` (created mode `0600`). It is not printed and is not written to the log. The file is UTF-8, one trailing newline per line:
    ```
-   ===========================================================
-     y2qd first-run: ROOT PASSWORD (recorded NOWHERE - copy now)
-       username: root
-       password: <43 url-safe-base64 chars>
-   ===========================================================
+   username: root
+   password: <url-safe-base64>
    ```
-   It is written by `println!`, bypassing the tracing subscriber, so it always appears regardless of `RUST_LOG`. Save it in your secret store before doing anything else. There is no recovery path if you lose it before adding a second user.
+   Stdout and stderr only name the path. Move the file somewhere safe and delete it before doing anything else. There is no recovery path if you lose it before adding a second user.
 
 6. (Optional but recommended) Create at least one operator user, then keep `root` for emergency access only:
    ```sh
@@ -117,7 +114,7 @@ make image          # y2q:latest
    - `--user $(id -u):$(id -g)` - runs the daemon as your host user
    - `-e Y2QD_NODE_KEY` - the node key, same as native. Never bake it into the image or the mounted config; pass it at run time from wherever your secret store puts it
 
-3. **Capture the root password** from stdout - it appears once on first run, same as native.
+3. **Read the root password** from `<keystore_dir>/initial-root-password` on the keys volume (mode `0600`). It is written once and is not printed to stdout or the container log. Move the file somewhere safe and delete it.
 
 ### Config in containers
 
@@ -585,7 +582,7 @@ location / {
 |---|---|---|
 | Daemon refuses to start: `acquire keystore lock` | Another `y2qd` is already running against the same `keystore_dir` | Check `ps` / systemd. If stale, the flock is released by the OS - investigate why the daemon didn't exit cleanly. |
 | Daemon refuses to start: `mlock failed` / `refusing to start: ... guarded memory` | `RLIMIT_MEMLOCK` too low to lock session key pages (Linux only) | Raise the limit (see [Memory hardening](#memory-hardening-linux-only)), or set `[server] allow_unprotected_memory = true` if raising it genuinely isn't possible. |
-| `503` on any object op | `KeystoreNotFound` - `keystore.json`/`users.redb` missing at the configured `keystore_dir` (misconfiguration, or a copy that left the keystore behind) | Confirm `[crypto] keystore_dir` and the node key are correct. On a genuine first boot this doesn't happen - first-run setup runs automatically and prints the root password. |
+| `503` on any object op | `KeystoreNotFound` - `keystore.json`/`users.redb` missing at the configured `keystore_dir` (misconfiguration, or a copy that left the keystore behind) | Confirm `[crypto] keystore_dir` and the node key are correct. On a genuine first boot this doesn't happen - first-run setup runs automatically and writes the root password to `initial-root-password` in the keystore directory (mode 0600). It is not printed. |
 | `409 Conflict` on PUT | Active in-flight write lock for that key (same key PUT in two concurrent requests) | Normally self-resolves; if stuck, use `GET /api/v1/locks` to check and `DELETE /api/v1/locks` to force-release. |
 | `500` on any op against an old object | The object or its metadata predates the current v3 per-bucket envelope (magic bytes aren't `Y2Q3` - e.g. leftover v1/v2 data from before this deployment adopted per-bucket keys). There is no unauthenticated passthrough or legacy decode - such objects are unreadable | If you have an out-of-band copy of the original plaintext, re-PUT it so it is stored as v3. Otherwise the object is unrecoverable through the API. |
 | `429 Too Many Requests` on login | Either the per-source-IP rate limit (bursty requests from one client, checked before credentials) or the per-username lockout after repeated failures | For the lockout, wait `lockout_seconds` or use another user - `Retry-After` tells you exactly how long. The IP rate limit clears itself after a few seconds; no body/header details are returned for it. |
