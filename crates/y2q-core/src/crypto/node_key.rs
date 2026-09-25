@@ -49,11 +49,12 @@ pub fn load_new_node_key(new_node_key_file: &str) -> Result<Zeroizing<[u8; 32]>,
     load_node_key_via(NEW_NODE_KEY_ENV_VAR, new_node_key_file)
 }
 
+/// Copy an env-supplied key out, then overwrite and unset it even if decoding fails.
 fn load_node_key_via(
     env_var: &str,
     node_key_file: &str,
 ) -> Result<Zeroizing<[u8; 32]>, CryptoError> {
-    if let Ok(env_val) = std::env::var(env_var) {
+    if let Some(env_val) = take_env_secret(env_var)? {
         let raw = decode_node_key(&env_val)?;
         return Ok(Zeroizing::new(*extract_node_key(&raw)));
     }
@@ -77,6 +78,71 @@ fn load_node_key_via(
     };
     Ok(Zeroizing::new(*extract_node_key(&raw)))
 }
+
+/// Copy `name` out of the environment, overwrite its `KEY=value` bytes, and unset it.
+///
+/// `unsetenv` only unlinks the pointer. The bytes stay in the original
+/// environment block, which root can still read from `/proc/<pid>/environ`.
+/// Returns `Ok(None)` when the variable is absent.
+fn take_env_secret(name: &str) -> Result<Option<Zeroizing<String>>, CryptoError> {
+    let Some(value) = std::env::var_os(name) else {
+        return Ok(None);
+    };
+    let bytes = Zeroizing::new(value.into_encoded_bytes());
+    scrub_process_env(name);
+    // SAFETY: the value already lives in `bytes`, and `scrub_process_env`
+    // has overwritten the environ slot. Edition 2024 makes `remove_var` unsafe.
+    unsafe { std::env::remove_var(name) };
+    let text = std::str::from_utf8(&bytes).map_err(|_| {
+        CryptoError::NodeKeyMalformed("node key environment variable is not valid UTF-8".to_owned())
+    })?;
+    Ok(Some(Zeroizing::new(text.to_owned())))
+}
+
+/// Overwrite a live `name=value` entry in the process environment block.
+///
+/// No-op when `name` is not set. On non-Linux targets there is no
+/// `/proc/<pid>/environ` image to scrub; [`take_env_secret`] still unsets.
+#[cfg(target_os = "linux")]
+fn scrub_process_env(name: &str) {
+    unsafe extern "C" {
+        static mut environ: *mut *mut libc::c_char;
+    }
+
+    // SAFETY: `environ` is the process environment. Entries are NUL-terminated
+    // C strings. Only bytes belonging to an entry named `name` are written,
+    // and never past that entry's terminating NUL. No reference to the
+    // `static mut` is formed (edition 2024).
+    unsafe {
+        let mut cursor = std::ptr::addr_of_mut!(environ).read();
+        if cursor.is_null() {
+            return;
+        }
+        let name_bytes = name.as_bytes();
+        while !(*cursor).is_null() {
+            let entry = *cursor;
+            let len = libc::strlen(entry);
+            // End the shared borrow before the volatile writes.
+            let is_match = if len > name_bytes.len() {
+                let bytes = std::slice::from_raw_parts(entry.cast::<u8>(), len);
+                bytes.starts_with(name_bytes) && bytes[name_bytes.len()] == b'='
+            } else {
+                false
+            };
+            if is_match {
+                let dst = entry.cast::<u8>();
+                for i in 0..len {
+                    std::ptr::write_volatile(dst.add(i), 0u8);
+                }
+                std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+            }
+            cursor = cursor.add(1);
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn scrub_process_env(_name: &str) {}
 
 /// Canonicalize operator-supplied key material to the 32-byte node key.
 ///
@@ -238,6 +304,11 @@ pub fn check_node_key_location(
 mod tests {
     use super::*;
 
+    fn lock_node_key_env() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|err| err.into_inner())
+    }
+
     #[test]
     fn hex_base64_and_raw_canonicalize_identically() {
         let raw: [u8; 32] = std::array::from_fn(|i| i as u8);
@@ -366,13 +437,61 @@ mod tests {
 
     #[test]
     fn missing_supply_is_node_key_missing() {
-        // SAFETY: test-only env var manipulation, no concurrent access in
-        // this process during the test.
+        let _guard = lock_node_key_env();
+        // SAFETY: test-only env var manipulation, serialized with the other
+        // env-mutating test via `lock_node_key_env`.
         unsafe { std::env::remove_var(NODE_KEY_ENV_VAR) };
         assert!(matches!(
             load_node_key(""),
             Err(CryptoError::NodeKeyMissing)
         ));
+    }
+
+    #[test]
+    fn env_supplied_node_key_is_scrubbed() {
+        let _guard = lock_node_key_env();
+        // 32 distinct decoded bytes and not all printable, so `reject_non_csprng`
+        // accepts it. Unique to this test — do not restore a prior value.
+        const CANARY: &str = "7f3a9c1e84b206d5f0a391c7e6b48d12c5f9a073e1b64d28f3c0a596e7d1b84a";
+        // SAFETY: test-only env var manipulation, serialized via `lock_node_key_env`.
+        unsafe { std::env::set_var(NODE_KEY_ENV_VAR, CANARY) };
+        let loaded = load_node_key("").expect("env-supplied node key should decode");
+        assert_eq!(loaded.len(), 32);
+        assert!(std::env::var(NODE_KEY_ENV_VAR).is_err());
+        #[cfg(target_os = "linux")]
+        {
+            let environ = std::fs::read("/proc/self/environ").expect("read /proc/self/environ");
+            assert!(
+                !environ
+                    .windows(CANARY.len())
+                    .any(|window| window == CANARY.as_bytes()),
+                "node key still present in /proc/self/environ"
+            );
+        }
+        drop(loaded);
+    }
+
+    #[test]
+    fn malformed_env_node_key_is_still_scrubbed() {
+        let _guard = lock_node_key_env();
+        const CANARY: &str = "y2q!malformed-node-key-canary-9f3c1a7eb204d8";
+        // SAFETY: test-only env var manipulation, serialized via `lock_node_key_env`.
+        unsafe { std::env::set_var(NODE_KEY_ENV_VAR, CANARY) };
+        assert!(matches!(
+            load_node_key(""),
+            Err(CryptoError::NodeKeyMalformed(_))
+        ));
+        assert!(std::env::var(NODE_KEY_ENV_VAR).is_err());
+        #[cfg(target_os = "linux")]
+        {
+            let environ = std::fs::read("/proc/self/environ").expect("read /proc/self/environ");
+            assert!(
+                !environ
+                    .windows(CANARY.len())
+                    .any(|window| window == CANARY.as_bytes()),
+                "malformed node key still present in /proc/self/environ"
+            );
+        }
     }
 
     #[test]
