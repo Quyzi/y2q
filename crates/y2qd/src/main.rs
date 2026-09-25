@@ -30,9 +30,11 @@
 //! auto-generated). Given a valid node key and no `keystore.json` in
 //! `[crypto] keystore_dir`, it treats this as first-run: generates a
 //! `root` identity keypair, wraps its secret key under a
-//! randomly-generated password, prints the password to stdout exactly
-//! once, and persists the keystore verifier + user record. RECORD THIS
-//! PASSWORD — losing it requires resetting everything.
+//! randomly-generated password, writes that password once to
+//! `initial-root-password` in the keystore directory (mode `0600`), and
+//! persists the keystore verifier + user record. The password is not
+//! printed and not logged. Move the file somewhere safe and delete it —
+//! losing the password requires resetting everything.
 //!
 //! # Authentication
 //!
@@ -341,7 +343,16 @@ async fn main() -> std::io::Result<()> {
             );
             let outcome = keystore_mod::first_run(&keystore_dir, "root", argon2_for_first_run, &nk)
                 .map_err(|e| std::io::Error::other(format!("first-run setup: {e}")))?;
-            print_first_run_password(&outcome.root_username, outcome.root_password.expose());
+            let password_path = write_initial_root_password(
+                &keystore_dir,
+                &outcome.root_username,
+                outcome.root_password.as_bytes(),
+            )?;
+            // `SecretString` scrubs its buffer on drop. Drop it before the
+            // path notice so the secret is not still live, and do not copy
+            // it into a `String`.
+            drop(outcome.root_password);
+            eprint!("{}", initial_root_password_notice(&password_path));
             tracing::info!(dir = %keystore_dir.display(), "keystore initialized");
             outcome.user_store
         }
@@ -806,19 +817,120 @@ fn reconcile_admin(user_store: &y2q_core::crypto::UserStore) -> std::io::Result<
     Ok(())
 }
 
-/// Print the first-run root password to stdout exactly once.
+const INITIAL_ROOT_PASSWORD_FILE: &str = "initial-root-password";
+
+fn initial_root_password_path(keystore_dir: &std::path::Path) -> PathBuf {
+    keystore_dir.join(INITIAL_ROOT_PASSWORD_FILE)
+}
+
+/// Persist the bootstrap root password under the keystore directory.
 ///
-/// Bypasses the tracing subscriber on purpose so it shows up regardless of
-/// `RUST_LOG`. Operators must capture this immediately — there is no second
-/// chance.
-fn print_first_run_password(username: &str, password: &str) {
-    println!();
-    println!("===========================================================");
-    println!("  y2qd first-run: ROOT PASSWORD (recorded NOWHERE — copy now)");
-    println!("    username: {username}");
-    println!("    password: {password}");
-    println!("===========================================================");
-    println!();
+/// Created with mode `0600` via `O_CREAT|O_EXCL` (`OpenOptionsExt::mode` +
+/// `create_new`). `password` is written from the caller's buffer; this
+/// function does not allocate a `String` copy and does not print or log it.
+/// Failure is fatal — there is no stdout fallback.
+fn write_initial_root_password(
+    keystore_dir: &std::path::Path,
+    username: &str,
+    password: &[u8],
+) -> std::io::Result<PathBuf> {
+    use std::io::Write;
+
+    let path = initial_root_password_path(keystore_dir);
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut file = opts.open(&path).map_err(|e| {
+        std::io::Error::other(format!(
+            "create initial root password file {}: {e}",
+            path.display()
+        ))
+    })?;
+    let write_result = (|| {
+        file.write_all(b"username: ")?;
+        file.write_all(username.as_bytes())?;
+        file.write_all(b"\npassword: ")?;
+        file.write_all(password)?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        Ok(())
+    })();
+    write_result.map_err(|e: std::io::Error| {
+        std::io::Error::other(format!(
+            "write initial root password file {}: {e}",
+            path.display()
+        ))
+    })?;
+    drop(file);
+    if let Some(parent) = path.parent() {
+        let dir = std::fs::File::open(parent).map_err(|e| {
+            std::io::Error::other(format!(
+                "open keystore dir {} to fsync initial root password: {e}",
+                parent.display()
+            ))
+        })?;
+        dir.sync_all().map_err(|e| {
+            std::io::Error::other(format!(
+                "fsync keystore dir {} after initial root password: {e}",
+                parent.display()
+            ))
+        })?;
+    }
+    Ok(path)
+}
+
+/// Operator notice for the password file. Names the path only — no secret,
+/// and no line whose trimmed text starts with `password:`.
+fn initial_root_password_notice(path: &std::path::Path) -> String {
+    format!(
+        "y2qd: first-run root credentials written to {p} (mode 0600).\n\
+         Move that file somewhere safe and delete it. The secret is not printed.\n",
+        p = path.display()
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn first_run_password_file_is_private() {
+        let dir = tempfile::tempdir().unwrap();
+        let password = b"url-safe-secret_NO-NEWLINE";
+        let path = write_initial_root_password(dir.path(), "root", password).unwrap();
+        assert_eq!(path, dir.path().join("initial-root-password"));
+
+        let body = std::fs::read(&path).unwrap();
+        assert_eq!(
+            body,
+            b"username: root\npassword: url-safe-secret_NO-NEWLINE\n"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "created mode was {mode:o}, want 0600");
+        }
+
+        let notice = initial_root_password_notice(&path);
+        assert!(
+            notice
+                .lines()
+                .all(|line| !line.trim().starts_with("password:")),
+            "{notice}"
+        );
+        assert!(!notice.contains("url-safe-secret_NO-NEWLINE"));
+        assert!(notice.contains("initial-root-password"));
+
+        let err = write_initial_root_password(dir.path(), "root", b"other").unwrap_err();
+        assert!(err.to_string().contains("initial-root-password"), "{err}");
+        assert_eq!(std::fs::read(&path).unwrap(), body);
+    }
 }
 
 /// Lowercase-hex encode `bytes`.

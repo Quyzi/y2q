@@ -77,17 +77,14 @@ returns an error - a standard `cargo build` works everywhere.
 
 ### First Run
 
-On first startup, `y2qd` generates an ML-KEM-768 keypair and prints a one-time root password to stdout:
+On first startup, `y2qd` generates an ML-KEM-768 keypair and writes a one-time root password to `initial-root-password` in the keystore directory (`[crypto] keystore_dir`). The file is created mode `0600`. The password is not printed and is not written to the log. The file is UTF-8, one trailing newline per line:
 
 ```
-===========================================================
-  y2qd first-run: ROOT PASSWORD (recorded NOWHERE - copy now)
-    username: root
-    password: <43 url-safe-base64 chars>
-===========================================================
+username: root
+password: <url-safe-base64>
 ```
 
-**This password is shown exactly once.** It is printed with `println!`, bypassing the log subscriber, so it always appears regardless of `RUST_LOG`. Use it to log in and create additional users. Store it before the line scrolls - there is no recovery path if you lose it before adding a second user.
+**This file is written exactly once.** Stdout and stderr only name the path. Move the file somewhere safe and delete it, then use the password to log in and create additional users. There is no recovery path if you lose it before adding a second user.
 
 ### Run
 
@@ -134,7 +131,7 @@ All three binaries (`y2qd`, `y2q`, `y2q-warp`) are present in the image. The ent
 podman run --entrypoint y2q --network=host ... y2q:latest ls prod/
 ```
 
-**The root password is printed once on first run** - same as the native path. Check stdout/container logs before doing anything else.
+**The root password is not printed.** On first run it is written once to `initial-root-password` in the keystore directory (mode `0600`) on the keys volume. Move that file somewhere safe and delete it; do not look for it in container logs.
 
 ## CLI (`y2q`)
 

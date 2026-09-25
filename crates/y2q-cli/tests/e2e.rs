@@ -9,7 +9,7 @@
 //!
 //! The whole flow lives in one `#[test]` so the server is started once.
 
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufReader, Read};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -207,6 +207,41 @@ fn start_server() -> Option<Server> {
     start_server_tls(None)
 }
 
+/// Drain `stdout` so a full pipe cannot block the daemon. The bootstrap
+/// password is not on this stream.
+fn drain_stdout(stdout: std::process::ChildStdout) {
+    std::thread::spawn(move || {
+        let mut sink = Vec::new();
+        let _ = BufReader::new(stdout).read_to_end(&mut sink);
+    });
+}
+
+/// Read `{keystore_dir}/initial-root-password` once the daemon has finished
+/// writing it. Returns the password field, or empty on timeout.
+fn read_initial_root_password(keys: &std::path::Path) -> String {
+    let path = keys.join("initial-root-password");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            if text.ends_with('\n') {
+                if let Some(password) = text.lines().find_map(|line| {
+                    line.trim()
+                        .strip_prefix("password:")
+                        .map(|rest| rest.trim().to_string())
+                }) {
+                    if !password.is_empty() {
+                        return password;
+                    }
+                }
+            }
+        }
+        if Instant::now() > deadline {
+            return String::new();
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// Start a daemon. When `tls` is `Some((cert, key))`, serve HTTPS with those
 /// PEM files and PQ-kex requirement relaxed (the throwaway cert is classical).
 fn start_server_tls(tls: Option<(PathBuf, PathBuf)>) -> Option<Server> {
@@ -258,30 +293,11 @@ fn start_server_tls(tls: Option<(PathBuf, PathBuf)>) -> Option<Server> {
     }
     let mut child = cmd.spawn().expect("spawn y2qd");
 
-    // Parse the first-run root password from stdout, then drain the rest in a
-    // background thread so the daemon never blocks on a full stdout pipe.
+    // The password is in `{keys}/initial-root-password`, not stdout. Still
+    // drain stdout so a full pipe cannot block the daemon.
     let stdout = child.stdout.take().unwrap();
-    let mut reader = BufReader::new(stdout);
-    let mut password = String::new();
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        let mut line = String::new();
-        if reader.read_line(&mut line).unwrap_or(0) == 0 {
-            break;
-        }
-        if let Some(p) = line.trim().strip_prefix("password:") {
-            password = p.trim().to_string();
-            break;
-        }
-        if Instant::now() > deadline {
-            break;
-        }
-    }
-    std::thread::spawn(move || {
-        let mut sink = Vec::new();
-        let _ = reader.read_to_end(&mut sink);
-    });
-
+    drain_stdout(stdout);
+    let password = read_initial_root_password(&keys);
     assert!(!password.is_empty(), "failed to capture first-run password");
 
     // Wait for the listener to accept connections.
@@ -379,26 +395,8 @@ fn e2e_node_key_rotation_crash_safety() {
         .stderr(Stdio::null());
     let mut child = boot.spawn().expect("spawn y2qd");
     let stdout = child.stdout.take().unwrap();
-    let mut reader = BufReader::new(stdout);
-    let mut password = String::new();
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        let mut line = String::new();
-        if reader.read_line(&mut line).unwrap_or(0) == 0 {
-            break;
-        }
-        if let Some(p) = line.trim().strip_prefix("password:") {
-            password = p.trim().to_string();
-            break;
-        }
-        if Instant::now() > deadline {
-            break;
-        }
-    }
-    std::thread::spawn(move || {
-        let mut sink = Vec::new();
-        let _ = reader.read_to_end(&mut sink);
-    });
+    drain_stdout(stdout);
+    let password = read_initial_root_password(&keys);
     assert!(!password.is_empty(), "failed to capture first-run password");
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
