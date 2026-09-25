@@ -850,7 +850,7 @@ fn write_initial_root_password(
             path.display()
         ))
     })?;
-    let write_result = (|| {
+    let write_result = (|| -> std::io::Result<()> {
         file.write_all(b"username: ")?;
         file.write_all(username.as_bytes())?;
         file.write_all(b"\npassword: ")?;
@@ -895,6 +895,16 @@ fn initial_root_password_notice(path: &std::path::Path) -> String {
     )
 }
 
+/// Lowercase-hex encode `bytes`.
+fn to_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -933,14 +943,4 @@ mod tests {
         assert!(err.to_string().contains("initial-root-password"), "{err}");
         assert_eq!(std::fs::read(&path).unwrap(), body);
     }
-}
-
-/// Lowercase-hex encode `bytes`.
-fn to_hex(bytes: &[u8]) -> String {
-    use std::fmt::Write;
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        let _ = write!(s, "{b:02x}");
-    }
-    s
 }

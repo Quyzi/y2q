@@ -222,18 +222,16 @@ fn read_initial_root_password(keys: &std::path::Path) -> String {
     let path = keys.join("initial-root-password");
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        if let Ok(text) = std::fs::read_to_string(&path) {
-            if text.ends_with('\n') {
-                if let Some(password) = text.lines().find_map(|line| {
-                    line.trim()
-                        .strip_prefix("password:")
-                        .map(|rest| rest.trim().to_string())
-                }) {
-                    if !password.is_empty() {
-                        return password;
-                    }
-                }
-            }
+        if let Ok(text) = std::fs::read_to_string(&path)
+            && text.ends_with('\n')
+            && let Some(password) = text.lines().find_map(|line| {
+                line.trim()
+                    .strip_prefix("password:")
+                    .map(|rest| rest.trim().to_string())
+            })
+            && !password.is_empty()
+        {
+            return password;
         }
         if Instant::now() > deadline {
             return String::new();
