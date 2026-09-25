@@ -520,6 +520,10 @@ encryption (index, paths, metadata, bucket-config sidecars). It:
   metadata sidecars, bucket-config sidecars, and the index are
   re-encrypted under the new key.
 
+If the key is supplied via the environment, the daemon overwrites and
+unsets that variable before serving; the key file on disk is unchanged
+and root who can read the file still has the key.
+
 `users.redb` and all bucket key material need no rotation when the node
 key rotates — they're wrapped under user passwords and sealed to identity
 keypairs, neither of which the node key touches.
