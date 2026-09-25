@@ -373,35 +373,38 @@ Full detail: [docs/architecture.md#authentication-and-sessions](docs/architectur
 Enforced when `auth.enforce_authorization = true` (default). Two policy
 layers intersect, plus a crypto-layer gate that policy alone cannot bypass:
 
-1. **Global role** — an account-wide ceiling: `admin` (everything),
+1. **Global role** — an account-wide ceiling: `admin` (full verb ceiling
+   on buckets this persona can decrypt, plus admin endpoints),
    `user`/`readonly`/`writeonly` (governed by bucket grants, capped to
-   read-only or write-only respectively), `auditor` (read every bucket,
-   read-only admin endpoints), `disabled` (nothing — login itself is
-   refused).
+   read-only or write-only respectively), `auditor` (read-only on buckets
+   this persona can decrypt, plus read-only admin endpoints), `disabled`
+   (nothing — login itself is refused). A global role is not a visibility
+   bypass.
 2. **Per-bucket ownership + ACL** — an owner (full control) plus an
    optional grant map (`read`/`write`/`writeonly`/`admin`) for other users.
-   New buckets are private to their creator. A bucket you have no
-   relationship to is indistinguishable from one that doesn't exist:
-   omitted from listings, 404 (never 403) on direct access — existence
-   itself cannot be probed. 403 appears only when you can already see a
-   bucket but lack the verb for the action.
-3. **Cryptographic bucket-key grant — strict admin exclusion.** This is
-   the property the per-bucket key hierarchy exists for. A global
-   `admin`/`auditor` role satisfies layers 1 and 2 for every bucket (so
-   `GET /` lists every bucket name), but actually reading an object
-   additionally requires the caller's *persona* to hold a real, sealed
-   bucket-key grant. A role ceiling alone confers none. **There is no
-   admin group key, no escrow secret, and no break-glass self-grant** — a
-   compromised admin account with no bucket grant of its own can see
-   bucket/object *names*, sizes, and labels (tier-0 metadata) but cannot
-   decrypt a single byte of content it wasn't explicitly granted. This is
-   enforced at the crypto layer, identically regardless of whether the
-   request even reaches the ACL check.
+   New buckets are private to the persona that created them. A bucket this
+   persona has no sealed grant for is indistinguishable from one that
+   doesn't exist: omitted from listings, 404 (never 403) on direct access
+   — existence itself cannot be probed. 403 appears only when you can
+   already see a bucket but lack the verb for the action. The exception is
+   an ACL relationship of exactly `writeonly` (a drop box): write needs no
+   sealed secret, so write stays allowed and a read is 403.
+3. **Cryptographic bucket-key grant.** This is the property the per-bucket
+   key hierarchy exists for. Listing, HEAD metadata, reading, writing,
+   deleting, and ACL changes all require the caller's *persona* to hold a
+   real, sealed bucket-key grant. A global `admin`/`auditor` role does not
+   skip that check: with no grant, `GET /` omits the bucket and
+   GET/HEAD/PUT/DELETE/ACL return **404**, not 403. An admin who
+   personally holds a real grant still sees and reads that bucket, and
+   creating a brand-new bucket still works for any role that can write.
+   **There is no admin group key, no escrow secret, and no break-glass
+   self-grant.**
 
 With `enforce_authorization = false` the first two layers are skipped
-(single-user/migration mode) — layer 3 still applies unconditionally,
-since it isn't an authorization *policy* choice, it's what the object is
-physically encrypted under.
+(single-user/migration mode) and today's global-role short-circuit stays
+— every authenticated caller has full access. Object plaintext is still
+sealed to whoever holds the bucket key; that isn't an authorization
+*policy* choice.
 
 Full model, capability table, and status codes:
 [docs/api.md#authorization](docs/api.md#authorization).
@@ -498,6 +501,22 @@ Nothing about a `UserRecord` or `BucketKeyVersion`'s on-disk byte shape —
 slot count, wrapped-ciphertext length, grant-row structure — distinguishes
 a real persona from a decoy from the outside, including from the server
 operator's own vantage point without that persona's password.
+
+`POST /api/v1/personas` and `DELETE /api/v1/personas/{slot}` always apply
+to every slot other than the one the caller is currently authenticated
+through, **including** the account's real `primary_slot`. The response
+shape does not depend on which slot it was (create's warning still says
+that slot was overwritten). A silent skip would let a follow-up login
+fail only for the real slot and identify it. There is no in-band way to
+preserve primary and also make that new password work: only four slots
+exist, so redirecting the write collides and is itself detectable.
+`primary_slot` is still the random slot third parties grant to; it is not
+immune to the account's own other personas.
+
+A bucket the signed-in persona cannot decrypt is 404 on read, write,
+delete, HEAD, and ACL — not 403 — including for an `admin` duress persona.
+A 403 is reserved for a bucket the persona can already see but lacks the
+verb for, and for a `writeonly` drop box (write allowed, read 403).
 
 Full mechanics and CLI/API examples:
 [docs/operations.md#duress-personas](docs/operations.md#duress-personas).

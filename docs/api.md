@@ -36,26 +36,26 @@ Every user has one global role - an account-wide ceiling applied on top of bucke
 
 | Role | Bucket reach | Capabilities | Admin endpoints |
 |---|---|---|---|
-| `admin` | all buckets | read + write + admin | all (read + write) |
-| `user` | owned / granted | governed by the bucket grant | none |
-| `readonly` | owned / granted | read only | none |
-| `writeonly` | owned / granted | write/delete only, never read | none |
-| `auditor` | **all buckets** | read only | read only (user list, rebuild status, lock list, any ACL) |
+| `admin` | buckets this persona holds a sealed grant for; may create new buckets | read + write + admin on those buckets | all (read + write) |
+| `user` | owned / granted, and only the persona that holds the sealed grant | governed by the bucket grant | none |
+| `readonly` | owned / granted, same grant rule | read only | none |
+| `writeonly` | owned / granted, same grant rule | write/delete only, never read | none |
+| `auditor` | buckets this persona holds a sealed grant for | read only | read only (user list, rebuild status, lock list) |
 | `disabled` | none | none - every request rejected, login refused | none |
 
-A role *caps* what a user can do even on buckets they own: a `readonly` owner can read their own bucket but not write it; a `writeonly` owner can write but not read.
+A role *caps* what a user can do even on buckets they own: a `readonly` owner can read their own bucket but not write it; a `writeonly` owner can write but not read. A global `admin` or `auditor` role does **not** see every bucket name. No sealed grant means the bucket is omitted from `GET /` and search, and direct access is 404.
 
 ### Per-bucket ownership and ACL
 
-Each bucket has an **owner** (full control) and an optional **ACL** mapping other users to a grant level: `read`, `write`, `writeonly` (write without read), or `admin`. Admins act on every bucket; auditors can read every bucket.
+Each bucket has an **owner** (full control) and an optional **ACL** mapping other users to a grant level: `read`, `write`, `writeonly` (write without read), or `admin`. An admin or auditor sees a bucket only when *that persona* holds a sealed grant for it. Holding the grant keeps the role ceiling (admin: full, auditor: read); it is not a pass to every other bucket.
 
-**New buckets are private to their creator.** A `PUT /{bucket}/` or the first object `PUT` into a non-existent bucket makes the caller its owner (only if their role permits writing). Until they grant access, only they (and admins/auditors) can see it.
+**New buckets are private to the persona that created them.** A `PUT /{bucket}/` or the first object `PUT` into a non-existent bucket makes the caller its owner (only if their role permits writing) and seals the epoch-0 key to that persona. Until someone with a grant shares it, no other persona — including other global admins and the owner's own duress slots — can see it.
 
-**Existence is hidden.** A bucket you have *no* relationship to is indistinguishable from one that does not exist: it is omitted from `GET /` and search results, and any direct operation on it returns **404** - never 403. **403** is returned only when you can already see the bucket but lack the verb for the action (because of your grant level, your role ceiling, or both).
+**Existence is hidden.** A bucket this persona cannot decrypt is indistinguishable from one that does not exist: it is omitted from `GET /`, search, and S3 listings, and GET/HEAD/PUT/DELETE/ACL return **404** - never 403. That includes a global admin or auditor with no sealed grant, and it includes write and delete, not only read. **403** is returned only when the persona can already see the bucket but lacks the verb (grant level, role ceiling, or both). The exception is an ACL relationship of exactly `writeonly`: write and delete stay allowed with no sealed secret (a drop box), and a read is **403** because that caller was given the bucket.
 
-**Legacy buckets** (created before ownership existed, so with no recorded owner) are accessible only to admins/auditors until an admin assigns an owner via `PUT /api/v1/buckets/{bucket}/acl`.
+**Legacy buckets** (no recorded owner and no sealed grant) are hidden from everyone while authorization is enforced, including admins. There is no break-glass path that lists them or assigns an owner without a grant.
 
-When `enforce_authorization = false`, all of the above is skipped and every authenticated user has full access (single-user / migration mode).
+When `enforce_authorization = false`, all of the above is skipped and every authenticated user has full access (single-user / migration mode). The global-role short-circuit stays in that mode.
 
 ## Error model
 
@@ -607,7 +607,7 @@ y2q search myalias/ --query 'name ^= "log-" or env =~ "prod|stage"'
 
 ## Access control (ACL)
 
-Manage a bucket's owner and per-user grants. See [Authorization](#authorization) for the model. Viewing (`GET`) is allowed for the bucket owner, a global admin, or an auditor (who may view any bucket's ACL). Editing (`PUT`) requires the bucket owner or a global admin; transferring ownership additionally requires being the current owner or a global admin. Owner/ACL are deliberately *not* settable through the generic `PUT /api/v1/buckets/{bucket}/config` body, so that endpoint cannot be used to escalate privileges.
+Manage a bucket's owner and per-user grants. See [Authorization](#authorization) for the model. Viewing (`GET`) requires the bucket admin capability, or a global admin/auditor persona that holds a sealed grant on that bucket — a global role with no grant gets **404**, not the ACL. Editing (`PUT`) requires the bucket admin capability (owner, bucket-admin grantee, or a global admin who holds a grant); transferring ownership additionally requires being the current owner or a global admin who can already see the bucket. Owner/ACL are deliberately *not* settable through the generic `PUT /api/v1/buckets/{bucket}/config` body, so that endpoint cannot be used to escalate privileges.
 
 ### `GET /api/v1/buckets/{bucket}/acl`
 

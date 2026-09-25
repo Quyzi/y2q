@@ -96,28 +96,12 @@ pub async fn handle(
         }));
     }
 
-    // Cross-bucket search. Admins and auditors can read every bucket, so the
-    // core cursor is safe to expose and no filtering is required.
-    if auth.is_admin_or_auditor() {
-        let opts = ListOptions {
-            prefix: q.prefix,
-            after: q.after,
-            limit: user_limit,
-        };
-        let page = storage
-            .search_objects(&parsed, None, opts)
-            .await
-            .map_err(AppError::from)?;
-        return Ok(HttpResponse::Ok().json(ListObjectsResponse {
-            items: page.items.into_iter().map(MetadataView::from).collect(),
-            next: page.next,
-        }));
-    }
-
-    // Cross-bucket search by a non-global role. Fetch a wide window, drop
-    // matches in buckets the caller cannot read, then paginate over the visible
-    // results in the daemon. The continuation cursor is built only from a
-    // visible item, so it never leaks a hidden bucket name or object key.
+    // Cross-bucket search. Fetch a wide window, drop matches in buckets the
+    // caller cannot read, then paginate over the visible results. A global
+    // admin/auditor is not exempt: no sealed grant means the bucket is
+    // omitted, same as `bucket_readable`. The continuation cursor is built
+    // only from a visible item, so it never leaks a hidden bucket name or
+    // object key.
     let lim = user_limit.unwrap_or(DEFAULT_LIST_LIMIT);
     let wide = ListOptions {
         prefix: q.prefix,

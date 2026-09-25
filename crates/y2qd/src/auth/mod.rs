@@ -41,8 +41,9 @@ use self::session::SessionInfo;
 pub struct Authenticated {
     /// Username from the user record this session was minted under.
     pub username: String,
-    /// Global role captured at login. Admins bypass per-bucket ACLs and may
-    /// call admin endpoints.
+    /// Global role captured at login. Admins may call admin endpoints. On a
+    /// bucket this persona can already decrypt, an admin's verb ceiling is
+    /// not narrowed by the ACL; the role is not a visibility bypass.
     pub role: Role,
     /// Hashed token id (used to look up / revoke this session).
     pub token_hash: [u8; 32],

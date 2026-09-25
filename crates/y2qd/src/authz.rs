@@ -8,12 +8,14 @@
 //! effective capability for an action is the intersection of two ceilings:
 //!
 //! - the caller's **global role** ([`role_caps`] / [`role_is_global`]), and
-//! - their **per-bucket relationship** (owner, ACL grant, or none).
+//! - their **per-bucket relationship** (owner, ACL grant, or none),
 //!
-//! Using a set rather than an ordered ladder is what lets `WriteOnly` grant
-//! write without read. The resolver is leak-averse (see [`authorize_bucket`]):
-//! a caller with no relationship to a bucket cannot tell it apart from one that
-//! does not exist.
+//! further gated on this persona's sealed bucket-key grant. A global role
+//! does not skip that gate. Using a set rather than an ordered ladder is
+//! what lets `WriteOnly` grant write without read. The resolver is
+//! leak-averse (see [`authorize_bucket`]): a caller with no sealed grant —
+//! and no `WriteOnly` drop-box relationship — cannot tell the bucket apart
+//! from one that does not exist.
 
 use y2q_core::crypto::Role;
 use y2q_core::{AnyStorage, BucketConfig, BucketPermission, Error as CoreError, Listing};
@@ -77,9 +79,16 @@ pub(crate) fn role_caps(role: Role) -> Caps {
     }
 }
 
-/// Whether a role sees every bucket (global visibility) rather than only the
-/// buckets it owns or has been granted. Admins act on all buckets; auditors can
-/// read all buckets.
+/// Whether a role is deployment-scoped (`Admin` or `Auditor`) rather than
+/// limited to buckets the account owns or was granted.
+///
+/// This is **not** a visibility bypass. When authorization is enforced, a
+/// global role still sees a bucket only when this persona holds a real
+/// sealed grant (or the username's relationship is exactly `WriteOnly`).
+/// The flag exists so [`role_permits`] can tell `Admin` from `User` and
+/// `Auditor` from `ReadOnly` — those pairs share a [`Caps`] triple — and so
+/// a global role that *does* hold a grant keeps its role ceiling instead of
+/// being narrowed to the ACL entry.
 pub(crate) fn role_is_global(role: Role) -> bool {
     matches!(role, Role::Admin | Role::Auditor)
 }
@@ -92,11 +101,11 @@ pub(crate) fn role_is_global(role: Role) -> bool {
 /// The capability-triple comparison alone cannot distinguish `Admin` from
 /// `User`, or `Auditor` from `ReadOnly` — each pair shares an identical
 /// [`Caps`] set. Only [`role_is_global`] tells them apart: `Admin`/`Auditor`
-/// additionally grant visibility into every bucket in the deployment, not
-/// just ones the account owns or was granted. Without this check, any
-/// account (even a plain `user`) could mint an `admin` persona for itself
-/// and log in as a global administrator — see the module docs on
-/// [`role_is_global`].
+/// are deployment-scoped (admin endpoints, and a verb ceiling that is not
+/// narrowed to an ACL entry on a bucket this persona can already decrypt).
+/// They still do not see buckets they hold no sealed grant for. Without
+/// this check, any account (even a plain `user`) could mint an `admin`
+/// persona for itself and log in as a global administrator.
 pub(crate) fn role_permits(candidate: Role, ceiling: Role) -> bool {
     let c = role_caps(candidate);
     let m = role_caps(ceiling);
@@ -112,6 +121,17 @@ pub(crate) fn bucket_grant_caps(cfg: &BucketConfig, username: &str) -> Option<Ca
         Some(owner) if owner == username => Some(Caps::FULL),
         Some(_) => cfg.acl.get(username).copied().map(grant_caps),
         None => None,
+    }
+}
+
+/// Username relationship is an ACL `WriteOnly` grant and nothing stronger.
+/// Owners are full control, not a drop box, even if the ACL also names them.
+fn is_write_only_relationship(cfg: &BucketConfig, username: &str) -> bool {
+    match cfg.owner.as_deref() {
+        Some(owner) if owner != username => {
+            cfg.acl.get(username).copied() == Some(BucketPermission::WriteOnly)
+        }
+        _ => false,
     }
 }
 
@@ -148,31 +168,41 @@ pub enum Decision {
 
 /// Effective capabilities for `auth` on `cfg` (role ceiling ∩ bucket
 /// relationship). The bool is whether the caller can *see* the bucket at all
-/// (owner, ACL grant, or a globally-scoped role) — used to choose 403 vs 404.
+/// — used to choose 403 vs 404.
 ///
-/// `read` and `admin` are additionally gated on `auth`'s *persona* actually
-/// holding a working cryptographic bucket-key grant (see
-/// [`crate::bucket_keys::is_visible`]): the ACL/ownership fields are
-/// username-keyed and persona-agnostic, but the sealed bucket-key grants
-/// are per-persona, so a duress persona whose slot was sealed with a decoy
-/// must not read — or administer (rotate keys, manage the ACL, delete the
-/// bucket) — here even when the ACL says the *user* can. `write` is
-/// unaffected by this gate — writing only needs the bucket's public key,
-/// never a persona-specific secret-key grant, so a `WriteOnly` drop-box
-/// grantee (who never gets a real grant row at all) keeps working.
+/// Visibility requires this persona's sealed bucket-key grant
+/// ([`crate::bucket_keys::is_visible`]). The ACL and owner fields are
+/// username-keyed and persona-agnostic, so a duress slot sealed with a decoy
+/// must not see the bucket even when the username is the owner or on the
+/// ACL, and a global admin/auditor role does not skip the check. No grant
+/// means no caps and not visible: listings omit the bucket and every verb
+/// (read, write, delete, admin) is 404.
+///
+/// The exception is a username relationship of exactly
+/// [`BucketPermission::WriteOnly`]. Writing needs only the bucket public
+/// key, so a drop-box grantee keeps `write` with no sealed secret, stays
+/// visible, and a read is 403 rather than 404. Any stronger relationship
+/// (owner, `read`, `write`, `admin`) without a real grant is hidden entirely
+/// — `write` is not left on, or a decoy persona of the owner could overwrite
+/// objects it cannot read, and a `readonly` decoy would 403 and confirm the
+/// bucket exists.
+///
+/// A global role that personally holds a real grant still receives its role
+/// ceiling on that bucket (admin: full, auditor: read), not an ACL narrowing.
+/// `enforce_authorization = false` never reaches this function.
 fn effective_caps(auth: &Authenticated, cfg: &BucketConfig, bucket: &str) -> (Caps, bool) {
     let rc = role_caps(auth.role);
-    if role_is_global(auth.role) {
-        return (rc.intersect(Caps::FULL), true);
+    let real_grant = crate::bucket_keys::is_visible(&auth.session, cfg, bucket);
+    if real_grant && role_is_global(auth.role) {
+        return (rc, true);
     }
     match bucket_grant_caps(cfg, &auth.username) {
-        Some(mut bc) => {
-            let real_grant = crate::bucket_keys::is_visible(&auth.session, cfg, bucket);
-            if bc.read && !real_grant {
-                bc.read = false;
-            }
-            if bc.admin && !real_grant {
-                bc.admin = false;
+        Some(bc) => {
+            if !real_grant {
+                if is_write_only_relationship(cfg, &auth.username) {
+                    return (rc.intersect(bc), true);
+                }
+                return (Caps::NONE, false);
             }
             (rc.intersect(bc), true)
         }
@@ -186,14 +216,14 @@ fn effective_caps(auth: &Authenticated, cfg: &BucketConfig, bucket: &str) -> (Ca
 /// ([`Decision::Allowed`]) or creating a brand-new one they implicitly own
 /// ([`Decision::ClaimOwnership`]). On denial returns an [`AppError`] carrying
 /// the correct status:
-/// - **404** when the caller has no relationship to the bucket and cannot see
-///   it — never reveal that such a bucket exists. This also covers a Read
-///   request denied *purely* because this persona's cryptographic bucket-key
-///   grant doesn't cover it while the username-keyed ACL says it should: that
-///   case is indistinguishable from the bucket not existing (the duress
-///   deniability property — see [`effective_caps`]).
-/// - **403** when the caller can see the bucket but lacks the verb (because of
-///   their role ceiling, their grant level, or both).
+/// - **404** when this persona has no sealed grant and the username's
+///   relationship is not exactly `WriteOnly` — including a global admin or
+///   auditor, and including write/delete/HEAD/ACL. Same when there is no
+///   relationship at all. Never reveal that such a bucket exists (see
+///   [`effective_caps`]).
+/// - **403** when the caller can see the bucket but lacks the verb (role
+///   ceiling, grant level, or both). A `WriteOnly` drop box can see the
+///   bucket, so a read is 403, not 404.
 pub async fn authorize_bucket(
     auth: &Authenticated,
     storage: &AnyStorage,
@@ -225,13 +255,11 @@ pub async fn authorize_bucket(
 
     let (eff, visible) = effective_caps(auth, &cfg, bucket);
     if eff.allows(required) {
-        // A globally-scoped role (Admin/Auditor) "sees" every bucket via its
-        // role ceiling, including one that doesn't exist yet — that
-        // ceiling is about visibility into *other* users' buckets, not an
-        // exemption from becoming the actual crypto owner of a bucket it
-        // creates itself. Without this, an admin's first write to a new
-        // bucket would never seed key material for anyone at all, leaving
-        // an object nobody — not even the admin who wrote it — can decrypt.
+        // A write that creates a bucket still has to claim ownership and seed
+        // key material. A global role is not an exemption from becoming the
+        // crypto owner of a bucket this persona creates — otherwise the
+        // first write would leave an object nobody, including the writer,
+        // can decrypt.
         if cfg.owner.is_none()
             && matches!(required, BucketPermission::Write)
             && !storage
@@ -370,6 +398,10 @@ pub async fn resolve_bucket_config(
 
 /// Whether `auth` may at least read `bucket`. Used to filter listings and
 /// search results without erroring.
+///
+/// A global role does not short-circuit: no sealed grant means the bucket is
+/// omitted, same rule as [`authorize_bucket`]. `enforce_authorization = false`
+/// still shows every bucket.
 pub async fn bucket_readable(
     auth: &Authenticated,
     storage: &AnyStorage,
@@ -377,11 +409,6 @@ pub async fn bucket_readable(
 ) -> Result<bool, AppError> {
     if !auth.authz_enforced {
         return Ok(true);
-    }
-    // Globally-scoped read roles (admin, auditor) short-circuit without a config
-    // read when their ceiling already grants read.
-    if role_is_global(auth.role) {
-        return Ok(role_caps(auth.role).read);
     }
     let cfg = storage
         .get_bucket_config(bucket)

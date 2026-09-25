@@ -54,12 +54,13 @@ pub static LOGIN_GOVERNOR_CONFIG: LazyLock<GovernorConfig<RealIpKeyExtractor, No
 /// Rate-limit config for `POST /api/v1/personas`: bursts of up to 5
 /// requests per source IP, replenishing one every 10 seconds thereafter.
 /// Unlike login this endpoint is authenticated, but its 409 `PasswordReused`
-/// response is a verification oracle for the caller's own other credential
-/// slot passwords (and, combined with the primary-slot silent-no-op, for
-/// which slot is the account's real primary) — throttling raises the cost
-/// of automating that probe. Legitimate persona setup is a handful of calls
-/// per account, never a tight loop, so this cap should not be felt in
-/// normal use.
+/// response is a same-account password check — a verification oracle for the
+/// caller's other credential-slot passwords. The primary-slot silent no-op
+/// is gone, so that oracle is gone: a slot write always takes effect and a
+/// later login cannot identify `primary_slot`. `PasswordReused` (409) remains
+/// a same-account password check and is why the endpoint stays throttled.
+/// Legitimate persona setup is a handful of calls per account, never a tight
+/// loop, so this cap should not be felt in normal use.
 pub static PERSONA_GOVERNOR_CONFIG: LazyLock<GovernorConfig<RealIpKeyExtractor, NoOpMiddleware>> =
     LazyLock::new(|| {
         let mut builder = GovernorConfigBuilder::default();
