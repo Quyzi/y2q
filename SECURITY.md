@@ -55,17 +55,20 @@ boundary is misleading. Full detail: [docs/architecture.md#threat-model-brief](d
   from an ordinary low-access account).
 - Server-stored-credential theft (Argon2id-wrapped keys, not passwords).
 - A quantum adversary (ML-KEM-768 throughout).
-- Memory disclosure while idle, **on Linux** (core dump, swap, same-uid
-  `ptrace`/`/proc/<pid>/mem`, VM snapshot — see
+- Memory disclosure of guarded secrets, **on Linux** (core dump, swap, and
+  `ptrace`/`/proc/<pid>/mem` — including a root reader, and including while
+  the pages are unlocked — see
   [Guarded memory](#guarded-memory-linux-only)).
 
 **Not defended against:**
 
-- A live memory read timed to a request actually in flight, or by a
-  root/kernel-privileged reader (guarded memory closes *idle* disclosure,
-  not a read that races a request).
-- Object body plaintext in ordinary heap (see
+- Object-body plaintext in ordinary heap while a request is in flight. A
+  root reader can recover that body via `ptrace` or `/proc/<pid>/mem`.
+  Those interfaces cannot read `SecretBuf`/`SecretVec` pages (see
   [Guarded memory's scope boundary](#guarded-memory-linux-only)).
+- A kernel compromise, or a hypervisor/cold-boot read of physical RAM.
+  `memfd_secret` removes pages from the kernel direct map; it does not
+  encrypt them.
 - The node key holder's view of deployment shape (bucket/object counts,
   labels, sizes — see [Key hierarchy](#key-hierarchy)).
 - A leaked, valid Bearer token, until it expires or is revoked.
@@ -161,9 +164,8 @@ Once a tier-1 identity key or a resolved tier-2 bucket key is unwrapped on
 login, it used to sit as a plain `Zeroizing<Vec<u8>>` in the session store
 for the session's whole lifetime (`auth.max_ttl_seconds`, up to 24 hours by
 default). `Zeroizing` only scrubs on drop — it does nothing for a *live*
-process, so a core dump, swap page, same-uid `ptrace`/`/proc/<pid>/mem`
-read, or a VM snapshot taken any time during that window recovered the key
-in plaintext. The same gap covered:
+process, so a core dump, a swap page, or a `ptrace`/`/proc/<pid>/mem` read
+(same-uid or root) recovered the key in plaintext. The same gap covered:
 
 - Every active session's identity secret key and its cached bucket keys
   (up to 32 per session).
@@ -179,26 +181,44 @@ in plaintext. The same gap covered:
 ### Mechanism
 
 `y2q_core::secmem` (`crates/y2q-core/src/secmem.rs`) provides two guarded
-allocation shapes, both built on `mmap` + `mprotect` + `mlock` + `madvise`:
+allocation shapes. The secret bytes are `memfd_secret` pages (`mmap`
+`MAP_SHARED`), not ordinary anonymous memory. `memfd_secret` removes those
+pages from the kernel direct map, so `PTRACE_PEEKDATA` and
+`/proc/<pid>/mem` cannot read them — even while the owning process has
+them `PROT_READ` or `PROT_READ|PROT_WRITE`, and even for root. A
+`PROT_NONE` anonymous mapping does **not** do this: Linux still satisfies
+those reads with `FOLL_FORCE`. `mprotect` between `PROT_NONE`,
+`PROT_READ`, and `PROT_READ|PROT_WRITE` still works on the secretmem pages.
 
-- **`SecretBuf`** — a long-lived secret. Its pages are `PROT_NONE` at rest
-  (unreadable, even to a reader that otherwise could access the process's
-  memory) and briefly made `PROT_READ` for the duration of an `unlock()`
-  guard, then restored to `PROT_NONE` when the guard drops. Reference-counted
-  nesting supports concurrent readers from multiple request threads sharing
-  one guard.
+- **`SecretBuf`** — a long-lived secret. Its `memfd_secret` pages are
+  `PROT_NONE` at rest and briefly `PROT_READ` for the duration of an
+  `unlock()` guard, then restored to `PROT_NONE` when the guard drops.
+  `PROT_NONE` stops accidental access from inside the process; it is not
+  what stops `ptrace`. Reference-counted nesting supports concurrent
+  readers from multiple request threads sharing one guard.
 - **`SecretVec`** — a transient plaintext workspace (the destination of a
-  decrypt, or the source of an encrypt), readable for its whole short life,
-  with a fixed capacity so it never reallocates (a realloc would leave a
-  stale, unzeroized copy in the old backing memory).
+  decrypt, or the source of an encrypt), also `memfd_secret`, readable for
+  its whole short life, with a fixed capacity so it never reallocates (a
+  realloc would leave a stale, unzeroized copy in the old backing memory).
 
-Both types are guard-paged (an inaccessible page immediately before and
-after the data region) and locked out of swap (`mlock`), hinted
-`MADV_DONTDUMP` (excluded from core dumps at the VMA level, independent of
-the process-wide `RLIMIT_CORE`/dumpable flag below) and `MADV_WIPEONFORK`
-(zeroed rather than copied into a child process). On drop, both scrub their
-content with a volatile write (not eligible for compiler dead-store
-elimination) before `munlock`/`munmap`.
+Guard pages on either side of the data are ordinary `PROT_NONE` anonymous
+mappings and hold no secrets. Secretmem pages are locked out of swap (the
+kernel charges them to `RLIMIT_MEMLOCK` and marks the VMA `VM_LOCKED`;
+`mlock(2)` itself cannot pin secretmem and is used only for the anonymous
+fallback below). They are hinted `MADV_DONTDUMP` (excluded from core dumps
+at the VMA level, independent of the process-wide `RLIMIT_CORE`/dumpable
+flag below). `MADV_WIPEONFORK` is applied when the kernel accepts it —
+secretmem rejects that hint. On drop, both scrub their content with a
+volatile write (not eligible for compiler dead-store elimination) before
+`munlock`/`munmap`.
+
+If `memfd_secret` fails (`ENOSYS`, a kernel built without it, `EAGAIN` from
+`RLIMIT_MEMLOCK`, permission) and the process policy is `Require` — the
+production default — the allocation fails and `harden_process` refuses to
+start. There is no silent fallback to anonymous `mmap`. `BestEffort`
+(`[server] allow_unprotected_memory`) does fall back, once, with one
+warning; those anonymous pages **are** readable by a privileged `ptrace`
+or `/proc/<pid>/mem` reader.
 
 **`MemoryKey`** wraps a fresh 32-byte AES-256-GCM key in a `SecretBuf`,
 generated once per process at boot. `SessionKeyring`
@@ -234,8 +254,9 @@ drop.
 `ptrace`/`gdb`/`strace -p`/`/proc/<pid>/mem` reads — a *process-wide*
 protection, distinct from the per-page `MADV_DONTDUMP` hint above) and
 `RLIMIT_CORE=0` (no core file on crash), then allocates and drops a
-one-page `SecretBuf` as a boot-time probe — so a too-low `RLIMIT_MEMLOCK`
-fails loudly at startup instead of silently at first login.
+one-page `SecretBuf` as a boot-time probe — so a missing `memfd_secret`
+or a too-low `RLIMIT_MEMLOCK` fails loudly at startup instead of silently
+at first login.
 
 ### Verifying it on a running daemon
 
@@ -256,9 +277,10 @@ grep VmLck /proc/$(pgrep -n y2qd)/status
 ### Configuration and failure mode
 
 `[server] allow_unprotected_memory` (default `false`) gates all of this.
-With the default, `y2qd` refuses to start if guarded allocation fails (most
-commonly `RLIMIT_MEMLOCK` set too low — a handful of pages are needed, not
-a meaningful fraction of any reasonable limit):
+With the default, `y2qd` refuses to start if guarded allocation fails —
+`memfd_secret` unavailable, or `RLIMIT_MEMLOCK` too small to charge the
+secretmem pages (a handful of pages, not a meaningful fraction of any
+reasonable limit):
 
 ```
 Error: refusing to start: mlock failed (1); raise RLIMIT_MEMLOCK or set
@@ -277,18 +299,22 @@ Full runbook: [docs/operations.md#memory-hardening-linux-only](docs/operations.m
 
 Stated explicitly because it's easy to over-claim guarded memory's reach:
 
-- **A root/kernel-privileged live read timed to a request in flight**
-  recovers that request's plaintext and the `MemoryKey` that sealed it.
-  Guarded memory defends against *idle* disclosure (a snapshot, dump, or
-  same-uid read taken when nothing is actively using the key) — not
-  against a privileged reader racing an in-progress operation.
+- **A kernel compromise, or a direct read of physical RAM.** Identity
+  keys, bucket keys, the process `MemoryKey`, node-derived keys,
+  passwords, and bearer tokens held in `SecretBuf`/`SecretVec` are
+  `memfd_secret` pages: `ptrace` and `/proc/<pid>/mem` cannot read them,
+  including while unlocked and including for root. That is removal from
+  the kernel direct map, not encryption, so a reader of guest physical
+  memory is outside this boundary.
 - **Object body plaintext is left in ordinary heap, deliberately.**
   `mlock`ing bodies up to `server.max_body_bytes` (256 MiB default) isn't
   viable, and scrubbing every GET's response body would be a real
   throughput regression for a much smaller marginal gain than guarding key
-  material. Body plaintext is only as protected as the response path
+  material. A root reader can still recover a request's body while it is
+  in flight. Body plaintext is only as protected as the response path
   itself (TLS in transit; nothing at rest in process memory beyond normal
-  OS page lifecycle).
+  OS page lifecycle). If `memfd_secret` is unavailable the daemon refuses
+  to start unless `[server] allow_unprotected_memory` is set.
 - **A dead-simple upgrade path exists if that boundary ever needs to move**
   (`Bytes::from_owner` over a scrubbing owner, the same mechanism used for
   the token response above) — it just isn't applied to bodies today.
@@ -613,8 +639,14 @@ above.
 Consolidated from the sections above, so the boundary of what this project
 claims is in one place:
 
-- A root/kernel-privileged reader racing a request in flight recovers that
-  request's plaintext, regardless of platform.
+- A root reader racing a request in flight can recover that request's
+  **object body** from ordinary heap, regardless of platform. On Linux,
+  secrets held in `SecretBuf`/`SecretVec` (identity keys, bucket keys, the
+  process `MemoryKey`, node-derived keys, passwords, bearer tokens) are
+  not readable via `ptrace` or `/proc/<pid>/mem`, including while unlocked.
+  If `memfd_secret` is unavailable the daemon refuses to start unless
+  `[server] allow_unprotected_memory` is set. A kernel compromise or a
+  direct read of physical RAM is still out of scope.
 - Object body plaintext is never guarded-memory protected, by design (cost
   vs. benefit at `server.max_body_bytes` scale).
 - Guarded memory and process hardening are Linux-only; see
