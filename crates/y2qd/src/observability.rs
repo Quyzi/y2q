@@ -127,7 +127,7 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         AUTH_LOGINS_TOTAL,
-        "Login attempts, labelled by result (success/wrong_password/not_found/locked)"
+        "Login attempts, labelled by result (success/wrong_password/locked/disabled). Unknown usernames are counted as wrong_password"
     );
     metrics::describe_gauge!(
         SESSIONS_ACTIVE,
