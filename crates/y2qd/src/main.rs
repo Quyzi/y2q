@@ -859,12 +859,14 @@ fn write_initial_root_password(
         file.sync_all()?;
         Ok(())
     })();
-    write_result.map_err(|e: std::io::Error| {
-        std::io::Error::other(format!(
+    if let Err(e) = write_result {
+        drop(file);
+        let _ = std::fs::remove_file(&path);
+        return Err(std::io::Error::other(format!(
             "write initial root password file {}: {e}",
             path.display()
-        ))
-    })?;
+        )));
+    }
     drop(file);
     if let Some(parent) = path.parent() {
         let dir = std::fs::File::open(parent).map_err(|e| {
