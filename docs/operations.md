@@ -248,7 +248,7 @@ curl -X DELETE https://y2qd.example/api/v1/personas/2/grant \
   -d '{"buckets":["prod"]}'
 ```
 
-`GET /api/v1/personas/me` reports the calling session's own slot and role - never the duress flag, even for the caller's own session, so a technical coercer who queries this endpoint directly can't read it off. This is the only introspection offered. `DELETE /api/v1/personas/{slot}` overwrites that slot (any slot other than the caller's own active one) with a fresh decoy.
+`GET /api/v1/personas/me` reports the calling session's own slot and role - never the duress flag, even for the caller's own session, so a technical coercer who queries this endpoint directly can't read it off. This is the only introspection offered. `DELETE /api/v1/personas/{slot}` overwrites that slot (any slot other than the caller's own active one, including the account's real primary slot) with a fresh decoy and revokes sessions opened through it. `POST /api/v1/personas` likewise always overwrites the requested slot, primary included. The response shape is the same either way. Skipping the real slot would let the next login fail only for that password and identify it; there is no spare slot to redirect the write onto without colliding with one of the other three. `primary_slot` is still just the random slot third parties grant to.
 
 A share made with `POST /api/v1/personas/{slot}/grant` does not survive a bucket key rotation performed by someone else - see the warning under [Key rotation](#key-rotation).
 

@@ -38,7 +38,9 @@ pub struct AclBody {
     pub key_epochs: Vec<u32>,
 }
 
-/// Read a bucket's owner and ACL. Requires bucket `Admin` (owner) or global admin.
+/// Read a bucket's owner and ACL. Requires the bucket admin capability, or a
+/// global admin/auditor who holds a sealed grant on this bucket. No grant is
+/// 404, including for a global role.
 #[utoipa::path(
     get,
     operation_id = "get_bucket_acl",
@@ -60,9 +62,14 @@ pub async fn get_acl(
     auth: Authenticated,
 ) -> Result<HttpResponse, AppError> {
     let bucket = path.into_inner();
-    // Global admins and auditors may view any bucket's ACL; otherwise the
-    // caller must be the bucket's owner or a bucket-admin grantee.
-    if !auth.is_admin_or_auditor() {
+    // Viewing an ACL requires the bucket to be visible to this persona.
+    // A global admin or auditor may read it only when they hold a sealed
+    // grant (Read); everyone else needs the bucket admin capability. No
+    // grant is 404, the same rule as `authorize_bucket` — a global role
+    // does not get to list an ACL it cannot decrypt.
+    if auth.is_admin_or_auditor() {
+        authorize_bucket(&auth, &storage, &bucket, BucketPermission::Read).await?;
+    } else {
         authorize_bucket(&auth, &storage, &bucket, BucketPermission::Admin).await?;
     }
     if !storage

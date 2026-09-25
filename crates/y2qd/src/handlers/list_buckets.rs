@@ -36,7 +36,8 @@ pub async fn handle(
     auth: Authenticated,
 ) -> Result<HttpResponse, AppError> {
     let all = storage.list_buckets().await.map_err(AppError::from)?;
-    // Hide buckets the caller has no read access to (admins see everything).
+    // Hide buckets this persona cannot decrypt. A global role does not
+    // short-circuit; `bucket_readable` applies the sealed-grant rule.
     let mut buckets = Vec::with_capacity(all.len());
     for b in all {
         if bucket_readable(&auth, &storage, &b).await? {
