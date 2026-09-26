@@ -498,18 +498,24 @@ hardened systemd units with `LimitMEMLOCK=0`), startup fails immediately
 with a clear error rather than falling back silently:
 
 ```
-Error: refusing to start: mlock failed (1); raise RLIMIT_MEMLOCK or set
+Error: refusing to start: mlock failed (11); raise RLIMIT_MEMLOCK or set
 [server] allow_unprotected_memory = true. Core dumps and swap would
 expose session identity keys; set [server] allow_unprotected_memory =
 true to override.
 ```
 
-Fix it by raising the limit rather than disabling the protection:
+Errno 11 is `EAGAIN` from the secretmem `mmap` when `RLIMIT_MEMLOCK` cannot
+hold the pages. `memfd_secret failed` with `EPERM` means a seccomp filter
+blocked the syscall (`@system-service` does not include it).
+
+Fix it by raising the limit and allowing the syscall, rather than disabling
+the protection:
 
 ```sh
 # systemd unit
 [Service]
 LimitMEMLOCK=infinity
+SystemCallFilter=memfd_secret
 
 # ulimit, for a shell-launched daemon
 ulimit -l unlimited
