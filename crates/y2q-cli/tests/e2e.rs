@@ -9,7 +9,7 @@
 //!
 //! The whole flow lives in one `#[test]` so the server is started once.
 
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufReader, Read};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -207,6 +207,39 @@ fn start_server() -> Option<Server> {
     start_server_tls(None)
 }
 
+/// Drain `stdout` so a full pipe cannot block the daemon. The bootstrap
+/// password is not on this stream.
+fn drain_stdout(stdout: std::process::ChildStdout) {
+    std::thread::spawn(move || {
+        let mut sink = Vec::new();
+        let _ = BufReader::new(stdout).read_to_end(&mut sink);
+    });
+}
+
+/// Read `{keystore_dir}/initial-root-password` once the daemon has finished
+/// writing it. Returns the password field, or empty on timeout.
+fn read_initial_root_password(keys: &std::path::Path) -> String {
+    let path = keys.join("initial-root-password");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Ok(text) = std::fs::read_to_string(&path)
+            && text.ends_with('\n')
+            && let Some(password) = text.lines().find_map(|line| {
+                line.trim()
+                    .strip_prefix("password:")
+                    .map(|rest| rest.trim().to_string())
+            })
+            && !password.is_empty()
+        {
+            return password;
+        }
+        if Instant::now() > deadline {
+            return String::new();
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// Start a daemon. When `tls` is `Some((cert, key))`, serve HTTPS with those
 /// PEM files and PQ-kex requirement relaxed (the throwaway cert is classical).
 fn start_server_tls(tls: Option<(PathBuf, PathBuf)>) -> Option<Server> {
@@ -258,30 +291,11 @@ fn start_server_tls(tls: Option<(PathBuf, PathBuf)>) -> Option<Server> {
     }
     let mut child = cmd.spawn().expect("spawn y2qd");
 
-    // Parse the first-run root password from stdout, then drain the rest in a
-    // background thread so the daemon never blocks on a full stdout pipe.
+    // The password is in `{keys}/initial-root-password`, not stdout. Still
+    // drain stdout so a full pipe cannot block the daemon.
     let stdout = child.stdout.take().unwrap();
-    let mut reader = BufReader::new(stdout);
-    let mut password = String::new();
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        let mut line = String::new();
-        if reader.read_line(&mut line).unwrap_or(0) == 0 {
-            break;
-        }
-        if let Some(p) = line.trim().strip_prefix("password:") {
-            password = p.trim().to_string();
-            break;
-        }
-        if Instant::now() > deadline {
-            break;
-        }
-    }
-    std::thread::spawn(move || {
-        let mut sink = Vec::new();
-        let _ = reader.read_to_end(&mut sink);
-    });
-
+    drain_stdout(stdout);
+    let password = read_initial_root_password(&keys);
     assert!(!password.is_empty(), "failed to capture first-run password");
 
     // Wait for the listener to accept connections.
@@ -379,26 +393,8 @@ fn e2e_node_key_rotation_crash_safety() {
         .stderr(Stdio::null());
     let mut child = boot.spawn().expect("spawn y2qd");
     let stdout = child.stdout.take().unwrap();
-    let mut reader = BufReader::new(stdout);
-    let mut password = String::new();
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        let mut line = String::new();
-        if reader.read_line(&mut line).unwrap_or(0) == 0 {
-            break;
-        }
-        if let Some(p) = line.trim().strip_prefix("password:") {
-            password = p.trim().to_string();
-            break;
-        }
-        if Instant::now() > deadline {
-            break;
-        }
-    }
-    std::thread::spawn(move || {
-        let mut sink = Vec::new();
-        let _ = reader.read_to_end(&mut sink);
-    });
+    drain_stdout(stdout);
+    let password = read_initial_root_password(&keys);
     assert!(!password.is_empty(), "failed to capture first-run password");
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
@@ -1379,13 +1375,9 @@ fn e2e_bucket_blast_radius() {
         "expected 404 not found, got: {stderr}"
     );
 
-    // dave is a global ADMIN with no bucket grant anywhere. This is the
-    // core claim of the whole plan: a compromised admin account cannot
-    // read data. Admin visibility still lists bucket *names* (role_is_global
-    // bypasses the ACL/ownership gate for listing), but the actual GET
-    // fails at the crypto layer - `authorize_bucket` lets the request
-    // through on role alone, then `bucket_keys::resolve_read_key` fails
-    // because dave holds no real sealed grant, surfacing as 403.
+    // dave is a global ADMIN with no bucket grant anywhere. No sealed grant
+    // means the bucket does not exist for him: a global role does not list
+    // names, and GET/ACL are 404, not 403.
     server.ok(&[
         "admin",
         "user",
@@ -1404,25 +1396,21 @@ fn e2e_bucket_blast_radius() {
     assert!(ok(&out), "admin must be able to list buckets");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout.contains("alpha") && stdout.contains("beta"),
-        "expected both bucket names, got: {stdout}"
+        !stdout.contains("alpha") && !stdout.contains("beta"),
+        "admin with no grant must not see alpha or beta, got: {stdout}"
     );
 
-    // `stat`/HEAD never decrypts the body (only Metadata, tier-0/node-key
-    // material an admin can already see) - use a real GET, the only path
-    // that calls `bucket_keys::resolve_read_key`.
     let dave_dl = server.base.join("dave_dl.txt");
     let out = server.y2q(&["get", "dave/alpha/secret.txt", dave_dl.to_str().unwrap()]);
     assert!(!ok(&out), "admin must not read alpha's plaintext");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("forbidden"),
-        "expected 403 forbidden, got: {stderr}"
+        stderr.contains("not found"),
+        "expected 404 not found, got: {stderr}"
     );
 
-    // Even the ACL endpoint itself refuses dave: granting requires sealing
-    // a new grant against the bucket wrap key, which only a real grantee
-    // can recover.
+    // Self-grant via ACL is the same hide: dave has no sealed grant, so the
+    // bucket is not found rather than forbidden.
     let out = server.y2q(&["admin", "acl", "grant", "dave", "alpha", "dave", "read"]);
     assert!(
         !ok(&out),
@@ -1430,8 +1418,8 @@ fn e2e_bucket_blast_radius() {
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("forbidden"),
-        "expected 403 forbidden, got: {stderr}"
+        stderr.contains("not found"),
+        "expected 404 not found, got: {stderr}"
     );
 
     // Root grants carol writeonly on alpha: she can write, but reading back
@@ -1692,14 +1680,15 @@ async fn e2e_duress_persona_deniability() {
     );
 }
 
-/// Regression: a duress persona must not be able to destroy the account's
-/// real identity through `create_persona`/`delete_persona`, and the two
-/// endpoints' responses must be indistinguishable whether or not the
-/// targeted slot happened to be the real one — otherwise a coercer holding
-/// only a duress password could enumerate the other three slots and read
-/// off which one is real from whichever refuses to change.
+/// A persona slot write is real, including the account's primary slot.
+/// `create_persona` on the real slot and on another slot return the same
+/// warning shape, and a later login with the password written onto the real
+/// slot succeeds and reports that slot. A silent no-op would let that login
+/// fail only for the real slot and identify `primary_slot`. Only four slots
+/// exist, so there is no in-band redirect that both preserves primary and
+/// makes the new password work.
 #[tokio::test]
-async fn e2e_duress_persona_cannot_destroy_primary() {
+async fn e2e_duress_slot_write_is_real() {
     let Some(server) = start_server() else {
         return;
     };
@@ -1707,11 +1696,11 @@ async fn e2e_duress_persona_cannot_destroy_primary() {
     let mk = || y2q_client::Y2qClient::new(y2q_client::ClientConfig::new(url.clone())).unwrap();
 
     // Login budget: the `/auth/login` rate limiter allows a burst of 5
-    // requests per source IP before throttling (see `rate_limit.rs`), so
-    // this test is deliberately structured to use exactly 5: root, real,
-    // duress, then one final "real still works" check and one "attacker
-    // password fails" check — both attacks below reuse the already
-    // logged-in `duress` session rather than minting fresh ones.
+    // requests per source IP for this server process (see `rate_limit.rs`).
+    // This test uses four: root, real, duress, then the attacker password
+    // that was written onto the real slot. Do not add a fifth unless one
+    // call is removed — `e2e_duress_persona_deniability` already sits on
+    // the same burst size against its own server.
     let mut root = mk();
     let root_tok = root
         .login("root", &server.password, None)
@@ -1747,27 +1736,25 @@ async fn e2e_duress_persona_cannot_destroy_primary() {
         duress_slot
     );
 
-    // The duress persona attempts to overwrite the real slot with an
-    // attacker-controlled password.
+    // Overwrite the real slot with an attacker-controlled password. The
+    // write must take effect; the response must not say that it didn't.
     let resp_on_real = duress
         .create_persona(real_slot, "attacker-password", Some("user"), false)
         .await
-        .expect("create_persona on the real slot must still return success");
+        .expect("create_persona on the real slot");
 
-    // Same call against a genuinely untouched (non-real) slot, for
-    // response-shape comparison.
+    // Same call against another slot, for response-shape comparison.
     let untouched_slot = (0..4u8)
         .find(|&s| s != real_slot && s != duress_slot)
         .unwrap();
     let resp_on_untouched = duress
         .create_persona(untouched_slot, "another-password", Some("user"), false)
         .await
-        .expect("create_persona on an untouched slot");
+        .expect("create_persona on another slot");
 
-    // The warning always echoes the caller's own requested slot number
-    // (which the caller already knows - not a leak), so compare the
-    // message *shape*, not literal text: both must say "overwritten",
-    // neither may say anything distinguishing real from decoy.
+    // The warning echoes the requested slot number (the caller already
+    // knows it). Both must say the slot was overwritten and that grants
+    // sealed to it are gone — nothing that distinguishes primary.
     for w in [&resp_on_real.warning, &resp_on_untouched.warning] {
         assert!(
             w.contains("overwritten") && w.contains("grants sealed to it are gone"),
@@ -1775,23 +1762,20 @@ async fn e2e_duress_persona_cannot_destroy_primary() {
         );
     }
 
-    // Now the same attack via delete_persona: targeting the real slot must
-    // also silently no-op, with an identical 204 either way.
-    duress
-        .delete_persona(real_slot)
-        .await
-        .expect("delete_persona on the real slot must still return success");
-
-    // The real password still works after both attacks; the attacker's
-    // injected password does not open any persona.
-    let real2 = mk();
-    real2
-        .login("mallory", "password-real", None)
-        .await
-        .expect("real password must still work - the primary slot was never touched");
-    let attacker_login = mk();
-    attacker_login
+    // The password written onto the real slot opens that slot.
+    let mut attacker = mk();
+    let attacker_tok = attacker
         .login("mallory", "attacker-password", None)
         .await
-        .expect_err("the attacker's injected password must not open any persona");
+        .expect("password written onto the real slot must log in");
+    attacker.set_token(attacker_tok.token);
+    assert_eq!(
+        attacker
+            .whoami_persona()
+            .await
+            .expect("whoami attacker")
+            .slot,
+        real_slot,
+        "login with the overwritten slot's password must report that slot"
+    );
 }

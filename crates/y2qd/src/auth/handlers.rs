@@ -216,7 +216,6 @@ pub async fn login(
         .get(&username)
         .map_err(|e| AuthError::Backend(e.to_string()))?;
 
-    let not_found = record.is_none();
     let result = match record {
         Some(rec) => attempt_unwrap(rec, password).await,
         None => {
@@ -313,12 +312,9 @@ pub async fn login(
             })
         }
         Err(e) => {
-            let result_label = if not_found {
-                "not_found"
-            } else {
-                "wrong_password"
-            };
-            record_login(result_label, None);
+            // Unknown usernames and bad passwords share one label so a
+            // Prometheus scrape cannot be used as a username oracle.
+            record_login("wrong_password", None);
             state.login_attempts.lock().unwrap().record_failure(
                 &username,
                 state.config.max_failed_logins,
@@ -896,19 +892,18 @@ async fn scrub_user_grants(storage: &AnyStorage, username: &str) -> Result<Vec<S
 /// slate instead of silently inheriting every stale ACL entry. The
 /// cryptographic grant rows are already scrubbed by [`scrub_user_grants`]
 /// (called first, from `delete_user`), which closes read; this closes the
-/// residual `write`/`admin` exposure an ACL entry alone still confers,
-/// since those verbs are not gated on any key material.
+/// residual `write`/`admin` exposure an ACL entry alone still confers.
+/// Those verbs are gated on the same crypto grant (see
+/// `authz::effective_caps`), except an ACL relationship of exactly
+/// `WriteOnly`, which keeps write with no sealed secret.
 ///
 /// Deliberately does NOT clear `BucketConfig::owner` even when it equals
 /// `username`: `claim_ownership` only seeds new key material for a bucket
 /// its own `create_bucket` call just physically created, so an
 /// already-existing bucket left with `owner: None` could never be claimed
-/// by anyone again. A reused owner username still cannot read (no crypto
-/// grant survives) or administer this bucket (the `admin` capability is
-/// gated on the same crypto grant — see `authz::effective_caps`); only
-/// `write` on an owned-but-orphaned bucket remains a residual gap, tracked
-/// as a known limitation pending a dedicated orphaned-bucket reassignment
-/// path.
+/// by anyone again. A reused owner username still cannot read, write, or
+/// administer this bucket: ownership is not a `WriteOnly` relationship, so
+/// with no surviving crypto grant the bucket is 404 to them.
 async fn scrub_deleted_user_acl_entries(
     storage: &AnyStorage,
     username: &str,
@@ -985,11 +980,10 @@ fn now_ns() -> u64 {
 /// `POST /api/v1/personas` request body.
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct PersonaCreateRequest {
-    /// Credential slot to write, `0..CREDENTIAL_SLOTS`. No slot is
-    /// privileged from this endpoint's point of view — the account's own
-    /// randomly-placed primary slot is protected only because it's always
-    /// the slot the caller is currently authenticated through, not because
-    /// of its numeric value; see [`create_persona`].
+    /// Credential slot to write, `0..CREDENTIAL_SLOTS`. The only slot this
+    /// endpoint refuses is the one the caller is currently authenticated
+    /// through. `primary_slot` is not special here — a write to it takes
+    /// effect like any other. See [`create_persona`].
     pub slot: u8,
     #[schema(value_type = String)]
     pub password: SecretString,
@@ -1033,21 +1027,26 @@ pub struct PersonaView {
 
 /// `POST /api/v1/personas` — write a new persona into the caller's own
 /// record at `slot` (`0..CREDENTIAL_SLOTS`), unconditionally overwriting
-/// whatever was there — except the slot the caller is *currently*
-/// authenticated through (refused outright, to prevent a session from
-/// silently invalidating its own login credential) and the account's real
-/// `primary_slot` when it differs from the caller's own slot: that write is
-/// silently discarded rather than applied, so a duress persona cannot use
-/// this endpoint to destroy the account's real identity. The discard is
-/// unobservable — same 201, same warning text, same KDF cost paid either
-/// way — because a distinguishable response would let a coercer holding
-/// only a duress password enumerate the other three slots and read off
-/// which one is real from whichever one refuses to change. No slot number
-/// otherwise carries any special meaning to this endpoint: each account's
-/// real/primary identity lives at a slot chosen uniformly at random on
-/// creation (`UserRecord::primary_slot`, never returned by any API), so
-/// there is nothing else to hardcode-protect by position. Acts only on the
-/// caller's own record: there is no admin route to add a persona for
+/// whatever was there. The only refusal is the slot the caller is
+/// *currently* authenticated through, so a session cannot silently
+/// invalidate its own login credential. Every other slot is actually
+/// overwritten, **including** the account's real `primary_slot`. The
+/// response shape does not depend on which slot it was: the warning still
+/// says the requested slot was overwritten and that grants sealed to it
+/// are gone.
+///
+/// There is no in-band way to preserve `primary_slot` and also make a
+/// follow-up login with the submitted password succeed. Only four slots
+/// exist, so redirecting the write onto a different slot collides with an
+/// existing credential and is itself detectable. A silent no-op would be
+/// worse — the later login fails only for that slot and identifies
+/// `primary_slot`. `primary_slot` remains the random slot third parties
+/// grant to; it is not immune to the account's own other personas.
+///
+/// No slot number otherwise carries any special meaning: each account's
+/// real identity was placed uniformly at random on creation
+/// (`UserRecord::primary_slot`, never returned by any API). Acts only on
+/// the caller's own record: there is no admin route to add a persona for
 /// someone else, because such a route would be the first thing a coercer
 /// with an admin account would reach for.
 #[utoipa::path(
@@ -1143,11 +1142,9 @@ pub async fn create_persona(
     .ok_or(AuthError::PasswordReused)?;
 
     let mut updated = rec.clone();
-    // Silently no-op against the real primary slot (see the doc comment
-    // above) — the response is identical either way.
-    if slot != rec.primary_slot as usize {
-        updated.slots[slot] = new_slot;
-    }
+    // Always applied, including when `slot` is `primary_slot`. A skip would
+    // let the next login identify that slot. See the doc comment above.
+    updated.slots[slot] = new_slot;
     state
         .user_store
         .upsert(&updated)
@@ -1160,14 +1157,14 @@ pub async fn create_persona(
 
 /// `DELETE /api/v1/personas/{slot}` — overwrite `slot`
 /// (`0..CREDENTIAL_SLOTS`, except the caller's own currently-authenticated
-/// slot) with a fresh decoy and revoke any live session opened through it.
-/// Idempotent: deleting an already-decoy slot is a no-op that still
-/// returns 204, and must not reveal which it was. Like [`create_persona`],
-/// silently no-ops (same 204, no session revoked) when `slot` is the
-/// account's real `primary_slot` and differs from the caller's own active
-/// slot — a duress persona cannot use this endpoint to delete the real
-/// identity, and the identical response means it cannot even detect that
-/// its attempt did nothing.
+/// slot) with a fresh decoy and revoke any live session opened through it,
+/// **including** when `slot` is the account's real `primary_slot`.
+/// Deleting an already-decoy slot still returns 204 and must not reveal
+/// which it was. Like [`create_persona`], the write always takes effect:
+/// a silent no-op on `primary_slot` would let a later login identify it,
+/// and with only four slots a redirect onto a different one collides and
+/// is itself detectable. `primary_slot` remains the random slot third
+/// parties grant to; it is not immune to the account's own other personas.
 #[utoipa::path(
     delete,
     path = "/api/v1/personas/{slot}",
@@ -1211,20 +1208,16 @@ pub async fn delete_persona(
         .map_err(|e| AuthError::Backend(e.to_string()))?;
 
     let mut updated = rec.clone();
-    let is_primary = slot == rec.primary_slot as usize;
-    if !is_primary {
-        updated.slots[slot] = decoy;
-    }
+    // Always applied, including `primary_slot`. See the doc comment above.
+    updated.slots[slot] = decoy;
     state
         .user_store
         .upsert(&updated)
         .map_err(|e| AuthError::Backend(e.to_string()))?;
 
-    if !is_primary {
-        state
-            .sessions
-            .revoke_user_persona(&auth.username, slot as u8);
-    }
+    state
+        .sessions
+        .revoke_user_persona(&auth.username, slot as u8);
     Ok(HttpResponse::NoContent().finish())
 }
 
