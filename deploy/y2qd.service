@@ -32,10 +32,17 @@ ProtectHome=true
 ProtectSystem=strict
 ReadWritePaths=/var/lib/y2q
 
-# Syscall filtering
+# Syscall filtering. `memfd_secret` is not in `@system-service` (or any
+# other systemd syscall group); without an explicit allow the filter
+# returns EPERM and guarded-memory startup refuses to boot.
 SystemCallFilter=@system-service
+SystemCallFilter=memfd_secret
 SystemCallFilter=~@privileged @resources
 SystemCallErrorNumber=EPERM
+
+# Secretmem pages are charged to RLIMIT_MEMLOCK at mmap. A zero or tiny
+# limit makes that mmap fail with EAGAIN.
+LimitMEMLOCK=infinity
 
 # Misc hardening
 LockPersonality=true
