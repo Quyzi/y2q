@@ -243,24 +243,39 @@ mod linux_region {
     /// on them returns `ENOMEM` — `get_user_pages` cannot pin secretmem — so
     /// the caller must not treat that as a failure. The anonymous fallback
     /// still calls `mlock`, and that failure still surfaces.
-    fn map_secretmem(data: *mut u8, data_len: usize) -> Result<(), SecMemError> {
-        // SAFETY: `SYS_memfd_secret` takes an unsigned flags word. `0` is the
-        // documented default (cached secretmem). The syscall either returns a
-        // new fd or `-1` and sets errno.
-        let fd = unsafe { libc::syscall(libc::SYS_memfd_secret, 0 as libc::c_long) };
+    ///
+    /// Failure from [`map_secretmem`]. `hole_removed` is set only when
+    /// `mmap(MAP_FIXED)` itself failed. On current kernels that call unmaps
+    /// the target range before returning (`EAGAIN` from `RLIMIT_MEMLOCK`,
+    /// and `EINVAL`), so the anonymous reservation is already gone.
+    /// Failures before `mmap` leave it intact.
+    struct MapSecretError {
+        err: SecMemError,
+        hole_removed: bool,
+    }
+
+    fn map_secretmem(data: *mut u8, data_len: usize) -> Result<(), MapSecretError> {
+        let fail = |err, hole_removed| MapSecretError { err, hole_removed };
+        // SAFETY: `SYS_memfd_secret` takes an unsigned flags word. The only
+        // accepted bit is `O_CLOEXEC` (the man page names it `FD_CLOEXEC`,
+        // which is a different constant and returns `EINVAL`). The syscall
+        // either returns a new fd or `-1` and sets errno.
+        let fd = unsafe { libc::syscall(libc::SYS_memfd_secret, libc::O_CLOEXEC as libc::c_long) };
         if fd < 0 {
-            return Err(SecMemError::SecretMem { errno: errno() });
+            return Err(fail(SecMemError::SecretMem { errno: errno() }, false));
         }
         let fd = SecretFd(fd as i32);
         // SAFETY: `fd.0` is the secretmem fd just opened. `FD_CLOEXEC` takes
         // no pointer. Failure is fatal: an inheritable secretmem fd is a leak.
+        // `O_CLOEXEC` above already requests this; the `fcntl` covers a kernel
+        // that accepted the open but did not set the flag.
         if unsafe { libc::fcntl(fd.0, libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
-            return Err(SecMemError::SecretMem { errno: errno() });
+            return Err(fail(SecMemError::SecretMem { errno: errno() }, false));
         }
         // SAFETY: `fd.0` is open and `data_len` fits the mapping we are about
         // to place. `off_t` is 64-bit in this libc.
         if unsafe { libc::ftruncate(fd.0, data_len as libc::off_t) } != 0 {
-            return Err(SecMemError::SecretMem { errno: errno() });
+            return Err(fail(SecMemError::SecretMem { errno: errno() }, false));
         }
         // SAFETY: `data` points at the middle of a live anonymous reservation
         // of at least `data_len` bytes owned by the caller. `MAP_FIXED`
@@ -278,16 +293,57 @@ mod linux_region {
         };
         if mapped == libc::MAP_FAILED {
             let e = errno();
-            if e == libc::EAGAIN {
-                return Err(SecMemError::Lock { errno: e });
-            }
-            return Err(SecMemError::SecretMem { errno: e });
+            // The kernel drops the `MAP_FIXED` target before returning, for
+            // both `EAGAIN` (memlock) and `EINVAL`. The caller must reinstall
+            // the hole; `mprotect` on it returns `ENOMEM`.
+            let err = if e == libc::EAGAIN {
+                SecMemError::Lock { errno: e }
+            } else {
+                SecMemError::SecretMem { errno: e }
+            };
+            return Err(fail(err, true));
         }
         if mapped != data.cast::<libc::c_void>() {
             // SAFETY: `mmap` returned a live mapping that is not the hole we
             // own. Drop it before reporting the error so it cannot leak.
+            // The hole was replaced, so it is gone either way.
             unsafe { libc::munmap(mapped, data_len) };
-            return Err(SecMemError::SecretMem {
+            return Err(fail(
+                SecMemError::SecretMem {
+                    errno: libc::EFAULT,
+                },
+                true,
+            ));
+        }
+        Ok(())
+    }
+
+    /// Put an anonymous `PROT_READ|PROT_WRITE` mapping back at `data` after a
+    /// failed secretmem `mmap(MAP_FIXED)` removed it.
+    fn reinstall_anonymous(data: *mut u8, data_len: usize) -> Result<(), SecMemError> {
+        // SAFETY: `data`/`data_len` are the caller's former hole inside the
+        // reserved span. `MAP_FIXED` installs a fresh anonymous mapping there.
+        let mapped = unsafe {
+            libc::mmap(
+                data.cast::<libc::c_void>(),
+                data_len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED,
+                -1,
+                0,
+            )
+        };
+        if mapped == libc::MAP_FAILED {
+            return Err(SecMemError::Map {
+                bytes: data_len,
+                errno: errno(),
+            });
+        }
+        if mapped != data.cast::<libc::c_void>() {
+            // SAFETY: unexpected mapping; drop it so it cannot leak.
+            unsafe { libc::munmap(mapped, data_len) };
+            return Err(SecMemError::Map {
+                bytes: data_len,
                 errno: libc::EFAULT,
             });
         }
@@ -381,26 +437,32 @@ mod linux_region {
 
             let secret = match map_secretmem(data, data_len) {
                 Ok(()) => true,
-                Err(e) => {
+                Err(MapSecretError { err, hole_removed }) => {
                     if matches!(policy(), Policy::Require) {
                         unmap(base, map_len);
-                        return Err(e);
+                        return Err(err);
                     }
-                    let errno = match e {
+                    let errno = match &err {
                         SecMemError::SecretMem { errno }
                         | SecMemError::Lock { errno }
                         | SecMemError::Map { errno, .. }
-                        | SecMemError::Protect { errno } => errno,
+                        | SecMemError::Protect { errno } => *errno,
                         SecMemError::Dumpable { .. }
                         | SecMemError::Capacity { .. }
                         | SecMemError::NotUtf8 => 0,
                     };
                     warn_secretmem_once(errno);
-                    // Secretmem did not replace the hole, so the anonymous
-                    // reservation is still there. Make just the data pages
-                    // writable; the guard pages stay `PROT_NONE`.
-                    if let Err(e) = protect_raw(data, data_len, libc::PROT_READ | libc::PROT_WRITE)
-                    {
+                    // A failed `mmap(MAP_FIXED)` has already unmapped the
+                    // hole. `mprotect` on that address returns `ENOMEM`, so
+                    // put an anonymous mapping back. Failures before `mmap`
+                    // (`memfd_secret`, `ftruncate`, `fcntl`) leave the
+                    // `PROT_NONE` reservation in place.
+                    let restored = if hole_removed {
+                        reinstall_anonymous(data, data_len)
+                    } else {
+                        protect_raw(data, data_len, libc::PROT_READ | libc::PROT_WRITE)
+                    };
+                    if let Err(e) = restored {
                         unmap(base, map_len);
                         return Err(e);
                     }
@@ -1079,9 +1141,10 @@ impl<'de> serde::Deserialize<'de> for SecretString {
 /// rather than at first login.
 ///
 /// `PR_SET_DUMPABLE = 0` also blocks same-uid `gdb`/`perf`/`strace -p`
-/// attach against this process — that is the point, and
-/// `[server] allow_unprotected_memory = true` is the escape hatch for
-/// operators who need it (e.g. local debugging).
+/// attach against this process. That is set for every policy, including
+/// [`Policy::BestEffort`]. `[server] allow_unprotected_memory` only selects
+/// the anonymous-page fallback when `memfd_secret` cannot be mapped; it
+/// does not re-enable `ptrace`.
 ///
 /// Call once, at boot, before loading any secret (including a node key).
 pub fn harden_process(policy: Policy) -> Result<(), SecMemError> {
@@ -1457,6 +1520,139 @@ mod tests {
         // process mapped `PROT_READ`.
         let byte = unsafe { std::ptr::read_volatile(ptr) };
         unsafe { libc::_exit(if byte == 0xAB { 0 } else { 8 }) };
+    }
+
+    /// Run `child` in a forked process and return the status byte it writes.
+    ///
+    /// The child must not return into the harness: `fork` from the
+    /// multi-threaded test process only duplicates this thread.
+    #[cfg(target_os = "linux")]
+    fn fork_status(child: fn() -> u8) -> u8 {
+        let mut fds = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork");
+        if pid == 0 {
+            unsafe { libc::close(fds[0]) };
+            let code = child();
+            let byte = [code];
+            let _ = unsafe { libc::write(fds[1], byte.as_ptr().cast(), 1) };
+            unsafe { libc::_exit(0) };
+        }
+        unsafe { libc::close(fds[1]) };
+        let mut byte = [0xffu8];
+        let n = unsafe { libc::read(fds[0], byte.as_mut_ptr().cast(), 1) };
+        unsafe { libc::close(fds[0]) };
+        let mut status = 0;
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert_eq!(n, 1, "child wrote no status");
+        byte[0]
+    }
+
+    #[cfg(target_os = "linux")]
+    fn memlock_to_zero() -> bool {
+        let mut old = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        let got = unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut old) };
+        if got != 0 {
+            return false;
+        }
+        let new = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: old.rlim_max,
+        };
+        let set = unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &new) };
+        set == 0
+    }
+
+    /// `true` when `addr` sits in a `/secretmem` mapping, or when the map
+    /// cannot be read. A successful anonymous fallback is `false`.
+    #[cfg(target_os = "linux")]
+    fn maps_line_is_secretmem(addr: usize) -> bool {
+        let Ok(maps) = std::fs::read_to_string("/proc/self/maps") else {
+            return true;
+        };
+        for line in maps.lines() {
+            let Some((range, rest)) = line.split_once(' ') else {
+                continue;
+            };
+            let Some((start_s, end_s)) = range.split_once('-') else {
+                continue;
+            };
+            let Ok(start) = usize::from_str_radix(start_s, 16) else {
+                continue;
+            };
+            let Ok(end) = usize::from_str_radix(end_s, 16) else {
+                continue;
+            };
+            if addr >= start && addr < end {
+                return rest.contains("secretmem");
+            }
+        }
+        true
+    }
+
+    /// `RLIMIT_MEMLOCK` of 0 makes the secretmem `mmap` return `EAGAIN` and
+    /// drop the `MAP_FIXED` hole. BestEffort must put an anonymous mapping
+    /// back and still return the bytes, not `SecMemError::Protect`.
+    #[cfg(target_os = "linux")]
+    fn child_best_effort_survives_memlock() -> u8 {
+        if !memlock_to_zero() {
+            return 9;
+        }
+        let buf = match SecretBuf::from_slice(&[0x5Au8; 8192]) {
+            Ok(buf) => buf,
+            Err(_) => return 1,
+        };
+        if maps_line_is_secretmem(buf.data_ptr() as usize) {
+            return 2;
+        }
+        let guard = match buf.unlock() {
+            Ok(guard) => guard,
+            Err(_) => return 3,
+        };
+        if guard.len() < 8192 || guard[..8192].iter().any(|b| *b != 0x5A) {
+            return 4;
+        }
+        0
+    }
+
+    /// The production policy must surface the memlock failure as `Lock`
+    /// (`EAGAIN`), not as `Protect` from an `mprotect` of a hole the kernel
+    /// already removed.
+    #[cfg(target_os = "linux")]
+    fn child_require_refuses_memlock() -> u8 {
+        if !memlock_to_zero() {
+            return 9;
+        }
+        match harden_process(Policy::Require) {
+            Err(SecMemError::Lock { errno }) if errno == libc::EAGAIN => 0,
+            Err(SecMemError::Protect { .. }) => 2,
+            Ok(()) => 1,
+            Err(_) => 3,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn best_effort_falls_back_when_secretmem_mmap_hits_memlock() {
+        let code = fork_status(child_best_effort_survives_memlock);
+        assert_eq!(
+            code, 0,
+            "best-effort fallback failed (1=alloc, 2=still secretmem, 3=unlock, 4=bytes, 9=setrlimit): {code}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn require_returns_lock_when_secretmem_mmap_hits_memlock() {
+        let code = fork_status(child_require_refuses_memlock);
+        assert_eq!(
+            code, 0,
+            "require policy did not return Lock/EAGAIN (1=started, 2=Protect, 3=other, 9=setrlimit): {code}"
+        );
     }
 
     #[test]

@@ -207,10 +207,11 @@ kernel charges them to `RLIMIT_MEMLOCK` and marks the VMA `VM_LOCKED`;
 `mlock(2)` itself cannot pin secretmem and is used only for the anonymous
 fallback below). They are hinted `MADV_DONTDUMP` (excluded from core dumps
 at the VMA level, independent of the process-wide `RLIMIT_CORE`/dumpable
-flag below). `MADV_WIPEONFORK` is applied when the kernel accepts it —
-secretmem rejects that hint. On drop, both scrub their content with a
-volatile write (not eligible for compiler dead-store elimination) before
-`munlock`/`munmap`.
+flag below). `MADV_WIPEONFORK` does not apply: secretmem is a shared
+mapping and the kernel rejects that hint, so a `fork` would hand the
+child the same bytes. `y2qd` does not fork. On drop, both scrub their
+content with a volatile write (not eligible for compiler dead-store
+elimination) before `munlock`/`munmap`.
 
 If `memfd_secret` fails (`ENOSYS`, a kernel built without it, `EAGAIN` from
 `RLIMIT_MEMLOCK`, permission) and the process policy is `Require` — the
@@ -283,11 +284,18 @@ secretmem pages (a handful of pages, not a meaningful fraction of any
 reasonable limit):
 
 ```
-Error: refusing to start: mlock failed (1); raise RLIMIT_MEMLOCK or set
+Error: refusing to start: mlock failed (11); raise RLIMIT_MEMLOCK or set
 [server] allow_unprotected_memory = true. Core dumps and swap would
 expose session identity keys; set [server] allow_unprotected_memory =
 true to override.
 ```
+
+Errno 11 is `EAGAIN`: the secretmem `mmap` could not charge the pages to
+`RLIMIT_MEMLOCK`. A seccomp filter that blocks `memfd_secret` is a
+different failure (`memfd_secret failed` with `EPERM`). `BestEffort`
+falls back for both, including after `EAGAIN`, by installing a fresh
+anonymous mapping — the failed `MAP_FIXED` mmap has already removed the
+reserved hole, so the fallback does not `mprotect` that address.
 
 Fix by raising the limit (`LimitMEMLOCK=infinity` in a systemd unit,
 `ulimit -l unlimited` for a shell-launched daemon), not by setting the
@@ -624,7 +632,7 @@ for that specific threat to already be closed by filesystem permissions.
 | TLS (native rustls, PQ-hybrid, mTLS) | Yes | Yes | Yes |
 | Authorization (roles/ACLs/strict admin exclusion) | Yes | Yes | Yes |
 | `uring` storage backend | Yes (kernel ≥5.6) | No | No |
-| **Guarded memory** (`PROT_NONE`-at-rest pages, `mlock`, `MADV_DONTDUMP`/`WIPEONFORK`) | **Yes** | **No — `Zeroizing`-only fallback** | **No — `Zeroizing`-only fallback** |
+| **Guarded memory** (`memfd_secret` pages, `PROT_NONE` at rest, `MADV_DONTDUMP`) | **Yes** | **No — `Zeroizing`-only fallback** | **No — `Zeroizing`-only fallback** |
 | **Process hardening** (`PR_SET_DUMPABLE=0`, `RLIMIT_CORE=0`, refuse-to-start probe) | **Yes** | **No — no-op, always starts** | **No — no-op, always starts** |
 
 The bottom two rows are the ones to read carefully. `y2q_core::secmem` is
