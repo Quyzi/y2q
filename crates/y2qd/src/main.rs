@@ -87,6 +87,8 @@ mod get_metadata_headers_test;
 mod handlers;
 mod node_key_rotation;
 pub(crate) mod observability;
+#[cfg(test)]
+mod owner_transfer_test;
 mod quota;
 mod rate_limit;
 mod request_id;
