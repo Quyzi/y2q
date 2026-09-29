@@ -434,6 +434,7 @@ async fn put_object(
         &ctx.storage,
         &cfg,
         &bucket,
+        &key,
         incoming,
         ctx.encryption.max_body_bytes,
     )
@@ -563,6 +564,7 @@ async fn copy_object(
         &ctx.storage,
         &dest_cfg,
         &dest_bucket,
+        &dest_key,
         src_md.size,
         ctx.encryption.max_body_bytes,
     )

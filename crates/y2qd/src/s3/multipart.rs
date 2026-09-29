@@ -167,12 +167,20 @@ pub async fn upload_part(
         &auth.auth.session,
     )
     .await?;
-    let max_bytes =
-        crate::quota::write_budget(&ctx.storage, &cfg, bucket, incoming, max_part_bytes)
-            .await?
-            .min(max_part_bytes);
-    let (epoch, pk) = bucket_keys::resolve_write_key(&cfg, bucket)?;
+    // Re-uploading a part replaces that part object only. Crediting the
+    // final object key would under-count the rest of the bucket.
     let stored_key = part_key(&upload_id, part_number);
+    let max_bytes = crate::quota::write_budget(
+        &ctx.storage,
+        &cfg,
+        bucket,
+        &stored_key,
+        incoming,
+        max_part_bytes,
+    )
+    .await?
+    .min(max_part_bytes);
+    let (epoch, pk) = bucket_keys::resolve_write_key(&cfg, bucket)?;
     let (guard, sink, write_offset) = ctx.storage.begin_streaming_put(bucket, &stored_key).await?;
 
     let sideband = ErrorSideband::new();
@@ -463,7 +471,7 @@ pub async fn complete(
     // individually bounded per part by `max_part_bytes` at `upload_part`
     // time); only the bucket quota, if any, caps the assembled size.
     let max_bytes =
-        crate::quota::write_budget(&ctx.storage, &cfg, &bucket, incoming, u64::MAX).await?;
+        crate::quota::write_budget(&ctx.storage, &cfg, &bucket, &key, incoming, u64::MAX).await?;
     let (epoch, pk) = bucket_keys::resolve_write_key(&cfg, &bucket)?;
     let (guard, sink, write_offset) = ctx.storage.begin_streaming_put(&bucket, &key).await?;
 
