@@ -82,6 +82,8 @@ mod cipher;
 mod cli;
 mod config;
 mod error;
+#[cfg(test)]
+mod get_metadata_headers_test;
 mod handlers;
 mod node_key_rotation;
 pub(crate) mod observability;
