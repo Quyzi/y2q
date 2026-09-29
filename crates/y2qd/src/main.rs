@@ -90,6 +90,8 @@ pub(crate) mod observability;
 #[cfg(test)]
 mod owner_transfer_test;
 mod quota;
+#[cfg(test)]
+mod quota_test;
 mod rate_limit;
 mod request_id;
 #[cfg(test)]
