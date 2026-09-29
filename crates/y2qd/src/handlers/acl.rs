@@ -118,6 +118,8 @@ pub async fn set_acl(
     auth: Authenticated,
 ) -> Result<HttpResponse, AppError> {
     let bucket = path.into_inner();
+    // A grantless caller, including a global admin, is 404. Falling through
+    // to the BWK open would turn this into a 403 and confirm the bucket exists.
     authorize_bucket(&auth, &storage, &bucket, BucketPermission::Admin).await?;
     if !storage
         .bucket_exists(&bucket)
@@ -136,8 +138,9 @@ pub async fn set_acl(
 
     // Ownership transfer / assignment: only the current owner or a global admin
     // may change the owner (a mere bucket-`Admin` grantee may not).
+    let previous_owner = cfg.owner.clone();
     if let Some(new_owner) = body.owner {
-        let is_current_owner = cfg.owner.as_deref() == Some(auth.username.as_str());
+        let is_current_owner = previous_owner.as_deref() == Some(auth.username.as_str());
         if !auth.is_admin() && !is_current_owner {
             return Err(AppError(y2q_core::Error::Forbidden {
                 bucket: bucket.clone(),
@@ -146,6 +149,7 @@ pub async fn set_acl(
         ensure_user_exists(&state, &new_owner)?;
         cfg.owner = Some(new_owner);
     }
+    let owner_changed = cfg.owner != previous_owner;
 
     // Validate the proposed grants before applying. Grantee existence is NOT
     // checked: a grant to an unknown username is inert (it can never match a
@@ -169,23 +173,22 @@ pub async fn set_acl(
     // entry — writing alone never needs one (WriteOnly grantees stay
     // decoy-only forever), but reading needs the real secret key. Diff the
     // old and new read-implying grantee sets so we only touch slots that
-    // actually changed.
+    // actually changed. An owner change is not part of that diff: the owner
+    // is not an ACL grant, so it is sealed separately below.
     let old_read_grantees = read_implying_grantees(&cfg.acl);
     let new_read_grantees = read_implying_grantees(&body.grants);
+    let grants_changed = old_read_grantees != new_read_grantees;
     cfg.acl = body.grants;
 
-    if old_read_grantees != new_read_grantees
+    if (grants_changed || owner_changed)
         && let Some(kv) = bucket_keys::current_key(&cfg).cloned()
     {
-        // Sealing a *new* grant requires the bucket wrap key, which only an
-        // existing real grantee's own persona can recover — the caller must
-        // already hold real crypto access (owner, or a bucket-admin grantee
-        // sealed earlier). A global admin with no grant on this bucket
-        // cannot conjure one here either: that would make the "global admin"
-        // role a de facto escrow key, exactly what strict admin exclusion
-        // rules out. Their ACL edit still applies below for write-only
-        // grants; a read-implying change from such a caller is rejected
-        // outright rather than silently landing as crypto-inert.
+        // Open the caller's real bucket wrap key before any seal rewrite.
+        // A failed open returns here, before `set_bucket_config`, so the
+        // in-memory owner/ACL assignment above is discarded. A global admin
+        // with no grant cannot conjure a seal — that would make the role an
+        // escrow key — and must not be able to orphan the bucket by saving
+        // a new owner string anyway.
         let bwk = auth
             .session
             .with_identity_sk(|sk| {
@@ -202,24 +205,42 @@ pub async fn set_acl(
             .map_err(AppError)?;
 
         let mut new_kv = kv;
-        for user in new_read_grantees.difference(&old_read_grantees) {
-            reseal_grantee(&state, &bucket, &mut new_kv, user, &bwk, true)?;
+        if grants_changed {
+            for user in new_read_grantees.difference(&old_read_grantees) {
+                reseal_grantee(&state, &bucket, &mut new_kv, user, &bwk, true)?;
+            }
+            for user in old_read_grantees.difference(&new_read_grantees) {
+                // Revoked: reseal every slot as decoy, and drop this user's live
+                // sessions so a token minted under the old grant can't keep
+                // reading from an in-memory cache after the grant is gone.
+                reseal_grantee(&state, &bucket, &mut new_kv, user, &bwk, false)?;
+                state.sessions.revoke_user(user);
+            }
         }
-        for user in old_read_grantees.difference(&new_read_grantees) {
-            // Revoked: reseal every slot as decoy, and drop this user's live
-            // sessions so a token minted under the old grant can't keep
-            // reading from an in-memory cache after the grant is gone.
-            reseal_grantee(&state, &bucket, &mut new_kv, user, &bwk, false)?;
-            state.sessions.revoke_user(user);
+        if owner_changed && let Some(new_owner) = cfg.owner.clone() {
+            // After the grant diff, so removing the new owner's old grant in
+            // this same request cannot leave them decoyed. The previous owner
+            // keeps a real seal when the new ACL still names them as a
+            // read-implying grantee.
+            reseal_grantee(&state, &bucket, &mut new_kv, &new_owner, &bwk, true)?;
+            if let Some(prev) = previous_owner.as_deref()
+                && prev != new_owner.as_str()
+                && !new_read_grantees.contains(prev)
+            {
+                reseal_grantee(&state, &bucket, &mut new_kv, prev, &bwk, false)?;
+                state.sessions.revoke_user(prev);
+            }
         }
         if let Some(slot) = cfg.keys.iter_mut().find(|k| k.epoch == new_kv.epoch) {
             *slot = new_kv;
         }
-    } else if old_read_grantees != new_read_grantees {
+    } else if grants_changed {
         // No key material exists yet (bucket registered but never claimed/
         // written to) — nothing to seal a grant against. The ACL-only
         // change still applies; the entries just stay crypto-inert until a
         // write creates key material and a crypto-capable caller re-grants.
+        // An owner-only change with no key material does not reach this
+        // branch: the owner string is persisted below and nothing is sealed.
         tracing::warn!(
             bucket = %bucket,
             "set_acl: read-implying grant changed on a bucket with no key material yet; ACL updated, no grant sealed"
