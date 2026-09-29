@@ -52,9 +52,9 @@ impl S3Error {
     /// `request_id::request_id_middleware`, shared with the REST listener)
     /// off `req`'s extensions. Empty if absent — every S3-listener request
     /// passes through `request_id_middleware` first, so absence only
-    /// happens in a unit test building an `S3Error` with no live request;
-    /// `routes::error_detail_middleware` overwrites this with the
-    /// response's own `x-request-id` regardless.
+    /// happens in a unit test building an `S3Error` with no live request.
+    /// `routes::error_detail_middleware` re-reads this extension when it
+    /// renders the wire error (the response header is stamped later).
     pub fn request_id_from(req: &HttpRequest) -> String {
         req.extensions()
             .get::<RequestIdExt>()

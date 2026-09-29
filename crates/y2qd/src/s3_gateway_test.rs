@@ -182,8 +182,12 @@ macro_rules! build_app {
     ($harness:expr) => {
         test::init_service(
             App::new()
-                .wrap(from_fn(request_id::request_id_middleware))
+                // Innermost first, matching `main.rs`: `error_detail` inside
+                // `request_id` (production also puts `TracingLogger` between
+                // them). `error_detail` reads `RequestIdExt`, which this
+                // outer middleware inserts before calling in.
                 .wrap(from_fn(routes::error_detail_middleware))
+                .wrap(from_fn(request_id::request_id_middleware))
                 .app_data($harness.storage.clone())
                 .app_data(web::Data::new(LabelLimits {
                     max_labels: 32,
