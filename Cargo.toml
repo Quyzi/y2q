@@ -68,7 +68,7 @@ toml                        = "1.1"
 tracing                     = "0.1.44"
 tracing-actix-web           = "0.7"
 tracing-subscriber          = { version = "0.3", features = ["env-filter", "json"] }
-utoipa                      = "5"
+utoipa                      = "6"
 webpki-roots                = "1"
 xxhash-rust                 = { version = "0.8", features = ["xxh3"] }
 zeroize                     = { version = "1", features = ["derive"] }
