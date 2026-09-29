@@ -95,7 +95,7 @@ pub async fn handle(
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(0);
-    let max_bytes = crate::quota::write_budget(
+    let budget = crate::quota::write_budget(
         &storage,
         &cfg,
         &bucket,
@@ -104,6 +104,7 @@ pub async fn handle(
         encryption.max_body_bytes,
     )
     .await?;
+    let max_bytes = budget.max_bytes;
 
     let (bucket_epoch, bucket_pk) =
         crate::bucket_keys::resolve_write_key(&cfg, &bucket).map_err(AppError)?;
@@ -149,6 +150,7 @@ pub async fn handle(
         )
         .await
         .map_err(AppError::from)?;
+    drop(budget);
 
     if was_overwrite {
         Ok(HttpResponse::Ok().finish())

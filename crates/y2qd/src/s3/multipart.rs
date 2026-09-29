@@ -170,7 +170,7 @@ pub async fn upload_part(
     // Re-uploading a part replaces that part object only. Crediting the
     // final object key would under-count the rest of the bucket.
     let stored_key = part_key(&upload_id, part_number);
-    let max_bytes = crate::quota::write_budget(
+    let budget = crate::quota::write_budget(
         &ctx.storage,
         &cfg,
         bucket,
@@ -178,8 +178,8 @@ pub async fn upload_part(
         incoming,
         max_part_bytes,
     )
-    .await?
-    .min(max_part_bytes);
+    .await?;
+    let max_bytes = budget.max_bytes.min(max_part_bytes);
     let (epoch, pk) = bucket_keys::resolve_write_key(&cfg, bucket)?;
     let (guard, sink, write_offset) = ctx.storage.begin_streaming_put(bucket, &stored_key).await?;
 
@@ -221,6 +221,7 @@ pub async fn upload_part(
             cipher_metadata,
         )
         .await?;
+    drop(budget);
 
     let md = ctx.storage.describe(bucket, &stored_key).await?;
     let part_etag = etag(&md);
@@ -470,8 +471,9 @@ pub async fn complete(
     // bounds a single PUT's body, not a multipart-assembled total (already
     // individually bounded per part by `max_part_bytes` at `upload_part`
     // time); only the bucket quota, if any, caps the assembled size.
-    let max_bytes =
+    let budget =
         crate::quota::write_budget(&ctx.storage, &cfg, &bucket, &key, incoming, u64::MAX).await?;
+    let max_bytes = budget.max_bytes;
     let (epoch, pk) = bucket_keys::resolve_write_key(&cfg, &bucket)?;
     let (guard, sink, write_offset) = ctx.storage.begin_streaming_put(&bucket, &key).await?;
 
@@ -523,6 +525,7 @@ pub async fn complete(
             cipher_metadata,
         )
         .await?;
+    drop(budget);
 
     // The upload is already committed regardless of what follows.
     // `abort_upload_parts` deletes every part the registry ever recorded
