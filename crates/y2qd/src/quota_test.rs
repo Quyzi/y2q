@@ -222,3 +222,64 @@ async fn quota_overwrite_credits_replaced_object() {
 
     assert_eq!(harness.storage.bucket_usage("shrink").await.unwrap(), 90);
 }
+
+/// Two concurrent 60-byte puts of distinct keys into an empty 100-byte
+/// bucket must not both succeed. Eight fresh buckets, so a single lucky
+/// schedule cannot hide the race and leftovers cannot leak into the next round.
+#[actix_web::test]
+async fn quota_concurrent_puts_cannot_both_pass() {
+    let harness = Harness::new();
+    let app = test::init_service(app(&harness)).await;
+
+    for round in 0..8 {
+        let bucket = format!("q{round}");
+        let (code, body) = exchange!(
+            app,
+            authed(&harness, TestRequest::put().uri(&format!("/{bucket}/")))
+        );
+        expect_status("create bucket", 200, code, &body);
+        let (code, body) = exchange!(
+            app,
+            authed(
+                &harness,
+                TestRequest::put()
+                    .uri(&format!("/api/v1/buckets/{bucket}/config"))
+                    .insert_header(("content-type", "application/json"))
+                    .set_payload(r#"{"quota_bytes":100}"#),
+            )
+        );
+        expect_status("set quota", 200, code, &body);
+
+        let req_a = put_object(&harness, &bucket, "a", vec![b'a'; 60]).to_request();
+        let req_b = put_object(&harness, &bucket, "b", vec![b'b'; 60]).to_request();
+        let (resp_a, resp_b) = tokio::join!(
+            test::call_service(&app, req_a),
+            test::call_service(&app, req_b),
+        );
+        let sa = resp_a.status().as_u16();
+        let sb = resp_b.status().as_u16();
+        let body_a = test::read_body(resp_a).await;
+        let body_b = test::read_body(resp_b).await;
+        assert!(
+            !(sa == 201 && sb == 201),
+            "round {round}: both puts returned 201\n{}\n{}",
+            String::from_utf8_lossy(&body_a),
+            String::from_utf8_lossy(&body_b),
+        );
+        assert!(
+            matches!(sa, 201 | 413) && matches!(sb, 201 | 413),
+            "round {round}: unexpected statuses {sa} {sb}\n{}\n{}",
+            String::from_utf8_lossy(&body_a),
+            String::from_utf8_lossy(&body_b),
+        );
+        assert!(
+            sa == 201 || sb == 201,
+            "round {round}: expected one success, got {sa} and {sb}"
+        );
+        let used = harness.storage.bucket_usage(&bucket).await.unwrap();
+        assert!(
+            used <= 100,
+            "round {round}: stored {used} bytes (statuses {sa}, {sb})"
+        );
+    }
+}
