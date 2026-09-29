@@ -23,8 +23,8 @@ use crate::error::{AppError, ErrorBody};
 /// If a `Range: bytes=N-M` header is present, returns 206 Partial Content with
 /// a `Content-Range` header: only the covering ciphertext chunks are read and
 /// decrypted. A malformed or out-of-bounds range returns 416. Without a
-/// `Range` header, returns 200 OK with the full body. Requires a valid Bearer
-/// token.
+/// `Range` header, returns 200 OK with the full body and the same metadata
+/// headers as `HEAD`. Requires a valid Bearer token.
 #[utoipa::path(
     get,
     operation_id = "get_object",
@@ -99,9 +99,10 @@ pub async fn handle(
         // anything shorter — a truncated envelope with a patched length field
         // must not surface as a 200 with a short body.
         let plaintext = cipher::decrypt_after_get(&bucket_sk, &bucket, &key, buf, md.size)?;
-        return Ok(HttpResponse::Ok()
-            .content_type("application/octet-stream")
-            .body(plaintext));
+        // 200 carries the HEAD metadata set. 206 stays Content-Range only.
+        let mut response = HttpResponse::Ok();
+        super::head::insert_object_metadata_headers(&mut response, &md);
+        return Ok(response.body(plaintext));
     };
 
     let size = md.size;
