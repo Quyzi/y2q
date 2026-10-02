@@ -13,6 +13,7 @@ resolver = "2"
 
 [workspace.package]
 version = "0.2.0"
+license-file = "LICENSE"
 
 [workspace.dependencies]
 actix-governor              = "0.10"
