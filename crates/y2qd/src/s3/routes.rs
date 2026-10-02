@@ -13,6 +13,7 @@ use actix_web::http::header;
 use actix_web::middleware::Next;
 use actix_web::{HttpMessage, ResponseError, web};
 
+use crate::request_id::RequestIdExt;
 use crate::s3::auth::OriginalUri;
 use crate::s3::object;
 use crate::s3::sigv4::percent_decode;
@@ -151,11 +152,12 @@ pub async fn vhost_middleware<B: MessageBody>(
 /// concerns — so almost-every S3 error no longer ships a random,
 /// unlogged `x-amz-request-id` and an empty `<Resource>`.
 ///
-/// Registered immediately after `request_id::request_id_middleware`
-/// (order otherwise irrelevant: this reads the response's own
-/// `x-request-id` header *after* `next.call` returns, and that header is
-/// set unconditionally by `request_id_middleware` regardless of relative
-/// wrap order).
+/// `request_id` middleware is wrapped outside this one so the root span
+/// can see [`RequestIdExt`] when it is built. That middleware stamps
+/// `X-Request-ID` only after `next.call` returns, which is after this
+/// middleware has already rendered the error body, so the id comes from
+/// the request extension. The response header is a fallback for callers
+/// that still wrap `request_id` inside this middleware.
 pub async fn error_detail_middleware<B: MessageBody + 'static>(
     req: ServiceRequest,
     next: Next<B>,
@@ -170,22 +172,28 @@ pub async fn error_detail_middleware<B: MessageBody + 'static>(
     else {
         return Ok(res.map_into_left_body());
     };
-    let request_id = res
+    let from_ext = res
+        .request()
+        .extensions()
+        .get::<RequestIdExt>()
+        .map(|id| id.0.clone())
+        .filter(|id| !id.is_empty());
+    let from_header = res
         .response()
         .headers()
         .get("x-request-id")
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_owned();
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned);
+    let request_id = from_ext.or(from_header).unwrap_or_default();
     let filled = s3_err
         .clone()
         .with_request_id(request_id.clone())
         .with_resource(resource);
     let mut error_resp = filled.error_response();
-    // `into_response` below replaces the whole response, which would
-    // otherwise drop the `X-Request-ID` header `request_id_middleware`
-    // already set — re-stamp it so the response still carries both the
-    // plain and `x-amz-`-prefixed forms, matching.
+    // `into_response` replaces the whole response. Re-stamp `X-Request-ID`
+    // here: `request_id` middleware is outside this one and has not set
+    // the header yet, and the replacement would drop it anyway.
     if let Ok(val) = actix_web::http::header::HeaderValue::from_str(&request_id) {
         error_resp.headers_mut().insert(
             actix_web::http::header::HeaderName::from_static("x-request-id"),

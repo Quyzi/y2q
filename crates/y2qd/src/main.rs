@@ -82,12 +82,20 @@ mod cipher;
 mod cli;
 mod config;
 mod error;
+#[cfg(test)]
+mod get_metadata_headers_test;
 mod handlers;
 mod node_key_rotation;
 pub(crate) mod observability;
+#[cfg(test)]
+mod owner_transfer_test;
 mod quota;
+#[cfg(test)]
+mod quota_test;
 mod rate_limit;
 mod request_id;
+#[cfg(test)]
+mod request_id_span_test;
 mod s3;
 #[cfg(test)]
 mod s3_gateway_test;
@@ -583,9 +591,12 @@ async fn main() -> std::io::Result<()> {
     let s3_state_s3 = s3_state.clone();
 
     let mut server = HttpServer::new(move || {
+        // Actix runs the last `.wrap` first. `request_id` must be outside
+        // `TracingLogger`: the root span reads `RequestIdExt` at creation,
+        // and that extension is empty if the logger runs first.
         let mut app = App::new()
-            .wrap(from_fn(request_id::request_id_middleware))
             .wrap(TracingLogger::<Y2qRootSpanBuilder>::new())
+            .wrap(from_fn(request_id::request_id_middleware))
             .wrap(from_fn(observability::metrics_middleware))
             .wrap(from_fn(trace::trace_middleware))
             .app_data(trace_hub.clone())
@@ -716,10 +727,13 @@ async fn main() -> std::io::Result<()> {
 
     let s3_max_body_bytes = max_body_bytes;
     let mut s3_server = HttpServer::new(move || {
+        // Same outermost-last order as the native listener: `request_id`
+        // outside `TracingLogger`. `error_detail` stays inside the logger
+        // and reads `RequestIdExt`; the response header is stamped later.
         App::new()
-            .wrap(from_fn(request_id::request_id_middleware))
             .wrap(from_fn(s3::routes::error_detail_middleware))
             .wrap(TracingLogger::<Y2qRootSpanBuilder>::new())
+            .wrap(from_fn(request_id::request_id_middleware))
             .wrap(from_fn(observability::metrics_middleware))
             .wrap(from_fn(trace::trace_middleware))
             .wrap(from_fn(s3::routes::vhost_middleware))

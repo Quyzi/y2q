@@ -430,14 +430,16 @@ async fn put_object(
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(0);
-    let max_bytes = crate::quota::write_budget(
+    let budget = crate::quota::write_budget(
         &ctx.storage,
         &cfg,
         &bucket,
+        &key,
         incoming,
         ctx.encryption.max_body_bytes,
     )
     .await?;
+    let max_bytes = budget.max_bytes;
 
     let (bucket_epoch, bucket_pk) = bucket_keys::resolve_write_key(&cfg, &bucket)?;
     let (guard, sink, write_offset) = ctx.storage.begin_streaming_put(&bucket, &key).await?;
@@ -485,6 +487,7 @@ async fn put_object(
             cipher_metadata,
         )
         .await?;
+    drop(budget);
 
     Ok(HttpResponse::Ok()
         .insert_header(("ETag", response_etag))
@@ -559,14 +562,16 @@ async fn copy_object(
         &auth.auth.session,
     )
     .await?;
-    let max_bytes = crate::quota::write_budget(
+    let budget = crate::quota::write_budget(
         &ctx.storage,
         &dest_cfg,
         &dest_bucket,
+        &dest_key,
         src_md.size,
         ctx.encryption.max_body_bytes,
     )
     .await?;
+    let max_bytes = budget.max_bytes;
     let (dest_epoch, dest_pk) = bucket_keys::resolve_write_key(&dest_cfg, &dest_bucket)?;
 
     let labels = if metadata_directive == "REPLACE" {
@@ -631,6 +636,7 @@ async fn copy_object(
             cipher_metadata,
         )
         .await?;
+    drop(budget);
 
     let dest_md = ctx.storage.describe(&dest_bucket, &dest_key).await?;
     let mut body = String::new();

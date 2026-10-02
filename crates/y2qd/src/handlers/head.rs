@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use actix_web::{HttpResponse, web};
+use actix_web::{HttpResponse, HttpResponseBuilder, web};
 use y2q_core::{AnyStorage, BucketPermission, Metadata, Storage};
 
 use crate::auth::Authenticated;
@@ -66,6 +66,16 @@ pub async fn handle(
 /// Build the `200 OK` metadata-header response for a HEAD request.
 fn build_response(meta: &Metadata) -> HttpResponse {
     let mut builder = HttpResponse::Ok();
+    insert_object_metadata_headers(&mut builder, meta);
+    builder.finish()
+}
+
+/// Insert the object-metadata header set shared by `HEAD` and a `200` GET.
+///
+/// `Content-Type` is always `application/octet-stream`. A label name may
+/// repeat with different values; append (not insert) so every value emits
+/// its own header line instead of overwriting the prior.
+pub(crate) fn insert_object_metadata_headers(builder: &mut HttpResponseBuilder, meta: &Metadata) {
     builder
         .insert_header(("Content-Length", meta.size.to_string()))
         .insert_header(("X-Y2Q-Size", meta.size.to_string()))
@@ -90,11 +100,7 @@ fn build_response(meta: &Metadata) -> HttpResponse {
         builder.insert_header(("X-Y2Q-Envelope-Version", v.to_string()));
     }
 
-    // A label name may repeat with different values; append (not insert) so
-    // every value emits its own header line instead of overwriting the prior.
     for (name, value) in &meta.labels {
         builder.append_header((format!("X-Y2Q-{}", name), value.clone()));
     }
-
-    builder.finish()
 }
