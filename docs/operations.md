@@ -427,26 +427,74 @@ Notes: `repair-state` takes `--tpm-tcti`, `--allow-away-repair` and `--accept-cu
 
 ### Deploying under systemd
 
-`deploy/y2qd.service` replaces `PrivateDevices=true` with a closed device policy and an explicit allowlist, because `PrivateDevices=` mounts a private `/dev` that hides `/dev/tpmrm0` and `/dev/hidraw*`:
+Device deployments use a **socket-activated one-shot key helper** under **two uids**. No resident process holds the Registry Master Key:
 
-```ini
-DevicePolicy=closed
-DeviceAllow=/dev/tpmrm0 rw
-DeviceAllow=char-hidraw rw      # omit on a TPM-only deployment (no away device)
-SupplementaryGroups=tss
-```
+- `deploy/y2q-keyd.socket` listens on `/run/y2q-keyd.sock` (`Accept=yes`, `SocketUser=y2qd`, mode `0600`, `MaxConnections=4`). Every connection spawns a fresh `deploy/y2q-keyd@.service`: `y2qd --key-serve` as `User=y2q-keyd`, `Group=y2q`, `SupplementaryGroups=tss`, with stdin set to the accepted socket. It alone has `/dev/tpmrm0` and hidraw access (`DevicePolicy=closed`, `DeviceAllow=/dev/tpmrm0 rw`, `DeviceAllow=char-hidraw rw`), handles **one** request (`arm` or `fetch`) and exits. The helper enforces peer uids itself: `arm` only from `key_agent_arm_uid` (default 0, root), `fetch` only from `key_agent_peer_uid` (the daemon).
+- `arm` stores one-time authorization material (empty, or a passcode / FIDO2 PIN / emergency code) in `<key_agent_state_dir>/armed` (default `/run/y2q-keyd`, tmpfs, dir `0700`, file `0600`). `fetch` makes the helper read **and delete** that file, unlock the registry with it, return NK plus metadata once, and exit. A fetch without a prior arm is refused, and the armed file is consumed by every fetch attempt, success or failure.
+- `deploy/y2qd.service` runs the network-facing daemon as `User=y2qd`, `Group=y2q` with `PrivateDevices=true`, no `tss` group and no TPM/hidraw. It has `Requires=`/`After=y2q-keyd.socket` and `ExecStartPre=+/usr/local/bin/y2qd --key-arm` (unattended arm as root before **every** start).
+- `deploy/y2q-keyd-sweep.timer` runs `deploy/y2q-keyd-sweep.service` (`y2qd --key-sweep`, one-shot, `OnBootSec=2min`, `OnUnitActiveSec=15min`) to sweep expired away grants and re-mint them. `deploy/y2q-keyd.tmpfiles.conf` creates `/run/y2q-keyd`; `RuntimeDirectory=` is deliberately not used because the armed file must outlive each one-shot helper.
 
-- `User=`/`Group=` must name a non-root account; `SupplementaryGroups=tss` is the only group grant (the TPM resource manager node is `tss`-group accessible).
-- `DeviceAllow=char-hidraw rw` admits **every** hidraw node to the cgroup device policy. The real gate is the udev DAC rule shipped as `deploy/70-y2q-fido2.rules`: install it as `/etc/udev/rules.d/70-y2q-fido2.rules`, then `udevadm control --reload && udevadm trigger`. It reads `SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1050", GROUP="tss", MODE="0660"`. `1050` is the Yubico USB vendor ID; confirm the attached token's vendor with `lsusb` and substitute it for any other token. A generic `SUBSYSTEM=="hidraw"` rule is deliberately not used because it would expose every HID raw node, including keyboards, to `tss`.
-- Hotplug: hidraw nodes appear and disappear with the token, so they cannot be covered by `BindPaths=`; the udev rule plus `DeviceAllow=char-hidraw` is what makes a token inserted after boot usable. Insert the token before starting the daemon (or before the unlock attempt on a restart).
-- Roughtime is outbound UDP. `ProtectSystem` and `IPAddressDeny` are untouched by the shipped unit, but if you add `IPAddressAllow=` it must include the configured Roughtime servers or every away unlock on that host fails closed.
-- **Authenticator PIN.** For devices registered with `uv_required` (the default) the daemon needs the PIN. Interactive entry on a terminal is the default. `Y2QD_FIDO2_PIN` may supply it, but only from a source outside `keystore_dir`: a PIN in a unit file or env file beside `keystore_dir`, or anywhere on the same medium as the registry, removes the authenticator's PIN retry-lockout as the hardware bound on a drive-and-token theft inside a live grant window. The shipped unit shows no PIN file for that reason. With neither a PIN source nor a TTY the away path fails with `no PIN source is available` and no touch is requested.
+Why: a compromised daemon uid cannot re-fetch NK or RMK (it can connect, but only root can arm), cannot run the TPM unseal, and cannot forge `devices.json`. It still holds the one transient raw NK copy it received at boot, plus derived structural keys, live session keys and in-flight object bodies; root on the live host gets everything. See [SECURITY.md](../SECURITY.md#what-a-compromised-daemon-uid-gets).
+
+#### Key helper deployment runbook
+
+1. Create the accounts and group (no login shells):
+   ```sh
+   groupadd --system y2q
+   useradd --system --gid y2q --shell /usr/sbin/nologin y2qd
+   useradd --system --gid y2q --groups tss --shell /usr/sbin/nologin y2q-keyd
+   ```
+2. Set the keystore directory modes. `keystore_dir` is group-shared with the sticky bit so neither uid can delete or replace the other's files:
+   ```sh
+   install -d -m 1770 -o y2qd -g y2q /var/lib/y2q/keystore
+   ```
+   Both uids must be in group `y2q`. The daemon's flock file `<keystore_dir>/.lock` is created by whichever process touches it first, with that process's umask; if the key uid creates it `0600`/`0644` (for example `y2q admin device init`), the daemon uid gets `Permission denied` opening it read+write and refuses to boot. `deploy/y2q-keyd.tmpfiles.conf` therefore pre-creates it (`f /var/lib/y2q/keystore/.lock 0660 y2qd y2q -`; edit the path to your `keystore_dir`), so the units' `UMask=0077` does not matter. If you skip tmpfiles, create it yourself: `install -m 0660 -o y2qd -g y2q /dev/null /var/lib/y2q/keystore/.lock`.
+   `users.redb`/`keystore.json` belong to `y2qd`; `devices.json` and `.devices.lock` are mode 0600 owned by `y2q-keyd` (the daemon uid gets `Permission denied` reading `devices.json`, and cannot replace or delete it; verified in a two-uid smoke run). Keep `ReadWritePaths=` in `y2q-keyd@.service` and `y2q-keyd-sweep.service` equal to your `keystore_dir`.
+3. Run every registry-touching CLI command **directly as the registry owner**, with `y2qd` stopped for mutating commands: `sudo -u y2q-keyd y2q admin device init --keystore-dir /var/lib/y2q/keystore ...` (likewise `add-tpm`, `add-fido2`, `remove`, `refresh`, `set-home-factor`, ...), and `--rotate-node-key` the same way. Do not run them as root or `y2qd`: they would create `devices.json` with the wrong owner.
+4. Install the units and tmpfiles entry, then enable the socket and timer:
+   ```sh
+   install -m 0644 deploy/y2q-keyd.socket deploy/y2q-keyd@.service deploy/y2q-keyd-sweep.service deploy/y2q-keyd-sweep.timer deploy/y2qd.service /etc/systemd/system/
+   install -m 0644 deploy/y2q-keyd.tmpfiles.conf /etc/tmpfiles.d/y2q-keyd.conf
+   systemd-tmpfiles --create
+   systemctl daemon-reload
+   systemctl enable --now y2q-keyd.socket y2q-keyd-sweep.timer
+   ```
+5. **Unattended boot** (no home second factor): `systemctl enable --now y2qd`. `ExecStartPre=+... --key-arm` arms with empty authorization as root before every start, the daemon fetches, and the helper exits.
+6. **Attended boot** (home device with a second factor, or an emergency code): remove the `ExecStartPre=` line with a drop-in (`systemctl edit y2qd`, add an empty `ExecStartPre=`), then arm interactively before each start: `sudo y2qd --key-arm --prompt-passcode --prompt-pin --config /etc/y2q/config.toml && systemctl start y2qd`. The passcode/PIN is typed into the arm command and sent over the RPC; no env var or file holds it.
+7. **Restart semantics.** Every start needs a fresh arm because the armed file is consumed by every fetch attempt, success or failure (a fetch from a refused peer uid does not consume it). Unattended hosts re-arm automatically through `ExecStartPre=`, so `Restart=on-failure` works. On attended hosts a crash restart **fails** (the fetch is refused: no armed file) until an operator arms again; `StartLimitBurst=5` keeps that from looping. Restarting only the helper has no effect on a running daemon: the fetch is over.
+8. `--upgrade-container-headers` is a second node-key entry point and fetches NK like a normal start: arm first (`sudo y2qd --key-arm ...`), then run it as the daemon uid (`sudo -u y2qd y2qd --upgrade-container-headers`). Node-key rotation (`--rotate-node-key`) and the device CLI commands do not use the socket; they run directly as the registry owner (step 3).
+9. **Sweep timer.** The timer re-mints away grants via an unattended home unlock. A home device with a second factor cannot be unlocked unattended, so the sweep logs and exits 0 and grants are refreshed only at arm+boot unlocks and by `y2q admin device refresh`.
+10. **Config file readability.** `--key-serve`, `--key-arm` and `--key-sweep` load the **full** daemon config (server, storage, crypto, auth tables), not just `[crypto.devices]`. The file must be readable by root (arm) and by the key uid `y2q-keyd` (serve and sweep), for example mode `0640` with group `y2q` under `/etc/y2q`.
+11. Config: `[crypto.devices] key_agent_socket = "/run/y2q-keyd.sock"`, `key_agent_peer_uid` (uid of `y2qd`; no default, and while unset the helper refuses every fetch), `key_agent_arm_uid` (default 0), `key_agent_state_dir` (default `/run/y2q-keyd`) and `key_agent_timeout_seconds`; `--key-arm` runs as root and therefore needs the daemon's config file readable by root, and each `--prompt-passcode`, `--prompt-pin` and `--prompt-emergency-code` flag sends that secret over the socket; see [configuration.md](configuration.md#cryptodevices).
+12. Health: `systemctl status y2q-keyd.socket y2qd` and `journalctl -u 'y2q-keyd@*' -u y2q-keyd-sweep -u y2qd`. Each helper run logs the unlock source.
+13. **Verified refusals** (two-uid smoke run, helper as the key uid, daemon as an unprivileged uid): a `--key-arm` from the daemon uid is refused (`arm refused: peer uid is not permitted to arm`), and a fetch without a prior arm is refused.
+14. What a helper failure looks like: if the arm is missing or refused, or the unlock fails (no TPM, PCR mismatch, wrong passcode/PIN, expired grant, exhausted codes), `y2qd` **fails at boot** with the helper's error and does not serve. After boot nothing depends on the helper; grants are only swept and re-minted by the timer, and an expired grant stays on disk until the next attested sweep.
+
+### Home second factors
+
+A TPM home device may require a second factor, so that a stolen host that boots the sealed TPM state still cannot unseal without it. The home KEK is derived from the TPM secret **and** the factor secret.
+
+- `y2q admin device set-home-factor <SELECTOR> --keystore-dir DIR` takes exactly one of `--passcode` (prompted twice on the terminal), `--fido2 <LABEL_OR_ID>` (binds the home device to a registered FIDO2 away token; the same token serves both roles) or `--none` (removes the factor). The Argon2id cost flags `--passcode-m-cost-kib` (default 65536), `--passcode-t-cost` (3) and `--passcode-p-cost` (1) are accepted only with `--passcode`. `device list` shows each home device's `FACTOR`. Needs the daemon stopped and the usual Roughtime flags.
+- A home device with a factor cannot be unlocked unattended: use the attended boot flow above, and expect the sweep timer to log and exit without refreshing grants.
+- Lost factor: the home device cannot unlock. Recover with an emergency code (`Y2QD_EMERGENCY_KEY`), then set or clear the factor again.
+- `device remove` of a token that a home factor references is refused; change the home factor first.
+
+**Legacy in-process mode** (empty `key_agent_socket`) runs the unlock inside `y2qd`. It is weaker: the daemon uid holds RMK and TPM/hidraw access, so a compromise of that uid can re-run the unseal and obtain NK and registry authority. In that mode the daemon unit needs `DevicePolicy=closed` with the `DeviceAllow` lines and `SupplementaryGroups=tss` instead of `PrivateDevices=true`, the daemon keeps the grant timer, and the udev rule's `GROUP=` must name the daemon's group.
+
+Unit notes (`y2q-keyd@.service` and `y2q-keyd-sweep.service`):
+
+- `User=`/`Group=` must name non-root accounts; `SupplementaryGroups=tss` is the only extra group (the TPM resource manager node is `tss`-group accessible).
+- `DeviceAllow=char-hidraw rw` admits **every** hidraw node to the cgroup device policy; omit it on a TPM-only deployment. The real gate is the udev DAC rule `deploy/70-y2q-fido2.rules`: install it as `/etc/udev/rules.d/70-y2q-fido2.rules`, then `udevadm control --reload && udevadm trigger`. It reads `SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1050", GROUP="y2q-keyd", MODE="0660"`. `1050` is the Yubico USB vendor ID; confirm the attached token's vendor with `lsusb` and substitute it for any other token. A generic `SUBSYSTEM=="hidraw"` rule is deliberately not used because it would expose every HID raw node, including keyboards, to the helper's group.
+- Hotplug: hidraw nodes appear and disappear with the token, so they cannot be covered by `BindPaths=`; the udev rule plus `DeviceAllow=char-hidraw` makes a token inserted after boot usable. Insert the token before arming and starting the daemon.
+- Roughtime is outbound UDP from the **helper and the sweep**. If you add `IPAddressDeny=`/`IPAddressAllow=` it must include the configured Roughtime servers or every away unlock fails closed.
+- **Authenticator PIN.** For devices registered with `uv_required` (the default) the helper needs the PIN. On attended hosts it is typed into `y2qd --key-arm --prompt-pin`. `Y2QD_FIDO2_PIN` (and `Y2QD_EMERGENCY_KEY`) may be supplied through `EnvironmentFile=` or a systemd credential, but only from a source outside `keystore_dir` and off the registry's medium: a PIN beside `keystore_dir` removes the authenticator's PIN retry lockout as the hardware bound on a drive-and-token theft inside a live grant window. With neither a PIN source nor a TTY the away path fails with `no PIN source is available` and no touch is requested.
+- **Secure Boot and PCR 7.** `device init` and `add-tpm` refuse a PCR-7 policy unless Secure Boot is enforcing, because with it off PCR 7 is identical on every boot and any bootable medium unseals. `--allow-secure-boot-off` overrides this and then provides no boot-chain binding.
 
 ### Away devices and grants
 
 - `add-fido2` under Home authority mints nothing; `device refresh` mints. Run `device refresh` before travelling. Grants never de-enroll records: an expired grant is erased, the record stays, and the next home unlock mints a fresh grant.
 - `set-grant-period`: Home re-mints; Emergency may only set a strictly smaller period, and then drops every grant and mints none; Away is always refused.
-- An expired grant is erased only by the next attested sweep, which runs on a daemon boot, an admin CLI unlock, an away unlock, or a daemon timer tick, and never on load or an emergency unlock. A medium powered off past `not_after_unix` keeps the grant openable by a patched binary holding the token and PIN until one of those sweeps runs with attested time.
+- An expired grant is erased only by the next attested sweep, which runs on a daemon boot, an admin CLI unlock, an away unlock, or a daemon timer tick, and never on load or an emergency unlock. A medium powered off past `not_after_unix` keeps the grant openable by a patched binary holding the token (and PIN, if `uv_required`) until one of those sweeps runs with attested time. A **copy** of the medium taken while a grant was live stays openable regardless of `not_after_unix` (the check is software) until `device init` creates a new RMK; `away_grant_seconds` bounds only the original medium.
 - The away path fails closed when Roughtime is unreachable; there is no host-clock fallback. Carry an emergency code.
 - Zero-home disclosure: with no TPM home device, anyone holding an away token, its PIN and the medium can add a persistent FIDO2 record (`add-fido2` under Away). Only an Emergency authority can remove such a record, and only with an emergency code. Check `device list` after any away unlock on a zero-home registry.
 - Removing the last TPM home device is refused (`DeviceLastHomeRemovalRefused`) while a FIDO2 record survives: add another home device first (this needs a home unlock).
@@ -455,7 +503,7 @@ SupplementaryGroups=tss
 
 ### TPM resealing
 
-Run `reseal-tpm` **before** a planned firmware or Secure Boot change, not after. After a PCR change the unseal fails with `TpmPcrMismatch`, and resealing then needs Home or Emergency authority - on a node whose PCRs already moved that can burn one of the ten irreplaceable codes unless another home device exists. The default `--pcrs 7` survives kernel updates; `--pcrs 0,4,7` binds more of the boot chain and needs a reseal after every firmware or kernel update.
+`reseal-tpm` enforces the same Secure Boot precheck as `init` and `add-tpm` for a PCR-7 policy; `--allow-secure-boot-off` overrides it and then provides no boot-chain binding. Run `reseal-tpm` **before** a planned firmware or Secure Boot change, not after. After a PCR change the unseal fails with `TpmPcrMismatch`, and resealing then needs Home or Emergency authority - on a node whose PCRs already moved that can burn one of the ten irreplaceable codes unless another home device exists. The default `--pcrs 7` survives kernel updates; `--pcrs 0,4,7` binds more of the boot chain and needs a reseal after every firmware or kernel update.
 
 ### Emergency codes
 

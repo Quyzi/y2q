@@ -171,6 +171,7 @@ pub fn init_registry(
         fido2: None,
         sign_count_last: None,
         kek_wrap: None,
+        home_factor: None,
         id_bytes,
     };
     match first.kind {
@@ -348,7 +349,8 @@ fn open_slot(
     Err(CryptoError::EmergencyCodeRejected)
 }
 
-/// Unlock with the code in `Y2QD_EMERGENCY_KEY`; `Ok(None)` when it is absent.
+/// Unlock with `code` (the operator-supplied emergency code text, normally
+/// from [`PinProvider::emergency_code`]); `Ok(None)` when no code was supplied.
 ///
 /// Performs no grant sweep and reads no attested time: a printed code is
 /// out-of-band authority and must work on a host with a wrong clock. This path
@@ -361,10 +363,12 @@ pub fn emergency_unlock(
     dir: &Path,
     reg: &mut DeviceRegistryFile,
     now_host: u64,
+    code: Option<Zeroizing<String>>,
 ) -> Result<Option<EmergencyUnlock>, CryptoError> {
-    let Some(code) = take_code()? else {
+    let Some(text) = code else {
         return Ok(None);
     };
+    let code = decode_code(text.trim())?;
     let path = devices_path(dir);
     let (rmk, pos) = open_slot(reg, &code, &path)?;
     let state_key = derive_state_key(&rmk)?;

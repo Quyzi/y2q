@@ -89,6 +89,30 @@ pub struct Fido2Params {
     pub uv_required: bool,
 }
 
+/// An optional second factor a `Tpm2` home record requires on top of its TPM
+/// secret. The home KEK is derived from `tpm_secret || factor_secret`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase", deny_unknown_fields)]
+pub enum HomeFactor {
+    /// A passcode stretched with Argon2id under the stored salt and costs.
+    Passcode {
+        /// base64(standard) of the 16-byte Argon2id salt.
+        salt_b64: String,
+        /// Argon2id memory cost in KiB.
+        m_cost_kib: u32,
+        /// Argon2id iteration count.
+        t_cost: u32,
+        /// Argon2id parallelism.
+        p_cost: u32,
+    },
+    /// The `hmac-secret` output of a registered `Fido2` record (same
+    /// credential and salt as its away role, a distinct HKDF domain).
+    Fido2 {
+        /// Id (32 lowercase hex chars) of the referenced `Fido2` record.
+        device_id: String,
+    },
+}
+
 /// One registered device.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -120,6 +144,10 @@ pub struct DeviceRecord {
     /// AES-256-GCM(KEK_CACHE_KEY, KEK_device). Away records only; never erased.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kek_wrap: Option<Wrap>,
+    /// Optional second factor, `Tpm2` records only. Bound into the device-wrap AAD
+    /// (as a factor byte) and covered by `state_mac`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub home_factor: Option<HomeFactor>,
     /// Raw bytes of `id`, filled by `load`.
     // Read only by the DEV-GATE registry modules.
     #[cfg_attr(not(all(target_os = "linux", feature = "devices")), allow(dead_code))]
@@ -343,10 +371,41 @@ pub struct NewDevice {
     pub sign_count: u32,
 }
 
-/// Supplies an authenticator PIN on demand. Ungated so `y2qd` can implement it.
+/// A freshly derived home-device second factor, ready to be installed.
+pub struct NewHomeFactor {
+    /// The factor description persisted in the registry.
+    pub factor: HomeFactor,
+    /// The 32-byte factor secret it yields.
+    pub secret: SecretBuf,
+}
+
+/// Supplies authorization material on demand: authenticator PINs, home-device
+/// passcodes and emergency codes. Ungated so `y2qd` and the CLI can implement
+/// it over a terminal, an environment variable or an RPC.
 pub trait PinProvider: Send + Sync {
-    /// `label` is the device's registry label, for the prompt.
+    /// An authenticator PIN. `label` is the device's registry label, for the prompt.
     fn pin(&self, label: &str) -> Result<Zeroizing<String>, CryptoError>;
+
+    /// The passcode of the home device `label`. The default reports that no
+    /// passcode source is available.
+    fn passcode(&self, label: &str) -> Result<Zeroizing<String>, CryptoError> {
+        let _ = label;
+        Err(CryptoError::DeviceBackend(
+            "no passcode source is available".into(),
+        ))
+    }
+
+    /// An emergency code, if the operator supplied one. The default takes
+    /// `Y2QD_EMERGENCY_KEY` out of the environment (scrubbing it); `Ok(None)`
+    /// when it is absent.
+    fn emergency_code(&self) -> Result<Option<Zeroizing<String>>, CryptoError> {
+        match crate::crypto::node_key::take_env_secret(super::EMERGENCY_KEY_ENV_VAR) {
+            Err(CryptoError::NodeKeyMalformed(_)) => Err(CryptoError::EmergencyCodeMalformed(
+                "Y2QD_EMERGENCY_KEY is not valid UTF-8".to_owned(),
+            )),
+            other => other,
+        }
+    }
 }
 
 /// A trustworthy lower bound on the current time. Ungated so `y2qd` and tests can implement it.

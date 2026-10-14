@@ -1,14 +1,20 @@
 //! Node-key resolution at boot.
 //!
-//! Two modes, in this precedence order:
+//! Three modes, in this precedence order:
 //!
 //! 1. **Operator mode** — `Y2QD_NODE_KEY` or `[crypto] node_key_file`. Unchanged
 //!    from before the device registry existed, and it wins at boot, so CI and
 //!    the e2e suite are unaffected.
-//! 2. **Device mode** — `<keystore_dir>/devices.json` exists. The node key is
-//!    recovered from a registered TPM home device, a FIDO2 away device or a
-//!    one-time emergency code (`y2q_core::crypto::devices`). Requires a Linux
-//!    build with the `devices` feature; any other build refuses the registry.
+//! 2. **Key helper** — `[crypto.devices] key_agent_socket` is set. The node key
+//!    is fetched once from a socket-activated one-shot `y2qd --key-serve`,
+//!    which owns the hardware and RMK for the length of one request; the
+//!    daemon never touches either. The helper must have been armed
+//!    (`y2qd --key-arm`) beforehand.
+//! 3. **Device mode** — `<keystore_dir>/devices.json` exists. The node key is
+//!    recovered in-process from a registered TPM home device, a FIDO2 away
+//!    device or a one-time emergency code (`y2q_core::crypto::devices`).
+//!    Requires a Linux build with the `devices` feature; any other build
+//!    refuses the registry.
 
 use std::path::Path;
 
@@ -41,6 +47,10 @@ pub enum Source {
     /// An emergency code opened the registry and was burned.
     #[cfg(all(target_os = "linux", feature = "devices"))]
     Emergency { index: u8 },
+    /// The socket-activated key helper opened the registry and handed the key
+    /// over.
+    #[cfg(target_os = "linux")]
+    Agent(y2q_core::crypto::devices::keyrpc::FetchMeta),
 }
 
 /// Result of [`resolve`].
@@ -114,6 +124,69 @@ impl PinProvider for DaemonPinProvider {
              terminal"
         )))
     }
+
+    /// Terminal-only: there is no environment variable for a passcode, so one
+    /// never sits in a unit file.
+    fn passcode(&self, label: &str) -> Result<Zeroizing<String>, CryptoError> {
+        if (self.tty_probe)() {
+            let entered =
+                rpassword::prompt_password(format!("Passcode for home device '{label}': "))
+                    .map_err(|e| CryptoError::DeviceBackend(format!("passcode prompt: {e}")))?;
+            return Ok(Zeroizing::new(entered));
+        }
+        Err(CryptoError::DeviceBackend(format!(
+            "home device '{label}' requires a passcode but no passcode source is available: \
+             start y2qd attached to a terminal"
+        )))
+    }
+}
+
+/// How long the daemon keeps retrying while the key-helper socket is absent.
+#[cfg(target_os = "linux")]
+const AGENT_CONNECT_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Fetch the node key from the socket-activated key helper.
+#[cfg(target_os = "linux")]
+fn resolve_agent(cfg: &crate::config::Config) -> Result<Resolved, std::io::Error> {
+    use y2q_core::crypto::devices::keyrpc;
+
+    let dev = &cfg.crypto.devices;
+    let fetched = keyrpc::fetch(
+        Path::new(&dev.key_agent_socket),
+        AGENT_CONNECT_WINDOW,
+        std::time::Duration::from_secs(dev.key_agent_timeout_seconds),
+    )
+    .map_err(|e| {
+        let text = e.to_string();
+        let hint = if text.contains("not armed") {
+            "; the key helper must be armed before the daemon starts: unattended hosts arm \
+             with empty authorization from ExecStartPre=+ (`y2qd --key-arm`), attended hosts \
+             arm interactively (`y2qd --key-arm --prompt-passcode`, `--prompt-pin` or \
+             `--prompt-emergency-code`) first"
+        } else {
+            ""
+        };
+        std::io::Error::other(format!("node key: {text}{hint}"))
+    })?;
+    if fetched.meta.emergency_slots_unused <= 3 {
+        tracing::warn!(
+            unused = fetched.meta.emergency_slots_unused,
+            "three or fewer emergency codes remain"
+        );
+    }
+    Ok(Resolved {
+        node_key: fetched.node_key,
+        registry_state_key: None,
+        registry_master_key: None,
+        source: Source::Agent(fetched.meta),
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn resolve_agent(_cfg: &crate::config::Config) -> Result<Resolved, std::io::Error> {
+    Err(std::io::Error::other(
+        "[crypto.devices] key_agent_socket requires Linux",
+    ))
 }
 
 /// Copy a guarded 32-byte secret out for one call. The copy zeroizes on drop;
@@ -155,7 +228,12 @@ pub fn resolve(
         });
     }
 
-    // 2. Device mode.
+    // 2. Key helper: the daemon never touches the hardware or devices.json.
+    if !cfg.crypto.devices.key_agent_socket.is_empty() {
+        return resolve_agent(cfg);
+    }
+
+    // 3. Device mode (in-process).
     if y2q_core::crypto::devices::devices_path(keystore_dir).exists() {
         return resolve_devices(cfg, keystore_dir);
     }
@@ -181,6 +259,21 @@ fn resolve_devices(
     cfg: &crate::config::Config,
     keystore_dir: &Path,
 ) -> Result<Resolved, std::io::Error> {
+    unlock_devices(cfg, keystore_dir).map(|(resolved, unused)| {
+        if unused <= 3 {
+            tracing::warn!(unused, "three or fewer emergency codes remain");
+        }
+        resolved
+    })
+}
+
+/// In-process device unlock (legacy mode, empty `key_agent_socket`). Returns
+/// the resolved key plus the number of unburned emergency slots.
+#[cfg(all(target_os = "linux", feature = "devices"))]
+pub(crate) fn unlock_devices(
+    cfg: &crate::config::Config,
+    keystore_dir: &Path,
+) -> Result<(Resolved, usize), std::io::Error> {
     use y2q_core::crypto::devices::roughtime::RoughtimeTimeSource;
 
     let dev_err = |e: &dyn std::fmt::Display| std::io::Error::other(format!("device unlock: {e}"));
@@ -202,13 +295,6 @@ fn resolve_devices(
         None
     };
 
-    if outcome.emergency_slots_unused <= 3 {
-        tracing::warn!(
-            unused = outcome.emergency_slots_unused,
-            "three or fewer emergency codes remain"
-        );
-    }
-
     let source = match &outcome.authority {
         Authority::Home { id, label } => Source::Device {
             label: label.clone(),
@@ -228,12 +314,31 @@ fn resolve_devices(
     };
 
     // The `Zeroizing` originals and the loaded registry drop here.
-    Ok(Resolved {
-        node_key: outcome.node_key,
-        registry_state_key: Some(state_key),
-        registry_master_key: master_key,
-        source,
-    })
+    Ok((
+        Resolved {
+            node_key: outcome.node_key,
+            registry_state_key: Some(state_key),
+            registry_master_key: master_key,
+            source,
+        },
+        outcome.emergency_slots_unused,
+    ))
+}
+
+/// One grant sweep / re-mint pass for the daemon's in-process timer (legacy
+/// mode). Copies the guarded keys out for this call only; both copies
+/// zeroize on drop.
+#[cfg(all(target_os = "linux", feature = "devices"))]
+pub(crate) fn grant_sweep_once(
+    dir: &Path,
+    policy: &DevicePolicy,
+    state_key: &SecretBuf,
+    master: Option<&SecretBuf>,
+) -> Result<(usize, usize), CryptoError> {
+    let state_key = unlock_key(state_key)?;
+    let rmk = master.map(unlock_key).transpose()?;
+    let time = devices::roughtime::RoughtimeTimeSource::new(policy.roughtime.clone());
+    devices::sweep_now(dir, &state_key, rmk.as_deref(), &time)
 }
 
 #[cfg(not(all(target_os = "linux", feature = "devices")))]
@@ -254,6 +359,22 @@ fn resolve_devices(
 pub fn log_source(source: &Source) {
     match source {
         Source::Operator => tracing::info!(source = "operator", "node key source resolved"),
+        #[cfg(target_os = "linux")]
+        Source::Agent(m) if m.kind == "emergency" => tracing::warn!(
+            source = "agent",
+            slot = m.slot.unwrap_or(0),
+            "node key unlocked via key agent by emergency code; this code is now burned"
+        ),
+        #[cfg(target_os = "linux")]
+        Source::Agent(m) => tracing::info!(
+            source = "agent",
+            kind = %m.kind,
+            device = %m.label,
+            device_id = %m.device_id,
+            grants_issued = m.grants_issued,
+            grants_erased = m.grants_erased,
+            "node key unlocked via key agent"
+        ),
         #[cfg(all(target_os = "linux", feature = "devices"))]
         Source::Device {
             label,
@@ -452,6 +573,43 @@ mod tests {
             err.to_string().contains("no PIN source is available"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn key_helper_flags_are_mutually_exclusive() {
+        use crate::cli::Cli;
+        let ok = |args: &[&str]| {
+            Cli::try_parse_from(std::iter::once("y2qd").chain(args.iter().copied()))
+        };
+        assert!(ok(&["--key-serve"]).is_ok());
+        assert!(ok(&["--key-sweep"]).is_ok());
+        assert!(ok(&["--key-arm", "--prompt-pin", "--prompt-passcode"]).is_ok());
+        assert!(ok(&["--key-serve", "--key-sweep"]).is_err());
+        assert!(ok(&["--key-arm", "--key-serve"]).is_err());
+        assert!(ok(&["--key-sweep", "--rotate-node-key"]).is_err());
+        assert!(ok(&["--key-serve", "--upgrade-container-headers"]).is_err());
+        assert!(ok(&["--prompt-pin"]).is_err());
+        assert!(ok(&["--key-agent"]).is_err());
+    }
+
+    #[cfg(all(target_os = "linux", feature = "devices"))]
+    #[test]
+    fn passcode_without_a_terminal_errors_and_emergency_code_comes_from_env() {
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_env();
+        let p = DaemonPinProvider::with_tty_probe(|| false).unwrap();
+        let err = p.passcode("home-1").err().unwrap();
+        assert!(
+            err.to_string().contains("no passcode source is available"),
+            "{err}"
+        );
+        assert!(p.emergency_code().unwrap().is_none());
+        set_env("Y2QD_EMERGENCY_KEY", "code-from-env");
+        assert_eq!(
+            p.emergency_code().unwrap().unwrap().as_str(),
+            "code-from-env"
+        );
+        clear_env();
     }
 
     #[cfg(all(target_os = "linux", feature = "devices"))]

@@ -44,7 +44,7 @@ impl Harness {
         )
         .unwrap();
         let node_key = [9u8; 32];
-        fs.install_node_key(node_key);
+        fs.install_node_key(&node_key);
         let storage: Arc<AnyStorage> = Arc::new(AnyStorage::Filesystem(fs));
 
         let user_dir = tempfile::TempDir::new().unwrap();

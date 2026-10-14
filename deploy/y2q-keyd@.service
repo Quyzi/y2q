@@ -1,0 +1,73 @@
+[Unit]
+Description=y2q key helper (one request, then exits)
+Documentation=https://github.com/Quyzi/y2q
+
+[Service]
+# Spawned per connection by y2q-keyd.socket (Accept=yes); stdin is the accepted socket.
+# Handles exactly one arm or fetch request and exits, so RMK and the state key exist
+# only inside this short-lived process.
+Type=simple
+StandardInput=socket
+StandardOutput=journal
+StandardError=journal
+ExecStart=/usr/local/bin/y2qd --key-serve --config /etc/y2q/config.toml
+
+# This uid owns TPM/hidraw access and devices.json / .devices.lock (mode 0600). Group y2q
+# lets it share keystore_dir (mode 1770) with y2qd.
+User=y2q-keyd
+Group=y2q
+SupplementaryGroups=tss
+UMask=0077
+ConfigurationDirectory=y2q
+ConfigurationDirectoryMode=0750
+
+# Capability restrictions
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=true
+
+# Device unlock needs the TPM resource manager and the FIDO2 HID node. PrivateDevices=
+# would hide both, so a closed device policy plus an explicit allowlist is used.
+DevicePolicy=closed
+DeviceAllow=/dev/tpmrm0 rw
+# A TPM-only deployment that never registers an away device omits the next line.
+# It admits every hidraw node to the cgroup device policy; the udev DAC rule
+# deploy/70-y2q-fido2.rules (install as /etc/udev/rules.d/70-y2q-fido2.rules) is the
+# real gate.
+DeviceAllow=char-hidraw rw
+
+# Roughtime is outbound UDP. If you add IPAddressDeny=/IPAddressAllow=, the allow list
+# must include every configured Roughtime server, or every away unlock fails closed.
+
+# Filesystem isolation
+ProtectHome=true
+ProtectSystem=strict
+# keystore_dir must match [crypto] keystore_dir. /run/y2q-keyd holds the one-time armed
+# file (created by deploy/y2q-keyd.tmpfiles.conf, which must outlive each helper, so
+# RuntimeDirectory= is deliberately not used).
+ReadWritePaths=/var/lib/y2q/keystore /run/y2q-keyd
+PrivateTmp=true
+ProtectProc=invisible
+ProcSubset=pid
+
+# Syscall filtering. `memfd_secret` is not in `@system-service`.
+SystemCallFilter=@system-service
+SystemCallFilter=memfd_secret
+SystemCallFilter=~@privileged @resources @debug
+SystemCallErrorNumber=EPERM
+LimitMEMLOCK=infinity
+
+# Misc hardening
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RemoveIPC=true

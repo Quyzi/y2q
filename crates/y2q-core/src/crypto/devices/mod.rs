@@ -28,13 +28,15 @@
 //!   exposure. No cryptographic time-lock exists without a trusted clock on the
 //!   medium.
 //! - A **copy of the medium taken while a grant was live**, combined later with
-//!   the away token and its PIN, yields RMK and therefore NK, on any host and at
-//!   any later date, until a `device init` rekeys the registry. Erasure never
-//!   reaches a copy already taken. A home-booted daemon re-mints grants every
-//!   `grant_timer_interval_seconds`, so while it runs a snapshot always contains
-//!   a live grant. After it stops, the last grant stays openable until the next
-//!   attested sweep. `away_grant_seconds` bounds each grant's lifetime, not the
-//!   uptime-driven refresh chain.
+//!   the away token (and its PIN, if `uv_required`), yields RMK and therefore
+//!   NK, on any host and at any later date, until a `device init` creates a new
+//!   RMK. The expiry check is software: a patched binary ignores
+//!   `not_after_unix` on the copy. Erasure never reaches a copy already taken.
+//!   A home-booted daemon re-mints grants every `grant_timer_interval_seconds`,
+//!   so while it runs a snapshot always contains a live grant. After it stops,
+//!   the last grant stays openable until the next attested sweep.
+//!   `away_grant_seconds` therefore bounds only the *original* medium (once an
+//!   attested sweep erases the grant), not a copy, and not the refresh chain.
 //! - A **home device** plus the medium always yields NK: the home wrap is
 //!   permanent by construction, because something has to be able to mint the
 //!   next grant. TPM sealing bounds that: the sealed blob is useless on another
@@ -51,13 +53,31 @@
 //!   It exists **only** for devices registered with `uv_required = true`, and
 //!   only when the PIN is not stored on the same medium — `--no-uv`
 //!   registration and a `Y2QD_FIDO2_PIN` written into a unit file beside
-//!   `keystore_dir` each remove it.
-//! - Roughtime's trust chain is Ed25519 (RFC 10049 §9.5: "the only supported
-//!   signature scheme, Ed25519, is not quantum resistant … will not survive the
-//!   advent of quantum computers"). A quantum adversary able to forge a
-//!   response could reopen a closed window *while a grant still exists on the
-//!   medium*; it buys nothing once the grant is erased, and nothing at all about
-//!   data at rest, every byte of which is protected by symmetric keys.
+//!   `keystore_dir` each remove it. Where this text says "token and PIN", a
+//!   `--no-uv` device needs the token alone.
+//! - Post-quantum posture. The ML-KEM-768 secrets (tiers 1 and 2) are wrapped at
+//!   rest under symmetric keys, so no Shor-reachable at-rest secret exists; the
+//!   symmetric layers lose only Grover margin. The quantum-exposed links are:
+//!   (a) Roughtime's Ed25519 signatures (RFC 10049 §9.5: "not quantum
+//!   resistant"): a quantum adversary holding a stale medium could forge time
+//!   and reopen an expired grant, though the token (and PIN) requirement still
+//!   applies; and (b) the CTAP2 `hmac-secret` transport, an ECDH exchange on the
+//!   local USB bus. y2q never verifies the FIDO2 assertion signature (ES256
+//!   credential); the secret comes from `hmac-secret` only.
+//! - Process separation. In socket-activated helper mode (`y2q-keyd.socket`
+//!   spawns a fresh `y2qd --key-serve` per connection, as a different uid) no
+//!   resident process holds RMK. Root arms one-time authorization (`--key-arm`,
+//!   stored in a 0600 file on tmpfs); the daemon fetches once; the helper
+//!   consumes the armed file, unlocks, returns NK and exits. A compromised
+//!   daemon uid holds one transient raw NK copy from boot but not RMK, the TPM
+//!   or registry authority, and cannot re-fetch without a root-armed
+//!   authorization. In legacy in-process mode (empty `key_agent_socket`) the
+//!   daemon holds RMK and TPM access, so compromising its uid yields NK and
+//!   registry authority. Root on the live host defeats both modes.
+//! - `devices.json` is not encrypted as a whole: labels, ids, timestamps, PCR
+//!   slots, credential ids, sign counts, burn flags, grant deadlines and the
+//!   device count are readable (every secret is AEAD-wrapped). A stale copy
+//!   replays burned slots and revives erased grants.
 //! - An older copy of `devices.json` verifies under the same state key, and RMK
 //!   is never rotated, so anyone who ever unlocked this registry retains RMK and
 //!   can forge registry state; a restored backup also revives already-burned
@@ -102,6 +122,9 @@ use super::CryptoError;
 
 pub mod types;
 pub use types::*;
+
+#[cfg(target_os = "linux")]
+pub mod keyrpc;
 
 #[cfg(all(target_os = "linux", feature = "devices"))]
 pub mod emergency;
@@ -151,6 +174,20 @@ pub use registry::sweep_now;
 /// Unavailable in this build.
 #[cfg(not(all(target_os = "linux", feature = "devices")))]
 pub fn unlock(
+    dir: &Path,
+    _policy: &DevicePolicy,
+    _pins: &dyn PinProvider,
+    _time: &dyn TimeSource,
+    _now_host: u64,
+) -> Result<UnlockOutcome, CryptoError> {
+    Err(CryptoError::DeviceSupportNotCompiled(
+        devices_path(dir).display().to_string(),
+    ))
+}
+
+/// Unavailable in this build.
+#[cfg(not(all(target_os = "linux", feature = "devices")))]
+pub fn unlock_home(
     dir: &Path,
     _policy: &DevicePolicy,
     _pins: &dyn PinProvider,
@@ -223,9 +260,85 @@ fn finish_outcome(
     })
 }
 
+/// Try every `Tpm2` record in file order. The first to open wins; its
+/// `persist` has already written the swept and freshly minted grants.
+/// Continue-class failures are appended to `reasons`; any other error is fatal.
+/// The raw TPM secret is combined with the record's second factor (passcode or
+/// a referenced token) by [`registry::home_device_secret`] before the unwrap.
+#[cfg(all(target_os = "linux", feature = "devices"))]
+fn try_home_records(
+    dir: &Path,
+    reg: &mut DeviceRegistryFile,
+    policy: &DevicePolicy,
+    pins: &dyn PinProvider,
+    time: &dyn TimeSource,
+    reasons: &mut Vec<String>,
+) -> Result<Option<(Unlock, Authority)>, CryptoError> {
+    for i in 0..reg.devices.len() {
+        if reg.devices[i].kind != DeviceKind::Tpm2 {
+            continue;
+        }
+        let label = reg.devices[i].label.clone();
+        let id = reg.devices[i].id.clone();
+        let attempt =
+            (|| -> Result<Unlock, CryptoError> {
+                let params = reg.devices[i].tpm2.clone().ok_or_else(|| {
+                    CryptoError::DeviceRegistryCorrupt {
+                        path: devices_path(dir).display().to_string(),
+                        reason: format!("tpm2 device {id} has no tpm2 parameters"),
+                    }
+                })?;
+                let secret = tpm2::unseal(&params, &policy.tpm_tcti)?;
+                let guard = secret.unlock()?;
+                let device_secret = registry::home_device_secret(reg, i, &guard, pins)?;
+                registry::unlock_with_home(dir, reg, i, &device_secret, time, policy)
+            })();
+        match attempt {
+            Ok(u) => return Ok(Some((u, Authority::Home { id, label }))),
+            Err(e) if is_continue_class(&e) => reasons.push(format!("{label}: {e}")),
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(None)
+}
+
+/// Unlock the registry with a home device only: no emergency code and no away
+/// device is tried (so no authenticator PIN is requested for an away record).
+/// Fails with [`CryptoError::DeviceUnlockUnavailable`] carrying the per-record
+/// reasons when no home record opens.
+#[cfg(all(target_os = "linux", feature = "devices"))]
+pub fn unlock_home(
+    dir: &Path,
+    policy: &DevicePolicy,
+    pins: &dyn PinProvider,
+    time: &dyn TimeSource,
+    _now_host: u64,
+) -> Result<UnlockOutcome, CryptoError> {
+    let mut reg = registry::load(dir)?;
+    let mut reasons: Vec<String> = Vec::new();
+    if let Some((u, authority)) = try_home_records(dir, &mut reg, policy, pins, time, &mut reasons)?
+    {
+        return finish_outcome(
+            reg,
+            u.nk,
+            u.rmk,
+            authority,
+            u.grants_issued,
+            u.grants_erased,
+        );
+    }
+    Err(CryptoError::DeviceUnlockUnavailable(
+        if reasons.is_empty() {
+            "no home devices registered".to_owned()
+        } else {
+            reasons.join("; ")
+        },
+    ))
+}
+
 /// Unlock the registry in `dir` and return NK.
 ///
-/// Order: load → emergency code (if `Y2QD_EMERGENCY_KEY` is set) → each TPM
+/// Order: load → emergency code (from `pins.emergency_code()`) → each TPM
 /// record → each FIDO2 record. Errors from device attempts are classified
 /// (fatal vs continue); see [`is_continue_class`]. The first success wins and
 /// has already persisted its own bookkeeping.
@@ -239,7 +352,8 @@ pub fn unlock(
 ) -> Result<UnlockOutcome, CryptoError> {
     let mut reg = registry::load(dir)?;
 
-    match emergency::emergency_unlock(dir, &mut reg, now_host) {
+    let code = pins.emergency_code()?;
+    match emergency::emergency_unlock(dir, &mut reg, now_host, code) {
         Ok(Some(e)) => {
             return finish_outcome(
                 reg,
@@ -259,38 +373,16 @@ pub fn unlock(
 
     let mut reasons: Vec<String> = Vec::new();
 
-    for i in 0..reg.devices.len() {
-        if reg.devices[i].kind != DeviceKind::Tpm2 {
-            continue;
-        }
-        let label = reg.devices[i].label.clone();
-        let id = reg.devices[i].id.clone();
-        let attempt =
-            (|| -> Result<Unlock, CryptoError> {
-                let params = reg.devices[i].tpm2.clone().ok_or_else(|| {
-                    CryptoError::DeviceRegistryCorrupt {
-                        path: devices_path(dir).display().to_string(),
-                        reason: format!("tpm2 device {id} has no tpm2 parameters"),
-                    }
-                })?;
-                let secret = tpm2::unseal(&params, &policy.tpm_tcti)?;
-                let guard = secret.unlock()?;
-                registry::unlock_with_home(dir, &mut reg, i, &guard, time, policy)
-            })();
-        match attempt {
-            Ok(u) => {
-                return finish_outcome(
-                    reg,
-                    u.nk,
-                    u.rmk,
-                    Authority::Home { id, label },
-                    u.grants_issued,
-                    u.grants_erased,
-                );
-            }
-            Err(e) if is_continue_class(&e) => reasons.push(format!("{label}: {e}")),
-            Err(e) => return Err(e),
-        }
+    if let Some((u, authority)) = try_home_records(dir, &mut reg, policy, pins, time, &mut reasons)?
+    {
+        return finish_outcome(
+            reg,
+            u.nk,
+            u.rmk,
+            authority,
+            u.grants_issued,
+            u.grants_erased,
+        );
     }
 
     for i in 0..reg.devices.len() {

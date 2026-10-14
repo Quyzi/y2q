@@ -152,6 +152,7 @@ impl Fx {
             time: &t,
             now_host: 5,
             policy: &p,
+            pins: &NoPins,
         };
         enroll_device(
             self.dir.path(),
@@ -218,6 +219,17 @@ fn edit_json(dir: &Path, f: impl FnOnce(&mut serde_json::Value)) {
 fn set_emergency_code(code: &str) {
     // SAFETY: serialised by ENV_LOCK in every test that touches this variable.
     unsafe { std::env::set_var(EMERGENCY_KEY_ENV_VAR, code) };
+}
+
+/// `emergency_unlock` fed by the default `PinProvider::emergency_code`, which
+/// takes `Y2QD_EMERGENCY_KEY` out of the environment.
+fn eu(
+    dir: &Path,
+    reg: &mut DeviceRegistryFile,
+    now_host: u64,
+) -> Result<Option<EmergencyUnlock>, CryptoError> {
+    let code = NoPins.emergency_code()?;
+    emergency::emergency_unlock(dir, reg, now_host, code)
 }
 
 // ---------------------------------------------------------------------------
@@ -428,6 +440,7 @@ fn grant_period_bounds_are_enforced_by_init_and_set_grant_period() {
         time: &t,
         now_host: 1,
         policy: &p,
+        pins: &NoPins,
     };
     for bad in [59u32, 2_592_001] {
         let err = set_grant_period(
@@ -602,9 +615,7 @@ fn each_code_unlocks_once_then_is_rejected_then_exhaustion() {
     for (i, code) in fx.codes.iter().enumerate() {
         let mut reg = load(&dir).unwrap();
         set_emergency_code(code);
-        let u = emergency::emergency_unlock(&dir, &mut reg, 777)
-            .unwrap()
-            .unwrap();
+        let u = eu(&dir, &mut reg, 777).unwrap().unwrap();
         assert_eq!(*u.nk, fx.nk, "code {i} must yield the same NK");
         assert_eq!(*u.rmk, fx.rmk);
         assert_eq!(usize::from(u.slot), i);
@@ -620,9 +631,7 @@ fn each_code_unlocks_once_then_is_rejected_then_exhaustion() {
         set_emergency_code(code);
         let mut again = load(&dir).unwrap();
         let before = fs::read(devices_path(&dir)).unwrap();
-        let err = emergency::emergency_unlock(&dir, &mut again, 1)
-            .err()
-            .unwrap();
+        let err = eu(&dir, &mut again, 1).err().unwrap();
         if i == 9 {
             assert!(matches!(err, CryptoError::EmergencyCodesExhausted));
         } else {
@@ -640,26 +649,22 @@ fn emergency_input_validation_and_foreign_codes() {
     let before = fx.bytes();
 
     // Absent variable → fall through.
-    assert!(
-        emergency::emergency_unlock(fx.dir.path(), &mut reg, 1)
-            .unwrap()
-            .is_none()
-    );
+    assert!(eu(fx.dir.path(), &mut reg, 1).unwrap().is_none());
 
     set_emergency_code(&STANDARD.encode([3u8; 31]));
     assert!(matches!(
-        emergency::emergency_unlock(fx.dir.path(), &mut reg, 1),
+        eu(fx.dir.path(), &mut reg, 1),
         Err(CryptoError::EmergencyCodeMalformed(_))
     ));
     set_emergency_code("not base64 !!");
     assert!(matches!(
-        emergency::emergency_unlock(fx.dir.path(), &mut reg, 1),
+        eu(fx.dir.path(), &mut reg, 1),
         Err(CryptoError::EmergencyCodeMalformed(_))
     ));
     // Well-formed but from nowhere.
     set_emergency_code(&STANDARD.encode([4u8; 32]));
     assert!(matches!(
-        emergency::emergency_unlock(fx.dir.path(), &mut reg, 1),
+        eu(fx.dir.path(), &mut reg, 1),
         Err(CryptoError::EmergencyCodeRejected)
     ));
     assert_eq!(before, fx.bytes());
@@ -999,7 +1004,7 @@ fn aad_bound_edits_fail_at_the_unwrap() {
     ));
     set_emergency_code(&fx.codes[0].clone());
     assert!(matches!(
-        emergency::emergency_unlock(fx.dir.path(), &mut fx.reg, 1),
+        eu(fx.dir.path(), &mut fx.reg, 1),
         Err(CryptoError::EmergencyCodeRejected)
     ));
 }
@@ -1123,7 +1128,7 @@ fn load_and_emergency_unlock_never_sweep() {
     // Emergency unlock burns one slot and leaves the (long-expired) grant alone.
     let mut reg = load(fx.dir.path()).unwrap();
     set_emergency_code(&fx.codes[0]);
-    emergency::emergency_unlock(fx.dir.path(), &mut reg, not_after + 10_000_000)
+    eu(fx.dir.path(), &mut reg, not_after + 10_000_000)
         .unwrap()
         .unwrap();
     let after = load(fx.dir.path()).unwrap();
@@ -1146,6 +1151,7 @@ fn sibling_expiry_is_erased_in_the_same_write_as_an_away_unlock() {
         time: &t,
         now_host: 5,
         policy: &p,
+        pins: &NoPins,
     };
     enroll_device(
         fx.dir.path(),
@@ -1246,6 +1252,7 @@ fn grant_deadline_saturates_instead_of_overflowing() {
         time: &t,
         now_host: 1,
         policy: &p,
+        pins: &NoPins,
     };
     let n = refresh_grants(fx.dir.path(), &mut fx.reg, &fx.rmk, &home(), &ctx).unwrap();
     assert_eq!(n, 1);
@@ -1384,6 +1391,7 @@ fn authority_matrix_with_a_home_device() {
         time: &t,
         now_host: 1,
         policy: &p,
+        pins: &NoPins,
     };
     let (dir, rmk, nk) = (fx.dir.path().to_path_buf(), fx.rmk, fx.nk);
 
@@ -1542,6 +1550,7 @@ fn removal_rules_protect_the_last_home_and_last_device() {
         time: &t,
         now_host: 1,
         policy: &p,
+        pins: &NoPins,
     };
     let (dir, rmk) = (fx.dir.path().to_path_buf(), fx.rmk);
     for by in [home(), emerg()] {
@@ -1567,6 +1576,7 @@ fn zero_home_registry_lifecycle() {
         time: &t,
         now_host: 1,
         policy: &p,
+        pins: &NoPins,
     };
 
     // Permanent wrap: away unlock needs neither network nor clock.
@@ -1668,6 +1678,7 @@ fn row9_without_attestation_strips_wraps_and_mints_nothing() {
         time: &t,
         now_host: 1,
         policy: &p,
+        pins: &NoPins,
     };
     enroll_device(
         fx.dir.path(),
@@ -1697,6 +1708,7 @@ fn set_grant_period_by_authority() {
         time: &t,
         now_host: 1,
         policy: &p,
+        pins: &NoPins,
     };
     let (dir, rmk, nk) = (fx.dir.path().to_path_buf(), fx.rmk, fx.nk);
 
@@ -1861,4 +1873,716 @@ fn repair_on_zero_home_registry_gates_away_repair_on_the_flag() {
         err,
         CryptoError::DeviceAuthorityInsufficient { .. }
     ));
+}
+
+// ---------------------------------------------------------------------------
+// Registry lock and Secure Boot probe
+// ---------------------------------------------------------------------------
+
+#[test]
+fn registry_lock_is_exclusive_and_skips_the_sweep_when_busy() {
+    let mut fx = home_fx();
+    let idx = fx.add_fido("away", false, 5);
+    let held = lock_registry(fx.dir.path()).unwrap();
+    assert!(matches!(
+        lock_registry(fx.dir.path()),
+        Err(CryptoError::DeviceRegistryIo(_))
+    ));
+    assert!(try_lock_registry(fx.dir.path()).unwrap().is_none());
+
+    // A sweep that lands while the lock is held does nothing, without asking for time.
+    let before = fx.bytes();
+    let r = sweep_now(fx.dir.path(), &fx.state_key(), Some(&fx.rmk), &PanicTime).unwrap();
+    assert_eq!(r, (0, 0));
+    assert_eq!(before, fx.bytes());
+
+    drop(held);
+    let r = sweep_now(
+        fx.dir.path(),
+        &fx.state_key(),
+        Some(&fx.rmk),
+        &FixedTime(Some(T0)),
+    )
+    .unwrap();
+    assert_eq!(r, (1, 0));
+    assert!(load(fx.dir.path()).unwrap().devices[idx].grant.is_some());
+}
+
+#[test]
+fn secure_boot_variable_parsing() {
+    use super::tpm2::{SecureBootState, parse_secure_boot};
+    assert_eq!(
+        parse_secure_boot(&[6, 0, 0, 0, 1]),
+        SecureBootState::Enabled
+    );
+    assert_eq!(
+        parse_secure_boot(&[6, 0, 0, 0, 0]),
+        SecureBootState::Disabled
+    );
+    assert_eq!(
+        parse_secure_boot(&[6, 0, 0, 0, 2]),
+        SecureBootState::Unknown
+    );
+    assert_eq!(parse_secure_boot(&[1]), SecureBootState::Unknown);
+    assert_eq!(parse_secure_boot(&[]), SecureBootState::Unknown);
+}
+
+// ---------------------------------------------------------------------------
+// Home-device second factors, RPC-supplied authorization, unlock_home
+// ---------------------------------------------------------------------------
+
+const FACTOR_SECRET: [u8; 32] = [0xF7; 32];
+
+/// Provides a fixed passcode; never a PIN.
+struct Pc(&'static str);
+impl PinProvider for Pc {
+    fn pin(&self, _: &str) -> Result<zeroize::Zeroizing<String>, CryptoError> {
+        panic!("no PIN may be requested");
+    }
+    fn passcode(&self, _: &str) -> Result<zeroize::Zeroizing<String>, CryptoError> {
+        Ok(zeroize::Zeroizing::new(self.0.to_owned()))
+    }
+}
+
+/// Supplies an emergency code (or none) without touching the environment.
+struct CodeProvider(Option<String>);
+impl PinProvider for CodeProvider {
+    fn pin(&self, _: &str) -> Result<zeroize::Zeroizing<String>, CryptoError> {
+        panic!("no PIN may be requested");
+    }
+    fn emergency_code(&self) -> Result<Option<zeroize::Zeroizing<String>>, CryptoError> {
+        Ok(self.0.clone().map(zeroize::Zeroizing::new))
+    }
+}
+
+fn mk_ctx<'a>(t: &'a FixedTime, p: &'a DevicePolicy) -> Ctx<'a> {
+    Ctx {
+        time: t,
+        now_host: 1,
+        policy: p,
+        pins: &NoPins,
+    }
+}
+
+fn set_passcode(fx: &mut Fx, pw: &str) {
+    let (t, p) = ctx_parts();
+    let f = new_passcode_factor(pw, 8, 1, 1).unwrap();
+    set_home_factor(
+        fx.dir.path(),
+        &mut fx.reg,
+        "home",
+        Some(f),
+        &HOME_SECRET,
+        &fx.rmk,
+        &home(),
+        &mk_ctx(&t, &p),
+    )
+    .unwrap();
+    fx.persist();
+}
+
+fn unlock_with(fx: &mut Fx, secret: &[u8]) -> Result<Unlock, CryptoError> {
+    unlock_with_home(
+        fx.dir.path(),
+        &mut fx.reg,
+        0,
+        secret,
+        &FixedTime(Some(T0)),
+        &policy(),
+    )
+}
+
+fn fake_hmac(
+    params: &Fido2Params,
+    label: &str,
+    _: &dyn PinProvider,
+) -> Result<(SecretBuf, u32), CryptoError> {
+    assert_eq!(label, "away", "the referenced away record is the one asked");
+    assert_eq!(params.rp_id, "y2q.local");
+    Ok((SecretBuf::from_slice(&FACTOR_SECRET)?, 1))
+}
+
+fn other_hmac(
+    _: &Fido2Params,
+    _: &str,
+    _: &dyn PinProvider,
+) -> Result<(SecretBuf, u32), CryptoError> {
+    Ok((SecretBuf::from_slice(&[0x5A; 32])?, 1))
+}
+
+fn failing_hmac(
+    _: &Fido2Params,
+    _: &str,
+    _: &dyn PinProvider,
+) -> Result<(SecretBuf, u32), CryptoError> {
+    Err(CryptoError::DeviceBackend("token absent".to_owned()))
+}
+
+#[test]
+fn passcode_factor_gates_the_home_unwrap() {
+    let mut fx = home_fx();
+    // Factor-less: the raw TPM secret opens it, and `home_device_secret` passes it through.
+    let plain = home_device_secret(&fx.reg, 0, &HOME_SECRET, &NoPins).unwrap();
+    assert_eq!(&plain[..], &HOME_SECRET[..]);
+
+    set_passcode(&mut fx, "correct horse");
+    fx.reload();
+    assert!(matches!(
+        fx.reg.devices[0].home_factor,
+        Some(HomeFactor::Passcode { .. })
+    ));
+
+    // Right passcode: the combined secret opens RMK and NK.
+    let good = home_device_secret(&fx.reg, 0, &HOME_SECRET, &Pc("correct horse")).unwrap();
+    assert_eq!(good.len(), 32);
+    assert_ne!(&good[..], &HOME_SECRET[..]);
+    let u = unlock_with(&mut fx, &good).unwrap();
+    assert_eq!(*u.nk, fx.nk);
+    assert_eq!(*u.rmk, fx.rmk);
+
+    // Wrong passcode → a different combined secret → the wrap does not open.
+    let bad = home_device_secret(&fx.reg, 0, &HOME_SECRET, &Pc("battery staple")).unwrap();
+    assert!(matches!(
+        unlock_with(&mut fx, &bad),
+        Err(CryptoError::DeviceUnwrapFailed)
+    ));
+    // The factor byte is in the AAD: the factor-less TPM secret alone fails too.
+    assert!(matches!(
+        unlock_with(&mut fx, &HOME_SECRET),
+        Err(CryptoError::DeviceUnwrapFailed)
+    ));
+    // No passcode source → a Continue-class backend error, never a wrong-secret attempt.
+    assert!(matches!(
+        home_device_secret(&fx.reg, 0, &HOME_SECRET, &NoPins).err(),
+        Some(CryptoError::DeviceBackend(_))
+    ));
+    // A non-home index is refused.
+    let i = fx.add_fido("away", false, 5);
+    assert!(matches!(
+        home_device_secret(&fx.reg, i, &HOME_SECRET, &NoPins).err(),
+        Some(CryptoError::DeviceRegistryCorrupt { .. })
+    ));
+    // The home secret must itself be 32 bytes when a factor is present.
+    assert!(matches!(
+        home_device_secret(&fx.reg, 0, &[1u8; 31], &Pc("correct horse")).err(),
+        Some(CryptoError::DeviceSecretLength { len: 31, .. })
+    ));
+}
+
+#[test]
+fn factor_byte_is_in_the_wrap_aad_and_none_is_unchanged() {
+    let mut fx = home_fx();
+    let id = fx.reg.devices[0].id_bytes;
+    let esc = fx.reg.esc;
+    // No factor: byte-identical to the pre-factor encoding.
+    assert_eq!(
+        record_wrap_aad(&fx.reg.devices[0], &esc),
+        device_wrap_aad(&id, DeviceKind::Tpm2, false, &esc)
+    );
+    assert_eq!(record_wrap_aad(&fx.reg.devices[0], &esc)[36], 0);
+
+    set_passcode(&mut fx, "pw");
+    let with_pc = record_wrap_aad(&fx.reg.devices[0], &esc);
+    assert_eq!(with_pc[36], 1);
+    assert_eq!(with_pc.len(), 69);
+    assert_ne!(with_pc, device_wrap_aad(&id, DeviceKind::Tpm2, false, &esc));
+    // Only byte 36 differs.
+    let none = device_wrap_aad(&id, DeviceKind::Tpm2, false, &esc);
+    assert!(
+        with_pc
+            .iter()
+            .zip(none.iter())
+            .enumerate()
+            .all(|(i, (a, b))| (i == 36) == (a != b))
+    );
+
+    // KEK combination is domain- and device-separated.
+    let a = combine_home_secret(&HOME_SECRET, &FACTOR_SECRET, &[1; 16]).unwrap();
+    assert_eq!(
+        *a,
+        *combine_home_secret(&HOME_SECRET, &FACTOR_SECRET, &[1; 16]).unwrap()
+    );
+    assert_ne!(
+        *a,
+        *combine_home_secret(&HOME_SECRET, &FACTOR_SECRET, &[2; 16]).unwrap()
+    );
+    assert_ne!(
+        *a,
+        *combine_home_secret(&HOME_SECRET, &[0u8; 32], &[1; 16]).unwrap()
+    );
+}
+
+#[test]
+fn clearing_the_factor_reverts_to_the_plain_secret() {
+    let mut fx = home_fx();
+    set_passcode(&mut fx, "pw");
+    let (t, p) = ctx_parts();
+    set_home_factor(
+        fx.dir.path(),
+        &mut fx.reg,
+        "home",
+        None,
+        &HOME_SECRET,
+        &fx.rmk,
+        &emerg(),
+        &mk_ctx(&t, &p),
+    )
+    .unwrap();
+    fx.persist();
+    fx.reload();
+    assert!(fx.reg.devices[0].home_factor.is_none());
+    assert!(
+        !String::from_utf8(fx.bytes())
+            .unwrap()
+            .contains("home_factor")
+    );
+    let u = unlock_with(&mut fx, &HOME_SECRET).unwrap();
+    assert_eq!(*u.nk, fx.nk);
+}
+
+#[test]
+fn fido2_factor_uses_the_referenced_away_record() {
+    let mut fx = home_fx();
+    let away_idx = fx.add_fido("away", false, 5);
+    let away_id = fx.reg.devices[away_idx].id.clone();
+    let (t, p) = ctx_parts();
+    let ctx = mk_ctx(&t, &p);
+
+    // A reference to nothing, or to the home itself, is refused.
+    for bad in ["0".repeat(32), fx.reg.devices[0].id.clone()] {
+        let nf = NewHomeFactor {
+            factor: HomeFactor::Fido2 { device_id: bad },
+            secret: SecretBuf::from_slice(&FACTOR_SECRET).unwrap(),
+        };
+        let before = fx.reg.clone();
+        let r = set_home_factor(
+            fx.dir.path(),
+            &mut fx.reg,
+            "home",
+            Some(nf),
+            &HOME_SECRET,
+            &fx.rmk,
+            &home(),
+            &ctx,
+        );
+        assert!(matches!(r, Err(CryptoError::DeviceFactorInvalid(_))));
+        assert_eq!(
+            serde_json::to_string(&before).unwrap(),
+            serde_json::to_string(&fx.reg).unwrap(),
+            "a refused change leaves the registry untouched"
+        );
+    }
+
+    let nf = NewHomeFactor {
+        factor: HomeFactor::Fido2 {
+            device_id: away_id.clone(),
+        },
+        secret: SecretBuf::from_slice(&FACTOR_SECRET).unwrap(),
+    };
+    set_home_factor(
+        fx.dir.path(),
+        &mut fx.reg,
+        "home",
+        Some(nf),
+        &HOME_SECRET,
+        &fx.rmk,
+        &home(),
+        &ctx,
+    )
+    .unwrap();
+    fx.persist();
+    fx.reload();
+    assert_eq!(record_wrap_aad(&fx.reg.devices[0], &fx.reg.esc)[36], 2);
+
+    let good = home_device_secret_with(&fx.reg, 0, &HOME_SECRET, &NoPins, fake_hmac).unwrap();
+    assert_eq!(*u_nk(&mut fx, &good), fx.nk);
+    // A different token output does not open it.
+    let other = home_device_secret_with(&fx.reg, 0, &HOME_SECRET, &NoPins, other_hmac).unwrap();
+    assert!(matches!(
+        unlock_with(&mut fx, &other),
+        Err(CryptoError::DeviceUnwrapFailed)
+    ));
+    // A missing token is a Continue-class backend error.
+    assert!(matches!(
+        home_device_secret_with(&fx.reg, 0, &HOME_SECRET, &NoPins, failing_hmac).err(),
+        Some(CryptoError::DeviceBackend(_))
+    ));
+
+    // The referenced record cannot be removed while a home names it.
+    for by in [home(), emerg()] {
+        let r = remove_device(fx.dir.path(), &mut fx.reg, "away", &fx.rmk, &by, &ctx);
+        assert!(
+            matches!(&r, Err(CryptoError::DeviceFactorInUse { label }) if label == "away"),
+            "{r:?}"
+        );
+    }
+    assert_eq!(fx.reg.devices.len(), 2);
+    // Once the factor is cleared it can be.
+    set_home_factor(
+        fx.dir.path(),
+        &mut fx.reg,
+        "home",
+        None,
+        &HOME_SECRET,
+        &fx.rmk,
+        &home(),
+        &ctx,
+    )
+    .unwrap();
+    remove_device(fx.dir.path(), &mut fx.reg, "away", &fx.rmk, &home(), &ctx).unwrap();
+    assert_eq!(fx.reg.devices.len(), 1);
+}
+
+fn u_nk(fx: &mut Fx, secret: &[u8]) -> crate::crypto::devices::Key32 {
+    unlock_with(fx, secret).unwrap().nk
+}
+
+#[test]
+fn mac_and_aad_cover_the_factor() {
+    type Edit = Box<dyn Fn(&mut serde_json::Value)>;
+    let other_salt = STANDARD.encode([9u8; 16]);
+    type Case = (&'static str, Edit, fn(&CryptoError) -> bool);
+    let cases: Vec<Case> = vec![
+        (
+            "salt",
+            Box::new(move |v| {
+                v["devices"][0]["home_factor"]["salt_b64"] = other_salt.clone().into()
+            }),
+            |e| matches!(e, CryptoError::DeviceStateTampered),
+        ),
+        (
+            "m_cost",
+            Box::new(|v| v["devices"][0]["home_factor"]["m_cost_kib"] = 16.into()),
+            |e| matches!(e, CryptoError::DeviceStateTampered),
+        ),
+        (
+            "t_cost",
+            Box::new(|v| v["devices"][0]["home_factor"]["t_cost"] = 2.into()),
+            |e| matches!(e, CryptoError::DeviceStateTampered),
+        ),
+        (
+            "factor removed",
+            Box::new(|v| {
+                v["devices"][0]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("home_factor");
+            }),
+            |e| matches!(e, CryptoError::DeviceUnwrapFailed),
+        ),
+    ];
+    for (name, edit, expect) in cases {
+        let mut fx = home_fx();
+        set_passcode(&mut fx, "pw");
+        let secret = home_device_secret(&fx.reg, 0, &HOME_SECRET, &Pc("pw")).unwrap();
+        // Pristine control.
+        unlock_with(&mut fx, &secret).unwrap();
+        edit_json(fx.path(), edit);
+        fx.reload();
+        let before = fx.bytes();
+        let err = unlock_with(&mut fx, &secret).err().unwrap();
+        assert!(expect(&err), "{name}: {err:?}");
+        assert_eq!(before, fx.bytes(), "{name}: nothing written");
+    }
+
+    // Swapping the factor kind (passcode → fido2) changes the AAD byte.
+    let mut fx = home_fx();
+    let away_idx = fx.add_fido("away", false, 5);
+    let away_id = fx.reg.devices[away_idx].id.clone();
+    set_passcode(&mut fx, "pw");
+    let secret = home_device_secret(&fx.reg, 0, &HOME_SECRET, &Pc("pw")).unwrap();
+    edit_json(fx.path(), |v| {
+        v["devices"][0]["home_factor"] = serde_json::json!({"kind": "fido2", "device_id": away_id});
+    });
+    fx.reload();
+    assert!(matches!(
+        unlock_with(&mut fx, &secret),
+        Err(CryptoError::DeviceUnwrapFailed)
+    ));
+}
+
+#[test]
+fn new_passcode_factor_enforces_bounds() {
+    for (m, t, p) in [
+        (7u32, 1u32, 1u32),
+        (1_048_577, 1, 1),
+        (8, 0, 1),
+        (8, 17, 1),
+        (16, 1, 0),
+        (16, 1, 17),
+        (8, 1, 2), // below 8 KiB per lane
+    ] {
+        assert!(
+            matches!(
+                new_passcode_factor("pw", m, t, p).err(),
+                Some(CryptoError::DeviceFactorInvalid(_))
+            ),
+            "({m},{t},{p})"
+        );
+    }
+    assert!(matches!(
+        new_passcode_factor("", 8, 1, 1).err(),
+        Some(CryptoError::DeviceFactorInvalid(_))
+    ));
+    let f = new_passcode_factor("pw", 8, 1, 1).unwrap();
+    let HomeFactor::Passcode { salt_b64, .. } = &f.factor else {
+        panic!("expected a passcode factor");
+    };
+    assert_eq!(STANDARD.decode(salt_b64).unwrap().len(), 16);
+    // Same passcode and salt re-derive the same secret; another passcode does not.
+    let again = passcode_factor_secret(&f.factor, "pw").unwrap();
+    assert_eq!(&*again.unlock().unwrap(), &*f.secret.unlock().unwrap());
+    let wrong = passcode_factor_secret(&f.factor, "pW").unwrap();
+    assert_ne!(&*wrong.unlock().unwrap(), &*f.secret.unlock().unwrap());
+    // A fido2 factor is not a passcode.
+    assert!(matches!(
+        passcode_factor_secret(
+            &HomeFactor::Fido2 {
+                device_id: "0".repeat(32)
+            },
+            "pw"
+        )
+        .err(),
+        Some(CryptoError::DeviceFactorInvalid(_))
+    ));
+    assert_eq!(DEFAULT_PASSCODE_M_COST_KIB, 65_536);
+    assert_eq!(DEFAULT_PASSCODE_T_COST, 3);
+    assert_eq!(DEFAULT_PASSCODE_P_COST, 1);
+}
+
+#[test]
+fn load_rejects_bad_factors() {
+    type Edit = Box<dyn Fn(&mut serde_json::Value)>;
+    let hf = |f: &'static str, val: serde_json::Value| -> Edit {
+        Box::new(move |v| v["devices"][0]["home_factor"][f] = val.clone())
+    };
+    let cases: Vec<(&str, Edit)> = vec![
+        ("m too small", hf("m_cost_kib", 7.into())),
+        ("m too large", hf("m_cost_kib", 1_048_577.into())),
+        ("t zero", hf("t_cost", 0.into())),
+        ("t too large", hf("t_cost", 17.into())),
+        ("p zero", hf("p_cost", 0.into())),
+        ("p too large", hf("p_cost", 17.into())),
+        ("p above m/8", hf("p_cost", 2.into())),
+        ("short salt", hf("salt_b64", "AAAA".into())),
+        (
+            "fido2 factor, missing record",
+            Box::new(|v| {
+                v["devices"][0]["home_factor"] =
+                    serde_json::json!({"kind": "fido2", "device_id": "0".repeat(32)});
+            }),
+        ),
+        (
+            "fido2 factor, points at the home itself",
+            Box::new(|v| {
+                let id = v["devices"][0]["id"].clone();
+                v["devices"][0]["home_factor"] =
+                    serde_json::json!({"kind": "fido2", "device_id": id});
+            }),
+        ),
+    ];
+    for (name, edit) in cases {
+        let mut fx = home_fx();
+        set_passcode(&mut fx, "pw");
+        edit_json(fx.path(), edit);
+        let before = fx.bytes();
+        let err = load(fx.path()).err();
+        assert!(
+            matches!(err, Some(CryptoError::DeviceFactorInvalid(_))),
+            "{name}: {err:?}"
+        );
+        assert_eq!(before, fx.bytes());
+    }
+    // A factor on an away record is refused.
+    let fx = zero_home_fx();
+    edit_json(fx.path(), |v| {
+        v["devices"][0]["home_factor"] = serde_json::json!({"kind": "passcode", "salt_b64": STANDARD.encode([1u8; 16]), "m_cost_kib": 8, "t_cost": 1, "p_cost": 1});
+    });
+    assert!(matches!(
+        load(fx.path()).err(),
+        Some(CryptoError::DeviceFactorInvalid(_))
+    ));
+    // persist() refuses an invalid factor as well, writing nothing.
+    let mut fx = home_fx();
+    set_passcode(&mut fx, "pw");
+    let before = fx.bytes();
+    if let Some(HomeFactor::Passcode { m_cost_kib, .. }) = &mut fx.reg.devices[0].home_factor {
+        *m_cost_kib = 1;
+    }
+    let sk = fx.state_key();
+    assert!(matches!(
+        persist(fx.dir.path(), &mut fx.reg, &sk).err(),
+        Some(CryptoError::DeviceFactorInvalid(_))
+    ));
+    assert_eq!(before, fx.bytes());
+}
+
+#[test]
+fn set_home_factor_authority_and_target_rules() {
+    let mut fx = home_fx();
+    fx.add_fido("away", false, 5);
+    let (t, p) = ctx_parts();
+    let ctx = mk_ctx(&t, &p);
+    let mk = |pw: &str| Some(new_passcode_factor(pw, 8, 1, 1).unwrap());
+
+    // Away authority is refused, naming the operation.
+    let r = set_home_factor(
+        fx.dir.path(),
+        &mut fx.reg,
+        "home",
+        mk("x"),
+        &HOME_SECRET,
+        &fx.rmk,
+        &away(),
+        &ctx,
+    );
+    assert!(
+        matches!(&r, Err(CryptoError::DeviceAuthorityInsufficient { operation, .. }) if operation == "set-home-factor"),
+        "{r:?}"
+    );
+    assert!(fx.reg.devices[0].home_factor.is_none());
+
+    // Only a home record carries a factor.
+    assert!(matches!(
+        set_home_factor(
+            fx.dir.path(),
+            &mut fx.reg,
+            "away",
+            mk("x"),
+            &HOME_SECRET,
+            &fx.rmk,
+            &home(),
+            &ctx
+        ),
+        Err(CryptoError::DeviceFactorInvalid(_))
+    ));
+    assert!(matches!(
+        set_home_factor(
+            fx.dir.path(),
+            &mut fx.reg,
+            "nope",
+            mk("x"),
+            &HOME_SECRET,
+            &fx.rmk,
+            &home(),
+            &ctx
+        ),
+        Err(CryptoError::DeviceNotFound(_))
+    ));
+    assert!(matches!(
+        set_home_factor(
+            fx.dir.path(),
+            &mut fx.reg,
+            "home",
+            mk("x"),
+            &[1u8; 31],
+            &fx.rmk,
+            &home(),
+            &ctx
+        ),
+        Err(CryptoError::DeviceSecretLength { len: 31, .. })
+    ));
+
+    // Home and Emergency may set it; the registry then still unlocks with the combined secret.
+    for by in [home(), emerg()] {
+        set_home_factor(
+            fx.dir.path(),
+            &mut fx.reg,
+            "HOME",
+            mk("pw"),
+            &HOME_SECRET,
+            &fx.rmk,
+            &by,
+            &ctx,
+        )
+        .unwrap();
+        fx.persist();
+        fx.reload();
+        // Each install draws a fresh salt; the passcode re-derives against the stored one.
+        let s = home_device_secret(&fx.reg, 0, &HOME_SECRET, &Pc("pw")).unwrap();
+        assert_eq!(*u_nk(&mut fx, &s), fx.nk);
+    }
+}
+
+#[test]
+fn unlock_home_skips_away_records_and_never_prompts_for_a_pin() {
+    // No TPM is reachable in tests, so the home record fails with a Continue-class
+    // error; the away record is never attempted (NoPins::pin would panic).
+    let mut fx = home_fx();
+    fx.add_fido("away", true, 5);
+    let before = fx.bytes();
+    let err = super::unlock_home(fx.path(), &policy(), &NoPins, &PanicTime, 1)
+        .err()
+        .unwrap();
+    match err {
+        CryptoError::DeviceUnlockUnavailable(reason) => {
+            assert!(reason.contains("home:"), "{reason}");
+            assert!(!reason.contains("away"), "{reason}");
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+    assert_eq!(before, fx.bytes());
+
+    // A registry with no home device at all.
+    let fx = zero_home_fx();
+    let err = super::unlock_home(fx.path(), &policy(), &NoPins, &PanicTime, 1)
+        .err()
+        .unwrap();
+    assert!(
+        matches!(&err, CryptoError::DeviceUnlockUnavailable(r) if r == "no home devices registered"),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn emergency_code_comes_from_the_pin_provider_not_the_environment() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let fx = home_fx();
+    // Make sure the environment offers nothing.
+    // SAFETY: serialised by ENV_LOCK.
+    unsafe { std::env::remove_var(EMERGENCY_KEY_ENV_VAR) };
+
+    // Whitespace around the printed code is tolerated.
+    let provider = CodeProvider(Some(format!("  {}\n", fx.codes[4])));
+    let out = super::unlock(fx.path(), &policy(), &provider, &PanicTime, 55).unwrap();
+    assert_eq!(*out.node_key, fx.nk);
+    assert!(matches!(out.authority, Authority::Emergency { index: 4 }));
+    assert_eq!(out.emergency_slots_unused, 9);
+    assert!(std::env::var_os(EMERGENCY_KEY_ENV_VAR).is_none());
+
+    // Burned: the same code no longer opens a slot, and with no TPM nothing else does.
+    let again = super::unlock(fx.path(), &policy(), &provider, &PanicTime, 56)
+        .err()
+        .unwrap();
+    assert!(matches!(again, CryptoError::DeviceUnlockUnavailable(_)));
+
+    // A malformed code is fatal, as an operator who supplied one meant it.
+    let bad = CodeProvider(Some("not a code".to_owned()));
+    assert!(matches!(
+        super::unlock(fx.path(), &policy(), &bad, &PanicTime, 57).err(),
+        Some(CryptoError::EmergencyCodeMalformed(_))
+    ));
+
+    // No code supplied: straight to hardware.
+    let none = CodeProvider(None);
+    assert!(matches!(
+        super::unlock(fx.path(), &policy(), &none, &PanicTime, 58).err(),
+        Some(CryptoError::DeviceUnlockUnavailable(_))
+    ));
+
+    // The default provider takes the variable out of the environment and maps bad UTF-8.
+    use std::os::unix::ffi::OsStrExt as _;
+    // SAFETY: serialised by ENV_LOCK.
+    unsafe {
+        std::env::set_var(
+            EMERGENCY_KEY_ENV_VAR,
+            std::ffi::OsStr::from_bytes(&[0xff, 0xfe]),
+        )
+    };
+    assert!(matches!(
+        NoPins.emergency_code().err(),
+        Some(CryptoError::EmergencyCodeMalformed(_))
+    ));
+    assert!(std::env::var_os(EMERGENCY_KEY_ENV_VAR).is_none());
+    assert!(NoPins.emergency_code().unwrap().is_none());
 }

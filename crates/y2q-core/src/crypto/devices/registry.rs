@@ -25,6 +25,7 @@ use aes_gcm::{
     Aes256Gcm, KeyInit,
     aead::{Aead, Payload},
 };
+use argon2::{Algorithm, Argon2, Params, Version};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
@@ -36,6 +37,7 @@ use zeroize::Zeroizing;
 use super::types::*;
 use super::{devices_path, fido2, tpm2};
 use crate::crypto::CryptoError;
+use crate::secmem::SecretBuf;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -60,6 +62,23 @@ pub(crate) const TMP_FILE: &str = "devices.json.tmp";
 /// Upper bound on records, so the state MAC's `u16` count can never overflow.
 const MAX_DEVICES: usize = 4096;
 
+/// Default Argon2id memory cost for a home passcode factor (KiB).
+pub const DEFAULT_PASSCODE_M_COST_KIB: u32 = 65_536;
+/// Default Argon2id iteration count for a home passcode factor.
+pub const DEFAULT_PASSCODE_T_COST: u32 = 3;
+/// Default Argon2id parallelism for a home passcode factor.
+pub const DEFAULT_PASSCODE_P_COST: u32 = 1;
+/// Accepted passcode memory cost range (KiB).
+const PASSCODE_M_COST_RANGE: std::ops::RangeInclusive<u32> = 8..=1_048_576;
+/// Accepted passcode iteration-count range.
+const PASSCODE_T_COST_RANGE: std::ops::RangeInclusive<u32> = 1..=16;
+/// Accepted passcode parallelism range.
+const PASSCODE_P_COST_RANGE: std::ops::RangeInclusive<u32> = 1..=16;
+/// Length of the Argon2id salt of a passcode factor, in bytes.
+const PASSCODE_SALT_LEN: usize = 16;
+/// HKDF salt of the home-device KEK input `tpm_secret || factor_secret`.
+const HOME_FACTOR_SALT: &[u8] = b"y2q/v1/home-factor";
+
 // ---------------------------------------------------------------------------
 // AAD builders
 // ---------------------------------------------------------------------------
@@ -71,11 +90,23 @@ fn kind_byte(kind: DeviceKind) -> u8 {
     }
 }
 
-/// `label || 0x00 || device_id[16] || kind_byte || uv_byte || ESC[32]` = 69 bytes.
-pub(crate) fn device_wrap_aad(
+/// Factor byte of a `Tpm2` record's wrap AAD: 0 none, 1 passcode, 2 fido2.
+fn factor_byte(factor: Option<&HomeFactor>) -> u8 {
+    match factor {
+        None => 0,
+        Some(HomeFactor::Passcode { .. }) => 1,
+        Some(HomeFactor::Fido2 { .. }) => 2,
+    }
+}
+
+/// `label || 0x00 || device_id[16] || kind_byte || selector_byte || ESC[32]` = 69 bytes.
+/// `selector_byte` is the `uv` byte for a `Fido2` record and the factor byte
+/// for a `Tpm2` record (0 for a factor-less one, which is byte-identical to
+/// the pre-factor encoding).
+pub(crate) fn device_wrap_aad_raw(
     device_id: &[u8; 16],
     kind: DeviceKind,
-    uv_required: bool,
+    selector_byte: u8,
     esc: &[u8; 32],
 ) -> [u8; DEVICE_WRAP_AAD_LEN] {
     let mut a = [0u8; DEVICE_WRAP_AAD_LEN];
@@ -83,9 +114,29 @@ pub(crate) fn device_wrap_aad(
     a[18] = 0;
     a[19..35].copy_from_slice(device_id);
     a[35] = kind_byte(kind);
-    a[36] = u8::from(uv_required);
+    a[36] = selector_byte;
     a[37..69].copy_from_slice(esc);
     a
+}
+
+/// [`device_wrap_aad_raw`] with the `uv` byte: the AAD of a factor-less record.
+pub(crate) fn device_wrap_aad(
+    device_id: &[u8; 16],
+    kind: DeviceKind,
+    uv_required: bool,
+    esc: &[u8; 32],
+) -> [u8; DEVICE_WRAP_AAD_LEN] {
+    device_wrap_aad_raw(device_id, kind, u8::from(uv_required), esc)
+}
+
+/// The wrap AAD of `d` as currently recorded: the `uv` byte for a `Fido2`
+/// record, the factor byte for a `Tpm2` record.
+pub(crate) fn record_wrap_aad(d: &DeviceRecord, esc: &[u8; 32]) -> [u8; DEVICE_WRAP_AAD_LEN] {
+    let selector = match d.kind {
+        DeviceKind::Tpm2 => factor_byte(d.home_factor.as_ref()),
+        DeviceKind::Fido2 => u8::from(d.fido2.as_ref().is_some_and(|f| f.uv_required)),
+    };
+    device_wrap_aad_raw(&d.id_bytes, d.kind, selector, esc)
 }
 
 /// `label || 0x00 || device_id[16] || uv_byte || u64_le(not_after) || u32_le(secs) || ESC[32]` = 79 bytes.
@@ -250,6 +301,39 @@ fn sha256_wrap(w: &Wrap) -> [u8; 32] {
     h.finalize().into()
 }
 
+/// Append the canonical encoding of a home factor to the MAC input. The leading
+/// marker is >= 0x80, so it cannot be mistaken for the label-length byte
+/// (<= 64) that follows a record's parameters: a factor-less record encodes
+/// exactly as before, and the two cases are unambiguous. Variable fields are
+/// length-prefixed.
+fn encode_home_factor(b: &mut Vec<u8>, f: &HomeFactor) {
+    match f {
+        HomeFactor::Passcode {
+            salt_b64,
+            m_cost_kib,
+            t_cost,
+            p_cost,
+        } => {
+            b.push(0x81);
+            b.extend_from_slice(
+                &u16::try_from(salt_b64.len())
+                    .unwrap_or(u16::MAX)
+                    .to_le_bytes(),
+            );
+            b.extend_from_slice(salt_b64.as_bytes());
+            b.extend_from_slice(&m_cost_kib.to_le_bytes());
+            b.extend_from_slice(&t_cost.to_le_bytes());
+            b.extend_from_slice(&p_cost.to_le_bytes());
+        }
+        HomeFactor::Fido2 { device_id } => {
+            b.push(0x82);
+            // `check` rejects a malformed reference before any MAC is computed or
+            // compared; the zero fallback is unreachable for a validated registry.
+            b.extend_from_slice(&decode_hex_id(device_id).unwrap_or([0u8; 16]));
+        }
+    }
+}
+
 /// `HMAC-SHA256(state_key, canonical_state_bytes)` over every mutable field.
 ///
 /// `esc_b64` is outside the MAC because all five AADs bind ESC, so editing it
@@ -298,6 +382,9 @@ pub(crate) fn state_mac(state_key: &[u8; 32], reg: &DeviceRegistryFile) -> [u8; 
                     b.extend_from_slice(t.pcr_bank.as_bytes());
                     b.push(u8::try_from(t.pcr_slots.len()).unwrap_or(u8::MAX));
                     b.extend_from_slice(&t.pcr_slots);
+                }
+                if let Some(f) = &d.home_factor {
+                    encode_home_factor(&mut b, f);
                 }
             }
             DeviceKind::Fido2 => {
@@ -517,9 +604,18 @@ pub(crate) fn check(reg: &DeviceRegistryFile, path: &Path) -> Result<(), CryptoE
                         format!("home device {} carries away-only fields", d.id),
                     ));
                 }
+                if let Some(f) = &d.home_factor {
+                    check_home_factor(reg, d, f)?;
+                }
             }
             // 9.
             DeviceKind::Fido2 => {
+                if d.home_factor.is_some() {
+                    return Err(CryptoError::DeviceFactorInvalid(format!(
+                        "away device {} carries a home factor; only home devices may",
+                        d.id
+                    )));
+                }
                 if d.sign_count_last.is_none() || d.kek_wrap.is_none() {
                     return Err(corrupt(
                         path,
@@ -652,6 +748,46 @@ pub fn persist(
         ))
     })?;
     fsync_dir(dir)
+}
+
+/// File name of the registry lock inside the keystore directory.
+pub const LOCK_FILE: &str = ".devices.lock";
+
+/// Try to take the exclusive registry lock (`<dir>/.devices.lock`).
+///
+/// Held across a whole read-modify-write: the key agent's sweep and every
+/// mutating CLI command take it, so neither can overwrite the other's
+/// changes. `Ok(None)` means another process holds it. The lock file is
+/// created mode 0600, so every registry-touching process must run as the
+/// registry's owner.
+pub fn try_lock_registry(dir: &Path) -> Result<Option<fs::File>, CryptoError> {
+    let path = dir.join(LOCK_FILE);
+    let f = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .open(&path)
+        .map_err(|e| CryptoError::DeviceRegistryIo(format!("open lock {}: {e}", path.display())))?;
+    match f.try_lock() {
+        Ok(()) => Ok(Some(f)),
+        Err(fs::TryLockError::WouldBlock) => Ok(None),
+        Err(fs::TryLockError::Error(e)) => Err(CryptoError::DeviceRegistryIo(format!(
+            "lock {}: {e}",
+            path.display()
+        ))),
+    }
+}
+
+/// Like [`try_lock_registry`], but contention is an error.
+pub fn lock_registry(dir: &Path) -> Result<fs::File, CryptoError> {
+    try_lock_registry(dir)?.ok_or_else(|| {
+        CryptoError::DeviceRegistryIo(format!(
+            "device registry is busy: another y2q process (the key agent or a device command) holds {}",
+            dir.join(LOCK_FILE).display()
+        ))
+    })
 }
 
 /// Whether a registry file exists in `dir`.
@@ -817,13 +953,7 @@ fn rmk_from_permanent(
         .wrap
         .as_ref()
         .ok_or_else(|| corrupt(path, format!("device {} has no permanent wrap", d.id)))?;
-    let uv = d.fido2.as_ref().is_some_and(|f| f.uv_required);
-    unwrap_secret(
-        kek,
-        wrap,
-        &device_wrap_aad(&d.id_bytes, d.kind, uv, &reg.esc),
-        path,
-    )
+    unwrap_secret(kek, wrap, &record_wrap_aad(d, &reg.esc), path)
 }
 
 /// Home unlock: unwrap RMK from the TPM record, verify the state MAC, then
@@ -980,6 +1110,13 @@ pub fn sweep_now(
     time: &dyn TimeSource,
 ) -> Result<(usize, usize), CryptoError> {
     let path = devices_path(dir);
+    // The CLI holds this lock across a whole command, so a tick that lands
+    // mid-command is skipped rather than racing it (a lost update could
+    // resurrect a removed device).
+    let Some(_lock) = try_lock_registry(dir)? else {
+        tracing::debug!("grant sweep skipped: device registry is locked by another process");
+        return Ok((0, 0));
+    };
     let mut reg = load(dir)?;
     if let Err(e) = verify_state_mac(state_key, &reg, &path) {
         tracing::warn!(error = %e, "grant sweep skipped: registry state does not authenticate");
@@ -1022,6 +1159,9 @@ pub struct Ctx<'a> {
     pub now_host: u64,
     /// Hardware access policy.
     pub policy: &'a DevicePolicy,
+    /// Supplies passcodes and PINs for operations that re-derive a home
+    /// device's secret (`reseal-tpm`).
+    pub pins: &'a dyn PinProvider,
 }
 
 /// Enroll a freshly provisioned device. In-memory only. Returns the new id.
@@ -1105,6 +1245,7 @@ pub fn enroll_device(
         fido2: None,
         sign_count_last: None,
         kek_wrap: None,
+        home_factor: None,
         id_bytes,
     };
     match new.kind {
@@ -1215,6 +1356,14 @@ pub fn remove_device(
     if reg.devices[idx].kind == DeviceKind::Tpm2 && home_count(reg) == 1 {
         return Err(CryptoError::DeviceLastHomeRemovalRefused { label });
     }
+    if reg.devices[idx].kind == DeviceKind::Fido2
+        && reg
+            .devices
+            .iter()
+            .any(|h| matches!(&h.home_factor, Some(HomeFactor::Fido2 { device_id }) if *device_id == reg.devices[idx].id))
+    {
+        return Err(CryptoError::DeviceFactorInUse { label });
+    }
     reg.devices.remove(idx);
     reg.permanent_away = home_count(reg) == 0 && !reg.devices.is_empty();
     Ok(())
@@ -1318,17 +1467,290 @@ pub fn reseal_device(
     let (new_params, new_secret) = tpm2::reseal(&params, &ctx.policy.tpm_tcti)?;
     let guard = new_secret.unlock()?;
     secret32(&reg.devices[idx].label, &guard)?;
+    // A record with a second factor re-wraps RMK under the same factor, so the
+    // factor secret is re-derived (prompting through `ctx.pins`).
+    let device_secret = home_device_secret(reg, idx, &guard, ctx.pins)?;
     let d = &reg.devices[idx];
-    let kek = derive_device_kek(&guard, &d.id_bytes)?;
-    let wrap = wrap_secret(
-        &kek,
-        rmk,
-        &device_wrap_aad(&d.id_bytes, DeviceKind::Tpm2, false, &reg.esc),
-    )?;
+    let kek = derive_device_kek(&device_secret, &d.id_bytes)?;
+    let wrap = wrap_secret(&kek, rmk, &record_wrap_aad(d, &reg.esc))?;
     let _ = dir;
     let d = &mut reg.devices[idx];
     d.tpm2 = Some(new_params);
     d.wrap = Some(wrap);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Home-device second factors
+// ---------------------------------------------------------------------------
+
+/// Validate a passcode factor's salt and Argon2id costs (the bounds enforced by
+/// [`new_passcode_factor`] and [`check`]).
+fn validate_passcode_params(
+    salt_b64: &str,
+    m_cost_kib: u32,
+    t_cost: u32,
+    p_cost: u32,
+) -> Result<(), CryptoError> {
+    let invalid = |why: String| CryptoError::DeviceFactorInvalid(why);
+    match STANDARD.decode(salt_b64) {
+        Ok(s) if s.len() == PASSCODE_SALT_LEN => {}
+        _ => {
+            return Err(invalid(format!(
+                "passcode salt must be {PASSCODE_SALT_LEN} bytes of standard base64"
+            )));
+        }
+    }
+    if !PASSCODE_M_COST_RANGE.contains(&m_cost_kib) {
+        return Err(invalid(format!(
+            "passcode memory cost {m_cost_kib} KiB is outside {}..={}",
+            PASSCODE_M_COST_RANGE.start(),
+            PASSCODE_M_COST_RANGE.end()
+        )));
+    }
+    if !PASSCODE_T_COST_RANGE.contains(&t_cost) {
+        return Err(invalid(format!(
+            "passcode time cost {t_cost} is outside {}..={}",
+            PASSCODE_T_COST_RANGE.start(),
+            PASSCODE_T_COST_RANGE.end()
+        )));
+    }
+    if !PASSCODE_P_COST_RANGE.contains(&p_cost) {
+        return Err(invalid(format!(
+            "passcode parallelism {p_cost} is outside {}..={}",
+            PASSCODE_P_COST_RANGE.start(),
+            PASSCODE_P_COST_RANGE.end()
+        )));
+    }
+    if m_cost_kib < 8 * p_cost {
+        return Err(invalid(format!(
+            "passcode memory cost {m_cost_kib} KiB is below the 8 KiB per lane Argon2 minimum for parallelism {p_cost}"
+        )));
+    }
+    Ok(())
+}
+
+/// Structural check of one home record's factor against the whole registry.
+fn check_home_factor(
+    reg: &DeviceRegistryFile,
+    home: &DeviceRecord,
+    factor: &HomeFactor,
+) -> Result<(), CryptoError> {
+    match factor {
+        HomeFactor::Passcode {
+            salt_b64,
+            m_cost_kib,
+            t_cost,
+            p_cost,
+        } => validate_passcode_params(salt_b64, *m_cost_kib, *t_cost, *p_cost),
+        HomeFactor::Fido2 { device_id } => match reg.devices.iter().find(|r| r.id == *device_id) {
+            Some(r) if r.kind == DeviceKind::Fido2 => Ok(()),
+            Some(_) => Err(CryptoError::DeviceFactorInvalid(format!(
+                "home device {} names {device_id} as its factor, which is not an away device",
+                home.id
+            ))),
+            None => Err(CryptoError::DeviceFactorInvalid(format!(
+                "home device {} names {device_id} as its factor, which is not registered",
+                home.id
+            ))),
+        },
+    }
+}
+
+/// Derive a fresh passcode factor: a random 16-byte salt and the Argon2id
+/// output of `passcode` under it. Costs outside the accepted bounds (m
+/// 8..=1048576 KiB, t 1..=16, p 1..=16) are `DeviceFactorInvalid`.
+pub fn new_passcode_factor(
+    passcode: &str,
+    m_cost_kib: u32,
+    t_cost: u32,
+    p_cost: u32,
+) -> Result<NewHomeFactor, CryptoError> {
+    if passcode.is_empty() {
+        return Err(CryptoError::DeviceFactorInvalid(
+            "passcode must not be empty".to_owned(),
+        ));
+    }
+    let mut salt = [0u8; PASSCODE_SALT_LEN];
+    rand::rng().fill_bytes(&mut salt);
+    let factor = HomeFactor::Passcode {
+        salt_b64: STANDARD.encode(salt),
+        m_cost_kib,
+        t_cost,
+        p_cost,
+    };
+    let secret = passcode_factor_secret(&factor, passcode)?;
+    Ok(NewHomeFactor { factor, secret })
+}
+
+/// The 32-byte Argon2id output of `passcode` under a `Passcode` factor's salt
+/// and costs.
+pub fn passcode_factor_secret(
+    factor: &HomeFactor,
+    passcode: &str,
+) -> Result<SecretBuf, CryptoError> {
+    let HomeFactor::Passcode {
+        salt_b64,
+        m_cost_kib,
+        t_cost,
+        p_cost,
+    } = factor
+    else {
+        return Err(CryptoError::DeviceFactorInvalid(
+            "factor is not a passcode".to_owned(),
+        ));
+    };
+    validate_passcode_params(salt_b64, *m_cost_kib, *t_cost, *p_cost)?;
+    let salt = STANDARD
+        .decode(salt_b64)
+        .map_err(|e| CryptoError::DeviceFactorInvalid(format!("passcode salt base64: {e}")))?;
+    let params = Params::new(*m_cost_kib, *t_cost, *p_cost, Some(32))
+        .map_err(|e| CryptoError::DeviceFactorInvalid(format!("argon2 parameters: {e}")))?;
+    let mut out = Zeroizing::new([0u8; 32]);
+    Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
+        .hash_password_into(passcode.as_bytes(), &salt, &mut *out)
+        .map_err(|e| CryptoError::Kdf(format!("passcode derivation: {e}")))?;
+    Ok(SecretBuf::from_slice(&*out)?)
+}
+
+/// `HKDF-SHA256(ikm = tpm_secret || factor_secret, salt = "y2q/v1/home-factor",
+/// info = device_id)`: the secret a factored home record's KEK is derived from.
+pub(crate) fn combine_home_secret(
+    tpm_secret: &[u8],
+    factor_secret: &[u8],
+    device_id: &[u8; 16],
+) -> Result<Key32, CryptoError> {
+    let mut ikm = Zeroizing::new(Vec::with_capacity(tpm_secret.len() + factor_secret.len()));
+    ikm.extend_from_slice(tpm_secret);
+    ikm.extend_from_slice(factor_secret);
+    hkdf32(&ikm, HOME_FACTOR_SALT, device_id)
+}
+
+/// Signature of the FIDO2 `hmac-secret` step used to obtain a `Fido2` factor.
+/// A function pointer so tests can inject a synthetic authenticator.
+pub(crate) type HmacSecretFn =
+    fn(&Fido2Params, &str, &dyn PinProvider) -> Result<(SecretBuf, u32), CryptoError>;
+
+/// The secret `KEK_device` of the home record at `index` is derived from,
+/// given the raw unsealed TPM secret.
+///
+/// With no `home_factor` this is `tpm_secret` itself (copied); otherwise the
+/// combined `tpm_secret || factor_secret` secret (see [`combine_home_secret`]),
+/// the factor coming from `pins.passcode(label)` or from the referenced away
+/// record's `hmac-secret` (which may prompt for that token's PIN through
+/// `pins`). Returned as a zeroizing byte vector so both cases share one type.
+pub fn home_device_secret(
+    reg: &DeviceRegistryFile,
+    index: usize,
+    tpm_secret: &[u8],
+    pins: &dyn PinProvider,
+) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
+    home_device_secret_with(reg, index, tpm_secret, pins, fido2::hmac_secret)
+}
+
+pub(crate) fn home_device_secret_with(
+    reg: &DeviceRegistryFile,
+    index: usize,
+    tpm_secret: &[u8],
+    pins: &dyn PinProvider,
+    hmac: HmacSecretFn,
+) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
+    let d = &reg.devices[index];
+    if d.kind != DeviceKind::Tpm2 {
+        return Err(corrupt(
+            Path::new(super::DEVICES_FILE),
+            format!("device {} is not a home device", d.label),
+        ));
+    }
+    let Some(factor) = &d.home_factor else {
+        return Ok(Zeroizing::new(tpm_secret.to_vec()));
+    };
+    secret32(&d.label, tpm_secret)?;
+    let factor_secret: SecretBuf = match factor {
+        HomeFactor::Passcode { .. } => {
+            let passcode = pins.passcode(&d.label)?;
+            passcode_factor_secret(factor, &passcode)?
+        }
+        HomeFactor::Fido2 { device_id } => {
+            let away = reg
+                .devices
+                .iter()
+                .find(|r| r.id == *device_id && r.kind == DeviceKind::Fido2)
+                .ok_or_else(|| {
+                    CryptoError::DeviceFactorInvalid(format!(
+                        "home device {} names {device_id} as its factor, which is not a registered away device",
+                        d.label
+                    ))
+                })?;
+            let params = away.fido2.as_ref().ok_or_else(|| {
+                corrupt(
+                    Path::new(super::DEVICES_FILE),
+                    format!("away device {} has no fido2 parameters", away.id),
+                )
+            })?;
+            hmac(params, &away.label, pins)?.0
+        }
+    };
+    let guard = factor_secret.unlock()?;
+    let combined = combine_home_secret(tpm_secret, &guard, &d.id_bytes)?;
+    Ok(Zeroizing::new(combined.to_vec()))
+}
+
+/// Install (`Some`) or clear (`None`) the second factor of the home record
+/// selected by `home_selector`, re-wrapping RMK under the new KEK (the factor
+/// byte is in the AAD). `tpm_secret` is the raw unsealed TPM secret of that
+/// record. Home or Emergency authority only. In-memory only; the caller
+/// persists.
+#[allow(clippy::too_many_arguments)] // mirrors the other mutators plus the factor and secret
+pub fn set_home_factor(
+    _dir: &Path,
+    reg: &mut DeviceRegistryFile,
+    home_selector: &str,
+    factor: Option<NewHomeFactor>,
+    tpm_secret: &[u8],
+    rmk: &[u8; 32],
+    by: &Authority,
+    _ctx: &Ctx<'_>,
+) -> Result<(), CryptoError> {
+    if !matches!(by, Authority::Home { .. } | Authority::Emergency { .. }) {
+        return Err(insufficient(
+            "set-home-factor",
+            "a home device or an emergency code",
+            by,
+        ));
+    }
+    let idx = resolve_selector(reg, home_selector)?;
+    let (label, id_bytes, kind) = {
+        let d = &reg.devices[idx];
+        (d.label.clone(), d.id_bytes, d.kind)
+    };
+    if kind != DeviceKind::Tpm2 {
+        return Err(CryptoError::DeviceFactorInvalid(format!(
+            "device '{label}' is not a home device; only home devices carry a second factor"
+        )));
+    }
+    secret32(&label, tpm_secret)?;
+    if let Some(nf) = &factor {
+        check_home_factor(reg, &reg.devices[idx], &nf.factor)?;
+    }
+    let device_secret: Zeroizing<Vec<u8>> = match &factor {
+        None => Zeroizing::new(tpm_secret.to_vec()),
+        Some(nf) => {
+            let guard = nf.secret.unlock()?;
+            Zeroizing::new(combine_home_secret(tpm_secret, &guard, &id_bytes)?.to_vec())
+        }
+    };
+    let kek = derive_device_kek(&device_secret, &id_bytes)?;
+    let aad = device_wrap_aad_raw(
+        &id_bytes,
+        DeviceKind::Tpm2,
+        factor_byte(factor.as_ref().map(|f| &f.factor)),
+        &reg.esc,
+    );
+    let wrap = wrap_secret(&kek, rmk, &aad)?;
+    let d = &mut reg.devices[idx];
+    d.wrap = Some(wrap);
+    d.home_factor = factor.map(|f| f.factor);
     Ok(())
 }
 
@@ -1391,7 +1813,8 @@ pub fn repair_state_entry(
                 tpm2::unseal(&params, &policy.tpm_tcti)
                     .and_then(|s| {
                         let g = s.unlock()?;
-                        unlock_for_repair(dir, &reg, i, &g)
+                        let secret = home_device_secret(&reg, i, &g, pins)?;
+                        unlock_for_repair(dir, &reg, i, &secret)
                     })
                     .map(|k| {
                         (

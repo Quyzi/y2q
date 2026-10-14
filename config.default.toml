@@ -229,6 +229,53 @@ tpm_tcti = "device:/dev/tpmrm0"
 # away grants on each tick. 60 .. 86400.
 grant_timer_interval_seconds = 900
 
+# Key helper (privilege separation). Helper mode isolates the TPM / FIDO2 unseal,
+# devices.json and the Registry Master Key from the network-facing daemon uid.
+# No resident process holds RMK: a systemd socket unit (`Accept=yes`) spawns a
+# fresh `y2qd --key-serve` per connection, as the key-owner uid (TPM / hidraw
+# access, owns devices.json). It handles exactly one request and exits.
+#
+#   arm   (peer uid = key_agent_arm_uid, default root): stores ONE-TIME
+#         authorization (passcode, FIDO2 PIN, emergency code) in
+#         <key_agent_state_dir>/armed. Unattended hosts arm with empty
+#         authorization from `ExecStartPre=+y2qd --key-arm` before every daemon
+#         start; attended hosts (a home device with a second factor) arm
+#         interactively: `y2qd --key-arm --prompt-passcode|--prompt-pin|
+#         --prompt-emergency-code` sends the secret over the socket, never via
+#         an environment variable or a file.
+#   fetch (peer uid = key_agent_peer_uid, the daemon's uid): the helper consumes
+#         the armed file (every attempt deletes it), unlocks the registry with
+#         that material and returns the node key once. A fetch without a prior
+#         arm is refused, so a compromised daemon uid can connect but cannot
+#         re-fetch the node key or RMK.
+#
+# `y2qd --key-sweep` (run from a systemd timer) refreshes / sweeps away grants
+# through an unattended home unlock. A home device with a second factor cannot
+# be unlocked unattended: the sweep then logs and exits 0, and grants are
+# refreshed at arm+boot unlocks and by `y2q admin device refresh`.
+#
+# Operator-supplied node keys still take precedence over the helper.
+# An EMPTY socket (the default) is the legacy in-process mode: the daemon itself
+# holds hardware access and RMK and keeps the grant timer, so anything running
+# as the daemon uid can repeat the unseal. This is the weaker mode; use it only
+# when a second uid is not available. The daemon still receives one transient
+# raw node-key copy at boot in either mode, and root on the live host defeats
+# both.
+# Must be an absolute path. Set it identically for the daemon, the helper and
+# the arm client.
+key_agent_socket = ""
+# The only uid a `fetch` is served to (the daemon's uid). Required by --key-serve.
+# key_agent_peer_uid = 990
+# The only uid an `arm` is accepted from. Default 0 (root).
+key_agent_arm_uid = 0
+# Directory for the armed authorization. Must be absolute, exist, be owned by
+# the helper's uid and have mode 0700 (systemd: RuntimeDirectory=y2q-keyd,
+# RuntimeDirectoryMode=0700 on the helper's service gives /run/y2q-keyd).
+key_agent_state_dir = "/run/y2q-keyd"
+# Daemon-side read/write timeout for the helper exchange, in seconds; it must
+# cover an interactive touch / PIN on the helper. 5 .. 900.
+key_agent_timeout_seconds = 180
+
 [crypto.devices.roughtime]
 # Attested time for away-device grants. There is no host-clock fallback.
 # min_responses is the number of independent servers that must answer.

@@ -39,9 +39,9 @@ mod imp {
 
     use y2q_core::crypto::CryptoError;
     use y2q_core::crypto::devices::{
-        self, Authority, DeviceKind, DevicePolicy, DeviceRecord, DeviceRegistryFile, PinProvider,
-        RoughtimeConfig, RoughtimeServer, TimeSource, UnlockOutcome, fido2, now_unix, registry,
-        roughtime, tpm2,
+        self, Authority, DeviceKind, DevicePolicy, DeviceRecord, DeviceRegistryFile, HomeFactor,
+        PinProvider, RoughtimeConfig, RoughtimeServer, TimeSource, UnlockOutcome, fido2, now_unix,
+        registry, roughtime, tpm2,
     };
     use y2q_core::crypto::devices::{MAX_AWAY_GRANT_SECONDS, MIN_AWAY_GRANT_SECONDS};
     use y2q_core::crypto::{keystore, node_key};
@@ -55,7 +55,14 @@ mod imp {
     const ATTESTATION_REFUSAL: &str = "a home device implies away grants, which require attested time: no Roughtime server answered — configure servers and verify with `y2q admin device check-time` first";
 
     fn cerr(e: CryptoError) -> CliError {
-        CliError::Other(e.to_string())
+        match e {
+            CryptoError::DeviceRegistryIo(msg) if msg.contains("Permission denied") => {
+                CliError::Other(format!(
+                    "device registry io: {msg}; device commands must run as the registry owner (the user that owns devices.json, normally the key-agent user, e.g. `sudo -u y2q-keyd y2q admin device ...`)"
+                ))
+            }
+            e => CliError::Other(e.to_string()),
+        }
     }
 
     fn harden() -> Result<(), CliError> {
@@ -72,13 +79,62 @@ mod imp {
         })
     }
 
-    /// PIN prompts on the controlling terminal; never from a flag or the environment.
+    /// Exclusive registry lock (`.devices.lock`), held until the returned `File` drops.
+    /// The key agent's periodic sweep takes the same lock, so neither side can
+    /// overwrite the other's changes.
+    fn registry_lock(dir: &Path) -> Result<File, CliError> {
+        registry::lock_registry(dir).map_err(|e| match e {
+            CryptoError::DeviceRegistryIo(msg) if msg.contains("busy") => CliError::Other(format!(
+                "{msg}; retry in a moment (the key agent holds the lock only for a few seconds per sweep) or check for another running y2q device command"
+            )),
+            e => cerr(e),
+        })
+    }
+
+    /// Decide whether a PCR-7 policy may be sealed. PCR 7 only separates a trusted boot
+    /// chain from any other bootable medium when Secure Boot is enforcing.
+    fn secure_boot_decision(
+        state: tpm2::SecureBootState,
+        pcrs: &[u8],
+        allow_off: bool,
+    ) -> Result<(), String> {
+        if !pcrs.contains(&7) || allow_off {
+            return Ok(());
+        }
+        let what = match state {
+            tpm2::SecureBootState::Enabled => return Ok(()),
+            tpm2::SecureBootState::Disabled => "Secure Boot is disabled",
+            tpm2::SecureBootState::Unknown => {
+                "the Secure Boot state is unknown (non-UEFI boot, or efivarfs is unavailable)"
+            }
+        };
+        Err(format!(
+            "refusing to bind the TPM policy to PCR 7: {what}. PCR 7 only separates a trusted boot chain from any other bootable medium when Secure Boot is enforcing, so without it anyone who can boot another OS on this host can unseal the key. Enable Secure Boot, or pass --allow-secure-boot-off to accept a PCR-7 policy that any bootable medium can satisfy (test rigs only)"
+        ))
+    }
+
+    fn secure_boot_precheck(pcrs: &[u8], allow_off: bool) -> Result<(), CliError> {
+        let state = if pcrs.contains(&7) && !allow_off {
+            tpm2::secure_boot_state()
+        } else {
+            tpm2::SecureBootState::Enabled
+        };
+        secure_boot_decision(state, pcrs, allow_off).map_err(CliError::Other)
+    }
+
+    /// PIN and passcode prompts on the controlling terminal; never from a flag or
+    /// the environment. Emergency codes keep the trait default (environment).
     struct CliPins;
 
     impl PinProvider for CliPins {
         fn pin(&self, label: &str) -> Result<Zeroizing<String>, CryptoError> {
             crate::cmd::auth::prompt_password(&format!("PIN for away device '{label}': "))
                 .map_err(|e| CryptoError::DeviceBackend(format!("pin prompt: {e}")))
+        }
+
+        fn passcode(&self, label: &str) -> Result<Zeroizing<String>, CryptoError> {
+            crate::cmd::auth::prompt_password(&format!("Passcode for home device '{label}': "))
+                .map_err(|e| CryptoError::DeviceBackend(format!("passcode prompt: {e}")))
         }
     }
 
@@ -134,7 +190,22 @@ mod imp {
         }
     }
 
-    fn inventory_row(d: &DeviceRecord, now: u64) -> Vec<String> {
+    /// The `FACTOR` column: `-` (none), `passcode`, or `fido2:<label of the away
+    /// record>` (the raw id when that record is no longer registered).
+    fn factor_column<'a>(
+        factor: Option<&HomeFactor>,
+        label_of: &dyn Fn(&str) -> Option<&'a str>,
+    ) -> String {
+        match factor {
+            None => "-".to_owned(),
+            Some(HomeFactor::Passcode { .. }) => "passcode".to_owned(),
+            Some(HomeFactor::Fido2 { device_id }) => {
+                format!("fido2:{}", label_of(device_id).unwrap_or(device_id))
+            }
+        }
+    }
+
+    fn inventory_row(d: &DeviceRecord, reg: &DeviceRegistryFile, now: u64) -> Vec<String> {
         let (valid_until, remaining) = match &d.grant {
             Some(g) => (
                 fmt_ts(g.not_after_unix),
@@ -146,6 +217,9 @@ mod imp {
             d.id.clone(),
             d.label.clone(),
             kind_str(d.kind).to_owned(),
+            factor_column(d.home_factor.as_ref(), &|id| {
+                find_record(reg, id).map(|r| r.label.as_str())
+            }),
             access_of(d).to_owned(),
             valid_until,
             remaining,
@@ -169,10 +243,11 @@ mod imp {
         ]
     }
 
-    const INVENTORY_HEADERS: [&str; 10] = [
+    const INVENTORY_HEADERS: [&str; 11] = [
         "ID",
         "LABEL",
         "KIND",
+        "FACTOR",
         "ACCESS",
         "VALID-UNTIL",
         "REMAINING",
@@ -189,7 +264,7 @@ mod imp {
                 .devices
                 .iter()
                 .map(|d| {
-                    let r = inventory_row(d, now);
+                    let r = inventory_row(d, reg, now);
                     let mut m = serde_json::Map::new();
                     for (h, v) in INVENTORY_HEADERS.iter().zip(r) {
                         m.insert(h.to_lowercase(), serde_json::Value::String(v));
@@ -201,8 +276,11 @@ mod imp {
         } else if reg.devices.is_empty() {
             println!("No devices registered; only the emergency codes can unlock this deployment");
         } else {
-            let rows: Vec<Vec<String>> =
-                reg.devices.iter().map(|d| inventory_row(d, now)).collect();
+            let rows: Vec<Vec<String>> = reg
+                .devices
+                .iter()
+                .map(|d| inventory_row(d, reg, now))
+                .collect();
             print_table(&INVENTORY_HEADERS, &rows);
         }
     }
@@ -291,8 +369,10 @@ mod imp {
         Ok(())
     }
 
-    /// Everything a mutating command holds while it works.
+    /// Everything a mutating command holds while it works. Field order is drop order:
+    /// the registry lock is released before the keystore lock.
     struct Session {
+        _reg_lock: File,
         _lock: File,
         out: UnlockOutcome,
         policy: DevicePolicy,
@@ -302,6 +382,7 @@ mod imp {
     fn open(dir: &Path, tcti: &str, rt: &RoughtimeArgs) -> Result<Session, CliError> {
         let cfg = roughtime_cfg(rt)?;
         let _lock = lock(dir)?;
+        let _reg_lock = registry_lock(dir)?;
         harden()?;
         let policy = DevicePolicy {
             tpm_tcti: tcti.to_owned(),
@@ -316,6 +397,7 @@ mod imp {
         })?;
         Ok(Session {
             _lock,
+            _reg_lock,
             out,
             policy,
             time,
@@ -349,6 +431,7 @@ mod imp {
                 permanent_away,
                 adopt_existing_node_key,
                 node_key_file,
+                allow_secure_boot_off,
                 roughtime,
             } => init(InitArgs {
                 dir: &keystore_dir,
@@ -363,6 +446,7 @@ mod imp {
                 permanent_away,
                 adopt: adopt_existing_node_key,
                 node_key_file: node_key_file.as_deref(),
+                allow_secure_boot_off,
                 roughtime: &roughtime,
             }),
             DeviceCmd::AddTpm {
@@ -370,8 +454,16 @@ mod imp {
                 label,
                 tpm_tcti,
                 pcrs,
+                allow_secure_boot_off,
                 roughtime,
-            } => add_tpm(&keystore_dir, label, &tpm_tcti, &pcrs, &roughtime),
+            } => add_tpm(
+                &keystore_dir,
+                label,
+                &tpm_tcti,
+                &pcrs,
+                allow_secure_boot_off,
+                &roughtime,
+            ),
             DeviceCmd::AddFido2 {
                 keystore_dir,
                 label,
@@ -402,8 +494,37 @@ mod imp {
                 keystore_dir,
                 id,
                 tpm_tcti,
+                allow_secure_boot_off,
                 roughtime,
-            } => reseal(&keystore_dir, &id, &tpm_tcti, &roughtime),
+            } => reseal(
+                &keystore_dir,
+                &id,
+                &tpm_tcti,
+                allow_secure_boot_off,
+                &roughtime,
+            ),
+            DeviceCmd::SetHomeFactor {
+                keystore_dir,
+                selector,
+                tpm_tcti,
+                passcode,
+                fido2,
+                none: _,
+                passcode_m_cost_kib,
+                passcode_t_cost,
+                passcode_p_cost,
+                roughtime,
+            } => set_home_factor(SetFactorArgs {
+                dir: &keystore_dir,
+                selector: &selector,
+                tcti: &tpm_tcti,
+                passcode,
+                fido2: fido2.as_deref(),
+                m_cost_kib: passcode_m_cost_kib,
+                t_cost: passcode_t_cost,
+                p_cost: passcode_p_cost,
+                rt: &roughtime,
+            }),
             DeviceCmd::Refresh {
                 keystore_dir,
                 tpm_tcti,
@@ -444,6 +565,7 @@ mod imp {
         permanent_away: bool,
         adopt: bool,
         node_key_file: Option<&'a Path>,
+        allow_secure_boot_off: bool,
         roughtime: &'a RoughtimeArgs,
     }
 
@@ -460,8 +582,12 @@ mod imp {
                 seconds: a.away_grant_seconds,
             }));
         }
+        if a.tpm {
+            secure_boot_precheck(a.pcrs, a.allow_secure_boot_off)?;
+        }
         let rt_cfg = roughtime_cfg(a.roughtime)?;
         let _lock = lock(a.dir)?;
+        let _reg_lock = registry_lock(a.dir)?;
         harden()?;
         if registry::exists(a.dir) {
             return Err(cerr(CryptoError::DeviceRegistryExists(
@@ -553,10 +679,13 @@ mod imp {
         label: String,
         tcti: &str,
         pcrs: &[u8],
+        allow_secure_boot_off: bool,
         rt: &RoughtimeArgs,
     ) -> Result<(), CliError> {
+        secure_boot_precheck(pcrs, allow_secure_boot_off)?;
         let Session {
             _lock,
+            _reg_lock,
             mut out,
             policy,
             time,
@@ -582,6 +711,7 @@ mod imp {
             time: &time as &dyn TimeSource,
             now_host: now_unix(),
             policy: &policy,
+            pins: &CliPins,
         };
         let id = registry::enroll_device(
             dir,
@@ -613,6 +743,7 @@ mod imp {
     ) -> Result<(), CliError> {
         let Session {
             _lock,
+            _reg_lock,
             mut out,
             policy,
             time,
@@ -634,6 +765,7 @@ mod imp {
             time: &time as &dyn TimeSource,
             now_host: now_unix(),
             policy: &policy,
+            pins: &CliPins,
         };
         let id = registry::enroll_device(
             dir,
@@ -657,6 +789,7 @@ mod imp {
     fn remove(dir: &Path, selector: &str, tcti: &str, rt: &RoughtimeArgs) -> Result<(), CliError> {
         let Session {
             _lock,
+            _reg_lock,
             mut out,
             policy,
             time,
@@ -665,6 +798,7 @@ mod imp {
             time: &time as &dyn TimeSource,
             now_host: now_unix(),
             policy: &policy,
+            pins: &CliPins,
         };
         registry::remove_device(
             dir,
@@ -688,9 +822,16 @@ mod imp {
         })
     }
 
-    fn reseal(dir: &Path, selector: &str, tcti: &str, rt: &RoughtimeArgs) -> Result<(), CliError> {
+    fn reseal(
+        dir: &Path,
+        selector: &str,
+        tcti: &str,
+        allow_secure_boot_off: bool,
+        rt: &RoughtimeArgs,
+    ) -> Result<(), CliError> {
         let Session {
             _lock,
+            _reg_lock,
             mut out,
             policy,
             time,
@@ -708,6 +849,10 @@ mod imp {
                 t.pcr_bank.clone(),
             )
         });
+        // The check follows the record's STORED selection: resealing to PCR 7 is as
+        // weak as sealing to it when Secure Boot is not enforcing.
+        let stored_slots: &[u8] = rec.tpm2.as_ref().map_or(&[], |t| &t.pcr_slots);
+        secure_boot_precheck(stored_slots, allow_secure_boot_off)?;
         if let Some((slots, bank)) = &pcrs {
             println!(
                 "resealing '{}' to the current values of PCRs [{slots}] (bank {bank}); check this against the intended selection",
@@ -718,6 +863,7 @@ mod imp {
             time: &time as &dyn TimeSource,
             now_host: now_unix(),
             policy: &policy,
+            pins: &CliPins,
         };
         registry::reseal_device(
             dir,
@@ -733,9 +879,128 @@ mod imp {
         Ok(())
     }
 
+    /// A passcode entered twice must match and must not be empty.
+    fn check_passcode_pair(first: &str, second: &str) -> Result<(), String> {
+        if first.is_empty() {
+            return Err("the passcode must not be empty".to_owned());
+        }
+        if first != second {
+            return Err("the two passcodes do not match".to_owned());
+        }
+        Ok(())
+    }
+
+    struct SetFactorArgs<'a> {
+        dir: &'a Path,
+        selector: &'a str,
+        tcti: &'a str,
+        passcode: bool,
+        fido2: Option<&'a str>,
+        m_cost_kib: u32,
+        t_cost: u32,
+        p_cost: u32,
+        rt: &'a RoughtimeArgs,
+    }
+
+    /// Install (`--passcode`, `--fido2`) or clear (neither) the second factor of a
+    /// TPM home device.
+    fn set_home_factor(a: SetFactorArgs<'_>) -> Result<(), CliError> {
+        let Session {
+            _lock,
+            _reg_lock,
+            mut out,
+            policy,
+            time,
+        } = open(a.dir, a.tcti, a.rt)?;
+        let rec = find_record(&out.registry, a.selector)
+            .ok_or_else(|| cerr(CryptoError::DeviceNotFound(a.selector.to_owned())))?;
+        let (home_id, home_label) = (rec.id.clone(), rec.label.clone());
+        let Some(tpm_params) = rec.tpm2.clone().filter(|_| rec.kind == DeviceKind::Tpm2) else {
+            return Err(CliError::Other(format!(
+                "device '{home_label}' is not a home (TPM) device; only a home device carries a second factor"
+            )));
+        };
+        let old = factor_column(rec.home_factor.as_ref(), &|id| {
+            find_record(&out.registry, id).map(|r| r.label.as_str())
+        });
+
+        let tpm_secret = tpm2::unseal(&tpm_params, a.tcti).map_err(cerr)?;
+        let tpm_guard = tpm_secret.unlock().map_err(|e| cerr(e.into()))?;
+
+        let new = if a.passcode {
+            let first = crate::cmd::auth::prompt_password(&format!(
+                "New passcode for home device '{home_label}': "
+            ))?;
+            let second = crate::cmd::auth::prompt_password("Repeat the passcode: ")?;
+            check_passcode_pair(&first, &second).map_err(CliError::Other)?;
+            Some(
+                registry::new_passcode_factor(&first, a.m_cost_kib, a.t_cost, a.p_cost)
+                    .map_err(cerr)?,
+            )
+        } else if let Some(sel) = a.fido2 {
+            let away = find_record(&out.registry, sel)
+                .ok_or_else(|| cerr(CryptoError::DeviceNotFound(sel.to_owned())))?;
+            let params = away
+                .fido2
+                .clone()
+                .filter(|_| away.kind == DeviceKind::Fido2)
+                .ok_or_else(|| {
+                    CliError::Other(format!(
+                        "device '{}' is not a FIDO2 away device; the second factor must be a registered away device",
+                        away.label
+                    ))
+                })?;
+            let (away_id, away_label) = (away.id.clone(), away.label.clone());
+            let (secret, _) = fido2::hmac_secret(&params, &away_label, &CliPins).map_err(cerr)?;
+            Some(devices::NewHomeFactor {
+                factor: devices::HomeFactor::Fido2 { device_id: away_id },
+                secret,
+            })
+        } else {
+            None
+        };
+        let has_factor = new.is_some();
+
+        let ctx = registry::Ctx {
+            time: &time as &dyn TimeSource,
+            now_host: now_unix(),
+            policy: &policy,
+            pins: &CliPins,
+        };
+        registry::set_home_factor(
+            a.dir,
+            &mut out.registry,
+            &home_id,
+            new,
+            &tpm_guard,
+            &out.registry_master_key,
+            &out.authority,
+            &ctx,
+        )
+        .map_err(cerr)?;
+        persist(a.dir, &mut out)?;
+
+        let new_label = find_record(&out.registry, &home_id).map_or_else(
+            || "-".to_owned(),
+            |r| {
+                factor_column(r.home_factor.as_ref(), &|id| {
+                    find_record(&out.registry, id).map(|x| x.label.as_str())
+                })
+            },
+        );
+        println!("home device '{home_label}' ({home_id}): second factor {old} -> {new_label}");
+        if has_factor {
+            println!(
+                "warning: the node can no longer boot unattended. Arm each start with `y2qd --key-arm --prompt-passcode` or `--prompt-pin`. The grant sweep timer can no longer re-mint away grants for this home device: grants refresh at attended boots and with `y2q admin device refresh`."
+            );
+        }
+        Ok(())
+    }
+
     fn refresh(dir: &Path, tcti: &str, rt: &RoughtimeArgs) -> Result<(), CliError> {
         let Session {
             _lock,
+            _reg_lock,
             mut out,
             policy,
             time,
@@ -744,6 +1009,7 @@ mod imp {
             time: &time as &dyn TimeSource,
             now_host: now_unix(),
             policy: &policy,
+            pins: &CliPins,
         };
         let n = registry::refresh_grants(
             dir,
@@ -775,6 +1041,7 @@ mod imp {
     ) -> Result<(), CliError> {
         let Session {
             _lock,
+            _reg_lock,
             mut out,
             policy,
             time,
@@ -784,6 +1051,7 @@ mod imp {
             time: &time as &dyn TimeSource,
             now_host: now_unix(),
             policy: &policy,
+            pins: &CliPins,
         };
         registry::set_grant_period(
             dir,
@@ -812,6 +1080,7 @@ mod imp {
         mode: OutputMode,
     ) -> Result<(), CliError> {
         let _lock = lock(dir)?;
+        let _reg_lock = registry_lock(dir)?;
         harden()?;
         let reg = registry::load(dir).map_err(cerr)?;
         println!("repair-state will apply these rules:");
@@ -896,11 +1165,136 @@ mod imp {
         }
 
         #[test]
+        fn secure_boot_decision_matrix() {
+            use tpm2::SecureBootState::{Disabled, Enabled, Unknown};
+            for state in [Enabled, Disabled, Unknown] {
+                for pcrs in [&[7u8][..], &[0, 4, 7][..], &[0, 4][..]] {
+                    for allow in [false, true] {
+                        let refused = secure_boot_decision(state, pcrs, allow).is_err();
+                        let expect = state != Enabled && pcrs.contains(&7) && !allow;
+                        assert_eq!(refused, expect, "{state:?} {pcrs:?} allow={allow}");
+                    }
+                }
+            }
+            let msg = secure_boot_decision(Disabled, &[7], false).unwrap_err();
+            assert!(msg.contains("disabled") && msg.contains("--allow-secure-boot-off"));
+            let msg = secure_boot_decision(Unknown, &[7], false).unwrap_err();
+            assert!(msg.contains("unknown"));
+        }
+
+        #[test]
         fn remaining_and_timestamps() {
             assert_eq!(fmt_remaining(100, 100), "~expired");
             assert_eq!(fmt_remaining(50, 100), "~expired");
             assert_eq!(fmt_remaining(130, 100), "~30s");
             assert_eq!(fmt_ts(0), "1970-01-01T00:00:00Z");
+        }
+
+        #[test]
+        fn reseal_precheck_uses_stored_slots() {
+            use tpm2::SecureBootState::{Disabled, Enabled, Unknown};
+            // A record sealed to PCR 7 is refused when Secure Boot is not enforcing...
+            assert!(secure_boot_decision(Disabled, &[7], false).is_err());
+            assert!(secure_boot_decision(Unknown, &[0, 4, 7], false).is_err());
+            // ...unless explicitly allowed, or Secure Boot is on.
+            assert!(secure_boot_decision(Disabled, &[7], true).is_ok());
+            assert!(secure_boot_decision(Enabled, &[7], false).is_ok());
+            // A record that never bound PCR 7 is never refused, whatever the state.
+            assert!(secure_boot_decision(Disabled, &[0, 4], false).is_ok());
+            // The precheck the command runs: stored slots, with the state probe skipped
+            // when the selection does not include PCR 7.
+            assert!(secure_boot_precheck(&[0, 4], false).is_ok());
+            assert!(secure_boot_precheck(&[7], true).is_ok());
+        }
+
+        #[test]
+        fn factor_column_formats() {
+            let lookup = |id: &str| (id == "aa").then_some("away-key1");
+            assert_eq!(factor_column(None, &lookup), "-");
+            let pass = HomeFactor::Passcode {
+                salt_b64: String::new(),
+                m_cost_kib: 8,
+                t_cost: 1,
+                p_cost: 1,
+            };
+            assert_eq!(factor_column(Some(&pass), &lookup), "passcode");
+            let f = HomeFactor::Fido2 {
+                device_id: "aa".to_owned(),
+            };
+            assert_eq!(factor_column(Some(&f), &lookup), "fido2:away-key1");
+            let gone = HomeFactor::Fido2 {
+                device_id: "bb".to_owned(),
+            };
+            assert_eq!(factor_column(Some(&gone), &lookup), "fido2:bb");
+        }
+
+        #[test]
+        fn passcode_confirmation_rules() {
+            assert!(check_passcode_pair("correct horse", "correct horse").is_ok());
+            assert!(check_passcode_pair("a", "b").is_err());
+            assert!(check_passcode_pair("", "").is_err());
+        }
+
+        #[test]
+        fn cli_defaults_match_core_passcode_costs() {
+            use clap::Parser as _;
+            let cli = crate::cli::Cli::try_parse_from([
+                "y2q",
+                "admin",
+                "device",
+                "set-home-factor",
+                "--keystore-dir",
+                "/k",
+                "home",
+                "--passcode",
+            ])
+            .unwrap();
+            let Some(crate::cli::Commands::Admin {
+                cmd:
+                    crate::cli::AdminCmd::Device {
+                        cmd:
+                            DeviceCmd::SetHomeFactor {
+                                passcode_m_cost_kib,
+                                passcode_t_cost,
+                                passcode_p_cost,
+                                ..
+                            },
+                    },
+            }) = cli.command
+            else {
+                panic!("not set-home-factor");
+            };
+            assert_eq!(passcode_m_cost_kib, registry::DEFAULT_PASSCODE_M_COST_KIB);
+            assert_eq!(passcode_t_cost, registry::DEFAULT_PASSCODE_T_COST);
+            assert_eq!(passcode_p_cost, registry::DEFAULT_PASSCODE_P_COST);
+        }
+
+        #[test]
+        fn set_home_factor_flags_are_exclusive() {
+            use clap::Parser as _;
+            let parse = |extra: &[&str]| {
+                let mut args = vec![
+                    "y2q",
+                    "admin",
+                    "device",
+                    "set-home-factor",
+                    "--keystore-dir",
+                    "/k",
+                    "home",
+                ];
+                args.extend_from_slice(extra);
+                crate::cli::Cli::try_parse_from(args)
+            };
+            assert!(parse(&["--passcode"]).is_ok());
+            assert!(parse(&["--fido2", "away-key1"]).is_ok());
+            assert!(parse(&["--none"]).is_ok());
+            assert!(parse(&[]).is_err());
+            assert!(parse(&["--passcode", "--none"]).is_err());
+            assert!(parse(&["--passcode", "--fido2", "k"]).is_err());
+            assert!(parse(&["--fido2", "k", "--none"]).is_err());
+            assert!(parse(&["--none", "--passcode-t-cost", "2"]).is_err());
+            assert!(parse(&["--fido2", "k", "--passcode-m-cost-kib", "8"]).is_err());
+            assert!(parse(&["--passcode", "--passcode-t-cost", "2"]).is_ok());
         }
     }
 }

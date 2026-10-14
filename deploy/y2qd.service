@@ -1,20 +1,39 @@
 [Unit]
 Description=y2qd post-quantum secure storage daemon
 Documentation=https://github.com/Quyzi/y2q
-After=network.target
+After=network.target y2q-keyd.socket
 Wants=network.target
+# The node key is fetched once at boot from a one-shot helper (y2q-keyd@.service,
+# socket-activated). This daemon has no TPM, no hidraw and no access to devices.json.
+# Remove the next line (and set `key_agent_socket = ""`) only for the weaker legacy
+# in-process mode or an operator-key (Y2QD_NODE_KEY) deployment.
+Requires=y2q-keyd.socket
+# Keep the restart budget small so a persistently failing unlock does not loop.
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
+# Unattended arm as root before EVERY start: stores empty one-time authorization that the
+# helper consumes on the fetch. Hosts whose home device has a second factor (passcode or
+# FIDO2 PIN) MUST remove this line (drop-in override: `ExecStartPre=` clears it) and an
+# operator arms interactively first:
+#   sudo y2qd --key-arm --prompt-passcode --prompt-pin ; systemctl start y2qd
+# The armed file is consumed by every fetch, so on such hosts a crash restart fails until
+# an operator re-arms.
+ExecStartPre=+/usr/local/bin/y2qd --key-arm --config /etc/y2q/config.toml
 ExecStart=/usr/local/bin/y2qd --config /etc/y2q/config.toml
 Restart=on-failure
 RestartSec=5s
 
 User=y2qd
-Group=y2qd
+Group=y2q
+# keystore_dir is group-shared (mode 1770, group y2q); y2qd owns users.redb/keystore.json,
+# y2q-keyd owns devices.json and .devices.lock (0600). The .lock flock file is
+# pre-created group-writable by deploy/y2q-keyd.tmpfiles.conf.
 
 # Filesystem isolation
-UMask=0027
+UMask=0077
 StateDirectory=y2q
 StateDirectoryMode=0750
 ConfigurationDirectory=y2q
@@ -25,37 +44,22 @@ CapabilityBoundingSet=
 AmbientCapabilities=
 NoNewPrivileges=true
 
-# Namespace isolation
+# Namespace isolation. No TPM or hidraw: PrivateDevices hides them on purpose.
 PrivateTmp=true
-# Device unlock needs the TPM resource manager and the FIDO2 HID node. PrivateDevices=
-# would hide both (it mounts a private /dev with pseudo-devices only), so it is replaced
-# by a closed device policy plus an explicit allowlist.
-DevicePolicy=closed
-DeviceAllow=/dev/tpmrm0 rw
-# A TPM-only deployment that never registers an away device omits the next line.
-# It admits every hidraw node to the cgroup device policy; the udev DAC rule
-# deploy/70-y2q-fido2.rules (install as /etc/udev/rules.d/70-y2q-fido2.rules) is the
-# real gate, because hotplugged nodes cannot be covered by BindPaths=.
-DeviceAllow=char-hidraw rw
-SupplementaryGroups=tss
-# Roughtime is outbound UDP. ProtectSystem/IPAddressDeny are untouched here, but a unit that
-# adds IPAddressAllow= must include the configured Roughtime servers or every away unlock
-# on this host fails closed.
-# Authenticator PIN for away-device unlock, when a device is registered with uv_required.
-# Supply it as Y2QD_FIDO2_PIN from a source outside keystore_dir, or enter it at the prompt.
-# Interactive entry is the default. A PIN file inside keystore_dir, or on the same medium as
-# the registry, defeats the joint-theft protection, so none is shown here.
-# User= and Group= must name a non-root account. SupplementaryGroups=tss is the only group grant.
+PrivateDevices=true
 ProtectHome=true
 ProtectSystem=strict
 ReadWritePaths=/var/lib/y2q
+ProtectProc=invisible
+ProcSubset=pid
 
 # Syscall filtering. `memfd_secret` is not in `@system-service` (or any
 # other systemd syscall group); without an explicit allow the filter
 # returns EPERM and guarded-memory startup refuses to boot.
+# ~@debug blocks ptrace and process_vm_readv against this daemon's siblings.
 SystemCallFilter=@system-service
 SystemCallFilter=memfd_secret
-SystemCallFilter=~@privileged @resources
+SystemCallFilter=~@privileged @resources @debug
 SystemCallErrorNumber=EPERM
 
 # Secretmem pages are charged to RLIMIT_MEMLOCK at mmap. A zero or tiny
@@ -65,9 +69,16 @@ LimitMEMLOCK=infinity
 # Misc hardening
 LockPersonality=true
 MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 RestrictNamespaces=true
 RestrictRealtime=true
 RestrictSUIDSGID=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
 RemoveIPC=true
 
 [Install]

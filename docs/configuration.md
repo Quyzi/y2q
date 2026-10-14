@@ -123,6 +123,11 @@ Only consulted when `<keystore_dir>/devices.json` exists and the binary was buil
 |---|---|---|---|
 | `tpm_tcti` | string | `"device:/dev/tpmrm0"` | TCTI string used to reach the TPM 2.0. Must not be empty or whitespace. |
 | `grant_timer_interval_seconds` | u64 | `900` | How often the daemon sweeps expired away grants. On a daemon whose boot authority was a home device, the same tick re-mints away grants. Bounds `60` .. `86400`. |
+| `key_agent_socket` | string | `""` | Absolute path of the key socket (`/run/y2q-keyd.sock`, `y2q-keyd.socket`, `Accept=yes`). Non-empty: the daemon fetches NK once from a socket-activated one-shot helper (`y2qd --key-serve`, uid `y2q-keyd`) that was armed by root (`y2qd --key-arm`); the daemon never holds RMK or touches the TPM or `devices.json` (it does hold one transient raw NK copy). Empty: **legacy in-process mode**, where the daemon itself unlocks, holds RMK and TPM access and runs the grant timer - weaker, since a compromised daemon uid can re-run the unseal. |
+| `key_agent_arm_uid` | u32 | `0` | The only peer uid the helper accepts for `arm` (root by default). |
+| `key_agent_peer_uid` | u32 | *(none)* | The only peer uid the helper serves a `fetch` to (the daemon's uid). No default: when unset, the helper refuses every fetch. |
+| `key_agent_state_dir` | string | `/run/y2q-keyd` | tmpfs directory (mode 0700, owned by the helper uid) holding the one-time armed file (must be absolute); created by `deploy/y2q-keyd.tmpfiles.conf`. |
+| `key_agent_timeout_seconds` | u64 | `180` | Daemon-side read/write timeout for the key helper exchange; covers an interactive touch/PIN on the helper. Bounds `5` .. `900`. |
 | `roughtime` | table | *(see below)* | Attested-time source. There is no host-clock fallback. |
 
 ### `[crypto.devices.roughtime]`

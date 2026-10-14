@@ -5691,6 +5691,7 @@ dependencies = [
  "flume",
  "futures-util",
  "hmac",
+ "libc",
  "metrics",
  "metrics-exporter-prometheus",
  "rand 0.10.2",

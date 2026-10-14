@@ -436,6 +436,29 @@ pub struct DevicesConfig {
     /// Seconds between grant sweeps / re-mints. 60 ..= 86400.
     #[serde(default = "default_grant_timer_interval_seconds")]
     pub grant_timer_interval_seconds: u64,
+    /// Unix socket of the key helper (`y2qd --key-serve`, socket-activated by
+    /// systemd with `Accept=yes`). Non-empty selects helper mode: the daemon
+    /// fetches the node key once at boot and never touches the TPM, FIDO2 or
+    /// `devices.json`. Empty = legacy in-process device mode, where the daemon
+    /// itself holds hardware access and RMK (the weaker mode). Must be an
+    /// absolute path.
+    #[serde(default)]
+    pub key_agent_socket: String,
+    /// The only uid the helper serves a `fetch` to (the daemon's uid). Required
+    /// by `--key-serve`.
+    #[serde(default)]
+    pub key_agent_peer_uid: Option<u32>,
+    /// The only uid the helper accepts an `arm` from. Default 0 (root).
+    #[serde(default)]
+    pub key_agent_arm_uid: u32,
+    /// Directory (tmpfs, mode 0700, owned by the helper's uid) holding the
+    /// one-time armed authorization. Default `/run/y2q-keyd`. Must be absolute.
+    #[serde(default = "default_key_agent_state_dir")]
+    pub key_agent_state_dir: String,
+    /// Daemon-side read/write timeout for the key helper exchange, in seconds
+    /// (covers an interactive touch/PIN on the helper). 5 ..= 900.
+    #[serde(default = "default_key_agent_timeout_seconds")]
+    pub key_agent_timeout_seconds: u64,
     /// Roughtime servers used for attested time.
     #[serde(default)]
     pub roughtime: RoughtimeTomlConfig,
@@ -447,12 +470,23 @@ fn default_tpm_tcti() -> String {
 fn default_grant_timer_interval_seconds() -> u64 {
     900
 }
+fn default_key_agent_timeout_seconds() -> u64 {
+    180
+}
+fn default_key_agent_state_dir() -> String {
+    "/run/y2q-keyd".to_string()
+}
 
 impl Default for DevicesConfig {
     fn default() -> Self {
         Self {
             tpm_tcti: default_tpm_tcti(),
             grant_timer_interval_seconds: default_grant_timer_interval_seconds(),
+            key_agent_socket: String::new(),
+            key_agent_peer_uid: None,
+            key_agent_arm_uid: 0,
+            key_agent_state_dir: default_key_agent_state_dir(),
+            key_agent_timeout_seconds: default_key_agent_timeout_seconds(),
             roughtime: RoughtimeTomlConfig::default(),
         }
     }
@@ -536,6 +570,17 @@ fn validate_devices(cfg: &DevicesConfig) -> Result<(), String> {
         return Err(
             "[crypto.devices] grant_timer_interval_seconds must be between 60 and 86400"
                 .to_string(),
+        );
+    }
+    if !cfg.key_agent_socket.is_empty() && !Path::new(&cfg.key_agent_socket).is_absolute() {
+        return Err("[crypto.devices] key_agent_socket must be an absolute path".to_string());
+    }
+    if !Path::new(&cfg.key_agent_state_dir).is_absolute() {
+        return Err("[crypto.devices] key_agent_state_dir must be an absolute path".to_string());
+    }
+    if !(5..=900).contains(&cfg.key_agent_timeout_seconds) {
+        return Err(
+            "[crypto.devices] key_agent_timeout_seconds must be between 5 and 900".to_string(),
         );
     }
     y2q_core::crypto::devices::RoughtimeConfig::from(&cfg.roughtime).validate()
@@ -830,6 +875,7 @@ impl Config {
         validate_devices(&cfg.crypto.devices).map_err(|msg| Box::new(figment::Error::from(msg)))?;
 
         if cfg.crypto.node_key_file.trim().is_empty()
+            && cfg.crypto.devices.key_agent_socket.is_empty()
             && std::env::var_os("Y2QD_NODE_KEY").is_none()
             && std::env::var_os("Y2QD_EMERGENCY_KEY").is_none()
             && !Path::new(&cfg.crypto.keystore_dir)
@@ -1022,6 +1068,28 @@ mod tests {
             validate_devices(&c).unwrap_err(),
             "[crypto.devices.roughtime] min_responses must be between 2 and 16"
         );
+    }
+
+    #[test]
+    fn key_agent_arm_and_state_dir_settings() {
+        let d = DevicesConfig::default();
+        assert_eq!(d.key_agent_arm_uid, 0);
+        assert_eq!(d.key_agent_state_dir, "/run/y2q-keyd");
+
+        let c = DevicesConfig {
+            key_agent_state_dir: "run/y2q-keyd".to_string(),
+            ..DevicesConfig::default()
+        };
+        assert_eq!(
+            validate_devices(&c).unwrap_err(),
+            "[crypto.devices] key_agent_state_dir must be an absolute path"
+        );
+        let c = DevicesConfig {
+            key_agent_arm_uid: 1000,
+            key_agent_state_dir: "/run/other".to_string(),
+            ..DevicesConfig::default()
+        };
+        assert!(validate_devices(&c).is_ok());
     }
 
     #[test]

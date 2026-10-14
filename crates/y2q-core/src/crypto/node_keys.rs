@@ -207,16 +207,16 @@ impl NodeKeySlot {
     /// buffer before anything else runs) — this only fails on a genuine bug,
     /// so it panics rather than threading a fallible signature through the
     /// ~40 storage-backend call sites that call the accessors below.
-    pub fn install(&self, nk: [u8; 32]) {
+    pub fn install(&self, nk: &[u8; 32]) {
         let mut concat = Zeroizing::new([0u8; 160]);
-        concat[IDX_INDEX_KEY..IDX_INDEX_KEY + 32].copy_from_slice(&derive_index_key(&nk));
-        concat[IDX_PATH_KEY..IDX_PATH_KEY + 32].copy_from_slice(&derive_path_key(&nk));
+        concat[IDX_INDEX_KEY..IDX_INDEX_KEY + 32].copy_from_slice(&derive_index_key(nk));
+        concat[IDX_PATH_KEY..IDX_PATH_KEY + 32].copy_from_slice(&derive_path_key(nk));
         concat[IDX_OBJECT_METADATA_KEY..IDX_OBJECT_METADATA_KEY + 32]
-            .copy_from_slice(&derive_object_metadata_key(&nk));
+            .copy_from_slice(&derive_object_metadata_key(nk));
         concat[IDX_BUCKET_CONFIG_KEY..IDX_BUCKET_CONFIG_KEY + 32]
-            .copy_from_slice(&derive_bucket_config_key(&nk));
+            .copy_from_slice(&derive_bucket_config_key(nk));
         concat[IDX_CONTAINER_HEADER_KEY..IDX_CONTAINER_HEADER_KEY + 32]
-            .copy_from_slice(&derive_container_header_key(&nk));
+            .copy_from_slice(&derive_container_header_key(nk));
         let buf =
             SecretBuf::from_slice(&concat[..]).expect("node key slot: guarded allocation failed");
         *self.inner.write().expect("NodeKeySlot poisoned") = Some(NodeKeys { buf });
@@ -548,7 +548,7 @@ mod tests {
         assert_eq!(slot.index_key(), None);
 
         let k = nk(1);
-        slot.install(k);
+        slot.install(&k);
         assert!(slot.is_set());
         assert_eq!(slot.index_key(), Some(derive_index_key(&k)));
         assert_eq!(slot.path_key(), Some(derive_path_key(&k)));

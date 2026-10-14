@@ -89,6 +89,8 @@ mod error;
 #[cfg(test)]
 mod get_metadata_headers_test;
 mod handlers;
+#[cfg(target_os = "linux")]
+mod key_agent;
 mod node_key_rotation;
 mod node_unlock;
 pub(crate) mod observability;
@@ -127,6 +129,29 @@ impl<W: std::io::Write> std::io::Write for IgnoreBrokenPipe<W> {
         match self.0.flush() {
             Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
             other => other,
+        }
+    }
+}
+
+/// Log writer: stdout normally, stderr for the key helper modes.
+struct LogSink {
+    to_stderr: bool,
+}
+
+impl std::io::Write for LogSink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.to_stderr {
+            std::io::Write::write(&mut std::io::stderr(), buf)
+        } else {
+            std::io::Write::write(&mut std::io::stdout(), buf)
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        if self.to_stderr {
+            std::io::Write::flush(&mut std::io::stderr())
+        } else {
+            std::io::Write::flush(&mut std::io::stdout())
         }
     }
 }
@@ -250,6 +275,32 @@ impl utoipa::Modify for SecurityAddon {
     }
 }
 
+/// Dispatch `--key-serve` / `--key-sweep` / `--key-arm`.
+#[cfg(target_os = "linux")]
+fn run_key_helper(cli: &cli::Cli, cfg: &config::Config) -> std::io::Result<()> {
+    if cli.key_serve {
+        key_agent::run_serve(cfg)
+    } else if cli.key_sweep {
+        key_agent::run_sweep(cfg)
+    } else {
+        key_agent::run_arm(
+            cfg,
+            key_agent::ArmFlags {
+                passcode: cli.prompt_passcode,
+                pin: cli.prompt_pin,
+                emergency_code: cli.prompt_emergency_code,
+            },
+        )
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn run_key_helper(_cli: &cli::Cli, _cfg: &config::Config) -> std::io::Result<()> {
+    Err(std::io::Error::other(
+        "--key-serve, --key-sweep and --key-arm require Linux",
+    ))
+}
+
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
     let cli = cli::Cli::parse();
@@ -261,15 +312,26 @@ async fn main() -> std::io::Result<()> {
     let log_filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(cfg.observability.log_filter.clone()));
 
+    // The key helper modes keep stdout free: `--key-serve` runs with the
+    // connection socket as stdin and, depending on the unit, possibly stdout.
+    let log_to_stderr = cli.key_serve || cli.key_sweep || cli.key_arm;
     match cfg.observability.log_format {
         LogFormat::Text => tracing_subscriber::fmt()
             .with_env_filter(log_filter)
-            .with_writer(|| IgnoreBrokenPipe(std::io::stdout()))
+            .with_writer(move || {
+                IgnoreBrokenPipe(LogSink {
+                    to_stderr: log_to_stderr,
+                })
+            })
             .init(),
         LogFormat::Json => tracing_subscriber::fmt()
             .json()
             .with_env_filter(log_filter)
-            .with_writer(|| IgnoreBrokenPipe(std::io::stdout()))
+            .with_writer(move || {
+                IgnoreBrokenPipe(LogSink {
+                    to_stderr: log_to_stderr,
+                })
+            })
             .init(),
     }
 
@@ -291,6 +353,14 @@ async fn main() -> std::io::Result<()> {
              identity keys; set [server] allow_unprotected_memory = true to override."
         ))
     })?;
+
+    // Key helper modes: never open storage or the user store and take no
+    // daemon keystore flock (the helper holds the registry lock only while
+    // unlocking). clap already rejects combining them with each other and with
+    // --rotate-node-key / --upgrade-container-headers.
+    if cli.key_serve || cli.key_sweep || cli.key_arm {
+        return run_key_helper(&cli, &cfg);
+    }
 
     // Offline node-key rotation short-circuits the entire normal boot
     // sequence: it acquires its own flock, walks the storage tree, and exits.
@@ -322,7 +392,16 @@ async fn main() -> std::io::Result<()> {
         // same operator-or-device path as a normal boot.
         let _flock = keystore_mod::acquire_lock(&keystore_dir)
             .map_err(|e| std::io::Error::other(e.to_string()))?;
-        let resolved = node_unlock::resolve(&cfg, &keystore_dir)?;
+        let resolved = node_unlock::resolve(&cfg, &keystore_dir).map_err(|e| {
+            if e.to_string().contains("not armed") {
+                std::io::Error::other(format!(
+                    "{e}; --upgrade-container-headers fetches the node key like a normal boot, so \
+                     run `y2qd --key-arm` as root first"
+                ))
+            } else {
+                e
+            }
+        })?;
         return node_key_rotation::upgrade_headers(&cfg, &resolved.node_key).await;
     }
 
@@ -442,7 +521,7 @@ async fn main() -> std::io::Result<()> {
     // (index, paths, object metadata) now come from the operator, not from
     // whoever logs in first. Drop the raw key immediately afterward; every
     // holder from here on is a derived, domain-separated sub-key.
-    storage_data.install_node_key(*nk);
+    storage_data.install_node_key(&nk);
     drop(nk);
 
     // Startup auto-rebuild: repair index consistency after any unclean
@@ -558,13 +637,7 @@ async fn main() -> std::io::Result<()> {
                     master.clone(),
                 );
                 match tokio::task::spawn_blocking(move || {
-                    // Copy out of guarded memory for this call only; both copies zeroize on drop.
-                    let state_key = node_unlock::unlock_key(&key)?;
-                    let rmk = master.as_deref().map(node_unlock::unlock_key).transpose()?;
-                    let time = y2q_core::crypto::devices::roughtime::RoughtimeTimeSource::new(
-                        policy.roughtime.clone(),
-                    );
-                    y2q_core::crypto::devices::sweep_now(&dir, &state_key, rmk.as_deref(), &time)
+                    node_unlock::grant_sweep_once(&dir, &policy, &key, master.as_deref())
                 })
                 .await
                 {

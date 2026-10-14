@@ -24,6 +24,42 @@ pub struct Cli {
     #[arg(long)]
     pub rotate_node_key: bool,
 
+    /// Serve exactly one key-helper connection from standard input, then exit.
+    /// Meant to be spawned by a systemd socket unit with `Accept=yes` (stdin is
+    /// the accepted unix socket) under the key-owner uid: handles one `arm` or
+    /// `fetch` request from `[crypto.devices] key_agent_socket` and never keeps
+    /// RMK past the process. Opens no storage or user store.
+    #[arg(long, conflicts_with_all = ["key_sweep", "key_arm", "rotate_node_key", "upgrade_container_headers"])]
+    pub key_serve: bool,
+
+    /// One-shot grant sweep / re-mint (run from a systemd timer): unlock the
+    /// registry with a home device that needs no second factor, refresh grants,
+    /// and exit. A home device with a passcode or FIDO2 factor cannot be
+    /// unlocked unattended; that is logged and the exit status is 0.
+    #[arg(long, conflicts_with_all = ["key_serve", "key_arm", "rotate_node_key", "upgrade_container_headers"])]
+    pub key_sweep: bool,
+
+    /// Arm the key helper for the next `fetch`: send one-time authorization to
+    /// `[crypto.devices] key_agent_socket` (run as `key_agent_arm_uid`, default
+    /// root). Without a `--prompt-*` flag it arms with empty authorization.
+    #[arg(long, conflicts_with_all = ["key_serve", "key_sweep", "rotate_node_key", "upgrade_container_headers"])]
+    pub key_arm: bool,
+
+    /// With `--key-arm`: prompt on the terminal for a home-device passcode and
+    /// send it over the socket.
+    #[arg(long, requires = "key_arm")]
+    pub prompt_passcode: bool,
+
+    /// With `--key-arm`: prompt on the terminal for a FIDO2 PIN and send it
+    /// over the socket.
+    #[arg(long, requires = "key_arm")]
+    pub prompt_pin: bool,
+
+    /// With `--key-arm`: prompt on the terminal for an emergency code and send
+    /// it over the socket.
+    #[arg(long, requires = "key_arm")]
+    pub prompt_emergency_code: bool,
+
     /// New node key material for `--rotate-node-key`, as a file path (same
     /// hex/base64/raw encoding rules as `[crypto] node_key_file`).
     /// `Y2QD_NEW_NODE_KEY` takes precedence when set.

@@ -20,6 +20,7 @@ figment                     = { workspace = true }
 flume                       = { workspace = true }
 futures-util                = { workspace = true }
 hmac                        = { workspace = true }
+libc                        = { workspace = true }
 metrics                     = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
 rand                        = { workspace = true }

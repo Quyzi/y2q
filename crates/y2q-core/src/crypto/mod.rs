@@ -314,6 +314,19 @@ pub enum CryptoError {
     #[error("device label invalid: {0}")]
     DeviceLabelInvalid(String),
 
+    /// A Fido2 record is still referenced as a home device's second factor.
+    #[error(
+        "device '{label}' is the second factor of a home device; change the home device's factor before removing it"
+    )]
+    DeviceFactorInUse {
+        /// Label of the record the caller tried to remove.
+        label: String,
+    },
+
+    /// A home-device second factor is not acceptable.
+    #[error("home device factor invalid: {0}")]
+    DeviceFactorInvalid(String),
+
     /// No registered device could unlock the node key.
     #[error(
         "no registered device could unlock the node key: {0}; set Y2QD_EMERGENCY_KEY to one of the ten codes printed at `y2q admin device init`"
@@ -436,6 +449,8 @@ impl CryptoError {
             | CryptoError::DeviceSecretLength { .. }
             | CryptoError::DeviceNotFound(_)
             | CryptoError::DeviceLabelInUse(_)
+            | CryptoError::DeviceFactorInUse { .. }
+            | CryptoError::DeviceFactorInvalid(_)
             | CryptoError::DeviceLabelInvalid(_)
             | CryptoError::DeviceUnlockUnavailable(_)
             | CryptoError::DeviceBackend(_)

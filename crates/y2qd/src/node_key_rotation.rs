@@ -316,13 +316,13 @@ async fn migrate(
     // index against still-old-keyed data and look like total data loss.
     let old_probe = FilesystemStorage::new(&base_path, &index_path)
         .map_err(|e| other(format!("open storage: {e}")))?;
-    old_probe.install_node_key(old_nk);
+    old_probe.install_node_key(&old_nk);
     let buckets_needing_walk = match old_probe.list_buckets().await {
         Ok(buckets) => Some(buckets),
         Err(_) => {
             let new_probe = FilesystemStorage::new(&base_path, &index_path)
                 .map_err(|e| other(format!("open storage: {e}")))?;
-            new_probe.install_node_key(new_nk);
+            new_probe.install_node_key(&new_nk);
             let new_opens = new_probe.list_buckets().await.is_ok();
             let file_missing = !tokio::fs::try_exists(&index_path).await.unwrap_or(true);
             if !new_opens && !file_missing {
@@ -378,7 +378,7 @@ async fn migrate(
     let _ = std::fs::remove_file(&index_path);
     let new_storage = FilesystemStorage::new(&base_path, &index_path)
         .map_err(|e| other(format!("open storage: {e}")))?;
-    new_storage.install_node_key(new_nk);
+    new_storage.install_node_key(&new_nk);
     new_storage
         .rebuild_cache()
         .await
@@ -435,7 +435,7 @@ pub async fn upgrade_headers(cfg: &Config, nk: &[u8; 32]) -> std::io::Result<()>
     // plaintext bucket list is readable under the current key as usual.
     let storage = FilesystemStorage::new(&base_path, &index_path)
         .map_err(|e| other(format!("open storage: {e}")))?;
-    storage.install_node_key(*nk);
+    storage.install_node_key(nk);
     let buckets = storage
         .list_buckets()
         .await

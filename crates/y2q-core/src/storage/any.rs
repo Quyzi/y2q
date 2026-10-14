@@ -235,7 +235,7 @@ impl AnyStreamingPutGuard {
 impl AnyStorage {
     /// Install the node key on the active backend. Supplied by the operator
     /// at boot; idempotent.
-    pub fn install_node_key(&self, nk: [u8; 32]) {
+    pub fn install_node_key(&self, nk: &[u8; 32]) {
         match self {
             Self::Filesystem(s) => s.install_node_key(nk),
             #[cfg(target_os = "linux")]

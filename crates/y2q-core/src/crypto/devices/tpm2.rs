@@ -8,7 +8,9 @@
 //! Security boundary: sealing defeats offline theft of the drive (a stolen disk
 //! cannot be unsealed on another machine and a changed boot chain refuses). With
 //! the default `--pcrs 7` it does NOT bound theft of the whole host (any
-//! Secure-Boot-trusted OS booted on it satisfies PCR 7), and it never defeats a
+//! Secure-Boot-trusted OS booted on it satisfies PCR 7); with Secure Boot off,
+//! PCR 7 is identical on every boot and any bootable medium unseals (`init` and
+//! `add-tpm` refuse that unless `--allow-secure-boot-off`). It never defeats a
 //! root-capable attacker on the live host, who can run the same unseal.
 
 use std::str::FromStr;
@@ -56,6 +58,40 @@ fn open(tcti: &str) -> Result<Context, CryptoError> {
 /// Verify the TPM is reachable; opens a context and drops it.
 pub fn probe(tcti: &str) -> Result<(), CryptoError> {
     open(tcti).map(drop)
+}
+
+/// Whether UEFI Secure Boot is enforcing on this host.
+///
+/// PCR 7 only separates "trusted boot chain" from "anything else" when Secure
+/// Boot is on. With it off, PCR 7 is the same on every boot, so any bootable
+/// medium satisfies a PCR-7-only policy and unseals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecureBootState {
+    /// The `SecureBoot` EFI variable reads 1.
+    Enabled,
+    /// The variable reads 0.
+    Disabled,
+    /// Not a UEFI boot, efivarfs not mounted, or the variable is unreadable.
+    Unknown,
+}
+
+/// Path of the `SecureBoot` EFI variable (global-variable GUID).
+const SECURE_BOOT_EFIVAR: &str =
+    "/sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c";
+
+/// Interpret the raw efivarfs bytes: 4 attribute bytes, then the 1-byte value.
+pub(crate) fn parse_secure_boot(raw: &[u8]) -> SecureBootState {
+    match raw {
+        [_, _, _, _, 1] => SecureBootState::Enabled,
+        [_, _, _, _, 0] => SecureBootState::Disabled,
+        _ => SecureBootState::Unknown,
+    }
+}
+
+/// Read the current Secure Boot state from efivarfs.
+pub fn secure_boot_state() -> SecureBootState {
+    std::fs::read(SECURE_BOOT_EFIVAR)
+        .map_or(SecureBootState::Unknown, |raw| parse_secure_boot(&raw))
 }
 
 fn pcr_slot(n: u8) -> Result<PcrSlot, CryptoError> {

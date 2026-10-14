@@ -610,8 +610,11 @@ takes precedence and the device path never runs.
 registered home device (permanent), by each away device (as a time-boxed
 *grant*), and by each of ten one-time emergency codes. The node key lives in
 a single `nk_wrap` under an RMK-derived key. Every wrap is symmetric
-(AES-256-GCM); no classical asymmetric sealing of key material exists in
-this feature.
+(AES-256-GCM). The ML-KEM-768 secrets of tiers 1 and 2 are wrapped at rest
+under symmetric keys, so no Shor-reachable at-rest secret exists; the
+symmetric layers lose only Grover margin. The quantum-exposed links are
+listed under [Transport note](#transport-note) and the Roughtime bullet
+below.
 
 - A **home device** is a TPM 2.0 on the host: non-interactive, PCR-sealed,
   holding a permanent wrap of RMK.
@@ -643,6 +646,14 @@ this feature.
 
 ### End state at its true strength
 
+**Principal exposure: the away window is a software-only time-box.** A copy
+of the medium taken while a grant was live, plus the away token (and PIN, if
+`uv_required`), opens on any host at any later date, because the expiry
+check is software that a patched binary skips. The only things that end
+that exposure are a `device init` (new RMK) or, for a home-only registry,
+having no away grants at all. Everything below about erasure concerns only
+the original medium; it never reaches a copy already taken.
+
 - A grant's `not_after_unix` is enforced in software on every away unlock,
   which requires an attested time. Key material enforces it only after an
   **attested sweep** erases the ciphertext: an unlock with attested time
@@ -650,19 +661,21 @@ this feature.
   the registry alone never erases, because it reads no clock. From the
   first such sweep after expiry, the away authenticator opens nothing on
   that medium, not with a patched binary and not with a correct PIN. Until
-  that sweep runs, a patched binary holding the token and PIN can still
+  that sweep runs, a patched binary holding the token (and PIN, if `uv_required`) can still
   open an expired grant, so a powered-off medium that is never swept keeps
   that exposure. No cryptographic time-lock exists without a trusted clock
   on the medium.
 - A **copy of the medium taken while a grant was live**, combined later
-  with the away token and its PIN, yields RMK and therefore the node key,
-  on any host and at any later date, until a `device init` rekeys the
-  registry. Erasure never reaches a copy already taken. Exposure is
-  therefore not one window: a home-booted daemon re-mints grants every
+  with the away token (and its PIN, if the device is `uv_required`), yields
+  RMK and therefore the node key, on any host and at any later date, until
+  a `device init` creates a new RMK. The expiry check is software: a
+  patched binary ignores `not_after_unix` on the copy. Erasure never
+  reaches a copy already taken. A home-booted daemon re-mints grants every
   `grant_timer_interval_seconds`, so while it runs a snapshot always
   contains a live grant. After it stops, the last grant stays openable
-  until the next attested sweep. `away_grant_seconds` bounds each grant's
-  lifetime, not the uptime-driven refresh chain.
+  until the next attested sweep. `away_grant_seconds` therefore bounds only
+  the *original* medium (once an attested sweep erases the grant), not a
+  copy, and not the uptime-driven refresh chain.
 - A **home device** plus the medium always yields the node key: the home
   wrap is permanent by construction, because something has to be able to
   mint the next grant. TPM sealing bounds that: the sealed blob is useless
@@ -683,10 +696,10 @@ this feature.
   unit file beside `keystore_dir` each remove it.
 - Roughtime's trust chain is Ed25519 (RFC 10049 §9.5: "the only supported
   signature scheme, Ed25519, is not quantum resistant … will not survive
-  the advent of quantum computers"). A quantum adversary able to forge a
-  response could reopen a closed window *while a grant still exists on the
-  medium*; it buys nothing once the grant is erased, and nothing at all
-  about data at rest, every byte of which is protected by symmetric keys.
+  the advent of quantum computers"). A quantum adversary holding a stale
+  medium could forge time and reopen an expired grant while a grant
+  ciphertext still exists on it; the token (and PIN, if `uv_required`)
+  requirement still applies, and it buys nothing once the grant is erased.
   Roughtime signatures bind freshness only, not at-rest confidentiality.
 - An older copy of `devices.json` verifies under the same state key, and
   RMK is never rotated, so anyone who ever unlocked this registry retains
@@ -714,14 +727,88 @@ this feature.
 ### TPM sealing boundary
 
 TPM sealing defeats **offline theft of the drive** — a stolen disk cannot
-be unsealed on another machine, and a changed boot chain refuses. With the
-default `--pcrs 7` it does **not** bound theft of the whole host: an
-attacker holding the machine can boot any Secure-Boot-trusted OS on it,
-satisfy the PCR 7 policy and unseal. `--pcrs 0,4,7` narrows that at the
-cost of resealing on every firmware or kernel update. It also does not
-defeat a root-capable attacker on the live, running host, who can invoke
-the same unseal under the same PCR state; the node key is in the daemon's
-memory regardless.
+be unsealed on another machine, and a changed boot chain refuses. PCR 7
+only separates a trusted boot chain from anything else while **Secure Boot
+is enforcing**; with it off, PCR 7 is identical on every boot, so any
+bootable medium unseals. `device init` and `add-tpm` therefore refuse a
+PCR-7 policy unless Secure Boot is enforcing (`--allow-secure-boot-off`
+overrides). Even with Secure Boot on and the default `--pcrs 7`, it does
+**not** bound theft of the whole host: an attacker holding the machine can
+boot any Secure-Boot-trusted OS on it, satisfy PCR 7 and unseal.
+`--pcrs 0,4,7` narrows that at the cost of resealing on every firmware or
+kernel update. It does not defeat a root-capable attacker on the live
+host, who can invoke the same unseal; in legacy mode the node key is also
+in the daemon's memory.
+
+`reseal-tpm` enforces the same Secure Boot precheck as `device init` and
+`add-tpm` for a PCR-7 policy, and takes the same `--allow-secure-boot-off`
+override.
+
+### What a compromised daemon uid gets
+
+With the **socket-activated key helper** (`y2q-keyd.socket` +
+`y2q-keyd@.service`, running `y2qd --key-serve` as uid `y2q-keyd`;
+recommended for device deployments; enabled by a non-empty `[crypto.devices]
+key_agent_socket`) no resident process holds RMK. Each connection spawns a
+fresh helper that handles exactly one request and exits. Root arms it
+(`y2qd --key-arm`, peer uid must equal `key_agent_arm_uid`, default 0) by
+storing one-time authorization material (empty for unattended hosts; an
+optional passcode, FIDO2 PIN or emergency code for attended ones) in a
+`0600` file on tmpfs under `/run/y2q-keyd`. The daemon then fetches (peer
+uid must equal `key_agent_peer_uid`); the helper reads **and deletes** the
+armed file, runs the registry unlock with that material, returns NK once
+and exits. The armed file is consumed by every fetch attempt, success or
+failure (a refused peer uid does not consume it). `key_agent_peer_uid` has no
+default; unset, the helper refuses every fetch.
+
+What a compromised daemon uid therefore gets, stated honestly:
+
+- It holds **one transient raw NK copy** from boot (the daemon needs it for
+  the keystore load and key derivation), plus node-derived structural keys,
+  live session keys and in-flight object bodies (ordinary heap, see above).
+  Anything that already read NK from the daemon's memory keeps it.
+- It does **not** get RMK, the TPM, any hardware secret, passcode or PIN, or
+  the ability to forge `devices.json` (`y2q-keyd`-owned, `0600`).
+- It **cannot re-fetch** NK or RMK: it can connect to the socket, but a
+  fetch without a prior arm is refused and only root (the arm uid) can
+  arm. Re-fetching would require root.
+
+In **legacy in-process mode** (`key_agent_socket = ""`) the daemon holds
+RMK and the state key and has TPM access, so a compromised daemon uid can
+re-run the PCR-policy unseal and obtain NK, RMK and registry authority. It
+is strictly weaker; use it only where a second uid is impossible.
+
+**Root on the live host gets everything in both modes**: it can arm and
+fetch, read in-flight object-body plaintext from ordinary heap, invoke the
+TPM unseal, and read process state other than `memfd_secret` pages.
+
+### Home second factor
+
+A Home (TPM) device may carry a second factor (`y2q admin device
+set-home-factor`, exactly one of `--passcode`, `--fido2 <label-or-id>` or
+`--none`): a passcode, or a registered FIDO2 away token (the same
+token can serve both roles). The home KEK is then derived from the TPM
+secret **and** the factor secret, so a stolen drive plus a booted copy of
+the host no longer unseals without the passcode or the token and PIN. Such a
+device cannot be unlocked unattended: the host is armed interactively at
+each start, a crash restart fails until re-armed, and the sweep timer logs
+and exits without refreshing grants. A lost factor is recoverable only with
+an emergency code. Removing a token that a home factor references is
+refused.
+
+### `devices.json`: what it exposes
+
+Every secret in `devices.json` (wraps, grants, `nk_wrap`, the factor
+blobs) is AEAD-encrypted. The file is not encrypted as a whole, so the
+following are readable by anyone holding a copy: device labels and ids,
+kinds, `added_at` timestamps, TPM PCR slots and bank, FIDO2 credential ids
+and rp id, signature counters, emergency-slot burn flags and burn
+timestamps, grant issue and expiry deadlines, `away_grant_seconds`, and the
+device count. This is metadata leakage, not key exposure. Encrypting the
+file in layers would only *reduce* that leakage; it would not change who
+can unlock, since everything that matters is already wrapped. A stale copy
+authenticates under the same state key, so it **replays burned emergency
+slots** and **revives erased grants**.
 
 ### Emergency-code bound
 
@@ -748,8 +835,10 @@ lifetime: once erased, the away device's secret opens nothing.
 The KEKs are symmetric at rest, but the CTAP2 `hmac-secret` exchange
 encrypts salt and output under a P-256 ECDH shared secret negotiated with
 the token over the local USB bus. That transport is classically asymmetric
-and outside the at-rest post-quantum invariant; a recorded USB session, not
-the drive, would be the exposure.
+and outside the at-rest post-quantum posture; a recorded USB session, not
+the drive, would be the exposure. y2q never verifies the FIDO2 assertion
+signature (ES256 credential); the secret comes from `hmac-secret` only.
+Together with Roughtime's Ed25519, these are the quantum-exposed links.
 
 ## Storage-tree metadata protection
 

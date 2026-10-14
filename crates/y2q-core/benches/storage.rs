@@ -100,7 +100,7 @@ fn backends() -> &'static [Backend] {
             .expect("init FilesystemStorage");
         // Metadata writes require an installed node key (supplied by the
         // operator at boot).
-        fs.install_node_key(BENCH_NODE_KEY);
+        fs.install_node_key(&BENCH_NODE_KEY);
         out.push(Backend {
             name: "filesystem",
             storage: Arc::new(AnyStorage::Filesystem(fs)),
@@ -113,7 +113,7 @@ fn backends() -> &'static [Backend] {
             let u_base = u_dir.path().to_path_buf();
             let u = UringStorage::new(&u_base, u_base.join("idx.redb"), UringConfig::default())
                 .expect("init UringStorage");
-            u.install_node_key(BENCH_NODE_KEY);
+            u.install_node_key(&BENCH_NODE_KEY);
             out.push(Backend {
                 name: "uring",
                 storage: Arc::new(AnyStorage::Uring(u)),

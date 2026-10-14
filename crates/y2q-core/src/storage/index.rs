@@ -89,13 +89,13 @@ impl MetadataIndex {
     /// no-op. An open failure is logged and leaves the index locked
     /// (operations error until the daemon restarts) — the index is a
     /// rebuildable cache, so this does not abort boot on its own.
-    pub fn set_node_key(&self, nk: [u8; 32]) {
+    pub fn set_node_key(&self, nk: &[u8; 32]) {
         self.slot.install(nk);
         let mut guard = self.db.write().expect("index db poisoned");
         if guard.is_some() {
             return;
         }
-        match Self::open_db(&self.path, &nk) {
+        match Self::open_db(&self.path, nk) {
             Ok(db) => *guard = Some(Arc::new(db)),
             Err(e) => {
                 tracing::error!(error = %e, path = %self.path.display(),

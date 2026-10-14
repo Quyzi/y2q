@@ -273,7 +273,7 @@ pub trait MetadataCipher {
 pub trait KeySlot: Send + Sync {
     /// Install `node_key`, deriving and storing the four structural keys.
     /// Replaces any prior value. Called exactly once, at boot.
-    fn install(&self, node_key: [u8; 32]);
+    fn install(&self, node_key: &[u8; 32]);
 
     /// A copy of the Index Key, if installed.
     fn index_key(&self) -> Option<[u8; 32]>;

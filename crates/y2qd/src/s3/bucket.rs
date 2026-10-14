@@ -553,7 +553,7 @@ mod tests {
         let base = dir.path().join("data");
         let index = dir.path().join("index.redb");
         let storage = FilesystemStorage::new(base, index).unwrap();
-        storage.install_node_key(TEST_NODE_KEY);
+        storage.install_node_key(&TEST_NODE_KEY);
         (AnyStorage::Filesystem(storage), dir)
     }
 

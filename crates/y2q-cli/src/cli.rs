@@ -435,6 +435,10 @@ pub enum AdminCmd {
     /// Manage the hardware devices that can unlock this deployment's node key.
     /// Local keystore surgery: no alias, no HTTP. Mutating subcommands require the
     /// daemon to be stopped (`systemctl stop y2qd`), because it holds the keystore lock.
+    ///
+    /// Device commands must run as the registry owner: the user that owns `devices.json`,
+    /// normally the key-agent user (for example `sudo -u y2q-keyd y2q admin device ...`).
+    /// A root-owned registry cannot be read or swept by the key agent.
     Device {
         #[command(subcommand)]
         cmd: DeviceCmd,
@@ -693,6 +697,10 @@ pub enum DeviceCmd {
         /// `Y2QD_NODE_KEY` is honoured.
         #[arg(long, value_name = "PATH")]
         node_key_file: Option<std::path::PathBuf>,
+        /// Accept a PCR-7 policy that any bootable medium can satisfy (Secure Boot
+        /// not enforcing). For test rigs only.
+        #[arg(long)]
+        allow_secure_boot_off: bool,
         #[command(flatten)]
         roughtime: RoughtimeArgs,
     },
@@ -710,6 +718,10 @@ pub enum DeviceCmd {
         /// every such update.
         #[arg(long, value_delimiter = ',', default_value = "7")]
         pcrs: Vec<u8>,
+        /// Accept a PCR-7 policy that any bootable medium can satisfy (Secure Boot
+        /// not enforcing). For test rigs only.
+        #[arg(long)]
+        allow_secure_boot_off: bool,
         #[command(flatten)]
         roughtime: RoughtimeArgs,
     },
@@ -756,6 +768,44 @@ pub enum DeviceCmd {
         id: String,
         #[arg(long, value_name = "STR", default_value = "device:/dev/tpmrm0")]
         tpm_tcti: String,
+        #[command(flatten)]
+        roughtime: RoughtimeArgs,
+        /// Accept a PCR-7 policy that any bootable medium can satisfy (Secure Boot
+        /// not enforcing). For test rigs only.
+        #[arg(long)]
+        allow_secure_boot_off: bool,
+    },
+    /// Set or clear the second factor of a TPM home device. With a factor the node
+    /// can no longer boot unattended: each start must be armed with the factor
+    /// (`y2qd --key-arm --prompt-passcode` / `--prompt-pin`).
+    #[command(group(
+        clap::ArgGroup::new("factor").required(true).multiple(false).args(["passcode", "fido2", "none"])
+    ))]
+    SetHomeFactor {
+        #[arg(long, value_name = "DIR")]
+        keystore_dir: std::path::PathBuf,
+        /// Home (TPM) device id or label.
+        selector: String,
+        #[arg(long, value_name = "STR", default_value = "device:/dev/tpmrm0")]
+        tpm_tcti: String,
+        /// Use a passcode (prompted twice on the terminal) as the second factor.
+        #[arg(long)]
+        passcode: bool,
+        /// Use a registered FIDO2 away device (label or id) as the second factor.
+        #[arg(long, value_name = "LABEL_OR_ID")]
+        fido2: Option<String>,
+        /// Remove the second factor.
+        #[arg(long)]
+        none: bool,
+        /// Argon2id memory cost of the passcode factor, in KiB.
+        #[arg(long, value_name = "KIB", default_value_t = 65_536, conflicts_with_all = ["fido2", "none"])]
+        passcode_m_cost_kib: u32,
+        /// Argon2id iteration count of the passcode factor.
+        #[arg(long, value_name = "N", default_value_t = 3, conflicts_with_all = ["fido2", "none"])]
+        passcode_t_cost: u32,
+        /// Argon2id parallelism of the passcode factor.
+        #[arg(long, value_name = "N", default_value_t = 1, conflicts_with_all = ["fido2", "none"])]
+        passcode_p_cost: u32,
         #[command(flatten)]
         roughtime: RoughtimeArgs,
     },

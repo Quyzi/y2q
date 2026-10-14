@@ -2118,6 +2118,7 @@ fn e2e_device_unlock_swtpm() {
             "--keystore-dir",
             keys_s,
             "--tpm",
+            "--allow-secure-boot-off",
             "--tpm-tcti",
             &tcti,
             "--label",
