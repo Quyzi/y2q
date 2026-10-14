@@ -432,6 +432,19 @@ pub enum AdminCmd {
     /// `[crypto] node_key_file` or `Y2QD_NODE_KEY`. Pure local generator —
     /// takes no alias, makes no HTTP call.
     GenNodeKey,
+    /// Manage the hardware devices that can unlock this deployment's node key.
+    /// Local keystore surgery: no alias, no HTTP. Mutating subcommands require the
+    /// daemon to be stopped (`systemctl stop y2qd`), because it holds the keystore lock.
+    Device {
+        #[command(subcommand)]
+        cmd: DeviceCmd,
+    },
+    /// Show which of the ten one-time emergency codes remain unused. Never prints the
+    /// codes themselves — they are displayed exactly once, by `device init`.
+    EmergencyKeys {
+        #[arg(long, value_name = "DIR")]
+        keystore_dir: std::path::PathBuf,
+    },
     /// Reset a user's identity keypair and password. Restores login; does
     /// not restore bucket access (every grant they held is scrubbed, since
     /// it was sealed to the identity keypair this replaces).
@@ -586,5 +599,203 @@ pub enum PersonaCmd {
         #[arg(long)]
         slot: u8,
         buckets: Vec<String>,
+    },
+}
+
+/// One `--roughtime-server NAME=ADDR=KEY_B64` value.
+// Fields are read only by the device-enabled build.
+#[cfg_attr(not(all(target_os = "linux", feature = "devices")), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoughtimeServerArg {
+    pub name: String,
+    pub addr: String,
+    pub public_key_b64: String,
+}
+
+/// Split on the first two `=` only: a base64 key ends in `=`.
+pub fn parse_roughtime_server(s: &str) -> Result<RoughtimeServerArg, String> {
+    let mut parts = s.splitn(3, '=');
+    let (Some(name), Some(addr), Some(key)) = (parts.next(), parts.next(), parts.next()) else {
+        return Err(format!("expected NAME=ADDR=KEY_B64, got `{s}`"));
+    };
+    if name.is_empty() || addr.is_empty() || key.is_empty() {
+        return Err(format!("expected NAME=ADDR=KEY_B64, got `{s}`"));
+    }
+    Ok(RoughtimeServerArg {
+        name: name.to_owned(),
+        addr: addr.to_owned(),
+        public_key_b64: key.to_owned(),
+    })
+}
+
+/// Roughtime flags shared by every device command that can read attested time.
+/// The CLI reads no `config.toml`, so these are the only source of servers.
+// Fields are read only by the device-enabled build.
+#[cfg_attr(not(all(target_os = "linux", feature = "devices")), allow(dead_code))]
+#[derive(clap::Args, Debug, Clone)]
+pub struct RoughtimeArgs {
+    /// Roughtime server as NAME=ADDR=KEY_B64 (repeatable). KEY_B64 is the server's
+    /// base64 Ed25519 public key.
+    #[arg(long = "roughtime-server", value_name = "NAME=ADDR=KEY_B64", value_parser = parse_roughtime_server)]
+    pub roughtime_server: Vec<RoughtimeServerArg>,
+    /// Number of independent servers that must answer.
+    #[arg(long, value_name = "N", default_value_t = 2)]
+    pub roughtime_min_responses: u8,
+    /// Per-server query timeout in milliseconds.
+    #[arg(long, value_name = "MS", default_value_t = 3000)]
+    pub roughtime_timeout_ms: u64,
+}
+
+// Fields are read only by the device-enabled build.
+#[cfg_attr(not(all(target_os = "linux", feature = "devices")), allow(dead_code))]
+#[derive(Subcommand, Debug)]
+pub enum DeviceCmd {
+    /// Create the device registry with its first device and print the ten
+    /// one-time emergency codes (once).
+    Init {
+        #[arg(long, value_name = "DIR")]
+        keystore_dir: std::path::PathBuf,
+        /// First device is a TPM 2.0 home device.
+        #[arg(long, conflicts_with = "fido2")]
+        tpm: bool,
+        /// First device is a FIDO2 away device (requires --permanent-away).
+        #[arg(long)]
+        fido2: bool,
+        /// Device label (default `home-tpm` with --tpm, `away-fido2` with --fido2).
+        #[arg(long)]
+        label: Option<String>,
+        #[arg(long, value_name = "STR", default_value = "device:/dev/tpmrm0")]
+        tpm_tcti: String,
+        /// SHA-256 PCR indices the TPM policy is bound to. 7 alone survives kernel and
+        /// initrd updates; adding 0 or 4 binds firmware and the boot binary but requires
+        /// `device reseal-tpm` — which needs a home device or an emergency code — after
+        /// every such update.
+        #[arg(long, value_delimiter = ',', default_value = "7")]
+        pcrs: Vec<u8>,
+        /// Register the authenticator without user verification (no PIN).
+        #[arg(long)]
+        no_uv: bool,
+        /// HID path of the authenticator when several are attached.
+        #[arg(long, value_name = "PATH")]
+        hid_path: Option<String>,
+        /// How long an away device may unlock after a home unlock, in seconds
+        /// (60 .. 2592000). Fixed at init and bound into the node-key wrap, so it cannot
+        /// be changed by editing the registry — use `device set-grant-period`.
+        #[arg(long, value_name = "SECONDS", default_value_t = 43_200)]
+        away_grant_seconds: u32,
+        /// With zero home devices, give FIDO2 devices a permanent wrap (no time-box).
+        #[arg(long, requires = "fido2")]
+        permanent_away: bool,
+        /// Wrap the node key this deployment already uses instead of generating one.
+        #[arg(long)]
+        adopt_existing_node_key: bool,
+        /// File holding the existing node key (with --adopt-existing-node-key);
+        /// `Y2QD_NODE_KEY` is honoured.
+        #[arg(long, value_name = "PATH")]
+        node_key_file: Option<std::path::PathBuf>,
+        #[command(flatten)]
+        roughtime: RoughtimeArgs,
+    },
+    /// Register a TPM 2.0 home device.
+    AddTpm {
+        #[arg(long, value_name = "DIR")]
+        keystore_dir: std::path::PathBuf,
+        #[arg(long, default_value = "home-tpm")]
+        label: String,
+        #[arg(long, value_name = "STR", default_value = "device:/dev/tpmrm0")]
+        tpm_tcti: String,
+        /// SHA-256 PCR indices the TPM policy is bound to. 7 alone survives kernel and
+        /// initrd updates; adding 0 or 4 binds firmware and the boot binary but requires
+        /// `device reseal-tpm` — which needs a home device or an emergency code — after
+        /// every such update.
+        #[arg(long, value_delimiter = ',', default_value = "7")]
+        pcrs: Vec<u8>,
+        #[command(flatten)]
+        roughtime: RoughtimeArgs,
+    },
+    /// Register a FIDO2 away device.
+    AddFido2 {
+        #[arg(long, value_name = "DIR")]
+        keystore_dir: std::path::PathBuf,
+        #[arg(long, default_value = "away-fido2")]
+        label: String,
+        /// Register the authenticator without user verification (no PIN).
+        #[arg(long)]
+        no_uv: bool,
+        /// HID path of the authenticator when several are attached.
+        #[arg(long, value_name = "PATH")]
+        hid_path: Option<String>,
+        #[arg(long, value_name = "STR", default_value = "device:/dev/tpmrm0")]
+        tpm_tcti: String,
+        #[command(flatten)]
+        roughtime: RoughtimeArgs,
+    },
+    /// List registered devices (read-only; works against a running daemon).
+    #[command(alias = "ls")]
+    List {
+        #[arg(long, value_name = "DIR")]
+        keystore_dir: std::path::PathBuf,
+    },
+    /// Remove a registered device by id or label.
+    #[command(alias = "rm")]
+    Remove {
+        #[arg(long, value_name = "DIR")]
+        keystore_dir: std::path::PathBuf,
+        /// Device id or label.
+        selector: String,
+        #[arg(long, value_name = "STR", default_value = "device:/dev/tpmrm0")]
+        tpm_tcti: String,
+        #[command(flatten)]
+        roughtime: RoughtimeArgs,
+    },
+    /// Re-seal a TPM device to the current PCR values.
+    ResealTpm {
+        #[arg(long, value_name = "DIR")]
+        keystore_dir: std::path::PathBuf,
+        /// Device id or label.
+        id: String,
+        #[arg(long, value_name = "STR", default_value = "device:/dev/tpmrm0")]
+        tpm_tcti: String,
+        #[command(flatten)]
+        roughtime: RoughtimeArgs,
+    },
+    /// Mint a fresh grant for every away device (home authority only).
+    Refresh {
+        #[arg(long, value_name = "DIR")]
+        keystore_dir: std::path::PathBuf,
+        #[arg(long, value_name = "STR", default_value = "device:/dev/tpmrm0")]
+        tpm_tcti: String,
+        #[command(flatten)]
+        roughtime: RoughtimeArgs,
+    },
+    /// Change the away-grant period. Drops every existing grant.
+    SetGrantPeriod {
+        #[arg(long, value_name = "DIR")]
+        keystore_dir: std::path::PathBuf,
+        /// New period in seconds (60 .. 2592000).
+        #[arg(long)]
+        seconds: u32,
+        #[arg(long, value_name = "STR", default_value = "device:/dev/tpmrm0")]
+        tpm_tcti: String,
+        #[command(flatten)]
+        roughtime: RoughtimeArgs,
+    },
+    /// Re-sign a registry whose state MAC does not verify (drops every grant).
+    RepairState {
+        #[arg(long, value_name = "DIR")]
+        keystore_dir: std::path::PathBuf,
+        #[arg(long, value_name = "STR", default_value = "device:/dev/tpmrm0")]
+        tpm_tcti: String,
+        /// With zero home devices, allow an away device to authorize the repair.
+        #[arg(long)]
+        allow_away_repair: bool,
+        /// Acknowledge that the printed inventory was reviewed; required to write.
+        #[arg(long)]
+        accept_current_inventory: bool,
+    },
+    /// Query the configured Roughtime servers and print the attested time.
+    CheckTime {
+        #[command(flatten)]
+        roughtime: RoughtimeArgs,
     },
 }

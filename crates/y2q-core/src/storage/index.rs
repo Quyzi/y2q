@@ -12,7 +12,7 @@
 //!
 //! The entire redb file is encrypted at rest by [`EncryptedFileBackend`], which
 //! transparently encrypts every block under a key derived from the
-//! operator-supplied node key ([`crate::crypto::derive_index_file_key`]).
+//! node key (operator-supplied or device-unlocked) ([`crate::crypto::derive_index_file_key`]).
 //! Inside the database, table keys are stored as plaintext length-prefixed
 //! composites and values as plain JSON - the whole-file layer is the sole
 //! protection.

@@ -25,9 +25,13 @@
 //!
 //! # First-run setup
 //!
-//! The daemon refuses to start without an operator-supplied node key
-//! (`Y2QD_NODE_KEY` env var or `[crypto] node_key_file`; never
-//! auto-generated). Given a valid node key and no `keystore.json` in
+//! The daemon refuses to start without a node key. In operator mode it is
+//! supplied by the operator (`Y2QD_NODE_KEY` env var or `[crypto]
+//! node_key_file`) and is never auto-generated; when set it takes precedence.
+//! In device mode (`<keystore_dir>/devices.json`, created by `y2q admin device
+//! init`) it is recovered from a registered TPM, FIDO2 authenticator or
+//! emergency code — see [`node_unlock`]. Given a valid node key and no
+//! `keystore.json` in
 //! `[crypto] keystore_dir`, it treats this as first-run: generates a
 //! `root` identity keypair, wraps its secret key under a
 //! randomly-generated password, writes that password once to
@@ -69,7 +73,7 @@ use tracing_subscriber::EnvFilter;
 use crate::config::LogFormat;
 use crate::span::Y2qRootSpanBuilder;
 use utoipa::OpenApi;
-use y2q_core::crypto::{Argon2Params, keystore as keystore_mod, node_key};
+use y2q_core::crypto::{Argon2Params, keystore as keystore_mod};
 use y2q_core::{AnyStorage, FilesystemStorage, StorageExt, secmem};
 
 #[cfg(target_os = "linux")]
@@ -86,6 +90,7 @@ mod error;
 mod get_metadata_headers_test;
 mod handlers;
 mod node_key_rotation;
+mod node_unlock;
 pub(crate) mod observability;
 #[cfg(test)]
 mod owner_transfer_test;
@@ -306,7 +311,19 @@ async fn main() -> std::io::Result<()> {
 
     // Same shape as rotation: takes the keystore flock, rewrites headers, exits.
     if cli.upgrade_container_headers {
-        return node_key_rotation::upgrade_headers(&cfg).await;
+        let keystore_dir = PathBuf::from(&cfg.crypto.keystore_dir);
+        if keystore_mod::rotation_journal_exists(&keystore_dir) {
+            return Err(std::io::Error::other(
+                node_key_rotation::INTERRUPTED_MESSAGE,
+            ));
+        }
+        // Takes the keystore flock (refuses a live daemon, and two concurrent
+        // upgrades refuse each other), then resolves the node key through the
+        // same operator-or-device path as a normal boot.
+        let _flock = keystore_mod::acquire_lock(&keystore_dir)
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        let resolved = node_unlock::resolve(&cfg, &keystore_dir)?;
+        return node_key_rotation::upgrade_headers(&cfg, &resolved.node_key).await;
     }
 
     // Acquire daemon-wide flock on the keystore directory before doing
@@ -321,18 +338,17 @@ async fn main() -> std::io::Result<()> {
     let _flock = keystore_mod::acquire_lock(&keystore_dir)
         .map_err(|e| std::io::Error::other(format!("acquire keystore lock: {e}")))?;
 
-    // Resolve the operator-supplied node key. Never auto-generated — refuses
-    // to start without one. Also refuse a node_key_file that resolves inside
-    // storage.base_path or keystore_dir, so a copy of the data can't carry
-    // the key that protects it.
-    node_key::check_node_key_location(
-        &cfg.crypto.node_key_file,
-        std::path::Path::new(&cfg.storage.base_path),
-        &keystore_dir,
-    )
-    .map_err(std::io::Error::other)?;
-    let nk = node_key::load_node_key(&cfg.crypto.node_key_file)
-        .map_err(|e| std::io::Error::other(format!("node key: {e}")))?;
+    // Resolve the node key: operator-supplied (`Y2QD_NODE_KEY` / `node_key_file`,
+    // never auto-generated, takes precedence) or recovered from the device
+    // registry. Runs inside the flock because the device path rewrites
+    // `devices.json`.
+    let resolved = node_unlock::resolve(&cfg, &keystore_dir)?;
+    let nk = resolved.node_key;
+    #[cfg(all(target_os = "linux", feature = "devices"))]
+    let device_state_key = resolved.registry_state_key;
+    #[cfg(all(target_os = "linux", feature = "devices"))]
+    let device_master_key = resolved.registry_master_key;
+    node_unlock::log_source(&resolved.source);
     let node_key_verifier = y2q_core::crypto::derive_node_key_verifier(&nk);
     let node_key_fingerprint = to_hex(&node_key_verifier);
 
@@ -518,6 +534,46 @@ async fn main() -> std::io::Result<()> {
                     if let Ok(d) = tokio::fs::File::open(&dir).await {
                         let _ = d.sync_all().await;
                     }
+                }
+            }
+        });
+    }
+
+    // Away-grant timer: erases expired grants (and, when this boot was unlocked
+    // by a home device, re-mints them) on attested time only. Never stops the
+    // daemon and never touches home wraps.
+    #[cfg(all(target_os = "linux", feature = "devices"))]
+    if let Some(state_key) = device_state_key {
+        let dir = keystore_dir.clone();
+        let policy: y2q_core::crypto::devices::DevicePolicy = (&cfg.crypto.devices).into();
+        let master = device_master_key;
+        let interval = Duration::from_secs(cfg.crypto.devices.grant_timer_interval_seconds.max(60));
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(interval).await;
+                let (dir, policy, key, master) = (
+                    dir.clone(),
+                    policy.clone(),
+                    state_key.clone(),
+                    master.clone(),
+                );
+                match tokio::task::spawn_blocking(move || {
+                    // Copy out of guarded memory for this call only; both copies zeroize on drop.
+                    let state_key = node_unlock::unlock_key(&key)?;
+                    let rmk = master.as_deref().map(node_unlock::unlock_key).transpose()?;
+                    let time = y2q_core::crypto::devices::roughtime::RoughtimeTimeSource::new(
+                        policy.roughtime.clone(),
+                    );
+                    y2q_core::crypto::devices::sweep_now(&dir, &state_key, rmk.as_deref(), &time)
+                })
+                .await
+                {
+                    Ok(Ok((0, 0))) => {}
+                    Ok(Ok((issued, erased))) => {
+                        tracing::info!(issued, erased, "away grants updated");
+                    }
+                    Ok(Err(e)) => tracing::warn!(error = %e, "grant sweep failed"),
+                    Err(e) => tracing::warn!(error = %e, "grant sweep task panicked"),
                 }
             }
         });

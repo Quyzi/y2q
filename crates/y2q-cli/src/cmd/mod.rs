@@ -6,6 +6,7 @@ pub mod bucket;
 pub mod bucketcfg;
 pub mod completions;
 pub mod cp;
+pub mod device;
 pub mod diff;
 pub mod du;
 pub mod find;

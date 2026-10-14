@@ -1,0 +1,9 @@
+# Install as /etc/udev/rules.d/70-y2q-fido2.rules, then:
+#   udevadm control --reload && udevadm trigger
+#
+# Lets the `tss` group (supplemented by deploy/y2qd.service) open the FIDO2
+# authenticator's HID raw node. 1050 is the Yubico USB vendor ID; confirm the
+# attached token's vendor with `lsusb` and substitute it for any other token.
+# A generic SUBSYSTEM=="hidraw" rule is deliberately not used: it would expose
+# every HID raw node, including keyboards, to `tss`.
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1050", GROUP="tss", MODE="0660"

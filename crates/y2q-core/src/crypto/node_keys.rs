@@ -167,7 +167,7 @@ pub fn derive_container_header_key(nk: &[u8; 32]) -> [u8; 32] {
 /// Index Key, Path Key, Object Metadata Key, Bucket Config Key, and Container
 /// Header Key.
 ///
-/// Installed once at boot from the operator-supplied node key (see
+/// Installed once at boot from the node key (operator-supplied, or unlocked from a device registry; see
 /// [`super::node_key::load_node_key`]) and never cleared — the daemon cannot
 /// serve anything without these, so unlike the old `MekSlot` (retired) there is no
 /// idle-drop path. Shared (behind an `Arc`) by the storage backend and its

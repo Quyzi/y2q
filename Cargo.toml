@@ -25,6 +25,7 @@ async-trait                 = "0.1"
 base64                      = "0.23"
 bytes                       = { version = "1.12", features = ["serde"] }
 chrono                      = "0.4"
+ctap-hid-fido2              = "3.6"
 clap                        = { version = "4", features = ["derive", "env"] }
 crc32fast                   = "1.5"
 criterion                   = { version = "0.8", features = ["async_tokio"] }
@@ -54,6 +55,8 @@ ratatui                     = { version = "0.30", features = ["crossterm"] }
 redb                        = "4.3"
 regex                       = "1"
 reqwest                     = { version = "0.13", features = ["json", "stream", "query", "rustls-no-provider"], default-features = false }
+roughenough-client          = "2.2"
+roughenough-protocol        = "2.2"
 rpassword                   = "7"
 rustls                      = { version = "0.23", default-features = false, features = ["aws_lc_rs", "logging", "tls12", "std", "prefer-post-quantum"] }
 serde                       = { version = "1", features = ["derive"] }
@@ -66,6 +69,7 @@ tokio                       = { version = "1.53", features = ["full"] }
 tokio-uring                 = "0.5"
 tokio-util                  = { version = "0.7", features = ["io", "codec"] }
 toml                        = "1.1"
+tss-esapi                   = "7.7"
 tracing                     = "0.1.44"
 tracing-actix-web           = "0.7"
 tracing-subscriber          = { version = "0.3", features = ["env-filter", "json"] }

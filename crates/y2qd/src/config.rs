@@ -393,14 +393,17 @@ pub struct CryptoConfig {
     /// `storage.base_path`, so a `cp -r` of the storage tree doesn't
     /// accidentally copy or strand authentication state.
     pub keystore_dir: String,
-    /// Path to a file holding the node key: raw binary, or text in hex or
-    /// base64. At least 32 bytes; anything longer is canonicalized down to
-    /// 32 and buys no extra security. Alternatively set `Y2QD_NODE_KEY`. One
-    /// of the two is required — the daemon will not start without it, and it
-    /// is never auto-generated. Must be CSPRNG output, not a passphrase: an
-    /// attacker with the storage tree can test candidates offline at HMAC
-    /// speed. Must not live inside `storage.base_path` or
-    /// `crypto.keystore_dir` (enforced at startup).
+    /// Operator-supplied node-key mode: path to a file holding the node key:
+    /// raw binary, or text in hex or base64. At least 32 bytes; anything
+    /// longer is canonicalized down to 32 and buys no extra security.
+    /// Alternatively set `Y2QD_NODE_KEY`. When either is set it takes
+    /// precedence at boot and the key is never auto-generated. Must be CSPRNG
+    /// output, not a passphrase: an attacker with the storage tree can test
+    /// candidates offline at HMAC speed. Must not live inside
+    /// `storage.base_path` or `crypto.keystore_dir` (enforced at startup).
+    /// Without either, the daemon unlocks the node key from the device
+    /// registry `<keystore_dir>/devices.json` (see `[crypto.devices]`), or
+    /// refuses to start.
     #[serde(default)]
     pub node_key_file: String,
     /// Argon2id parameters for new user records.
@@ -412,6 +415,130 @@ pub struct CryptoConfig {
     /// own stored chunk size. Bounds enforced at load: 64 KiB ..= 256 MiB.
     #[serde(default = "default_envelope_chunk_size_bytes")]
     pub envelope_chunk_size_bytes: usize,
+    /// Device-unlock transport settings. Only consulted when
+    /// `<keystore_dir>/devices.json` exists. The away-device window length is NOT here:
+    /// it lives in the registry and is bound into `nk_wrap`'s AAD.
+    #[serde(default)]
+    pub devices: DevicesConfig,
+}
+
+/// `[crypto.devices]`: how to reach the hardware and the time source. Ignored
+/// unless `<keystore_dir>/devices.json` exists and the binary was built with
+/// the `devices` feature.
+///
+/// The grant timer re-mints away grants only on a daemon whose boot authority
+/// was a home device. There is no host-clock fallback for attested time.
+#[derive(Debug, Deserialize, Clone)]
+pub struct DevicesConfig {
+    /// TCTI string for the TPM, e.g. `device:/dev/tpmrm0`.
+    #[serde(default = "default_tpm_tcti")]
+    pub tpm_tcti: String,
+    /// Seconds between grant sweeps / re-mints. 60 ..= 86400.
+    #[serde(default = "default_grant_timer_interval_seconds")]
+    pub grant_timer_interval_seconds: u64,
+    /// Roughtime servers used for attested time.
+    #[serde(default)]
+    pub roughtime: RoughtimeTomlConfig,
+}
+
+fn default_tpm_tcti() -> String {
+    "device:/dev/tpmrm0".to_string()
+}
+fn default_grant_timer_interval_seconds() -> u64 {
+    900
+}
+
+impl Default for DevicesConfig {
+    fn default() -> Self {
+        Self {
+            tpm_tcti: default_tpm_tcti(),
+            grant_timer_interval_seconds: default_grant_timer_interval_seconds(),
+            roughtime: RoughtimeTomlConfig::default(),
+        }
+    }
+}
+
+/// `[crypto.devices.roughtime]`.
+#[derive(Debug, Deserialize, Clone)]
+pub struct RoughtimeTomlConfig {
+    /// Trusted servers. Empty by default on purpose.
+    #[serde(default)]
+    pub servers: Vec<RoughtimeServerToml>,
+    /// Per-server query timeout in milliseconds. 200 ..= 30000.
+    #[serde(default = "default_roughtime_timeout_ms")]
+    pub timeout_ms: u64,
+    /// Number of independent servers that must answer before any away unlock
+    /// is allowed. 2 ..= 16.
+    #[serde(default = "default_roughtime_min_responses")]
+    pub min_responses: u8,
+}
+
+fn default_roughtime_timeout_ms() -> u64 {
+    3000
+}
+fn default_roughtime_min_responses() -> u8 {
+    2
+}
+
+impl Default for RoughtimeTomlConfig {
+    fn default() -> Self {
+        Self {
+            servers: Vec::new(),
+            timeout_ms: default_roughtime_timeout_ms(),
+            min_responses: default_roughtime_min_responses(),
+        }
+    }
+}
+
+/// One `[[crypto.devices.roughtime.servers]]` entry.
+#[derive(Debug, Deserialize, Clone)]
+pub struct RoughtimeServerToml {
+    pub name: String,
+    pub addr: String,
+    pub public_key_b64: String,
+}
+
+impl From<&RoughtimeTomlConfig> for y2q_core::crypto::devices::RoughtimeConfig {
+    fn from(c: &RoughtimeTomlConfig) -> Self {
+        Self {
+            servers: c
+                .servers
+                .iter()
+                .map(|s| y2q_core::crypto::devices::RoughtimeServer {
+                    name: s.name.clone(),
+                    addr: s.addr.clone(),
+                    public_key_b64: s.public_key_b64.clone(),
+                })
+                .collect(),
+            timeout_ms: c.timeout_ms,
+            min_responses: c.min_responses,
+        }
+    }
+}
+
+/// The daemon's only construction site for a `DevicePolicy`.
+/// `grant_timer_interval_seconds` is read only by `main.rs`'s timer.
+impl From<&DevicesConfig> for y2q_core::crypto::devices::DevicePolicy {
+    fn from(c: &DevicesConfig) -> Self {
+        Self {
+            tpm_tcti: c.tpm_tcti.clone(),
+            roughtime: (&c.roughtime).into(),
+        }
+    }
+}
+
+/// Validate `[crypto.devices]`.
+fn validate_devices(cfg: &DevicesConfig) -> Result<(), String> {
+    if cfg.tpm_tcti.trim().is_empty() {
+        return Err("[crypto.devices] tpm_tcti must not be empty or whitespace".to_string());
+    }
+    if !(60..=86_400).contains(&cfg.grant_timer_interval_seconds) {
+        return Err(
+            "[crypto.devices] grant_timer_interval_seconds must be between 60 and 86400"
+                .to_string(),
+        );
+    }
+    y2q_core::crypto::devices::RoughtimeConfig::from(&cfg.roughtime).validate()
 }
 
 fn default_envelope_chunk_size_bytes() -> usize {
@@ -700,10 +827,20 @@ impl Config {
         validate_s3(&cfg.s3, cfg.server.max_body_bytes)
             .map_err(|msg| Box::new(figment::Error::from(msg)))?;
 
-        if cfg.crypto.node_key_file.trim().is_empty() && std::env::var("Y2QD_NODE_KEY").is_err() {
+        validate_devices(&cfg.crypto.devices).map_err(|msg| Box::new(figment::Error::from(msg)))?;
+
+        if cfg.crypto.node_key_file.trim().is_empty()
+            && std::env::var_os("Y2QD_NODE_KEY").is_none()
+            && std::env::var_os("Y2QD_EMERGENCY_KEY").is_none()
+            && !Path::new(&cfg.crypto.keystore_dir)
+                .join(y2q_core::crypto::devices::DEVICES_FILE)
+                .exists()
+        {
             return Err(Box::new(figment::Error::from(
-                "[crypto] node_key_file or Y2QD_NODE_KEY is required; generate one with \
-                 `y2q admin gen-node-key`"
+                "[crypto] node_key_file, Y2QD_NODE_KEY, a device registry at \
+                 <crypto.keystore_dir>/devices.json, or Y2QD_EMERGENCY_KEY is required; \
+                 generate a key with `y2q admin gen-node-key`, or register a device with \
+                 `y2q admin device init`"
                     .to_string(),
             )));
         }
@@ -848,5 +985,78 @@ mod tests {
         assert!(!host_is_loopback("0.0.0.0"));
         assert!(!host_is_loopback("10.0.0.5"));
         assert!(!host_is_loopback("example.com"));
+    }
+
+    #[test]
+    fn devices_defaults_validate_and_bounds_hold() {
+        assert!(validate_devices(&DevicesConfig::default()).is_ok());
+
+        let c = DevicesConfig {
+            grant_timer_interval_seconds: 59,
+            ..DevicesConfig::default()
+        };
+        assert_eq!(
+            validate_devices(&c).unwrap_err(),
+            "[crypto.devices] grant_timer_interval_seconds must be between 60 and 86400"
+        );
+
+        let c = DevicesConfig {
+            tpm_tcti: "  ".to_string(),
+            ..DevicesConfig::default()
+        };
+        assert_eq!(
+            validate_devices(&c).unwrap_err(),
+            "[crypto.devices] tpm_tcti must not be empty or whitespace"
+        );
+
+        let mut c = DevicesConfig::default();
+        c.roughtime.timeout_ms = 199;
+        assert_eq!(
+            validate_devices(&c).unwrap_err(),
+            "[crypto.devices.roughtime] timeout_ms must be between 200 and 30000"
+        );
+
+        let mut c = DevicesConfig::default();
+        c.roughtime.min_responses = 1;
+        assert_eq!(
+            validate_devices(&c).unwrap_err(),
+            "[crypto.devices.roughtime] min_responses must be between 2 and 16"
+        );
+    }
+
+    #[test]
+    fn devices_roughtime_server_rules() {
+        use base64::Engine as _;
+        let key = |b: u8| base64::engine::general_purpose::STANDARD.encode([b; 32]);
+        let server = |n: &str, k: String| RoughtimeServerToml {
+            name: n.to_string(),
+            addr: "127.0.0.1:2002".to_string(),
+            public_key_b64: k,
+        };
+        let mut c = DevicesConfig::default();
+        c.roughtime.servers = vec![server("a", key(1))];
+        assert_eq!(
+            validate_devices(&c).unwrap_err(),
+            "[crypto.devices.roughtime] min_responses exceeds the number of configured servers"
+        );
+        c.roughtime.servers = vec![server("a", key(1)), server("b", key(2))];
+        assert!(validate_devices(&c).is_ok());
+        c.roughtime.servers = vec![server("a", key(1)), server("a", key(2))];
+        assert_eq!(
+            validate_devices(&c).unwrap_err(),
+            "[crypto.devices.roughtime] server names must be unique"
+        );
+        c.roughtime.servers = vec![server("a", key(1)), server("b", key(1))];
+        assert!(
+            validate_devices(&c)
+                .unwrap_err()
+                .contains("duplicates another server's key")
+        );
+        c.roughtime.servers = vec![server("a", key(1)), server("b", "AAAA".to_string())];
+        assert!(
+            validate_devices(&c)
+                .unwrap_err()
+                .contains("must decode to 32 bytes")
+        );
     }
 }

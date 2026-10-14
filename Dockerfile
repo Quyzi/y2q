@@ -7,6 +7,7 @@
 #
 # The io_uring storage backend is always compiled in (the build image is Linux);
 # select it at runtime with `storage.backend = "uring"` (kernel >= 5.6).
+# The image is built without the `devices` feature: TPM/FIDO2 unlock is unavailable here and `Y2QD_NODE_KEY` remains required.
 #
 # Runtime configuration (figment env-override convention: Y2QD_SECTION__KEY):
 #   Y2QD_SERVER__HOST         bind address (default: 0.0.0.0, set in image)

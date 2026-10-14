@@ -192,7 +192,10 @@ default_sync = "durable"
 keystore_dir = "/var/lib/y2q/keys"  # required
 
 # Node key: protects the metadata index, the on-disk path blinding, and
-# object metadata sidecars. REQUIRED — never auto-generated. The file may
+# object metadata sidecars. In operator mode it is supplied by you and is
+# never auto-generated; when set it takes precedence at boot. Without it the
+# daemon recovers the key from the device registry (<keystore_dir>/devices.json,
+# see [crypto.devices] below) or refuses to start. The file may
 # hold raw bytes, hex, or base64; Y2QD_NODE_KEY takes precedence and accepts
 # the same text forms. Minimum 32 bytes; more is accepted but adds nothing,
 # because every key derived from it is 256-bit.
@@ -214,6 +217,31 @@ keystore_dir = "/var/lib/y2q/keys"  # required
 # size. Smaller chunks make ranged reads finer-grained but add per-chunk overhead.
 # Bounds: 65536 (64 KiB) .. 268435456 (256 MiB).
 envelope_chunk_size_bytes = 4194304
+
+# Device-unlock transport settings: how to reach the TPM and the time source.
+# Ignored unless <keystore_dir>/devices.json exists and y2qd was built with the
+# `devices` feature. The away-device window length is NOT configured here: it is
+# registry policy, set by `y2q admin device init --away-grant-seconds` and
+# changed only by `y2q admin device set-grant-period`.
+[crypto.devices]
+tpm_tcti = "device:/dev/tpmrm0"
+# Seconds between grant sweeps. A daemon booted by a home device also re-mints
+# away grants on each tick. 60 .. 86400.
+grant_timer_interval_seconds = 900
+
+[crypto.devices.roughtime]
+# Attested time for away-device grants. There is no host-clock fallback.
+# min_responses is the number of independent servers that must answer.
+timeout_ms    = 3000   # 200 .. 30000
+min_responses = 2      # 2 .. 16
+# The server list ships EMPTY on purpose: keys rotate, several published keys
+# have no primary source, and interop with the RFC 10049 framing varies by
+# server. Run `y2q admin device check-time` before relying on any entry.
+# [[crypto.devices.roughtime.servers]]
+# name = "example"
+# addr = "<host>:<port>"
+# public_key_b64 = "<base64 Ed25519 key, copied from the server operator>"
+# Verify every entry with `y2q admin device check-time` before use; prefer a self-hosted roughenough server for anything load-bearing.
 
 [crypto.argon2]
 # Argon2id parameters used when hashing passwords for new user records.

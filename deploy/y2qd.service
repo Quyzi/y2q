@@ -27,7 +27,25 @@ NoNewPrivileges=true
 
 # Namespace isolation
 PrivateTmp=true
-PrivateDevices=true
+# Device unlock needs the TPM resource manager and the FIDO2 HID node. PrivateDevices=
+# would hide both (it mounts a private /dev with pseudo-devices only), so it is replaced
+# by a closed device policy plus an explicit allowlist.
+DevicePolicy=closed
+DeviceAllow=/dev/tpmrm0 rw
+# A TPM-only deployment that never registers an away device omits the next line.
+# It admits every hidraw node to the cgroup device policy; the udev DAC rule
+# deploy/70-y2q-fido2.rules (install as /etc/udev/rules.d/70-y2q-fido2.rules) is the
+# real gate, because hotplugged nodes cannot be covered by BindPaths=.
+DeviceAllow=char-hidraw rw
+SupplementaryGroups=tss
+# Roughtime is outbound UDP. ProtectSystem/IPAddressDeny are untouched here, but a unit that
+# adds IPAddressAllow= must include the configured Roughtime servers or every away unlock
+# on this host fails closed.
+# Authenticator PIN for away-device unlock, when a device is registered with uv_required.
+# Supply it as Y2QD_FIDO2_PIN from a source outside keystore_dir, or enter it at the prompt.
+# Interactive entry is the default. A PIN file inside keystore_dir, or on the same medium as
+# the registry, defeats the joint-theft protection, so none is shown here.
+# User= and Group= must name a non-root account. SupplementaryGroups=tss is the only group grant.
 ProtectHome=true
 ProtectSystem=strict
 ReadWritePaths=/var/lib/y2q

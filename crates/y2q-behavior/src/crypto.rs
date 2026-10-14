@@ -8,7 +8,7 @@
 //! (one slot per password the account accepts) — see [`KeyDerivation`]. The
 //! metadata index, on-disk paths, object-metadata sidecars, and bucket-config
 //! sidecars are each sealed under their own key, all derived directly (by
-//! keyed HMAC-PRF) from a single operator-supplied node key installed once at
+//! keyed HMAC-PRF) from a single node key (operator-supplied or unlocked from a device registry) installed once at
 //! boot — see [`MetadataCipher`] and [`KeySlot`].
 
 use async_trait::async_trait;
@@ -194,7 +194,7 @@ pub trait KeyDerivation {
 /// Encryption for server-structural state: the metadata index, on-disk
 /// paths, object-metadata sidecars, and bucket-config sidecars. Every key
 /// here derives directly (flat keyed-HMAC, not a chained KEK) from a single
-/// operator-supplied node key, installed once at boot — never from any
+/// node key (operator-supplied or device-unlocked), installed once at boot — never from any
 /// user's password. A compromised user account therefore never carries the
 /// power to decrypt this layer; only the operator holding the node key can.
 pub trait MetadataCipher {
@@ -263,7 +263,7 @@ pub trait MetadataCipher {
 /// Shared, in-memory holder for the node-derived structural keys (Index Key,
 /// Path Key, Object Metadata Key, Bucket Config Key).
 ///
-/// Installed exactly once, at boot, from the operator-supplied node key —
+/// Installed exactly once, at boot, from the node key (operator-supplied or device-unlocked) —
 /// never from a login. There is no idle-drop or per-session lifetime: the
 /// daemon cannot serve anything without these, so once installed they live
 /// for the process lifetime. Shared (behind an `Arc`) by the storage backend
