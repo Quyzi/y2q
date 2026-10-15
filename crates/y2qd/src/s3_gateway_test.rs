@@ -53,7 +53,7 @@ impl Harness {
             storage_dir.path().join("index.redb"),
         )
         .unwrap();
-        fs.install_node_key([3u8; 32]);
+        fs.install_node_key(&[3u8; 32]);
         let storage: Arc<AnyStorage> = Arc::new(AnyStorage::Filesystem(fs));
 
         let user_dir = tempfile::TempDir::new().unwrap();

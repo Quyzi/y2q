@@ -1779,3 +1779,392 @@ async fn e2e_duress_slot_write_is_real() {
         "login with the overwritten slot's password must report that slot"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Device unlock (swtpm + local Roughtime servers). Compiled only with
+// `--features devices`; skips cleanly when `swtpm` or `roughenough_server`
+// are not installed.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "devices")]
+static TPM_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Kills and reaps a child on every exit path.
+#[cfg(feature = "devices")]
+struct KillOnDrop(Child);
+
+#[cfg(feature = "devices")]
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Locate `name` on `PATH`, also checking the pinned Roughtime install root.
+#[cfg(feature = "devices")]
+fn find_tool(name: &str) -> Option<PathBuf> {
+    let mut dirs: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).collect())
+        .unwrap_or_default();
+    if let Some(home) = std::env::var_os("HOME") {
+        dirs.push(PathBuf::from(home).join(".cache/y2q-rt/bin"));
+    }
+    dirs.into_iter().map(|d| d.join(name)).find(|p| p.is_file())
+}
+
+/// Build `y2qd` with the `devices` feature into a dedicated target dir. The
+/// default-feature `y2qd` next to the test binary must not be reused.
+#[cfg(feature = "devices")]
+fn ensure_y2qd_devices() -> Option<PathBuf> {
+    let target = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/devices-e2e")
+        });
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let status = Command::new(cargo)
+        .args([
+            "build",
+            "-p",
+            "y2qd",
+            "--features",
+            "devices",
+            "--target-dir",
+        ])
+        .arg(&target)
+        .status()
+        .ok()?;
+    let bin = target.join("debug").join("y2qd");
+    (status.success() && bin.exists()).then_some(bin)
+}
+
+/// Collect a child's stdout and stderr into one shared buffer.
+#[cfg(feature = "devices")]
+fn capture_output(child: &mut Child) -> std::sync::Arc<std::sync::Mutex<String>> {
+    let buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    if let Some(out) = child.stdout.take() {
+        pump(out, buf.clone());
+    }
+    if let Some(err) = child.stderr.take() {
+        pump(err, buf.clone());
+    }
+    buf
+}
+
+#[cfg(feature = "devices")]
+fn pump<R: Read + Send + 'static>(reader: R, buf: std::sync::Arc<std::sync::Mutex<String>>) {
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        for line in BufReader::new(reader).lines().map_while(Result::ok) {
+            let mut b = buf.lock().unwrap_or_else(|e| e.into_inner());
+            b.push_str(&line);
+            b.push('\n');
+        }
+    });
+}
+
+/// Start a device-mode daemon (no `Y2QD_NODE_KEY`), returning the child and
+/// its captured output. `log` is INFO so `node key unlocked by …` is visible.
+#[cfg(feature = "devices")]
+fn start_server_devices(
+    bin: &std::path::Path,
+    keystore_dir: &std::path::Path,
+    config: &std::path::Path,
+    tcti: &str,
+    port: u16,
+) -> (KillOnDrop, std::sync::Arc<std::sync::Mutex<String>>) {
+    let data = keystore_dir.parent().expect("base dir").join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let mut child = Command::new(bin)
+        .arg("--config")
+        .arg(config)
+        .env_remove("Y2QD_NODE_KEY")
+        .env_remove("Y2QD_EMERGENCY_KEY")
+        .env("Y2QD_SERVER__HOST", "127.0.0.1")
+        .env("Y2QD_SERVER__PORT", port.to_string())
+        .env("Y2QD_SERVER__TLS__ENABLED", "false")
+        .env("Y2QD_STORAGE__BASE_PATH", &data)
+        .env("Y2QD_CRYPTO__KEYSTORE_DIR", keystore_dir)
+        .env("Y2QD_CRYPTO__DEVICES__TPM_TCTI", tcti)
+        .env("Y2QD_CRYPTO__ARGON2__M_COST_KIB", "8")
+        .env("Y2QD_CRYPTO__ARGON2__T_COST", "1")
+        .env("Y2QD_CRYPTO__ARGON2__P_COST", "1")
+        .env("Y2QD_AUTH__MIN_LOGIN_RESPONSE_MS", "0")
+        .env("Y2QD_OBSERVABILITY__LOG_FILTER", "info")
+        .env("RUST_LOG", "info")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn y2qd");
+    let buf = capture_output(&mut child);
+    (KillOnDrop(child), buf)
+}
+
+/// Wait until the shared log contains `needle`; panics with the log on timeout
+/// or when the daemon exits first.
+#[cfg(feature = "devices")]
+fn wait_for_log(
+    child: &mut KillOnDrop,
+    buf: &std::sync::Arc<std::sync::Mutex<String>>,
+    needle: &str,
+) -> String {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let text = buf.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if text.contains(needle) {
+            return text;
+        }
+        if let Ok(Some(status)) = child.0.try_wait() {
+            // Give the pump threads a moment to drain.
+            std::thread::sleep(Duration::from_millis(200));
+            panic!(
+                "y2qd exited ({status}) before logging `{needle}`:\n{}",
+                buf.lock().unwrap_or_else(|e| e.into_inner())
+            );
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for `{needle}`:\n{text}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[cfg(feature = "devices")]
+fn log_fingerprint(log: &str) -> String {
+    let rest = log
+        .split("node_key_fingerprint=")
+        .nth(1)
+        .expect("node_key_fingerprint in log");
+    rest.trim_start_matches('"')
+        .chars()
+        .take_while(char::is_ascii_hexdigit)
+        .collect()
+}
+
+#[cfg(feature = "devices")]
+fn stop_daemon(mut d: KillOnDrop) {
+    let _ = Command::new("kill")
+        .arg("-TERM")
+        .arg(d.0.id().to_string())
+        .status();
+    let _ = wait_for_exit(&mut d.0, Duration::from_secs(10));
+}
+
+#[cfg(feature = "devices")]
+fn hex_to_b64(hex: &str) -> String {
+    use base64::Engine as _;
+    let bytes: Vec<u8> = (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("hex"))
+        .collect();
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+/// Start a local Roughtime server on UDP `port`; returns the child and its
+/// `NAME=ADDR=KEY_B64` flag value.
+#[cfg(feature = "devices")]
+fn start_roughtime(
+    bin: &std::path::Path,
+    dir: &std::path::Path,
+    name: &str,
+    port: u16,
+) -> (KillOnDrop, String) {
+    let mut seed = [0u8; 32];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut seed))
+        .expect("read /dev/urandom");
+    let seed_hex: String = seed.iter().map(|b| format!("{b:02x}")).collect();
+    let seed_file = dir.join(format!("{name}.seed"));
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&seed_file)
+            .and_then(|mut f| f.write_all(seed_hex.as_bytes()))
+            .expect("write seed file");
+    }
+    let log_path = dir.join(format!("{name}.log"));
+    let log = std::fs::File::create(&log_path).unwrap();
+    let child = Command::new(bin)
+        .arg("--seed-file")
+        .arg(&seed_file)
+        .args(["-i", "127.0.0.1", "-p", &port.to_string(), "-j", "1"])
+        .stdout(Stdio::from(log.try_clone().unwrap()))
+        .stderr(Stdio::from(log))
+        .spawn()
+        .expect("spawn roughenough_server");
+    let guard = KillOnDrop(child);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let key_hex = loop {
+        let text = std::fs::read_to_string(&log_path).unwrap_or_default();
+        if let Some(start) = text.find("PUBK(") {
+            let rest = &text[start + 5..];
+            if let Some(end) = rest.find(')') {
+                break rest[..end].to_ascii_lowercase();
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "roughtime server gave no PUBK: {text}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    let flag = format!("{name}=127.0.0.1:{port}={}", hex_to_b64(&key_hex));
+    (guard, flag)
+}
+
+/// Start swtpm on fresh TCP ports and return it with its TCTI string.
+#[cfg(feature = "devices")]
+fn start_swtpm(swtpm: &std::path::Path, dir: &std::path::Path) -> (KillOnDrop, String) {
+    let state = dir.join("swtpm");
+    std::fs::create_dir_all(&state).unwrap();
+    // The swtpm TCTI hard-wires the control port to `port + 1`.
+    let (port, ctrl) = (1..50)
+        .find_map(|_| {
+            let p = free_port();
+            TcpListener::bind(("127.0.0.1", p + 1))
+                .ok()
+                .map(|_| (p, p + 1))
+        })
+        .expect("two adjacent free ports");
+    let spawn = || {
+        Command::new(swtpm)
+            .args(["socket", "--tpm2", "--tpmstate"])
+            .arg(format!("dir={}", state.display()))
+            .arg("--server")
+            .arg(format!("type=tcp,port={port}"))
+            .arg("--ctrl")
+            .arg(format!("type=tcp,port={ctrl}"))
+            .args(["--flags", "startup-clear"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn swtpm")
+    };
+    let mut child = spawn();
+    std::thread::sleep(Duration::from_millis(300));
+    if child.try_wait().ok().flatten().is_some() {
+        // Uninitialised state: run the one documented fallback and retry.
+        let _ = Command::new("swtpm_setup")
+            .args(["--tpm2", "--createek", "--tpmstate"])
+            .arg(&state)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        child = spawn();
+    }
+    let guard = KillOnDrop(child);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while TcpStream::connect(("127.0.0.1", port)).is_err() {
+        assert!(Instant::now() < deadline, "swtpm did not open its port");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    (guard, format!("swtpm:host=127.0.0.1,port={port}"))
+}
+
+#[cfg(feature = "devices")]
+#[test]
+fn e2e_device_unlock_swtpm() {
+    let (Some(swtpm), Some(rt_bin)) = (find_tool("swtpm"), find_tool("roughenough_server")) else {
+        eprintln!("skipping device e2e: swtpm or roughenough_server not installed");
+        return;
+    };
+    let _tpm = TPM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(y2qd) = ensure_y2qd_devices() else {
+        eprintln!("skipping device e2e: could not build y2qd with the devices feature");
+        return;
+    };
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let base = std::env::temp_dir().join(format!("y2q-dev-e2e-{}-{}", std::process::id(), nanos));
+    let keys = base.join("keys");
+    std::fs::create_dir_all(&keys).unwrap();
+
+    let (_swtpm, tcti) = start_swtpm(&swtpm, &base);
+    let (_rt_a, flag_a) = start_roughtime(&rt_bin, &base, "local-a", free_port());
+    let (_rt_b, flag_b) = start_roughtime(&rt_bin, &base, "local-b", free_port());
+
+    let y2q = |args: &[&str]| {
+        Command::new(y2q_bin())
+            .args(args)
+            .env_remove("Y2QD_NODE_KEY")
+            .env_remove("Y2QD_EMERGENCY_KEY")
+            .output()
+            .expect("run y2q")
+    };
+    let keys_s = keys.to_str().unwrap();
+    let rt_flags = ["--roughtime-server", &flag_a, "--roughtime-server", &flag_b];
+
+    let out = y2q(&[&["admin", "device", "check-time"][..], &rt_flags[..]].concat());
+    assert!(
+        ok(&out),
+        "check-time: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let out = y2q(&[
+        &[
+            "admin",
+            "device",
+            "init",
+            "--keystore-dir",
+            keys_s,
+            "--tpm",
+            "--allow-secure-boot-off",
+            "--tpm-tcti",
+            &tcti,
+            "--label",
+            "home-swtpm",
+        ][..],
+        &rt_flags[..],
+    ]
+    .concat());
+    assert!(ok(&out), "init: {}", String::from_utf8_lossy(&out.stderr));
+    let init_text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let code_lines = init_text
+        .lines()
+        .filter(|l| {
+            l.split_once(':')
+                .is_some_and(|(n, c)| n.trim().parse::<u32>().is_ok() && c.trim().len() == 44)
+        })
+        .count();
+    assert_eq!(code_lines, 10, "init output:\n{init_text}");
+
+    let cfg_path = base.join("y2qd.toml");
+    let mut cfg = String::new();
+    for flag in [&flag_a, &flag_b] {
+        let mut p = flag.splitn(3, '=');
+        let (n, a, k) = (p.next().unwrap(), p.next().unwrap(), p.next().unwrap());
+        cfg.push_str(&format!(
+            "[[crypto.devices.roughtime.servers]]\nname = \"{n}\"\naddr = \"{a}\"\npublic_key_b64 = \"{k}\"\n\n"
+        ));
+    }
+    std::fs::write(&cfg_path, cfg).unwrap();
+
+    let mut fingerprints = Vec::new();
+    for _ in 0..2 {
+        let (mut daemon, buf) = start_server_devices(&y2qd, &keys, &cfg_path, &tcti, free_port());
+        let log = wait_for_log(&mut daemon, &buf, "node_key_fingerprint=");
+        assert!(
+            log.contains("node key unlocked by home device"),
+            "no home-device unlock line:\n{log}"
+        );
+        fingerprints.push(log_fingerprint(&log));
+        stop_daemon(daemon);
+    }
+    assert_eq!(fingerprints[0].len(), 16, "{fingerprints:?}");
+    assert_eq!(
+        fingerprints[0], fingerprints[1],
+        "node key fingerprint changed across restart"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}

@@ -173,7 +173,7 @@ impl UringStorage {
     /// and the whole-file-encrypted metadata index is opened (its file key
     /// is derived from the node key too). Idempotent, though only ever
     /// called once in practice.
-    pub fn install_node_key(&self, nk: [u8; 32]) {
+    pub fn install_node_key(&self, nk: &[u8; 32]) {
         self.index.set_node_key(nk);
     }
 
@@ -935,7 +935,7 @@ mod tests {
             },
         )
         .unwrap();
-        s.install_node_key(TEST_NODE_KEY);
+        s.install_node_key(&TEST_NODE_KEY);
         s
     }
 
@@ -956,7 +956,7 @@ mod tests {
             },
         )
         .unwrap();
-        s.install_node_key(TEST_NODE_KEY);
+        s.install_node_key(&TEST_NODE_KEY);
         s
     }
 
@@ -1368,7 +1368,7 @@ mod tests {
             },
         )
         .unwrap();
-        storage.install_node_key(TEST_NODE_KEY);
+        storage.install_node_key(&TEST_NODE_KEY);
         // Index is empty right now.
         let page = storage
             .list_objects("b", ListOptions::default())

@@ -1,0 +1,10 @@
+# Install as /etc/udev/rules.d/70-y2q-fido2.rules, then:
+#   udevadm control --reload && udevadm trigger
+#
+# Lets the `y2q-keyd` group (the key helper's user, deploy/y2q-keyd@.service) open the
+# FIDO2 authenticator's HID raw node. The y2qd daemon uid is deliberately not in this
+# group. 1050 is the Yubico USB vendor ID; confirm the attached token's vendor with
+# `lsusb` and substitute it for any other token.
+# A generic SUBSYSTEM=="hidraw" rule is deliberately not used: it would expose
+# every HID raw node, including keyboards, to `y2q-keyd`.
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1050", GROUP="y2q-keyd", MODE="0660"

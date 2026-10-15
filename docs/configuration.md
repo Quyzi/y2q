@@ -96,7 +96,7 @@ Optional. When `enabled = true` the daemon binds **HTTPS** at `[server] port` us
 |---|---|---|---|
 | `backend` | enum | `"filesystem"` | Either `"filesystem"` or `"uring"`. `uring` requires Linux ≥ 5.6 and is always compiled in on Linux (no cargo feature); on non-Linux targets it is unavailable and selecting it returns a runtime error. Both backends use the same on-disk `.obj` format and files are cross-compatible. |
 | `base_path` | string | *required* | Root directory for the object tree. Created on first write if absent. |
-| `index_path` | string | `<base_path>/_y2q_index.redb` | Path to the redb metadata index file. The whole file is encrypted at rest under a key derived from the operator-supplied node key; it is resident for the daemon's whole lifetime (no idle-drop). Override to put the index on a faster disk. |
+| `index_path` | string | `<base_path>/_y2q_index.redb` | Path to the redb metadata index file. The whole file is encrypted at rest under a key derived from the node key (operator-supplied, or device-unlocked); it is resident for the daemon's whole lifetime (no idle-drop). Override to put the index on a faster disk. |
 | `max_labels` | usize | `32` | Maximum `X-Y2Q-<label>` headers accepted per PUT. |
 | `max_label_name_bytes` | usize | `64` | Maximum byte length of a label name (after stripping `X-Y2Q-` and lowercasing). |
 | `max_label_value_bytes` | usize | `1024` | Maximum byte length of a label value. |
@@ -111,9 +111,34 @@ The reserved bucket name `"api"` (case-insensitive) is rejected - it would colli
 | Field | Type | Default | Notes |
 |---|---|---|---|
 | `keystore_dir` | string | *required* | Directory holding `keystore.json`, `users.redb`, and the daemon's `.lock`. Should be on a path you back up; should *not* live under `storage.base_path` so a `cp -r` of the storage tree can't accidentally copy authentication state. |
-| `node_key_file` | string | *(none)* | Path to a file holding the operator-supplied node key (raw binary, hex, or base64; at least 32 bytes). Alternatively set `Y2QD_NODE_KEY`. One of the two is required - the daemon refuses to start without it and never auto-generates one. Must not live inside `storage.base_path` or `crypto.keystore_dir` (enforced at startup). |
+| `node_key_file` | string | *(none)* | Path to a file holding the operator-supplied node key (raw binary, hex, or base64; at least 32 bytes). Alternatively set `Y2QD_NODE_KEY`. A node key source is required: one of these two, or a device registry at `<keystore_dir>/devices.json` (created by `y2q admin device init`; Linux, `devices` build feature), or `Y2QD_EMERGENCY_KEY` against such a registry. The daemon refuses to start without one and never auto-generates one outside `device init`. When an operator key is configured it takes precedence and the device path never runs. Must not live inside `storage.base_path` or `crypto.keystore_dir` (enforced at startup). |
 | `envelope_chunk_size_bytes` | usize | `4194304` (4 MiB) | Plaintext chunk size for the v3/v4 chunked streaming envelope (current writes are v4; see [architecture.md#envelope-format](architecture.md#envelope-format)). Bounds: `65536` (64 KiB) .. `268435456` (256 MiB); out-of-range values are rejected at startup. Smaller chunks make ranged GETs finer-grained but add per-chunk AEAD overhead. **Recorded per-object in the envelope header** - see note below. |
 | `argon2` | table | *(see below)* | Argon2id parameters used when writing *new* credential slots (existing slots keep their stored parameters). |
+
+### `[crypto.devices]`
+
+Only consulted when `<keystore_dir>/devices.json` exists and the binary was built with the `devices` feature. These keys say how to *reach* hardware and time; none can influence the away-device window. `away_grant_seconds` is registry policy: set by `device init --away-grant-seconds` (default 43 200; bounds 60..=2 592 000), bound into `nk_wrap`'s AAD, and changed only by `y2q admin device set-grant-period`.
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `tpm_tcti` | string | `"device:/dev/tpmrm0"` | TCTI string used to reach the TPM 2.0. Must not be empty or whitespace. |
+| `grant_timer_interval_seconds` | u64 | `900` | How often the daemon sweeps expired away grants. On a daemon whose boot authority was a home device, the same tick re-mints away grants. Bounds `60` .. `86400`. |
+| `key_agent_socket` | string | `""` | Absolute path of the key socket (`/run/y2q-keyd.sock`, `y2q-keyd.socket`, `Accept=yes`). Non-empty: the daemon fetches NK once from a socket-activated one-shot helper (`y2qd --key-serve`, uid `y2q-keyd`) that was armed by root (`y2qd --key-arm`); the daemon never holds RMK or touches the TPM or `devices.json` (it does hold one transient raw NK copy). Empty: **legacy in-process mode**, where the daemon itself unlocks, holds RMK and TPM access and runs the grant timer - weaker, since a compromised daemon uid can re-run the unseal. |
+| `key_agent_arm_uid` | u32 | `0` | The only peer uid the helper accepts for `arm` (root by default). |
+| `key_agent_peer_uid` | u32 | *(none)* | The only peer uid the helper serves a `fetch` to (the daemon's uid). No default: when unset, the helper refuses every fetch. |
+| `key_agent_state_dir` | string | `/run/y2q-keyd` | tmpfs directory (mode 0700, owned by the helper uid) holding the one-time armed file (must be absolute); created by `deploy/y2q-keyd.tmpfiles.conf`. |
+| `key_agent_timeout_seconds` | u64 | `180` | Daemon-side read/write timeout for the key helper exchange; covers an interactive touch/PIN on the helper. Bounds `5` .. `900`. |
+| `roughtime` | table | *(see below)* | Attested-time source. There is no host-clock fallback. |
+
+### `[crypto.devices.roughtime]`
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `servers` | array of tables | `[]` | Each entry has `name` (unique), `addr` (`host:port`) and `public_key_b64` (32-byte Ed25519 key, unique). Empty on purpose: keys rotate and interop varies, so verify every entry with `y2q admin device check-time`. An empty list is valid for a zero-home deployment; any unlock that needs attested time then fails with `RoughtimeNotConfigured`. |
+| `timeout_ms` | u64 | `3000` | Per-server query timeout. Bounds `200` .. `30000`. |
+| `min_responses` | u8 | `2` | Number of independent servers that must answer before any away unlock is allowed. Bounds `2` .. `16`; may not exceed the number of configured servers when any are configured. |
+
+Two ports on one host are not independent sources. Prefer a self-hosted `roughenough` server for anything load-bearing.
 
 The chunk size is stored in each object's envelope header, and decryption always
 reads it from there. Changing `envelope_chunk_size_bytes` therefore only affects

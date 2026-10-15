@@ -1,0 +1,12 @@
+[Unit]
+Description=y2q away-grant sweep timer
+Documentation=https://github.com/Quyzi/y2q
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=15min
+Persistent=false
+Unit=y2q-keyd-sweep.service
+
+[Install]
+WantedBy=timers.target

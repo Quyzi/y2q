@@ -43,7 +43,7 @@ fn open_index() -> (Arc<MetadataIndex>, TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let idx = MetadataIndex::new(dir.path().join("idx.redb"));
     // Install a node key so the encrypted index file is opened before use.
-    idx.set_node_key([0x5a; 32]);
+    idx.set_node_key(&[0x5a; 32]);
     (Arc::new(idx), dir)
 }
 

@@ -192,7 +192,10 @@ default_sync = "durable"
 keystore_dir = "/var/lib/y2q/keys"  # required
 
 # Node key: protects the metadata index, the on-disk path blinding, and
-# object metadata sidecars. REQUIRED — never auto-generated. The file may
+# object metadata sidecars. In operator mode it is supplied by you and is
+# never auto-generated; when set it takes precedence at boot. Without it the
+# daemon recovers the key from the device registry (<keystore_dir>/devices.json,
+# see [crypto.devices] below) or refuses to start. The file may
 # hold raw bytes, hex, or base64; Y2QD_NODE_KEY takes precedence and accepts
 # the same text forms. Minimum 32 bytes; more is accepted but adds nothing,
 # because every key derived from it is 256-bit.
@@ -214,6 +217,78 @@ keystore_dir = "/var/lib/y2q/keys"  # required
 # size. Smaller chunks make ranged reads finer-grained but add per-chunk overhead.
 # Bounds: 65536 (64 KiB) .. 268435456 (256 MiB).
 envelope_chunk_size_bytes = 4194304
+
+# Device-unlock transport settings: how to reach the TPM and the time source.
+# Ignored unless <keystore_dir>/devices.json exists and y2qd was built with the
+# `devices` feature. The away-device window length is NOT configured here: it is
+# registry policy, set by `y2q admin device init --away-grant-seconds` and
+# changed only by `y2q admin device set-grant-period`.
+[crypto.devices]
+tpm_tcti = "device:/dev/tpmrm0"
+# Seconds between grant sweeps. A daemon booted by a home device also re-mints
+# away grants on each tick. 60 .. 86400.
+grant_timer_interval_seconds = 900
+
+# Key helper (privilege separation). Helper mode isolates the TPM / FIDO2 unseal,
+# devices.json and the Registry Master Key from the network-facing daemon uid.
+# No resident process holds RMK: a systemd socket unit (`Accept=yes`) spawns a
+# fresh `y2qd --key-serve` per connection, as the key-owner uid (TPM / hidraw
+# access, owns devices.json). It handles exactly one request and exits.
+#
+#   arm   (peer uid = key_agent_arm_uid, default root): stores ONE-TIME
+#         authorization (passcode, FIDO2 PIN, emergency code) in
+#         <key_agent_state_dir>/armed. Unattended hosts arm with empty
+#         authorization from `ExecStartPre=+y2qd --key-arm` before every daemon
+#         start; attended hosts (a home device with a second factor) arm
+#         interactively: `y2qd --key-arm --prompt-passcode|--prompt-pin|
+#         --prompt-emergency-code` sends the secret over the socket, never via
+#         an environment variable or a file.
+#   fetch (peer uid = key_agent_peer_uid, the daemon's uid): the helper consumes
+#         the armed file (every attempt deletes it), unlocks the registry with
+#         that material and returns the node key once. A fetch without a prior
+#         arm is refused, so a compromised daemon uid can connect but cannot
+#         re-fetch the node key or RMK.
+#
+# `y2qd --key-sweep` (run from a systemd timer) refreshes / sweeps away grants
+# through an unattended home unlock. A home device with a second factor cannot
+# be unlocked unattended: the sweep then logs and exits 0, and grants are
+# refreshed at arm+boot unlocks and by `y2q admin device refresh`.
+#
+# Operator-supplied node keys still take precedence over the helper.
+# An EMPTY socket (the default) is the legacy in-process mode: the daemon itself
+# holds hardware access and RMK and keeps the grant timer, so anything running
+# as the daemon uid can repeat the unseal. This is the weaker mode; use it only
+# when a second uid is not available. The daemon still receives one transient
+# raw node-key copy at boot in either mode, and root on the live host defeats
+# both.
+# Must be an absolute path. Set it identically for the daemon, the helper and
+# the arm client.
+key_agent_socket = ""
+# The only uid a `fetch` is served to (the daemon's uid). Required by --key-serve.
+# key_agent_peer_uid = 990
+# The only uid an `arm` is accepted from. Default 0 (root).
+key_agent_arm_uid = 0
+# Directory for the armed authorization. Must be absolute, exist, be owned by
+# the helper's uid and have mode 0700 (systemd: RuntimeDirectory=y2q-keyd,
+# RuntimeDirectoryMode=0700 on the helper's service gives /run/y2q-keyd).
+key_agent_state_dir = "/run/y2q-keyd"
+# Daemon-side read/write timeout for the helper exchange, in seconds; it must
+# cover an interactive touch / PIN on the helper. 5 .. 900.
+key_agent_timeout_seconds = 180
+
+[crypto.devices.roughtime]
+# Attested time for away-device grants. There is no host-clock fallback.
+# min_responses is the number of independent servers that must answer.
+timeout_ms    = 3000   # 200 .. 30000
+min_responses = 2      # 2 .. 16
+# The server list ships EMPTY on purpose: keys rotate, several published keys
+# have no primary source, and interop with the RFC 10049 framing varies by
+# server. Run `y2q admin device check-time` before relying on any entry.
+# [[crypto.devices.roughtime.servers]]
+# name = "example"
+# addr = "<host>:<port>"
+# public_key_b64 = "<base64 Ed25519 key, copied from the server operator>"
+# Verify every entry with `y2q admin device check-time` before use; prefer a self-hosted roughenough server for anything load-bearing.
 
 [crypto.argon2]
 # Argon2id parameters used when hashing passwords for new user records.

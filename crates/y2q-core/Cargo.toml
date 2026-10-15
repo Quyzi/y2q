@@ -4,6 +4,11 @@ version.workspace = true
 license-file.workspace = true
 edition = "2024"
 
+[features]
+default = []
+# Device-based node-key unlock (TPM 2.0 home devices, FIDO2 away devices, Roughtime).
+devices = ["dep:tss-esapi", "dep:ctap-hid-fido2", "dep:roughenough-client", "dep:roughenough-protocol"]
+
 [dependencies]
 aes-gcm         = { workspace = true }
 argon2          = { workspace = true }
@@ -38,6 +43,10 @@ zeroize         = { workspace = true }
 aligned-vec   = { workspace = true }
 libc          = { workspace = true }
 tokio-uring   = { workspace = true }
+ctap-hid-fido2       = { workspace = true, optional = true }
+roughenough-client   = { workspace = true, optional = true }
+roughenough-protocol = { workspace = true, optional = true }
+tss-esapi            = { workspace = true, optional = true }
 
 [dev-dependencies]
 criterion = { workspace = true }

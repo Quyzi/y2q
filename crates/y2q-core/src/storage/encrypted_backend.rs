@@ -30,7 +30,7 @@
 //!
 //! ## Key
 //!
-//! The file key is derived from the operator-supplied node key, installed
+//! The file key is derived from the node key (operator-supplied or device-unlocked), installed
 //! once at boot ([`crate::crypto::derive_index_file_key`]). Used by
 //! [`crate::storage::index::MetadataIndex`] for `_y2q_index.redb`.
 

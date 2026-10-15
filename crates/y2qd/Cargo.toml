@@ -6,12 +6,14 @@ edition = "2024"
 
 [features]
 default = []
+devices = ["y2q-core/devices"]
 
 [dependencies]
 actix-governor              = { workspace = true }
 actix-web                   = { workspace = true, features = ["rustls-0_23"] }
 base64                      = { workspace = true }
 bytes                       = { workspace = true }
+chrono                      = { workspace = true }
 clap                        = { workspace = true }
 crc32fast                   = { workspace = true }
 dashmap                     = { workspace = true }
@@ -19,9 +21,12 @@ figment                     = { workspace = true }
 flume                       = { workspace = true }
 futures-util                = { workspace = true }
 hmac                        = { workspace = true }
+libc                        = { workspace = true }
 metrics                     = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
 rand                        = { workspace = true }
+ratatui                     = { workspace = true }
+rpassword                   = { workspace = true }
 rustls                      = { workspace = true }
 serde                       = { workspace = true }
 serde_json                  = { workspace = true }
@@ -29,6 +34,7 @@ sha2                        = { workspace = true }
 subtle                      = { workspace = true }
 thiserror                   = { workspace = true }
 tokio                       = { workspace = true }
+toml_edit                   = { workspace = true }
 tracing                     = { workspace = true }
 tracing-actix-web           = { workspace = true }
 tracing-subscriber          = { workspace = true }

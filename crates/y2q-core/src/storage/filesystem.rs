@@ -117,7 +117,7 @@ impl FilesystemStorage {
     /// and the whole-file-encrypted metadata index is opened (its file key
     /// is derived from the node key too). Idempotent, though only ever
     /// called once in practice.
-    pub fn install_node_key(&self, nk: [u8; 32]) {
+    pub fn install_node_key(&self, nk: &[u8; 32]) {
         self.index.set_node_key(nk);
     }
 
@@ -1963,7 +1963,7 @@ mod tests {
         let base = dir.path().join("data");
         let index = dir.path().join("index.redb");
         let storage = FilesystemStorage::new(base, index).unwrap();
-        storage.install_node_key(TEST_NODE_KEY);
+        storage.install_node_key(&TEST_NODE_KEY);
         (storage, dir)
     }
 
@@ -2083,7 +2083,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let s2 =
             FilesystemStorage::new(dir.path().join("data"), dir.path().join("i.redb")).unwrap();
-        s2.install_node_key([9u8; 32]);
+        s2.install_node_key(&[9u8; 32]);
         let p2 = s2.key_path("b", "k").unwrap();
 
         // Same (bucket, key) under a different deployment key yields a different
@@ -2468,13 +2468,13 @@ mod tests {
         let index = dir.path().join("index.redb");
         {
             let s = FilesystemStorage::new(&base, &index).unwrap();
-            s.install_node_key(TEST_NODE_KEY);
+            s.install_node_key(&TEST_NODE_KEY);
             s.put("b", "k", make_object(b"v"), opts(&[("env", "prod")]))
                 .await
                 .unwrap();
         }
         let s2 = FilesystemStorage::new(&base, &index).unwrap();
-        s2.install_node_key(TEST_NODE_KEY);
+        s2.install_node_key(&TEST_NODE_KEY);
         let hits = s2.index().lookup_by_label("env", "prod").await.unwrap();
         assert_eq!(hits, vec![("b".to_owned(), "k".to_owned())]);
     }
@@ -2824,7 +2824,7 @@ mod tests {
 
         {
             let s = FilesystemStorage::new(&base, &index_a).unwrap();
-            s.install_node_key(TEST_NODE_KEY);
+            s.install_node_key(&TEST_NODE_KEY);
             s.put("b1", "k1", make_object(b"v1"), opts(&[("env", "prod")]))
                 .await
                 .unwrap();
@@ -2837,7 +2837,7 @@ mod tests {
         }
 
         let s2 = FilesystemStorage::new(&base, &index_b).unwrap();
-        s2.install_node_key(TEST_NODE_KEY);
+        s2.install_node_key(&TEST_NODE_KEY);
         // The fresh index is empty; the label index proves it. list_buckets now
         // unions on-disk bucket directories, so it already reflects b1/b2 here
         // even before the rebuild repopulates the object/label index.

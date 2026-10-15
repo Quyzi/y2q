@@ -1,0 +1,17 @@
+[Unit]
+Description=y2q key socket (one-shot device unlock helper, socket-activated)
+Documentation=https://github.com/Quyzi/y2q
+
+[Socket]
+ListenStream=/run/y2q-keyd.sock
+# One fresh y2q-keyd@.service process per connection: no resident process ever holds
+# the Registry Master Key. The helper itself enforces the peer uid (arm: key_agent_arm_uid,
+# fetch: key_agent_peer_uid). Root can connect regardless of the socket mode.
+Accept=yes
+SocketUser=y2qd
+SocketGroup=y2qd
+SocketMode=0600
+MaxConnections=4
+
+[Install]
+WantedBy=sockets.target
