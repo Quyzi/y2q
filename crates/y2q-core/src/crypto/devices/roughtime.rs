@@ -109,6 +109,31 @@ pub fn probe_all(cfg: &RoughtimeConfig) -> Vec<ServerProbe> {
         .collect()
 }
 
+/// Probe every server once and combine the answers: the `check-time` routine.
+/// `on_probe` sees each server's result as it is evaluated. Returns
+/// `(attested_unix, agreeing, total)`; an empty server list is
+/// [`CryptoError::RoughtimeNotConfigured`].
+pub fn attest_with(
+    cfg: &RoughtimeConfig,
+    on_probe: &mut dyn FnMut(&ServerProbe),
+) -> Result<(u64, usize, usize), CryptoError> {
+    if cfg.servers.is_empty() {
+        return Err(CryptoError::RoughtimeNotConfigured);
+    }
+    let probes = probe_all(cfg);
+    let mut pairs = Vec::new();
+    let mut failures = Vec::new();
+    for p in &probes {
+        on_probe(p);
+        match &p.outcome {
+            Ok(ok) => pairs.push((ok.lower, ok.upper)),
+            Err(reason) => failures.push(format!("{}: {reason}", p.name)),
+        }
+    }
+    let t = combine_intervals(&pairs, cfg.min_responses, &failures.join("; "))?;
+    Ok((t, pairs.len(), probes.len()))
+}
+
 /// Quorum, consistency and `max(L)` rules over surviving `(lower, upper)` pairs.
 pub fn combine_intervals(
     intervals: &[(u64, u64)],
@@ -185,6 +210,14 @@ mod tests {
             timeout_ms: 300,
             min_responses: 2,
         }
+    }
+
+    #[test]
+    fn attest_with_no_servers_is_not_configured() {
+        let mut seen = 0;
+        let e = attest_with(&cfg(vec![]), &mut |_| seen += 1).unwrap_err();
+        assert!(matches!(e, CryptoError::RoughtimeNotConfigured));
+        assert_eq!(seen, 0);
     }
 
     #[test]

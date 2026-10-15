@@ -4735,6 +4735,7 @@ dependencies = [
  "indexmap",
  "toml_datetime 1.1.1+spec-1.1.0",
  "toml_parser",
+ "toml_writer",
  "winnow 1.0.4",
 ]
 
@@ -5684,6 +5685,7 @@ dependencies = [
  "actix-web",
  "base64 0.23.1",
  "bytes",
+ "chrono",
  "clap",
  "crc32fast",
  "dashmap",
@@ -5695,6 +5697,7 @@ dependencies = [
  "metrics",
  "metrics-exporter-prometheus",
  "rand 0.10.2",
+ "ratatui",
  "rpassword",
  "rustls",
  "serde",
@@ -5704,6 +5707,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
+ "toml_edit 0.25.15+spec-1.1.0",
  "tracing",
  "tracing-actix-web",
  "tracing-subscriber",

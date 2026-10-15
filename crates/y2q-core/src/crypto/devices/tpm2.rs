@@ -94,6 +94,28 @@ pub fn secure_boot_state() -> SecureBootState {
         .map_or(SecureBootState::Unknown, |raw| parse_secure_boot(&raw))
 }
 
+/// Why a PCR-7 policy must not be sealed right now, or `None` when it may be.
+///
+/// Returns the "what" clause only; each caller composes its own refusal text
+/// around it. `None` when the policy does not use PCR 7, when `allow_off` is
+/// set, or when Secure Boot is enforcing.
+pub fn secure_boot_problem(
+    state: SecureBootState,
+    pcrs: &[u8],
+    allow_off: bool,
+) -> Option<&'static str> {
+    if !pcrs.contains(&7) || allow_off {
+        return None;
+    }
+    match state {
+        SecureBootState::Enabled => None,
+        SecureBootState::Disabled => Some("Secure Boot is disabled"),
+        SecureBootState::Unknown => {
+            Some("the Secure Boot state is unknown (non-UEFI boot, or efivarfs is unavailable)")
+        }
+    }
+}
+
 fn pcr_slot(n: u8) -> Result<PcrSlot, CryptoError> {
     Ok(match n {
         0 => PcrSlot::Slot0,
@@ -377,6 +399,26 @@ mod tests {
     use tss_esapi::structures::DigestValues;
 
     use super::*;
+
+    #[test]
+    fn secure_boot_problem_matrix() {
+        use SecureBootState::{Disabled, Enabled, Unknown};
+        // Enabled never has a problem.
+        assert_eq!(secure_boot_problem(Enabled, &[7], false), None);
+        // Without PCR 7 the state is irrelevant.
+        assert_eq!(secure_boot_problem(Disabled, &[0, 4], false), None);
+        // Explicit opt-out.
+        assert_eq!(secure_boot_problem(Disabled, &[7], true), None);
+        assert_eq!(
+            secure_boot_problem(Disabled, &[7], false),
+            Some("Secure Boot is disabled")
+        );
+        assert!(
+            secure_boot_problem(Unknown, &[0, 7], false)
+                .unwrap()
+                .contains("unknown")
+        );
+    }
 
     static TPM_LOCK: Mutex<()> = Mutex::new(());
 

@@ -131,6 +131,18 @@ fn enumerate() -> Result<Vec<HidInfo>, CryptoError> {
         .map_err(|_| backend_msg("fido2: hidapi initialisation failed"))
 }
 
+/// HID paths of every attached FIDO2 authenticator, in enumeration order.
+///
+/// Only `HidParam::Path` entries are returned: those are the ones [`enroll`]
+/// can select by path.
+pub fn list_authenticators() -> Result<Vec<String>, CryptoError> {
+    Ok(enumerate()?
+        .iter()
+        .filter(|d| matches!(d.param, HidParam::Path(_)))
+        .map(path_of)
+        .collect())
+}
+
 fn cfg() -> Cfg {
     Cfg::init()
         .with_enable_log(false)

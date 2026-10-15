@@ -79,6 +79,24 @@ How to run, manage, and recover a `y2qd` deployment. Read this before putting an
      -d '{"username":"alice","password":"<strong password>"}'
    ```
 
+### Guided setup (`y2qd setup`)
+
+`y2qd setup` is an interactive terminal wizard (Linux only; it needs a terminal on stdin and stdout) that replaces steps 2-4 above:
+
+```sh
+y2qd setup --config /etc/y2q/config.toml      # `--config` is the only flag it accepts
+```
+
+It scans the host (guarded memory, io_uring, systemd, TPM, Secure Boot, FIDO2, existing installs), walks through paths, network/TLS, S3, storage, security and the node-key authority, shows a review of every change, and then applies it:
+
+- **Authority.** *Operator key file*: generates a 32-byte key (`0400`, base64, never printed) or uses one you name. *Device registry*: creates `devices.json` through the same library path as `y2q admin device init`; the ten emergency codes are shown once on a separate screen that ignores Enter for 3 s and is erased afterwards (a display failure aborts before any registry exists). An existing deployment can *Keep current*, or *Finish registry migration* after a half-finished adoption. Setup never rotates a node key and never edits an existing registry (use `y2q admin device ...`).
+- **System.** Creates the data and keystore directories with their modes (`0750` / `0700`, or `1770` with the key helper) and, as root, their owners; optionally installs the `deploy/` units rendered for your users, paths and binary. It does not create users or run `systemctl`/`udevadm`; the closing summary prints the exact next commands.
+- **Config file.** Only the keys setup manages are written; everything else (comments, tuning keys, unknown keys) is preserved. The file starts with `# y2qd setup:` header lines recording when it was last updated; before an existing file is rewritten it is copied to `<name>.bak-<timestamp>`. A rerun with no changes writes nothing.
+- **Refusals.** Setup stops if `Y2QD_NODE_KEY`, `Y2QD_NEW_NODE_KEY`, `Y2QD_EMERGENCY_KEY` or `Y2QD_FIDO2_PIN` is set, if a daemon holds the keystore lock, or if the config file changed on disk after setup read it. As root it also refuses paths whose ancestors another user could swap.
+- Changing the keystore directory does not move data; setup asks for an explicit acknowledgement when existing data would be orphaned.
+
+Registry creation needs a build with `--features devices` (`cargo build --release -p y2qd --features devices`).
+
 ## Container
 
 Both storage backends are compiled into one image; pick the backend at runtime with `storage.backend` (`uring` needs Linux >= 5.6). Image variants:

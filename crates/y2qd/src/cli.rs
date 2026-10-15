@@ -5,7 +5,7 @@ use std::path::PathBuf;
 #[command(version, about = "y2qd — post-quantum secure object store daemon")]
 pub struct Cli {
     /// Path to the configuration file. Defaults to `config.toml` in the working directory.
-    #[arg(short, long, value_name = "FILE")]
+    #[arg(short, long, value_name = "FILE", global = true)]
     pub config: Option<PathBuf>,
 
     /// Override a config value, e.g. `--set server.port=9090`.
@@ -77,10 +77,77 @@ pub struct Cli {
     /// refuses to run against a live daemon.
     #[arg(long)]
     pub upgrade_container_headers: bool,
+
+    #[command(subcommand)]
+    pub command: Option<Subcmd>,
+}
+
+#[derive(clap::Subcommand, Debug)]
+pub enum Subcmd {
+    /// Interactive setup wizard: scan this host, configure the service, set up the node-key authority.
+    Setup,
+}
+
+impl Cli {
+    /// `y2qd setup` takes only `--config`; every daemon-mode flag is refused.
+    pub fn reject_daemon_flags_with_subcommand(&self) -> Result<(), String> {
+        let set: [(&str, bool); 10] = [
+            ("set", !self.overrides.is_empty()),
+            ("rotate-node-key", self.rotate_node_key),
+            ("key-serve", self.key_serve),
+            ("key-sweep", self.key_sweep),
+            ("key-arm", self.key_arm),
+            ("prompt-passcode", self.prompt_passcode),
+            ("prompt-pin", self.prompt_pin),
+            ("prompt-emergency-code", self.prompt_emergency_code),
+            ("new-node-key-file", self.new_node_key_file.is_some()),
+            ("upgrade-container-headers", self.upgrade_container_headers),
+        ];
+        match set.iter().find(|(_, on)| *on) {
+            Some((flag, _)) => Err(format!("`y2qd setup` takes only --config; remove --{flag}")),
+            None => Ok(()),
+        }
+    }
 }
 
 fn parse_key_value(s: &str) -> Result<(String, String), String> {
     s.split_once('=')
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .ok_or_else(|| format!("expected KEY=VALUE, got {s:?}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Cli {
+        Cli::try_parse_from(std::iter::once("y2qd").chain(args.iter().copied())).unwrap()
+    }
+
+    #[test]
+    fn setup_parses_with_config_before_or_after() {
+        for args in [
+            ["--config", "x.toml", "setup"],
+            ["setup", "--config", "x.toml"],
+        ] {
+            let cli = parse(&args);
+            assert!(matches!(cli.command, Some(Subcmd::Setup)));
+            assert_eq!(cli.config.as_deref(), Some(std::path::Path::new("x.toml")));
+            assert!(cli.reject_daemon_flags_with_subcommand().is_ok());
+        }
+        assert!(parse(&[]).command.is_none());
+    }
+
+    #[test]
+    fn daemon_flags_are_rejected_with_setup() {
+        let cli = parse(&["--key-arm", "setup"]);
+        let msg = cli.reject_daemon_flags_with_subcommand().unwrap_err();
+        assert!(msg.contains("--key-arm"), "{msg}");
+        let cli = parse(&["--set", "a=b", "setup"]);
+        assert!(
+            cli.reject_daemon_flags_with_subcommand()
+                .unwrap_err()
+                .contains("--set")
+        );
+    }
 }

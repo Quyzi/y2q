@@ -131,6 +131,8 @@ pub mod emergency;
 #[cfg(all(target_os = "linux", feature = "devices"))]
 pub mod fido2;
 #[cfg(all(target_os = "linux", feature = "devices"))]
+pub mod provision;
+#[cfg(all(target_os = "linux", feature = "devices"))]
 pub mod registry;
 #[cfg(all(target_os = "linux", feature = "devices"))]
 pub mod roughtime;

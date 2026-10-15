@@ -34,6 +34,7 @@ WORKDIR /work
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ ./crates/
 COPY config.default.toml ./
+COPY deploy/ ./deploy/
 
 RUN cargo build --release -p y2qd && \
     cargo build --release -p y2q-cli && \

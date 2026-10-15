@@ -442,7 +442,8 @@ pub(crate) fn corrupt(path: &Path, reason: impl Into<String>) -> CryptoError {
     }
 }
 
-pub(crate) fn valid_label(label: &str) -> Result<(), String> {
+/// Check a device label: non-empty, at most [`MAX_LABEL_LEN`] bytes, printable ASCII.
+pub fn valid_label(label: &str) -> Result<(), String> {
     if label.is_empty() {
         return Err("label must not be empty".to_owned());
     }

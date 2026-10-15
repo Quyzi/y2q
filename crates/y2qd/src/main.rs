@@ -108,6 +108,7 @@ mod s3;
 mod s3_gateway_test;
 #[cfg(test)]
 mod session_residency_test;
+mod setup;
 mod span;
 mod tls;
 mod trace;
@@ -304,6 +305,19 @@ fn run_key_helper(_cli: &cli::Cli, _cfg: &config::Config) -> std::io::Result<()>
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
     let cli = cli::Cli::parse();
+
+    if let Some(cli::Subcmd::Setup) = cli.command {
+        if let Err(msg) = cli.reject_daemon_flags_with_subcommand() {
+            <cli::Cli as clap::CommandFactory>::command()
+                .error(clap::error::ErrorKind::ArgumentConflict, msg)
+                .exit();
+        }
+        if let Err(e) = setup::run(&cli) {
+            eprintln!("y2qd setup: {}", setup::sanitize(&e.to_string()));
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
 
     let cfg = config::Config::load(&cli)
         .expect("failed to load config (config.toml, Y2QD_* env vars, or --set)");

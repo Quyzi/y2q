@@ -465,7 +465,7 @@ pub struct DevicesConfig {
 }
 
 fn default_tpm_tcti() -> String {
-    "device:/dev/tpmrm0".to_string()
+    y2q_core::crypto::devices::DEFAULT_TPM_TCTI.to_string()
 }
 fn default_grant_timer_interval_seconds() -> u64 {
     900
@@ -864,21 +864,42 @@ impl Config {
             figment = figment.merge(Serialized::globals(serde_json::Value::Object(map)));
         }
 
+        let cfg = Self::from_figment(figment)?;
+        cfg.validate_node_key_source()?;
+        Ok(cfg)
+    }
+
+    /// Extract and field-validate a configuration from a prepared figment.
+    fn from_figment(figment: Figment) -> Result<Self, Box<figment::Error>> {
         let cfg: Config = figment.extract().map_err(Box::new)?;
-
-        validate_envelope_chunk_size(cfg.crypto.envelope_chunk_size_bytes)
+        cfg.validate_fields()
             .map_err(|msg| Box::new(figment::Error::from(msg)))?;
+        Ok(cfg)
+    }
 
-        validate_s3(&cfg.s3, cfg.server.max_body_bytes)
-            .map_err(|msg| Box::new(figment::Error::from(msg)))?;
+    /// Field validators shared by the daemon and `y2qd setup`.
+    fn validate_fields(&self) -> Result<(), String> {
+        validate_envelope_chunk_size(self.crypto.envelope_chunk_size_bytes)?;
+        validate_s3(&self.s3, self.server.max_body_bytes)?;
+        validate_devices(&self.crypto.devices)
+    }
 
-        validate_devices(&cfg.crypto.devices).map_err(|msg| Box::new(figment::Error::from(msg)))?;
+    /// Parse and validate TOML text only: no file, no environment, no `--set`.
+    /// Used by `y2qd setup` to prove the file it renders is loadable. Does not
+    /// apply the node-key-source rule; see [`Config::validate_node_key_source`].
+    #[cfg(target_os = "linux")]
+    pub fn from_toml_str(text: &str) -> Result<Self, Box<figment::Error>> {
+        Self::from_figment(Figment::new().merge(Toml::string(text)))
+    }
 
-        if cfg.crypto.node_key_file.trim().is_empty()
-            && cfg.crypto.devices.key_agent_socket.is_empty()
+    /// The daemon needs some source for the node key: a key file, a key
+    /// helper, a device registry, or one of the secret environment variables.
+    pub fn validate_node_key_source(&self) -> Result<(), Box<figment::Error>> {
+        if self.crypto.node_key_file.trim().is_empty()
+            && self.crypto.devices.key_agent_socket.is_empty()
             && std::env::var_os("Y2QD_NODE_KEY").is_none()
             && std::env::var_os("Y2QD_EMERGENCY_KEY").is_none()
-            && !Path::new(&cfg.crypto.keystore_dir)
+            && !Path::new(&self.crypto.keystore_dir)
                 .join(y2q_core::crypto::devices::DEVICES_FILE)
                 .exists()
         {
@@ -890,8 +911,7 @@ impl Config {
                     .to_string(),
             )));
         }
-
-        Ok(cfg)
+        Ok(())
     }
 }
 

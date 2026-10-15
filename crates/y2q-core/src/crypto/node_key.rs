@@ -64,9 +64,58 @@ fn load_node_key_via(
     if node_key_file.trim().is_empty() {
         return Err(CryptoError::NodeKeyMissing);
     }
-    let bytes = std::fs::read(node_key_file)
-        .map_err(|e| CryptoError::NodeKeyMalformed(format!("read {node_key_file}: {e}")))?;
-    let raw = match std::str::from_utf8(&bytes) {
+    let bytes = Zeroizing::new(
+        std::fs::read(node_key_file)
+            .map_err(|e| CryptoError::NodeKeyMalformed(format!("read {node_key_file}: {e}")))?,
+    );
+    decode_key_file_bytes(&bytes)
+}
+
+/// Longest key file [`load_node_key_file`] reads. Real files are ≤ 100 bytes.
+const MAX_KEY_FILE_BYTES: u64 = 4096;
+
+/// Decode a node-key file by path, never consulting `Y2QD_NODE_KEY`.
+///
+/// Same encoding rules as the file branch of [`load_node_key`]. Hardened for
+/// interactive callers: the path must be a regular file (a FIFO or a typed
+/// device such as `/dev/zero` would hang or exhaust memory) and at most
+/// 4 KiB are read, into a zeroizing buffer.
+pub fn load_node_key_file(path: &str) -> Result<Zeroizing<[u8; 32]>, CryptoError> {
+    use std::io::Read as _;
+
+    let bad = |what: String| CryptoError::NodeKeyMalformed(format!("{path}: {what}"));
+    if path.trim().is_empty() {
+        return Err(CryptoError::NodeKeyMissing);
+    }
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    // O_NONBLOCK so opening a FIFO with no writer returns instead of blocking.
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY);
+    }
+    let file = opts.open(path).map_err(|e| bad(format!("open: {e}")))?;
+    let meta = file.metadata().map_err(|e| bad(format!("stat: {e}")))?;
+    if !meta.is_file() {
+        return Err(bad("not a regular file".to_owned()));
+    }
+    if meta.len() > MAX_KEY_FILE_BYTES {
+        return Err(bad(format!("larger than {MAX_KEY_FILE_BYTES} bytes")));
+    }
+    let mut bytes = Zeroizing::new(Vec::with_capacity(meta.len() as usize));
+    file.take(MAX_KEY_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| bad(format!("read: {e}")))?;
+    if bytes.len() as u64 > MAX_KEY_FILE_BYTES {
+        return Err(bad(format!("larger than {MAX_KEY_FILE_BYTES} bytes")));
+    }
+    decode_key_file_bytes(&bytes)
+}
+
+/// Shared decode of key-file contents: text (hex/base64) or raw CSPRNG bytes.
+fn decode_key_file_bytes(bytes: &[u8]) -> Result<Zeroizing<[u8; 32]>, CryptoError> {
+    let raw = Zeroizing::new(match std::str::from_utf8(bytes) {
         Ok(text) => decode_node_key(text.trim())?,
         Err(_) => {
             if bytes.len() < MIN_NODE_KEY_BYTES {
@@ -75,10 +124,10 @@ fn load_node_key_via(
                     bytes.len()
                 )));
             }
-            reject_non_csprng(&bytes)?;
-            bytes
+            reject_non_csprng(bytes)?;
+            bytes.to_vec()
         }
-    };
+    });
     Ok(Zeroizing::new(*extract_node_key(&raw)))
 }
 
@@ -313,6 +362,46 @@ mod tests {
     fn lock_node_key_env() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         LOCK.lock().unwrap_or_else(|err| err.into_inner())
+    }
+    #[test]
+    fn key_file_loader_ignores_env_and_rejects_non_regular_or_oversized_files() {
+        let _g = lock_node_key_env();
+        let dir = tempfile::tempdir().unwrap();
+        let raw: [u8; 32] = std::array::from_fn(|i| (i as u8).wrapping_mul(7).wrapping_add(3));
+        let path = dir.path().join("node.key");
+        std::fs::write(&path, format!("{}\n", STANDARD.encode(raw))).unwrap();
+
+        // SAFETY: serialised by `lock_node_key_env`; no other test reads this var concurrently.
+        unsafe { std::env::set_var(NODE_KEY_ENV_VAR, "ab".repeat(32)) };
+        let got = load_node_key_file(path.to_str().unwrap());
+        // SAFETY: as above.
+        unsafe { std::env::remove_var(NODE_KEY_ENV_VAR) };
+        assert_eq!(*got.unwrap(), *extract_node_key(&raw));
+
+        let big = dir.path().join("big");
+        std::fs::write(&big, vec![b'a'; 5000]).unwrap();
+        assert!(matches!(
+            load_node_key_file(big.to_str().unwrap()),
+            Err(CryptoError::NodeKeyMalformed(_))
+        ));
+        // A directory is not a regular file.
+        assert!(load_node_key_file(dir.path().to_str().unwrap()).is_err());
+        assert!(matches!(
+            load_node_key_file(""),
+            Err(CryptoError::NodeKeyMissing)
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn key_file_loader_does_not_hang_on_fifo_or_dev_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("fifo");
+        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        // SAFETY: valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        assert!(load_node_key_file(fifo.to_str().unwrap()).is_err());
+        assert!(load_node_key_file("/dev/zero").is_err());
     }
 
     #[test]

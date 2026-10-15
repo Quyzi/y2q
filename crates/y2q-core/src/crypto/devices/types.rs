@@ -24,6 +24,8 @@ pub const MIN_AWAY_GRANT_SECONDS: u32 = 60;
 pub const MAX_AWAY_GRANT_SECONDS: u32 = 2_592_000;
 /// Default away-grant period (seconds): 12 hours.
 pub const DEFAULT_AWAY_GRANT_SECONDS: u32 = 43_200;
+/// Default TPM TCTI string: the kernel's resource-managed TPM device node.
+pub const DEFAULT_TPM_TCTI: &str = "device:/dev/tpmrm0";
 
 /// A 32-byte secret that zeroizes on drop.
 pub type Key32 = Zeroizing<[u8; 32]>;

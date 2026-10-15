@@ -38,6 +38,7 @@ mod imp {
     use std::time::Duration;
 
     use y2q_core::crypto::CryptoError;
+    use y2q_core::crypto::devices::provision::{self, FirstDevice, InitError, InitRequest};
     use y2q_core::crypto::devices::{
         self, Authority, DeviceKind, DevicePolicy, DeviceRecord, DeviceRegistryFile, HomeFactor,
         PinProvider, RoughtimeConfig, RoughtimeServer, TimeSource, UnlockOutcome, fido2, now_unix,
@@ -98,19 +99,12 @@ mod imp {
         pcrs: &[u8],
         allow_off: bool,
     ) -> Result<(), String> {
-        if !pcrs.contains(&7) || allow_off {
-            return Ok(());
+        match tpm2::secure_boot_problem(state, pcrs, allow_off) {
+            None => Ok(()),
+            Some(what) => Err(format!(
+                "refusing to bind the TPM policy to PCR 7: {what}. PCR 7 only separates a trusted boot chain from any other bootable medium when Secure Boot is enforcing, so without it anyone who can boot another OS on this host can unseal the key. Enable Secure Boot, or pass --allow-secure-boot-off to accept a PCR-7 policy that any bootable medium can satisfy (test rigs only)"
+            )),
         }
-        let what = match state {
-            tpm2::SecureBootState::Enabled => return Ok(()),
-            tpm2::SecureBootState::Disabled => "Secure Boot is disabled",
-            tpm2::SecureBootState::Unknown => {
-                "the Secure Boot state is unknown (non-UEFI boot, or efivarfs is unavailable)"
-            }
-        };
-        Err(format!(
-            "refusing to bind the TPM policy to PCR 7: {what}. PCR 7 only separates a trusted boot chain from any other bootable medium when Secure Boot is enforcing, so without it anyone who can boot another OS on this host can unseal the key. Enable Secure Boot, or pass --allow-secure-boot-off to accept a PCR-7 policy that any bootable medium can satisfy (test rigs only)"
-        ))
     }
 
     fn secure_boot_precheck(pcrs: &[u8], allow_off: bool) -> Result<(), CliError> {
@@ -331,33 +325,18 @@ mod imp {
     /// The `check-time` routine: probe every server once, optionally print each
     /// result, then combine. Returns `(attested_unix, agreeing, total)`.
     fn attest(cfg: &RoughtimeConfig, print: bool) -> Result<(u64, usize, usize), CryptoError> {
-        if cfg.servers.is_empty() {
-            return Err(CryptoError::RoughtimeNotConfigured);
-        }
-        let probes = roughtime::probe_all(cfg);
-        let mut pairs = Vec::new();
-        let mut failures = Vec::new();
-        for p in &probes {
-            match &p.outcome {
-                Ok(ok) => {
-                    if print {
-                        println!(
-                            "{}  {}  ok  lower={} upper={} radi={}",
-                            p.name, p.addr, ok.lower, ok.upper, ok.radi
-                        );
-                    }
-                    pairs.push((ok.lower, ok.upper));
-                }
-                Err(reason) => {
-                    if print {
-                        println!("{}  {}  FAILED  {reason}", p.name, p.addr);
-                    }
-                    failures.push(format!("{}: {reason}", p.name));
-                }
+        roughtime::attest_with(cfg, &mut |p| {
+            if !print {
+                return;
             }
-        }
-        let t = roughtime::combine_intervals(&pairs, cfg.min_responses, &failures.join("; "))?;
-        Ok((t, pairs.len(), probes.len()))
+            match &p.outcome {
+                Ok(ok) => println!(
+                    "{}  {}  ok  lower={} upper={} radi={}",
+                    p.name, p.addr, ok.lower, ok.upper, ok.radi
+                ),
+                Err(reason) => println!("{}  {}  FAILED  {reason}", p.name, p.addr),
+            }
+        })
     }
 
     fn check_time(cfg: &RoughtimeConfig) -> Result<(), CliError> {
@@ -589,23 +568,16 @@ mod imp {
         let _lock = lock(a.dir)?;
         let _reg_lock = registry_lock(a.dir)?;
         harden()?;
-        if registry::exists(a.dir) {
-            return Err(cerr(CryptoError::DeviceRegistryExists(
-                devices::devices_path(a.dir).display().to_string(),
-            )));
-        }
         if a.fido2 && !a.permanent_away {
             return Err(cerr(CryptoError::DevicePermanentAwayMismatch {
                 kind: DeviceKind::Fido2,
             }));
         }
+        // Cheap refusals (grant period, existing registry, label, keystore.json
+        // without --adopt) outrank the key load and the network probes below.
+        provision::preflight(a.dir, a.label.as_deref(), a.adopt, a.away_grant_seconds)
+            .map_err(init_err(a.dir))?;
         let keystore_exists = a.dir.join("keystore.json").exists();
-        if keystore_exists && !a.adopt {
-            return Err(CliError::Other(format!(
-                "{} already contains keystore.json; a fresh registry would generate a new node key that cannot read existing data — re-run with --adopt-existing-node-key to wrap the key this deployment already uses",
-                a.dir.display()
-            )));
-        }
         let adopted = if a.adopt {
             let file = a
                 .node_key_file
@@ -624,43 +596,60 @@ mod imp {
         }
 
         let first = if a.tpm {
-            let label = a.label.unwrap_or_else(|| "home-tpm".to_owned());
-            tpm2::enroll(label, a.tcti, a.pcrs).map_err(cerr)?
+            FirstDevice::Tpm {
+                label: a.label,
+                tcti: a.tcti,
+                pcrs: a.pcrs,
+            }
         } else {
-            let label = a.label.unwrap_or_else(|| "away-fido2".to_owned());
-            fido2::enroll(label, !a.no_uv, &CliPins, a.hid_path).map_err(cerr)?
+            FirstDevice::Fido2 {
+                label: a.label,
+                uv_required: !a.no_uv,
+                hid_path: a.hid_path,
+            }
         };
-        let (label, kind) = (first.label.clone(), first.kind);
 
         println!("registry: {}", devices::devices_path(a.dir).display());
         println!("away_grant_seconds: {}", a.away_grant_seconds);
         let mut stdout = std::io::stdout().lock();
-        let outcome = devices::emergency::init_registry(
-            a.dir,
-            first,
-            a.away_grant_seconds,
-            a.permanent_away,
+        let report = provision::init(
+            &InitRequest {
+                dir: a.dir,
+                first,
+                away_grant_seconds: a.away_grant_seconds,
+                adopt: adopted.as_deref(),
+            },
+            &CliPins,
             now_unix(),
-            adopted.as_deref(),
             &mut stdout,
         )
-        .map_err(cerr)?;
+        .map_err(init_err(a.dir))?;
         stdout.flush()?;
         drop(stdout);
 
-        let id = outcome
-            .registry
-            .devices
-            .first()
-            .map(|d| d.id.clone())
-            .unwrap_or_default();
-        println!("device: {label} ({}) id {id}", kind_str(kind));
+        println!(
+            "device: {} ({}) id {}",
+            report.device_label,
+            kind_str(report.device_kind),
+            report.device_id
+        );
         if a.adopt {
             println!(
                 "the operator-supplied node key still unlocks this deployment and takes precedence over devices; while it remains set the daemon never runs the device path, so away grants are never minted — remove it from the environment and config to rely on devices alone"
             );
         }
         Ok(())
+    }
+
+    /// Map a provisioning refusal to the CLI's error text.
+    fn init_err(dir: &Path) -> impl FnOnce(InitError) -> CliError + '_ {
+        move |e| match e {
+            InitError::KeystoreExists => CliError::Other(format!(
+                "{} already contains keystore.json; a fresh registry would generate a new node key that cannot read existing data — re-run with --adopt-existing-node-key to wrap the key this deployment already uses",
+                dir.display()
+            )),
+            InitError::Crypto(e) => cerr(e),
+        }
     }
 
     fn away_wraps(reg: &DeviceRegistryFile) -> usize {

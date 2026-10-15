@@ -69,6 +69,7 @@ tokio                       = { version = "1.53", features = ["full"] }
 tokio-uring                 = "0.5"
 tokio-util                  = { version = "0.7", features = ["io", "codec"] }
 toml                        = "1.1"
+toml_edit                   = "0.25"
 tss-esapi                   = "7.7"
 tracing                     = "0.1.44"
 tracing-actix-web           = "0.7"
