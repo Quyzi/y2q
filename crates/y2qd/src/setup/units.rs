@@ -171,8 +171,15 @@ fn under(dir: &str, root: &str) -> bool {
     dir == root || dir.strip_prefix(root).is_some_and(|r| r.starts_with('/'))
 }
 
+/// The config file sits directly in `/etc/y2q`, the directory that
+/// `ConfigurationDirectory=y2q` manages.
+fn config_in_shipped_dir(p: &UnitParams) -> bool {
+    std::path::Path::new(&p.config).parent() == Some(std::path::Path::new("/etc/y2q"))
+}
+
 fn render_y2qd(p: &UnitParams) -> String {
     let rw_default = p.rw_dirs.iter().all(|d| under(d, SHIPPED_RW_ROOT));
+    let keep_config_dir = config_in_shipped_dir(p);
     let mut seen: Vec<&str> = Vec::new();
     for d in &p.rw_dirs {
         if !seen.contains(&d.as_str()) {
@@ -198,6 +205,14 @@ fn render_y2qd(p: &UnitParams) -> String {
             "User" => set_value(key, &p.daemon_user),
             "Group" => set_value(key, &p.group),
             "ReadWritePaths" if !rw_default => set_value(key, &rw),
+            // The shipped `ConfigurationDirectory=y2q` / `StateDirectory=y2q` make
+            // systemd create and chown /etc/y2q and /var/lib/y2q for the unit's
+            // user. With config or data elsewhere they would take over those
+            // directories (possibly another install's), so they go.
+            "ConfigurationDirectory" | "ConfigurationDirectoryMode" if !keep_config_dir => {
+                Action::Drop
+            }
+            "StateDirectory" | "StateDirectoryMode" if !rw_default => Action::Drop,
             _ => Action::Keep,
         }
     })
@@ -213,6 +228,7 @@ fn render_socket(p: &UnitParams) -> String {
 }
 
 fn render_helper(template: &str, p: &UnitParams, rw: &str) -> String {
+    let keep_config_dir = config_in_shipped_dir(p);
     map_lines(template, |line| {
         let Some((key, value)) = directive(line) else {
             return Action::Keep;
@@ -222,6 +238,9 @@ fn render_helper(template: &str, p: &UnitParams, rw: &str) -> String {
             "User" => set_value(key, &p.key_user),
             "Group" => set_value(key, &p.group),
             "ReadWritePaths" => set_value(key, rw),
+            "ConfigurationDirectory" | "ConfigurationDirectoryMode" if !keep_config_dir => {
+                Action::Drop
+            }
             _ => Action::Keep,
         }
     })
@@ -308,6 +327,22 @@ mod tests {
         &files.iter().find(|f| f.rel_path == rel).unwrap().content
     }
 
+    /// A template without the directory directives that custom paths drop.
+    fn without_dir_directives(text: &str) -> String {
+        text.split_inclusive('\n')
+            .filter(|l| {
+                ![
+                    "ConfigurationDirectory=",
+                    "ConfigurationDirectoryMode=",
+                    "StateDirectory=",
+                    "StateDirectoryMode=",
+                ]
+                .iter()
+                .any(|k| l.starts_with(k))
+            })
+            .collect()
+    }
+
     fn changed(a: &str, b: &str) -> Vec<(String, String)> {
         let (a, b): (Vec<_>, Vec<_>) = (a.lines().collect(), b.lines().collect());
         assert_eq!(a.len(), b.len());
@@ -356,7 +391,10 @@ mod tests {
     #[test]
     fn custom_params_change_only_targeted_lines() {
         let f = render(&custom(), true).unwrap();
-        let d = changed(Y2QD_SERVICE, find(&f, "systemd/system/y2qd.service"));
+        let d = changed(
+            &without_dir_directives(Y2QD_SERVICE),
+            find(&f, "systemd/system/y2qd.service"),
+        );
         let new: Vec<&str> = d.iter().map(|(_, n)| n.as_str()).collect();
         assert_eq!(
             new,
@@ -378,7 +416,10 @@ mod tests {
                 "SocketGroup=sock"
             ]
         );
-        let d = changed(KEYD_SERVICE, find(&f, "systemd/system/y2q-keyd@.service"));
+        let d = changed(
+            &without_dir_directives(KEYD_SERVICE),
+            find(&f, "systemd/system/y2q-keyd@.service"),
+        );
         let new: Vec<&str> = d.iter().map(|(_, n)| n.as_str()).collect();
         assert_eq!(
             new,
@@ -390,7 +431,7 @@ mod tests {
             ]
         );
         let d = changed(
-            SWEEP_SERVICE,
+            &without_dir_directives(SWEEP_SERVICE),
             find(&f, "systemd/system/y2q-keyd-sweep.service"),
         );
         let new: Vec<&str> = d.iter().map(|(_, n)| n.as_str()).collect();
@@ -459,6 +500,45 @@ mod tests {
         assert!(
             find(&f, "systemd/system/y2qd.service")
                 .contains("ReadWritePaths=/var/lib/y2q-extra/data\n")
+        );
+    }
+
+    #[test]
+    fn shipped_directory_directives_follow_the_paths() {
+        let has = |text: &str, key: &str| text.lines().any(|l| l.starts_with(&format!("{key}=")));
+
+        // Config in /etc/y2q and data under /var/lib/y2q: all kept (shipped output).
+        let f = render(&UnitParams::shipped(), false).unwrap();
+        let y = find(&f, "systemd/system/y2qd.service");
+        assert!(has(y, "ConfigurationDirectory") && has(y, "StateDirectory"));
+
+        // Config elsewhere: no unit may manage /etc/y2q, but state is unaffected.
+        let mut p = UnitParams::shipped();
+        p.config = "/etc/y2q-other/config.toml".into();
+        let f = render(&p, true).unwrap();
+        for unit in [
+            "systemd/system/y2qd.service",
+            "systemd/system/y2q-keyd@.service",
+            "systemd/system/y2q-keyd-sweep.service",
+        ] {
+            let t = find(&f, unit);
+            assert!(!has(t, "ConfigurationDirectory"), "{unit}");
+            assert!(!has(t, "ConfigurationDirectoryMode"), "{unit}");
+        }
+        assert!(has(
+            find(&f, "systemd/system/y2qd.service"),
+            "StateDirectory"
+        ));
+
+        // Data elsewhere: the daemon must not manage /var/lib/y2q either.
+        let mut p = UnitParams::shipped();
+        p.rw_dirs = vec!["/srv/y2q/data".into()];
+        let y = render(&p, false).unwrap().remove(0).content;
+        assert!(!has(&y, "StateDirectory") && !has(&y, "StateDirectoryMode"));
+        assert!(has(&y, "ConfigurationDirectory"));
+        // Neighbouring lines survive; only the StateDirectory pair went.
+        assert!(
+            y.contains("UMask=0077\nConfigurationDirectory=y2q\nConfigurationDirectoryMode=0750\n")
         );
     }
 

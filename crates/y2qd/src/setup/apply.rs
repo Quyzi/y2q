@@ -1081,7 +1081,14 @@ pub fn summary(
                 out.push("  udevadm control --reload && udevadm trigger".to_owned());
             }
             out.push(
-                "  systemctl daemon-reload && systemctl enable --now y2q-keyd.socket y2q-keyd-sweep.timer y2qd.service"
+                "  systemctl daemon-reload && systemctl enable --now y2q-keyd.socket y2qd.service"
+                    .to_owned(),
+            );
+            // The timer's OnBootSec has already elapsed on a running host, so enabling
+            // it fires a sweep at once; that sweep holds the registry lock and would
+            // make the daemon's first key fetch fail with "registry is busy".
+            out.push(
+                "  systemctl enable --now y2q-keyd-sweep.timer   # once `systemctl status y2qd` shows it running"
                     .to_owned(),
             );
         } else {
