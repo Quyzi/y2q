@@ -1,5 +1,7 @@
 use std::io::Read;
 
+use y2q_client::ClientError;
+
 use crate::cli::AliasCmd;
 use crate::client_builder::resolve_config_path;
 use crate::config::{Alias, CliConfig};
@@ -20,6 +22,8 @@ pub async fn run(cmd: AliasCmd, mode: OutputMode) -> Result<(), CliError> {
             client_cert,
             client_key,
         } => {
+            // Before the username prompt: a bad URL must fail without asking anything.
+            y2q_client::validate_base_url(&url)?;
             let username = match user {
                 Some(u) => u,
                 None => {
@@ -107,12 +111,30 @@ pub async fn run(cmd: AliasCmd, mode: OutputMode) -> Result<(), CliError> {
                 toml::from_str(&buf).map_err(|e| CliError::Other(format!("import parse: {e}")))?;
             let incoming = imported.aliases.into_iter().chain(imported.profiles);
             let mut added = 0usize;
+            let mut inserted = Vec::new();
             for (name, entry) in incoming {
                 if !merge && config.aliases.contains_key(&name) {
                     continue;
                 }
+                inserted.push(name.clone());
                 config.aliases.insert(name, entry);
                 added += 1;
+            }
+            // All-or-nothing: check the entries that actually ended up in the
+            // config (a later duplicate may have replaced an earlier bad one)
+            // before anything is written to disk.
+            for name in &inserted {
+                let Some(entry) = config.aliases.get(name) else {
+                    continue;
+                };
+                if let Err(ClientError::BadRequest { message }) =
+                    y2q_client::validate_base_url(&entry.url)
+                {
+                    return Err(ClientError::BadRequest {
+                        message: format!("alias `{name}`: {message}; nothing was imported"),
+                    }
+                    .into());
+                }
             }
             config.save(&config_path)?;
             if mode == OutputMode::Json {

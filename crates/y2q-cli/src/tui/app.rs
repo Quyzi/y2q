@@ -1132,7 +1132,19 @@ impl App {
                 return;
             }
         };
-        for (name, entry) in imported.aliases.into_iter().chain(imported.profiles) {
+        let incoming: Vec<_> = imported
+            .aliases
+            .into_iter()
+            .chain(imported.profiles)
+            .collect();
+        // All-or-nothing, same as `y2q alias import`.
+        for (name, entry) in &incoming {
+            if let Err(e) = y2q_client::validate_base_url(&entry.url) {
+                self.mode = Mode::Error(format!("alias `{name}`: {e}; nothing was imported"));
+                return;
+            }
+        }
+        for (name, entry) in incoming {
             self.config.aliases.insert(name, entry);
         }
         self.save_config();
@@ -2693,6 +2705,10 @@ impl App {
             InputAction::NewAliasUrl { name } => {
                 let url = value.trim().to_owned();
                 if url.is_empty() {
+                    return;
+                }
+                if let Err(e) = y2q_client::validate_base_url(&url) {
+                    self.mode = Mode::Error(e.to_string());
                     return;
                 }
                 // Pre-fill the username when editing an existing alias.
