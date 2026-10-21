@@ -7,6 +7,7 @@ mod ops;
 mod output;
 mod path;
 mod progress;
+mod staged_file;
 mod token;
 mod tui;
 

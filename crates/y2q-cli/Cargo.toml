@@ -37,3 +37,6 @@ tracing-subscriber  = { workspace = true }
 y2q-client          = { path = "../y2q-client" }
 y2q-config          = { path = "../y2q-config" }
 zeroize             = { workspace = true }
+
+[dev-dependencies]
+tempfile           = { workspace = true }
