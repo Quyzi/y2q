@@ -8,12 +8,18 @@
 //!
 //! Staging is only used where there is something to protect and a rename is
 //! safe: `dest` is missing, or resolves to a regular file. Anything else
-//! (directory, device, FIFO, `/dev/stdout`, a dangling symlink, a trailing
-//! separator) keeps the plain `File::create` behaviour.
+//! (directory, device, FIFO, anything under `/dev` or `/proc` such as
+//! `/dev/stdout`, a dangling symlink, a trailing separator) keeps the plain
+//! `File::create` behaviour.
+//!
+//! A writable file in a directory we cannot create files in is staged in the
+//! temp dir; `commit` then copies the finished download over it in place, so
+//! the destination is still untouched until the transfer has fully succeeded.
 //!
 //! Not preserved by the rename: owner/group, hard links, xattrs/ACLs. The mode
-//! bits (minus setuid/setgid/sticky) are. A process killed mid-download leaves
-//! one `.y2q-part-*` file next to `dest`; `dest` itself is never half-written.
+//! bits (minus setuid/setgid/sticky) are. Drop does not run when the process is
+//! killed or interrupted (SIGKILL, SIGTERM, Ctrl+C), which leaves one
+//! `.y2q-part-*` file behind; `dest` itself is never half-written.
 
 use std::io::{ErrorKind, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -53,20 +59,12 @@ impl StagedFile {
             OpenOptions::new().write(true).open(&target).await?;
         }
 
-        let stage = stage_dir(&target).join(stage_name());
-
-        let mut opts = OpenOptions::new();
-        opts.read(true).write(true).create_new(true);
-        #[cfg(unix)]
-        if existing.is_some() {
-            // Never let decrypted bytes sit in a more permissive file than the
-            // one being replaced; real mode is applied below, before any write.
-            opts.mode(0o600);
-        }
-        let file = match opts.open(&stage).await {
-            Ok(f) => f,
-            // Writable file inside a directory we cannot create in: the old
-            // in-place overwrite worked, so keep it working.
+        let (file, stage) = match open_stage(stage_dir(&target), existing.is_some()).await {
+            Ok(v) => v,
+            // Writable file inside a directory we cannot create in. Stage in
+            // the temp dir instead: the destination stays untouched until the
+            // download is complete, then `commit` copies it over in place.
+            // (Truncating here would reintroduce the lose-the-file-on-404 bug.)
             Err(e)
                 if existing.is_some()
                     && matches!(
@@ -74,7 +72,7 @@ impl StagedFile {
                         ErrorKind::PermissionDenied | ErrorKind::ReadOnlyFilesystem
                     ) =>
             {
-                return Self::direct(dest).await;
+                open_stage(&std::env::temp_dir(), true).await?
             }
             Err(e) => return Err(e.into()),
         };
@@ -155,7 +153,11 @@ impl StagedFile {
 /// applies, `None` for direct `File::create` semantics.
 async fn staging_target(dest: &Path) -> Option<(PathBuf, Option<std::fs::Metadata>)> {
     let bytes = dest.as_os_str().as_encoded_bytes();
+    // `/dev/stdout`, `/dev/fd/N`, `/proc/self/fd/N` name whatever the caller
+    // redirected to; never resolve them to a real path and rename over it.
     if dest.file_name().is_none()
+        || dest.starts_with("/dev")
+        || dest.starts_with("/proc")
         || bytes
             .last()
             .is_some_and(|b| std::path::is_separator(*b as char))
@@ -187,6 +189,24 @@ fn stage_dir(target: &Path) -> &Path {
         Some(p) if !p.as_os_str().is_empty() => p,
         _ => Path::new("."),
     }
+}
+
+/// Create the hidden stage in `dir`. `restrict` makes it owner-only from the
+/// start (used when replacing a file whose real mode is applied afterwards).
+async fn open_stage(dir: &Path, restrict: bool) -> std::io::Result<(File, PathBuf)> {
+    let stage = dir.join(stage_name());
+    let mut opts = OpenOptions::new();
+    opts.read(true).write(true).create_new(true);
+    #[cfg(unix)]
+    if restrict {
+        // Never let decrypted bytes sit in a more permissive file than the
+        // one being replaced; real mode is applied right after, before any write.
+        opts.mode(0o600);
+    }
+    #[cfg(not(unix))]
+    let _ = restrict;
+    let file = opts.open(&stage).await?;
+    Ok((file, stage))
 }
 
 fn stage_name() -> String {
@@ -388,31 +408,75 @@ mod tests {
         assert!(leftovers(dir.path()).is_empty());
     }
 
+    /// Runs `body` with `dir` made read-only; returns `None` (skip) as root,
+    /// where directory permission bits do not apply.
+    #[cfg(unix)]
+    async fn with_readonly_dir<F, Fut>(dir: &Path, body: F) -> Option<()>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = ()>,
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let set = |m| std::fs::set_permissions(dir, std::fs::Permissions::from_mode(m));
+        set(0o555).unwrap();
+        if std::fs::File::create(dir.join("probe")).is_ok() {
+            set(0o755).unwrap();
+            return None;
+        }
+        body().await;
+        set(0o755).unwrap();
+        Some(())
+    }
+
     #[cfg(unix)]
     #[tokio::test]
-    async fn writable_file_in_unwritable_dir_is_overwritten_in_place() {
-        use std::os::unix::fs::PermissionsExt;
+    async fn failed_download_keeps_file_in_unwritable_dir() {
         let dir = tempfile::tempdir().unwrap();
         let dest = dir.path().join("f");
-        std::fs::write(&dest, b"old").unwrap();
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
-        let restore = |m| std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(m));
-        if std::fs::File::create(dir.path().join("probe")).is_ok() {
-            restore(0o755).unwrap();
-            return; // running as root: directory bits do not apply
-        }
+        std::fs::write(&dest, b"PRECIOUS").unwrap();
 
-        let result = async {
-            let mut s = StagedFile::create(&dest).await?;
-            assert!(s.stage.is_none(), "cannot stage in a read-only directory");
-            s.file_mut().write_all(b"new").await?;
-            s.commit().await
-        }
+        let d = dest.clone();
+        with_readonly_dir(dir.path(), || async move {
+            let mut s = StagedFile::create(&d).await.unwrap();
+            assert!(s.stage.is_some(), "must stage, not truncate in place");
+            // The destination is untouched while the download is in flight...
+            assert_eq!(std::fs::read(&d).unwrap(), b"PRECIOUS");
+            s.file_mut().write_all(b"partial").await.unwrap();
+            // ...and when it fails (guard dropped without commit).
+            drop(s);
+            assert_eq!(std::fs::read(&d).unwrap(), b"PRECIOUS");
+        })
         .await;
-        restore(0o755).unwrap();
+    }
 
-        result.unwrap();
-        assert_eq!(std::fs::read(&dest).unwrap(), b"new");
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn writable_file_in_unwritable_dir_is_replaced_on_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("f");
+        std::fs::write(&dest, b"a longer old body").unwrap();
+
+        let d = dest.clone();
+        let ran = with_readonly_dir(dir.path(), || async move {
+            let mut s = StagedFile::create(&d).await.unwrap();
+            s.file_mut().write_all(b"new").await.unwrap();
+            s.commit().await.unwrap();
+        })
+        .await
+        .is_some();
+        if ran {
+            assert_eq!(std::fs::read(&dest).unwrap(), b"new");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dev_paths_are_never_staged() {
+        // Whatever /dev/stdout points at (file, pipe, tty), do not resolve it
+        // to a real path and rename over it.
+        for p in ["/dev/stdout", "/dev/fd/1", "/proc/self/fd/1"] {
+            assert!(staging_target(Path::new(p)).await.is_none(), "{p}");
+        }
     }
 
     #[tokio::test]
