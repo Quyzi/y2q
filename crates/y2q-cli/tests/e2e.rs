@@ -954,6 +954,105 @@ fn e2e_full_cli_flow() {
     server.ok(&["logout", "test"]);
 }
 
+/// Run `y2q` against an isolated, empty config home (no daemon needed).
+/// Returns `(output, config_home)`; stdin is `input` or closed.
+fn y2q_isolated(home: &std::path::Path, args: &[&str], input: &[u8]) -> std::process::Output {
+    use std::io::Write;
+    let mut child = Command::new(y2q_bin())
+        .env("XDG_CONFIG_HOME", home.join("config"))
+        .env("XDG_DATA_HOME", home.join("data"))
+        .env("NO_COLOR", "1")
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn y2q");
+    child.stdin.take().unwrap().write_all(input).unwrap();
+    child.wait_with_output().expect("wait y2q")
+}
+
+fn isolated_home(tag: &str) -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("y2q-e2e-{tag}-{}-{nanos}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// Regression for #137: a URL that `Url::parse` accepts but that cannot carry
+/// HTTP requests (`mailto:`, `data:`, `localhost:8080`, ...) used to be saved
+/// as an alias and then panic (exit 101) on the first request.
+#[test]
+fn e2e_alias_rejects_non_http_urls_instead_of_panicking_later() {
+    let home = isolated_home("alias-url");
+    let text = |o: &std::process::Output| {
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&o.stdout),
+            String::from_utf8_lossy(&o.stderr)
+        )
+    };
+
+    // `alias set`: rejected up front (also without `--user`, so no prompt), not saved.
+    for bad in [
+        "mailto:ops@example.com",
+        "data:text/plain,x",
+        "localhost:8080",
+    ] {
+        let out = y2q_isolated(&home, &["alias", "set", "m", bad], b"");
+        assert_eq!(out.status.code(), Some(5), "{bad}: {}", text(&out));
+        assert!(text(&out).contains("http"), "{bad}: {}", text(&out));
+    }
+    let out = y2q_isolated(&home, &["--json", "alias", "list"], b"");
+    assert!(out.status.success());
+    assert!(
+        !text(&out).contains("\"m\""),
+        "bad alias was saved: {}",
+        text(&out)
+    );
+
+    // A valid URL still works.
+    let out = y2q_isolated(
+        &home,
+        &["alias", "set", "ok", "http://127.0.0.1:1", "-u", "root"],
+        b"",
+    );
+    assert!(out.status.success(), "{}", text(&out));
+
+    // `alias import` is all-or-nothing: one bad entry rejects the good one too.
+    let input = b"[aliases.good]\nurl = \"https://y2q.example\"\nusername = \"u\"\n\
+                  [aliases.evil]\nurl = \"mailto:ops@example.com\"\nusername = \"u\"\n";
+    let out = y2q_isolated(&home, &["alias", "import"], input);
+    assert_eq!(out.status.code(), Some(5), "{}", text(&out));
+    assert!(text(&out).contains("evil"), "{}", text(&out));
+    let out = y2q_isolated(&home, &["--json", "alias", "list"], b"");
+    assert!(
+        !text(&out).contains("\"good\"") && !text(&out).contains("\"evil\""),
+        "failed import must not save anything: {}",
+        text(&out)
+    );
+
+    // A bad alias that is already in the config file (hand-edited, or saved by
+    // an older build) yields a clean error, not a panic, and can still log out.
+    let cfg = home.join("config").join("y2q");
+    std::fs::create_dir_all(&cfg).unwrap();
+    std::fs::write(
+        cfg.join("config.toml"),
+        "[aliases.m]\nurl = \"mailto:ops@example.com\"\nusername = \"root\"\n",
+    )
+    .unwrap();
+    let out = y2q_isolated(&home, &["login", "m", "--password", "x"], b"");
+    assert_eq!(out.status.code(), Some(5), "{}", text(&out));
+    assert!(!text(&out).contains("panicked"), "{}", text(&out));
+    let out = y2q_isolated(&home, &["logout", "m"], b"");
+    assert!(out.status.success(), "{}", text(&out));
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 /// Exercises the phase-3 per-bucket key grant flow end to end: the owner
 /// writes an object, a second user is denied (404, not 403 — visibility
 /// follows the cryptographic grant) until explicitly granted `read` via
