@@ -109,24 +109,15 @@ pub async fn run(cmd: AliasCmd, mode: OutputMode) -> Result<(), CliError> {
             }
             let imported: Imported =
                 toml::from_str(&buf).map_err(|e| CliError::Other(format!("import parse: {e}")))?;
-            let incoming = imported.aliases.into_iter().chain(imported.profiles);
-            let mut added = 0usize;
-            let mut inserted = Vec::new();
-            for (name, entry) in incoming {
-                if !merge && config.aliases.contains_key(&name) {
-                    continue;
-                }
-                inserted.push(name.clone());
-                config.aliases.insert(name, entry);
-                added += 1;
-            }
-            // All-or-nothing: check the entries that actually ended up in the
-            // config (a later duplicate may have replaced an earlier bad one)
-            // before anything is written to disk.
-            for name in &inserted {
-                let Some(entry) = config.aliases.get(name) else {
-                    continue;
-                };
+            let incoming: Vec<_> = imported
+                .aliases
+                .into_iter()
+                .chain(imported.profiles)
+                .collect();
+            // All-or-nothing: every entry in the file must be valid, including
+            // ones the non-`--merge` path would skip because the name already
+            // exists, before anything is written to disk.
+            for (name, entry) in &incoming {
                 if let Err(ClientError::BadRequest { message }) =
                     y2q_client::validate_base_url(&entry.url)
                 {
@@ -135,6 +126,14 @@ pub async fn run(cmd: AliasCmd, mode: OutputMode) -> Result<(), CliError> {
                     }
                     .into());
                 }
+            }
+            let mut added = 0usize;
+            for (name, entry) in incoming {
+                if !merge && config.aliases.contains_key(&name) {
+                    continue;
+                }
+                config.aliases.insert(name, entry);
+                added += 1;
             }
             config.save(&config_path)?;
             if mode == OutputMode::Json {
