@@ -132,7 +132,10 @@ impl StagedFile {
         let mut out = File::create(&self.target).await?;
         let copied = async {
             tokio::io::copy(&mut self.file, &mut out).await?;
-            out.flush().await
+            out.flush().await?;
+            // Same reason as the sync before the rename path: the stage is
+            // unlinked right after we return, so the copy must be durable.
+            out.sync_all().await
         }
         .await;
         if let Err(e) = copied {
@@ -408,6 +411,19 @@ mod tests {
         assert!(leftovers(dir.path()).is_empty());
     }
 
+    /// Restores a directory's mode on drop, so a panicking assert in the body
+    /// cannot leave a 0555 directory that `TempDir` then fails to remove.
+    #[cfg(unix)]
+    struct RestoreMode<'a>(&'a Path);
+
+    #[cfg(unix)]
+    impl Drop for RestoreMode<'_> {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(self.0, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+
     /// Runs `body` with `dir` made read-only; returns `None` (skip) as root,
     /// where directory permission bits do not apply.
     #[cfg(unix)]
@@ -417,14 +433,12 @@ mod tests {
         Fut: Future<Output = ()>,
     {
         use std::os::unix::fs::PermissionsExt;
-        let set = |m| std::fs::set_permissions(dir, std::fs::Permissions::from_mode(m));
-        set(0o555).unwrap();
+        let _restore = RestoreMode(dir);
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o555)).unwrap();
         if std::fs::File::create(dir.join("probe")).is_ok() {
-            set(0o755).unwrap();
             return None;
         }
         body().await;
-        set(0o755).unwrap();
         Some(())
     }
 
@@ -438,13 +452,15 @@ mod tests {
         let d = dest.clone();
         with_readonly_dir(dir.path(), || async move {
             let mut s = StagedFile::create(&d).await.unwrap();
-            assert!(s.stage.is_some(), "must stage, not truncate in place");
+            let stage = s.stage.clone().expect("must stage, not truncate in place");
             // The destination is untouched while the download is in flight...
             assert_eq!(std::fs::read(&d).unwrap(), b"PRECIOUS");
             s.file_mut().write_all(b"partial").await.unwrap();
-            // ...and when it fails (guard dropped without commit).
+            // ...and when it fails (guard dropped without commit), which also
+            // removes the stage.
             drop(s);
             assert_eq!(std::fs::read(&d).unwrap(), b"PRECIOUS");
+            assert!(!stage.exists(), "stage left behind: {}", stage.display());
         })
         .await;
     }
