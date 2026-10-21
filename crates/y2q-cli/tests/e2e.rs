@@ -954,8 +954,8 @@ fn e2e_full_cli_flow() {
     server.ok(&["logout", "test"]);
 }
 
-/// Run `y2q` against an isolated, empty config home (no daemon needed).
-/// Returns `(output, config_home)`; stdin is `input` or closed.
+/// Run `y2q` against an isolated config home (no daemon needed); stdin is
+/// `input`.
 fn y2q_isolated(home: &std::path::Path, args: &[&str], input: &[u8]) -> std::process::Output {
     use std::io::Write;
     let mut child = Command::new(y2q_bin())
@@ -982,36 +982,52 @@ fn isolated_home(tag: &str) -> PathBuf {
     dir
 }
 
-/// Regression for #137: a URL that `Url::parse` accepts but that cannot carry
-/// HTTP requests (`mailto:`, `data:`, `localhost:8080`, ...) used to be saved
-/// as an alias and then panic (exit 101) on the first request.
-#[test]
-fn e2e_alias_rejects_non_http_urls_instead_of_panicking_later() {
-    let home = isolated_home("alias-url");
-    let text = |o: &std::process::Output| {
-        format!(
-            "{}{}",
-            String::from_utf8_lossy(&o.stdout),
-            String::from_utf8_lossy(&o.stderr)
-        )
-    };
+/// `$XDG_CONFIG_HOME/y2q` of an isolated home (holds config.toml and tokens.toml).
+fn isolated_cfg_dir(home: &std::path::Path) -> PathBuf {
+    let dir = home.join("config").join("y2q");
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
 
-    // `alias set`: rejected up front (also without `--user`, so no prompt), not saved.
+fn output_text(o: &std::process::Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&o.stdout),
+        String::from_utf8_lossy(&o.stderr)
+    )
+}
+
+/// Config holding one alias `m` whose URL `Url::parse` accepts but that cannot
+/// carry HTTP requests: what an older build, a hand edit or an import left behind.
+fn write_mailto_alias(home: &std::path::Path) {
+    std::fs::write(
+        isolated_cfg_dir(home).join("config.toml"),
+        "[aliases.m]\nurl = \"mailto:ops@example.com\"\nusername = \"root\"\n",
+    )
+    .unwrap();
+}
+
+/// Regression for #137: `alias set` saved `mailto:`, `data:`, `localhost:8080`
+/// and the like, which then panicked (exit 101) on the first request.
+#[test]
+fn e2e_alias_set_rejects_non_http_urls() {
+    let home = isolated_home("alias-set");
+    // Rejected up front (also without `--user`, so no prompt), and not saved.
     for bad in [
         "mailto:ops@example.com",
         "data:text/plain,x",
         "localhost:8080",
     ] {
         let out = y2q_isolated(&home, &["alias", "set", "m", bad], b"");
-        assert_eq!(out.status.code(), Some(5), "{bad}: {}", text(&out));
-        assert!(text(&out).contains("http"), "{bad}: {}", text(&out));
+        assert_eq!(out.status.code(), Some(5), "{bad}: {}", output_text(&out));
+        assert!(output_text(&out).contains("http"), "{bad}");
     }
     let out = y2q_isolated(&home, &["--json", "alias", "list"], b"");
     assert!(out.status.success());
     assert!(
-        !text(&out).contains("\"m\""),
+        !output_text(&out).contains("\"m\""),
         "bad alias was saved: {}",
-        text(&out)
+        output_text(&out)
     );
 
     // A valid URL still works.
@@ -1020,36 +1036,82 @@ fn e2e_alias_rejects_non_http_urls_instead_of_panicking_later() {
         &["alias", "set", "ok", "http://127.0.0.1:1", "-u", "root"],
         b"",
     );
-    assert!(out.status.success(), "{}", text(&out));
+    assert!(out.status.success(), "{}", output_text(&out));
+    let _ = std::fs::remove_dir_all(&home);
+}
 
-    // `alias import` is all-or-nothing: one bad entry rejects the good one too.
+/// `alias import` is all-or-nothing: any invalid entry in the file, including
+/// one that `--merge`-less import would skip because the name already exists,
+/// rejects the whole file.
+#[test]
+fn e2e_alias_import_rejects_any_non_http_entry() {
+    let home = isolated_home("alias-import");
+    let out = y2q_isolated(
+        &home,
+        &["alias", "set", "ok", "http://127.0.0.1:1", "-u", "root"],
+        b"",
+    );
+    assert!(out.status.success(), "{}", output_text(&out));
+
+    let list = || output_text(&y2q_isolated(&home, &["--json", "alias", "list"], b""));
+    let before = list();
+
+    // Bad entry under a new name, next to a good one.
     let input = b"[aliases.good]\nurl = \"https://y2q.example\"\nusername = \"u\"\n\
                   [aliases.evil]\nurl = \"mailto:ops@example.com\"\nusername = \"u\"\n";
     let out = y2q_isolated(&home, &["alias", "import"], input);
-    assert_eq!(out.status.code(), Some(5), "{}", text(&out));
-    assert!(text(&out).contains("evil"), "{}", text(&out));
-    let out = y2q_isolated(&home, &["--json", "alias", "list"], b"");
-    assert!(
-        !text(&out).contains("\"good\"") && !text(&out).contains("\"evil\""),
-        "failed import must not save anything: {}",
-        text(&out)
-    );
+    assert_eq!(out.status.code(), Some(5), "{}", output_text(&out));
+    assert!(output_text(&out).contains("evil"), "{}", output_text(&out));
+    assert_eq!(list(), before, "failed import must not save anything");
 
-    // A bad alias that is already in the config file (hand-edited, or saved by
-    // an older build) yields a clean error, not a panic, and can still log out.
-    let cfg = home.join("config").join("y2q");
-    std::fs::create_dir_all(&cfg).unwrap();
+    // Bad entry under a name that already exists (skipped without --merge, but
+    // still an invalid file), next to a good new one.
+    let input = b"[aliases.ok]\nurl = \"mailto:ops@example.com\"\nusername = \"u\"\n\
+                  [aliases.good]\nurl = \"https://y2q.example\"\nusername = \"u\"\n";
+    let out = y2q_isolated(&home, &["alias", "import"], input);
+    assert_eq!(out.status.code(), Some(5), "{}", output_text(&out));
+    assert_eq!(list(), before, "failed import must not save anything");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A bad alias already in the config gives a clean error on first use, not a
+/// panic (exit 101).
+#[test]
+fn e2e_login_with_non_http_alias_is_an_error_not_a_panic() {
+    let home = isolated_home("alias-login");
+    write_mailto_alias(&home);
+    let out = y2q_isolated(&home, &["login", "m", "--password", "x"], b"");
+    assert_eq!(out.status.code(), Some(5), "{}", output_text(&out));
+    assert!(
+        !output_text(&out).contains("panicked"),
+        "{}",
+        output_text(&out)
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A session token cached for an alias whose URL is unusable can still be
+/// dropped locally; the user is told the server session was not revoked.
+#[test]
+fn e2e_logout_clears_token_of_non_http_alias() {
+    let home = isolated_home("alias-logout");
+    write_mailto_alias(&home);
+    let tokens = isolated_cfg_dir(&home).join("tokens.toml");
     std::fs::write(
-        cfg.join("config.toml"),
-        "[aliases.m]\nurl = \"mailto:ops@example.com\"\nusername = \"root\"\n",
+        &tokens,
+        "[sessions.m]\ntoken = \"SECRET-TOKEN\"\nexpires_at = 4102444800\nusername = \"root\"\n",
     )
     .unwrap();
-    let out = y2q_isolated(&home, &["login", "m", "--password", "x"], b"");
-    assert_eq!(out.status.code(), Some(5), "{}", text(&out));
-    assert!(!text(&out).contains("panicked"), "{}", text(&out));
-    let out = y2q_isolated(&home, &["logout", "m"], b"");
-    assert!(out.status.success(), "{}", text(&out));
 
+    let out = y2q_isolated(&home, &["logout", "m"], b"");
+    assert!(out.status.success(), "{}", output_text(&out));
+    assert!(
+        output_text(&out).contains("not revoked"),
+        "{}",
+        output_text(&out)
+    );
+    let left = std::fs::read_to_string(&tokens).unwrap_or_default();
+    assert!(!left.contains("SECRET-TOKEN"), "token not cleared: {left}");
     let _ = std::fs::remove_dir_all(&home);
 }
 
