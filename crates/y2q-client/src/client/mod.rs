@@ -46,6 +46,40 @@ impl ClientConfig {
     }
 }
 
+/// Parse a server base URL, accepting only what the client can build request
+/// URLs from: an `http`/`https` URL with a host.
+///
+/// `Url::parse` alone also accepts `mailto:x`, `data:…`, `file:///x` and even
+/// `localhost:8080` (scheme `localhost`); the first request would then panic in
+/// [`Y2qClient::url`] / [`Y2qClient::object_url`]. The URL itself is not echoed
+/// in errors: it may carry credentials.
+pub(crate) fn parse_base_url(s: &str) -> Result<Url, ClientError> {
+    let url = Url::parse(s).map_err(|e| ClientError::BadRequest {
+        message: format!("invalid server URL: {e}; expected an http:// or https:// URL"),
+    })?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(ClientError::BadRequest {
+            message: format!(
+                "invalid server URL: unsupported scheme `{}`; expected an http:// or https:// URL",
+                url.scheme()
+            ),
+        });
+    }
+    if url.cannot_be_a_base() || url.host_str().is_none() {
+        return Err(ClientError::BadRequest {
+            message: "invalid server URL: missing host; expected an http:// or https:// URL".into(),
+        });
+    }
+    Ok(url)
+}
+
+/// Check that `s` is usable as a server base URL (`http`/`https` with a host),
+/// the same rule [`Y2qClient::new`] enforces. For validating user input early,
+/// e.g. when an alias is saved.
+pub fn validate_base_url(s: &str) -> Result<(), ClientError> {
+    parse_base_url(s).map(drop)
+}
+
 #[derive(Clone)]
 pub struct Y2qClient {
     pub(crate) inner: reqwest::Client,
@@ -55,9 +89,7 @@ pub struct Y2qClient {
 
 impl Y2qClient {
     pub fn new(config: ClientConfig) -> Result<Self, ClientError> {
-        let base_url = Url::parse(&config.base_url).map_err(|e| ClientError::BadRequest {
-            message: format!("invalid server URL: {e}"),
-        })?;
+        let base_url = parse_base_url(&config.base_url)?;
         let rustls_cfg = build_rustls_client_config(&config.tls)?;
         let inner = reqwest::ClientBuilder::new()
             .use_preconfigured_tls(rustls_cfg)
@@ -83,6 +115,8 @@ impl Y2qClient {
     }
 
     pub(crate) fn url(&self, path: &str) -> Url {
+        // `base_url` is an http(s) URL that can be a base (see `parse_base_url`),
+        // so joining a relative path onto it cannot fail.
         self.base_url.join(path).expect("path join failed")
     }
 
@@ -322,5 +356,53 @@ mod tests {
             .object_url("bucket", "nested/path/to/file.txt")
             .unwrap();
         assert_eq!(url.path(), "/bucket/nested/path/to/file.txt");
+    }
+
+    #[test]
+    fn base_url_rejects_everything_that_cannot_carry_http_requests() {
+        // All of these parse with `Url::parse`; before validation the first
+        // request panicked in `url()` / `object_url()`.
+        for bad in [
+            "mailto:ops@example.com",
+            "data:text/plain,x",
+            "localhost:8080",
+            "file:///tmp/x",
+            "ftp://example.com/",
+            "ws://example.com/",
+            "",
+            "notaurl",
+        ] {
+            assert!(
+                matches!(
+                    Y2qClient::new(ClientConfig::new(bad.to_owned())),
+                    Err(ClientError::BadRequest { .. })
+                ),
+                "{bad:?} must be rejected by Y2qClient::new"
+            );
+            assert!(validate_base_url(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn base_url_accepts_http_and_https_forms() {
+        for ok in [
+            "http://127.0.0.1:8080",
+            "https://y2q.example/",
+            "https://y2q.example/prefix/",
+            "HTTPS://Y2Q.EXAMPLE",
+            "http://[::1]:9000",
+            "https://user@y2q.example",
+        ] {
+            let url = parse_base_url(ok).unwrap_or_else(|e| panic!("{ok:?}: {e}"));
+            // The invariant `url()` / `object_url()` rely on.
+            assert!(!url.cannot_be_a_base(), "{ok:?}");
+            url.join("api/v1/users").expect("join");
+        }
+    }
+
+    #[test]
+    fn base_url_error_does_not_echo_credentials() {
+        let err = validate_base_url("ftp://user:s3cret@example.com/").unwrap_err();
+        assert!(!err.to_string().contains("s3cret"), "{err}");
     }
 }

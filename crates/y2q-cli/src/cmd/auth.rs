@@ -89,8 +89,16 @@ pub async fn logout(alias: &str, mode: OutputMode) -> Result<(), CliError> {
 
     let mut store = TokenStore::load(&tokens_path)?;
     if let Some(tok) = store.get_valid(alias) {
-        let client = client_from_alias(entry, Some(Zeroizing::new(tok.token.clone())))?;
-        let _ = crate::ops::auth::logout(&client).await;
+        // Best effort: an alias whose URL/TLS config is unusable must still be
+        // able to drop its cached token locally.
+        match client_from_alias(entry, Some(Zeroizing::new(tok.token.clone()))) {
+            Ok(client) => {
+                let _ = crate::ops::auth::logout(&client).await;
+            }
+            Err(e) => eprintln!(
+                "warning: cannot reach `{alias}` ({e}); removed the local token but the server session was not revoked"
+            ),
+        }
     }
     store.clear(alias);
     store.save(&tokens_path)?;

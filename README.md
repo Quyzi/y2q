@@ -152,7 +152,7 @@ y2q alias set prod https://y2qd.example --user alice
 y2q login prod
 ```
 
-Aliases live in `~/.config/y2q/config.toml`; cached session tokens in `~/.local/share/y2q/tokens.toml`. `y2q alias export`/`import` move alias sets between machines as TOML. Paths use `alias/bucket/key` syntax.
+Aliases live in `~/.config/y2q/config.toml`; cached session tokens in `~/.local/share/y2q/tokens.toml`. `y2q alias export`/`import` move alias sets between machines as TOML. Paths use `alias/bucket/key` syntax. An alias URL must be `http://` or `https://`; `alias set` and `alias import` reject anything else (an import with any invalid entry saves nothing).
 
 For a self-signed dev endpoint, add `--insecure` (per alias or per command), or trust a CA bundle with `--ca-cert <pem>`. For mutual TLS, add `--client-cert`/`--client-key` to the alias.
 

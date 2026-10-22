@@ -1,5 +1,7 @@
 use std::io::Read;
 
+use y2q_client::ClientError;
+
 use crate::cli::AliasCmd;
 use crate::client_builder::resolve_config_path;
 use crate::config::{Alias, CliConfig};
@@ -20,6 +22,8 @@ pub async fn run(cmd: AliasCmd, mode: OutputMode) -> Result<(), CliError> {
             client_cert,
             client_key,
         } => {
+            // Before the username prompt: a bad URL must fail without asking anything.
+            y2q_client::validate_base_url(&url)?;
             let username = match user {
                 Some(u) => u,
                 None => {
@@ -105,7 +109,24 @@ pub async fn run(cmd: AliasCmd, mode: OutputMode) -> Result<(), CliError> {
             }
             let imported: Imported =
                 toml::from_str(&buf).map_err(|e| CliError::Other(format!("import parse: {e}")))?;
-            let incoming = imported.aliases.into_iter().chain(imported.profiles);
+            let incoming: Vec<_> = imported
+                .aliases
+                .into_iter()
+                .chain(imported.profiles)
+                .collect();
+            // All-or-nothing: every entry in the file must be valid, including
+            // ones the non-`--merge` path would skip because the name already
+            // exists, before anything is written to disk.
+            for (name, entry) in &incoming {
+                if let Err(ClientError::BadRequest { message }) =
+                    y2q_client::validate_base_url(&entry.url)
+                {
+                    return Err(ClientError::BadRequest {
+                        message: format!("alias `{name}`: {message}; nothing was imported"),
+                    }
+                    .into());
+                }
+            }
             let mut added = 0usize;
             for (name, entry) in incoming {
                 if !merge && config.aliases.contains_key(&name) {
