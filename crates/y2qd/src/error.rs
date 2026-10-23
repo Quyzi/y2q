@@ -232,11 +232,8 @@ mod tests {
 
     #[test]
     fn incomplete_payload_maps_to_bad_request_body_400() {
-        let err = map_payload_read_error(
-            "b",
-            "k",
-            actix_web::error::PayloadError::Incomplete(None),
-        );
+        let err =
+            map_payload_read_error("b", "k", actix_web::error::PayloadError::Incomplete(None));
         assert!(matches!(
             err.0,
             CoreError::BadRequestBody {
@@ -253,11 +250,8 @@ mod tests {
 
     #[test]
     fn encoding_corrupted_payload_maps_to_bad_request_body_400() {
-        let err = map_payload_read_error(
-            "b",
-            "k",
-            actix_web::error::PayloadError::EncodingCorrupted,
-        );
+        let err =
+            map_payload_read_error("b", "k", actix_web::error::PayloadError::EncodingCorrupted);
         assert!(matches!(err.0, CoreError::BadRequestBody { .. }));
         assert_eq!(err.status_code(), StatusCode::BAD_REQUEST);
         let text = body_text(&err);

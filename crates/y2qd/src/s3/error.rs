@@ -250,11 +250,9 @@ impl From<AppError> for S3Error {
                 StatusCode::PAYLOAD_TOO_LARGE,
                 format!("Your proposed upload exceeds the maximum allowed size ({limit} bytes)."),
             ),
-            CoreError::BadRequestBody { message, .. } => S3Error::new(
-                "IncompleteBody",
-                StatusCode::BAD_REQUEST,
-                message,
-            ),
+            CoreError::BadRequestBody { message, .. } => {
+                S3Error::new("IncompleteBody", StatusCode::BAD_REQUEST, message)
+            }
             CoreError::InvalidAcl { reason }
             | CoreError::InvalidPersonaRequest { reason }
             | CoreError::Query { message: reason }
