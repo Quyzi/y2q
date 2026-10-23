@@ -136,6 +136,16 @@ pub async fn vhost_middleware<B: MessageBody>(
                 let mut parts = req.uri().clone().into_parts();
                 parts.path_and_query = Some(pq);
                 if let Ok(new_uri) = actix_web::http::Uri::from_parts(parts) {
+                    // App middleware runs before `AppRouting::recognize`, which
+                    // matches against `match_info`'s path — not `head.uri`.
+                    // Sync both the way `AppInitService` reseeds a pooled
+                    // request (`Url::update` + `Path::reset`) so `web::Path`
+                    // sees `/<bucket>/…` instead of the client path.
+                    {
+                        let info = req.match_info_mut();
+                        info.get_mut().update(&new_uri);
+                        info.reset();
+                    }
                     req.head_mut().uri = new_uri;
                 }
             }

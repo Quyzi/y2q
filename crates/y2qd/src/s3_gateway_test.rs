@@ -18,7 +18,10 @@ use actix_web::http::header::{HeaderMap, HeaderName, HeaderValue};
 use actix_web::middleware::from_fn;
 use actix_web::test::{self, TestRequest};
 use actix_web::{App, web};
-use y2q_core::crypto::{Role, UserStore};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+use y2q_core::crypto::{
+    self, Argon2Params, CredentialSlot, Role, UserRecord, UserStore, kem,
+};
 use y2q_core::secmem::SecretVec;
 use y2q_core::{AnyStorage, FilesystemStorage, Listing};
 
@@ -29,11 +32,13 @@ use crate::request_id;
 use crate::s3::state::{MultipartRegistry, S3CredentialStore, S3State};
 use crate::s3::{routes, sigv4};
 
-/// Live harness: a real actix service wired exactly like `main.rs`'s S3
-/// listener (same middleware order, same app_data, same route table), an
-/// empty-but-functional `UserStore` (fine for every test here: none of
-/// them exercise `claim_ownership`, which is the only code path that reads
-/// it), one live session, and one minted S3 credential.
+/// Live harness: a real actix service wired like `main.rs`'s S3 listener
+/// (same middleware order including `vhost_middleware`, same app_data,
+/// same route table), a UserStore with alice's identity key material
+/// (needed when a first write claims bucket ownership), one live session,
+/// and one minted S3 credential. `virtual_host_domain` is always
+/// `s3.local` so path-style tests also cover the "domain set but Host is
+/// not a vhost" no-op rewrite.
 struct Harness {
     _storage_dir: tempfile::TempDir,
     _user_dir: tempfile::TempDir,
@@ -58,6 +63,13 @@ impl Harness {
 
         let user_dir = tempfile::TempDir::new().unwrap();
         let user_store = UserStore::open(&user_dir.path().join("users.redb"), &[0u8; 32]).unwrap();
+        // Cheap KDF: these tests never unwrap a password slot. The dummy
+        // login record inside `AuthState::new` still runs Argon2.
+        let argon2_config = Argon2Config {
+            m_cost_kib: 8,
+            t_cost: 1,
+            p_cost: 1,
+        };
         let auth_config = AuthConfig {
             default_ttl_seconds: 3600,
             max_ttl_seconds: 86_400,
@@ -68,8 +80,35 @@ impl Harness {
             enforce_authorization,
             max_refreshes: 1,
         };
-        let auth_state = AuthState::new(user_store, auth_config, Argon2Config::default()).unwrap();
+        let auth_state = AuthState::new(user_store, auth_config, argon2_config).unwrap();
 
+        let (pk, sk) = kem::keypair();
+        let mut slots = Vec::with_capacity(crypto::CREDENTIAL_SLOTS);
+        slots.push(CredentialSlot {
+            identity_pk_b64: STANDARD.encode(pk.to_bytes()),
+            wrapped: crypto::WrappedSk::default(),
+        });
+        for _ in 1..crypto::CREDENTIAL_SLOTS {
+            let (other_pk, _) = kem::keypair();
+            slots.push(CredentialSlot {
+                identity_pk_b64: STANDARD.encode(other_pk.to_bytes()),
+                wrapped: crypto::WrappedSk::default(),
+            });
+        }
+        auth_state
+            .user_store
+            .upsert(&UserRecord {
+                username: "alice".to_owned(),
+                created_at: 1,
+                last_login: None,
+                kdf: Argon2Params::with_random_salt(8, 1, 1),
+                slots,
+                primary_slot: 0,
+                role: Role::User,
+            })
+            .unwrap();
+
+        let identity_sk = SecretVec::from_slice(sk.to_bytes().as_ref()).unwrap();
         let token = auth_state
             .sessions
             .insert(NewSession {
@@ -79,7 +118,7 @@ impl Harness {
                 expires_at: SystemTime::now() + Duration::from_secs(3600),
                 persona: 0,
                 revoke_other_sessions: false,
-                identity_sk: SecretVec::zeroed(32).unwrap(),
+                identity_sk,
             })
             .unwrap();
         let token_hash = token.hash();
@@ -88,6 +127,7 @@ impl Harness {
         let s3_config = S3Config {
             region: region.clone(),
             max_clock_skew_secs: 900,
+            virtual_host_domain: "s3.local".to_owned(),
             ..Default::default()
         };
         let credentials = S3CredentialStore::new(auth_state.sessions.keyring(), 4);
@@ -182,12 +222,13 @@ macro_rules! build_app {
     ($harness:expr) => {
         test::init_service(
             App::new()
-                // Innermost first, matching `main.rs`: `error_detail` inside
-                // `request_id` (production also puts `TracingLogger` between
-                // them). `error_detail` reads `RequestIdExt`, which this
-                // outer middleware inserts before calling in.
+                // Outer→inner among these wraps: vhost, request_id,
+                // error_detail — same relative order as `main.rs` (which
+                // also inserts TracingLogger / metrics / trace between
+                // request_id and vhost). Last `.wrap` is outermost.
                 .wrap(from_fn(routes::error_detail_middleware))
                 .wrap(from_fn(request_id::request_id_middleware))
+                .wrap(from_fn(routes::vhost_middleware))
                 .app_data($harness.storage.clone())
                 .app_data(web::Data::new(LabelLimits {
                     max_labels: 32,
@@ -209,6 +250,36 @@ macro_rules! build_app {
 }
 
 const HOST: &str = "example.com";
+const VHOST_DOMAIN: &str = "s3.local";
+const VHOST_BUCKET: &str = "alice-priv";
+
+fn vhost_host(bucket: &str) -> String {
+    format!("{bucket}.{VHOST_DOMAIN}")
+}
+
+/// Signed request helper that also stamps Host / SigV4 headers used by every
+/// gateway test here.
+fn signed_req(
+    harness: &Harness,
+    method: actix_web::http::Method,
+    path: &str,
+    query: &str,
+    host: &str,
+) -> TestRequest {
+    let uri = if query.is_empty() {
+        path.to_owned()
+    } else {
+        format!("{path}?{query}")
+    };
+    let (auth_header, amz_date) = sign(harness, method.as_str(), path, query, host);
+    TestRequest::default()
+        .method(method)
+        .uri(&uri)
+        .insert_header(("host", host))
+        .insert_header(("x-amz-content-sha256", sigv4::UNSIGNED_PAYLOAD))
+        .insert_header(("x-amz-date", amz_date))
+        .insert_header(("authorization", auth_header))
+}
 
 /// Check: `DELETE /{bucket}?policy` returns 501 and never touches the
 /// bucket (it still exists afterward); `PUT /{bucket}?acl` likewise 501s
@@ -338,4 +409,142 @@ async fn error_response_carries_matching_request_id_and_populated_resource() {
         text.contains(&format!("<RequestId>{amz_request_id}</RequestId>")),
         "body: {text}"
     );
+}
+
+/// Virtual-hosted PUT then GET must bind `web::Path` from the rewritten
+/// `/<bucket>/<key>` path (not the client `/<key>`), while SigV4 still
+/// verifies against the client-sent URI via `OriginalUri`.
+#[actix_web::test]
+async fn virtual_hosted_object_put_get_round_trip() {
+    let harness = Harness::new(false);
+    let app = build_app!(harness);
+    let host = vhost_host(VHOST_BUCKET);
+
+    for (key, payload) in [("keep.txt", &b"keep-me"[..]), ("noperiod", &b"plain"[..])] {
+        let path = format!("/{key}");
+        let put = signed_req(
+            &harness,
+            actix_web::http::Method::PUT,
+            &path,
+            "",
+            &host,
+        )
+        .set_payload(payload.to_vec())
+        .to_request();
+        let put_resp = test::call_service(&app, put).await;
+        let put_status = put_resp.status();
+        let put_body = test::read_body(put_resp).await;
+        assert_eq!(
+            put_status,
+            200,
+            "vhost PUT {path} Host={host}: {}",
+            String::from_utf8_lossy(&put_body)
+        );
+
+        let get = signed_req(
+            &harness,
+            actix_web::http::Method::GET,
+            &path,
+            "",
+            &host,
+        )
+        .to_request();
+        let get_resp = test::call_service(&app, get).await;
+        let get_status = get_resp.status();
+        let get_body = test::read_body(get_resp).await;
+        assert_eq!(
+            get_status,
+            200,
+            "vhost GET {path} Host={host}: {}",
+            String::from_utf8_lossy(&get_body)
+        );
+        assert_eq!(&get_body[..], payload, "GET body mismatch for {key}");
+    }
+}
+
+/// `GET /` with a virtual-hosted Host must list that bucket's objects
+/// (`ListBucketResult`), not the service-level `ListAllMyBuckets`.
+#[actix_web::test]
+async fn virtual_hosted_bucket_root_lists_objects() {
+    let harness = Harness::new(false);
+    let app = build_app!(harness);
+    let host = vhost_host(VHOST_BUCKET);
+
+    let put = signed_req(
+        &harness,
+        actix_web::http::Method::PUT,
+        "/listed.txt",
+        "",
+        &host,
+    )
+    .set_payload(b"listed".to_vec())
+    .to_request();
+    let put_resp = test::call_service(&app, put).await;
+    assert_eq!(put_resp.status(), 200, "seed PUT must succeed");
+
+    let list = signed_req(&harness, actix_web::http::Method::GET, "/", "", &host).to_request();
+    let list_resp = test::call_service(&app, list).await;
+    let list_status = list_resp.status();
+    let list_body = test::read_body(list_resp).await;
+    let text = String::from_utf8(list_body.to_vec()).unwrap();
+    assert_eq!(list_status, 200, "vhost GET /: {text}");
+    assert!(
+        text.contains("ListBucketResult"),
+        "expected ListObjects XML, got: {text}"
+    );
+    assert!(
+        !text.contains("ListAllMyBucketsResult"),
+        "vhost GET / must not hit ListAllMyBuckets: {text}"
+    );
+    assert!(
+        text.contains("<Name>alice-priv</Name>") || text.contains("<Key>listed.txt</Key>"),
+        "listing must be scoped to the Host bucket: {text}"
+    );
+}
+
+/// Path-style addressing must keep working with `virtual_host_domain` set
+/// and `vhost_middleware` wrapped — Host `example.com` is not a vhost, so
+/// the rewrite is a no-op.
+#[actix_web::test]
+async fn path_style_still_works_with_vhost_domain_configured() {
+    let harness = Harness::new(false);
+    let app = build_app!(harness);
+
+    let put = signed_req(
+        &harness,
+        actix_web::http::Method::PUT,
+        "/pathbkt/obj.txt",
+        "",
+        HOST,
+    )
+    .set_payload(b"path-style".to_vec())
+    .to_request();
+    let put_resp = test::call_service(&app, put).await;
+    let put_status = put_resp.status();
+    let put_body = test::read_body(put_resp).await;
+    assert_eq!(
+        put_status,
+        200,
+        "path-style PUT: {}",
+        String::from_utf8_lossy(&put_body)
+    );
+
+    let get = signed_req(
+        &harness,
+        actix_web::http::Method::GET,
+        "/pathbkt/obj.txt",
+        "",
+        HOST,
+    )
+    .to_request();
+    let get_resp = test::call_service(&app, get).await;
+    let get_status = get_resp.status();
+    let get_body = test::read_body(get_resp).await;
+    assert_eq!(
+        get_status,
+        200,
+        "path-style GET: {}",
+        String::from_utf8_lossy(&get_body)
+    );
+    assert_eq!(&get_body[..], b"path-style");
 }
