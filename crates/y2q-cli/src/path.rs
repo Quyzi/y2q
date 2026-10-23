@@ -40,9 +40,15 @@ pub enum CpEndpoint {
 
 impl CpEndpoint {
     pub fn parse(s: &str) -> Self {
-        // Glob chars or stdin → always local
-        if s == "-" || !s.contains('/') || s.contains(['*', '?', '[']) {
+        if s == "-" || !s.contains('/') {
             return Self::Local(s.to_owned());
+        }
+        if s.contains(['*', '?', '[']) {
+            // Single-slash local globs (dir/*.txt) stay Local; alias/bucket/key… stay Remote.
+            match RemotePath::parse(s) {
+                Ok(r) if r.key.is_some() => return Self::Remote(r),
+                _ => return Self::Local(s.to_owned()),
+            }
         }
         match RemotePath::parse(s) {
             Ok(r) => Self::Remote(r),
@@ -93,8 +99,31 @@ mod tests {
             CpEndpoint::Local(_)
         ));
         assert!(matches!(CpEndpoint::parse("a/*.txt"), CpEndpoint::Local(_)));
+        assert!(matches!(CpEndpoint::parse("*.txt"), CpEndpoint::Local(_)));
         assert!(matches!(CpEndpoint::parse("a/b/c"), CpEndpoint::Remote(_)));
         assert!(CpEndpoint::parse("a/b/c").is_remote());
         assert!(!CpEndpoint::parse("local.txt").is_remote());
+    }
+
+    #[test]
+    fn cp_endpoint_glob_chars_in_remote_key() {
+        match CpEndpoint::parse("alias/bucket/x[1].txt") {
+            CpEndpoint::Remote(r) => {
+                assert_eq!(r.alias, "alias");
+                assert_eq!(r.bucket.as_deref(), Some("bucket"));
+                assert_eq!(r.key.as_deref(), Some("x[1].txt"));
+            }
+            CpEndpoint::Local(_) => panic!("expected Remote for alias/bucket/x[1].txt"),
+        }
+        match CpEndpoint::parse("alias/bucket/file?.txt") {
+            CpEndpoint::Remote(r) => {
+                assert_eq!(r.key.as_deref(), Some("file?.txt"));
+            }
+            CpEndpoint::Local(_) => panic!("expected Remote for alias/bucket/file?.txt"),
+        }
+        assert!(matches!(
+            CpEndpoint::parse("alias/bucket/*.log"),
+            CpEndpoint::Remote(_)
+        ));
     }
 }
