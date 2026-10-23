@@ -119,6 +119,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
     );
     cfg.service(
         web::resource("/api/v1/buckets/{bucket}/acl")
+            .app_data(acl::json_config())
             .route(web::get().to(acl::get_acl))
             .route(web::put().to(acl::set_acl)),
     );

@@ -615,11 +615,12 @@ Manage a bucket's owner and per-user grants. See [Authorization](#authorization)
 ```json
 {
   "owner": "alice",
-  "grants": { "bob": "read", "carol": "write" }
+  "grants": { "bob": "read", "carol": "write" },
+  "key_epochs": [0]
 }
 ```
 
-`owner` is `null` only for an unclaimed legacy bucket. `grants` maps username → `"read"` | `"write"` | `"writeonly"` | `"admin"`; the owner is never listed (they have implicit full control).
+`owner` is `null` only for an unclaimed legacy bucket. `grants` maps username → `"read"` | `"write"` | `"writeonly"` | `"admin"`; the owner is never listed (they have implicit full control). `key_epochs` (retained bucket key epochs, ascending) is returned when non-empty.
 
 | Code | Meaning |
 |---|---|
@@ -630,7 +631,7 @@ Manage a bucket's owner and per-user grants. See [Authorization](#authorization)
 
 ### `PUT /api/v1/buckets/{bucket}/acl`
 
-Replace the ACL, and optionally transfer ownership by setting `owner`. The body fully replaces the existing `grants`.
+Replace the ACL, and optionally transfer ownership by setting `owner`. The body must be a JSON object with `grants`, which is **required** and fully replaces the existing grants; send `{"grants":{}}` to clear every grant (this revokes each removed read-capable grantee's sealed grants and live sessions). `owner` is optional: omit it to keep the owner, set it to transfer; sending `owner` requires being the current owner or a global admin, so omit `owner` unless transferring. `key_epochs` (as returned by GET) is accepted and ignored, so a GET body can be sent back unchanged. Unknown fields, a missing `grants`, or a body that is not a JSON object with `grants` are rejected with 400 and `{"error":"invalid acl: …"}`; nothing is changed. An ownership transfer must still include `grants` (echo the current ones).
 
 **Request:**
 ```json
@@ -645,7 +646,7 @@ A new `owner` must be an existing user; grantees are not checked for existence (
 | Code | Meaning |
 |---|---|
 | 200 | Updated owner and ACL |
-| 400 | Unknown grantee, empty username, or redundant owner grant |
+| 400 | Malformed body (not a JSON object, unknown field, missing `grants`, bad permission), unknown owner, empty username, or redundant owner grant |
 | 401 | Token missing or invalid |
 | 403 | Caller may not manage this ACL, or may not transfer ownership |
 | 404 | Bucket not found (or not visible to the caller) |

@@ -10,6 +10,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+use actix_web::error::JsonPayloadError;
 use actix_web::{HttpResponse, web};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -23,6 +24,7 @@ use crate::error::{AppError, ErrorBody};
 
 /// Owner + grants view returned by `GET` and accepted by `PUT`.
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct AclBody {
     /// Bucket owner (full control). `null` only for unclaimed legacy buckets,
     /// which are admin-only until an admin assigns an owner here.
@@ -30,7 +32,7 @@ pub struct AclBody {
     pub owner: Option<String>,
     /// Per-user grants. Keys are usernames; values are `"read"`, `"write"`, or
     /// `"admin"`. The owner is never listed (they have implicit full control).
-    #[serde(default)]
+    /// Required on `PUT`; fully replaces the grants, so `{}` clears them all.
     #[schema(value_type = std::collections::HashMap<String, String>)]
     pub grants: BTreeMap<String, BucketPermission>,
     /// Retained bucket key epochs, ascending. Read-only: ignored on `PUT`.
@@ -90,9 +92,10 @@ pub async fn get_acl(
     }))
 }
 
-/// Replace a bucket's ACL (and optionally transfer ownership). Requires bucket
-/// `Admin` (owner) or global admin; assigning a new `owner` additionally
-/// requires being the current owner or a global admin.
+/// Replace a bucket's ACL (and optionally transfer ownership). The body must
+/// be a JSON object with a required `grants` map; `{"grants":{}}` clears all
+/// grants. Requires bucket `Admin` (owner) or global admin; assigning a new
+/// `owner` additionally requires being the current owner or a global admin.
 #[utoipa::path(
     put,
     operation_id = "set_bucket_acl",
@@ -101,7 +104,7 @@ pub async fn get_acl(
     request_body(content = AclBody, content_type = "application/json"),
     responses(
         (status = 200, description = "Updated owner and ACL", body = AclBody, content_type = "application/json"),
-        (status = 400, description = "Unknown grantee, empty username, or redundant owner grant", body = ErrorBody, content_type = "application/json"),
+        (status = 400, description = "Malformed body (not an object, unknown field, missing `grants`), unknown grantee, empty username, or redundant owner grant", body = ErrorBody, content_type = "application/json"),
         (status = 401, description = "Authentication required", body = ErrorBody, content_type = "application/json"),
         (status = 403, description = "Caller may not manage this ACL or transfer ownership", body = ErrorBody, content_type = "application/json"),
         (status = 404, description = "Bucket not found (or not visible to the caller)", body = ErrorBody, content_type = "application/json"),
@@ -329,6 +332,17 @@ fn ensure_user_exists(state: &AuthState, username: &str) -> Result<(), AppError>
     }
 }
 
+/// `web::JsonConfig` for the ACL resource: turn body-shape failures (not an
+/// object, unknown field, missing `grants`) into the documented
+/// `{"error": "invalid acl: …"}` 400. Other payload errors keep actix's
+/// default status and body.
+pub(crate) fn json_config() -> web::JsonConfig {
+    web::JsonConfig::default().error_handler(|err, _req| match err {
+        JsonPayloadError::Deserialize(e) => invalid_acl(&e.to_string()).into(),
+        other => other.into(),
+    })
+}
+
 fn invalid_acl(reason: &str) -> AppError {
     AppError(y2q_core::Error::InvalidAcl {
         reason: reason.to_owned(),
@@ -340,4 +354,38 @@ fn not_found(bucket: &str) -> AppError {
         bucket: bucket.to_owned(),
         key: String::new(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AclBody;
+
+    #[test]
+    fn acl_body_requires_grants() {
+        let err = serde_json::from_str::<AclBody>("{}").unwrap_err();
+        assert!(err.to_string().contains("grants"));
+        serde_json::from_str::<AclBody>(r#"{"owner":"x"}"#).unwrap_err();
+    }
+
+    #[test]
+    fn acl_body_rejects_unknown_fields() {
+        let err = serde_json::from_str::<AclBody>(r#"{"grants":{},"grnats":{}}"#).unwrap_err();
+        assert!(err.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn acl_body_rejects_non_object() {
+        for body in ["[]", "null", r#""x""#, "1"] {
+            serde_json::from_str::<AclBody>(body).unwrap_err();
+        }
+    }
+
+    #[test]
+    fn acl_body_accepts_explicit_empty_and_key_epochs() {
+        serde_json::from_str::<AclBody>(r#"{"grants":{}}"#).unwrap();
+        serde_json::from_str::<AclBody>(
+            r#"{"owner":"a","grants":{"b":"read"},"key_epochs":[0,1]}"#,
+        )
+        .unwrap();
+    }
 }

@@ -81,6 +81,8 @@ use y2q_core::{AnyStorage, FilesystemStorage, StorageExt, secmem};
 #[cfg(target_os = "linux")]
 use y2q_core::{UringStorage, storage::uring::UringConfig};
 
+#[cfg(test)]
+mod acl_put_test;
 mod auth;
 mod authz;
 mod bucket_keys;
