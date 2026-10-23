@@ -1595,7 +1595,10 @@ mod tests {
             .permissions()
             .mode()
             & 0o777;
-        assert_eq!(shard_mode, 0o700, "streaming shard dir must be created 0700");
+        assert_eq!(
+            shard_mode, 0o700,
+            "streaming shard dir must be created 0700"
+        );
         drop(guard);
     }
 }
