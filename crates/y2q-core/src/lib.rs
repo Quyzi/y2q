@@ -506,10 +506,11 @@ pub enum Error {
         version: u16,
     },
 
-    /// A label search query failed to parse, or contained an invalid regex.
+    /// A label search query failed to parse, contained an invalid regex, or
+    /// exceeded a complexity limit (parenthesis nesting depth or operator count).
     #[error("invalid query: {message}")]
     Query {
-        /// Human-readable parse or regex-compilation error.
+        /// Human-readable parse, regex-compilation or limit error.
         message: String,
     },
 
