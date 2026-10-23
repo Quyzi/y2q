@@ -573,12 +573,7 @@ pub fn upload_stream(
     let bucket_for_err = bucket.clone();
     let key_for_err = key;
     let base = futures_util::TryStreamExt::map_err(payload, move |e| {
-        AppError(y2q_core::Error::InternalError {
-            bucket: bucket_for_err.clone(),
-            key: key_for_err.clone(),
-            operation: "read body".to_owned(),
-            message: e.to_string(),
-        })
+        crate::error::map_payload_read_error(bucket_for_err.clone(), key_for_err.clone(), e)
     });
     let base: AppByteStream = Box::pin(base);
 

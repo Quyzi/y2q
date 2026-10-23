@@ -345,7 +345,7 @@ Reserved label names (rejected case-insensitively): `Created`, `Modified`, `Chec
 |---|---|
 | 200 | Existing object replaced |
 | 201 | Object created |
-| 400 | Invalid bucket, key, label, or `X-Y2Q-Sync` value |
+| 400 | Invalid bucket, key, label, or `X-Y2Q-Sync` value; incomplete or truncated body (Content-Length under-delivery or early close) |
 | 401 | Token missing or invalid |
 | 409 | Object is currently locked (a PUT to this key is already in progress, or a stale lock is present) |
 | 413 | Body exceeds `server.max_body_bytes`, or would exceed the bucket's `quota_bytes` |
@@ -821,6 +821,7 @@ Every request must carry a valid SigV4 signature (header `Authorization: AWS4-HM
 | `RequestTimeTooSkewed` | 403 | `X-Amz-Date` outside `[s3] max_clock_skew_secs` of server time |
 | `AuthorizationHeaderMalformed` | 400 | Malformed signature/scope, or the scope's region doesn't match `[s3] region` |
 | `XAmzContentSHA256Mismatch` | 400 | Declared payload SHA-256 doesn't match the actual body |
+| `IncompleteBody` | 400 | Request body truncated or corrupted (Content-Length under-delivery / early close) |
 | `EntityTooLarge` | 413 | Body exceeds `server.max_body_bytes`/bucket quota, or a multipart part exceeds `[s3] max_part_bytes` |
 | `InvalidRequest` | 400 | Unsupported checksum algorithm, or other malformed input |
 | `NotImplemented` | 501 | A recognized but unimplemented S3 sub-resource |

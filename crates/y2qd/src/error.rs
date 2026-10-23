@@ -45,10 +45,46 @@ pub struct ErrorBody {
 /// | `KeystoreCorrupt`             | 500 (generic body) |
 /// | `Query`                       | 400         |
 /// | `BodyTooLarge`                | 413         |
+/// | `BadRequestBody`              | 400         |
 /// | `TooManyBucketKeyEpochs`      | 409         |
 /// | `RekeyAlreadyRunning`         | 409         |
 #[derive(Debug)]
 pub struct AppError(pub CoreError);
+
+/// Classify an actix payload-read failure for object PUT / S3 upload streams.
+///
+/// Client/protocol faults (`Incomplete`, `EncodingCorrupted`, `UnknownLength`)
+/// become [`CoreError::BadRequestBody`] (HTTP 400). Remaining variants stay
+/// [`CoreError::InternalError`] (HTTP 500).
+pub(crate) fn map_payload_read_error(
+    bucket: impl Into<String>,
+    key: impl Into<String>,
+    err: actix_web::error::PayloadError,
+) -> AppError {
+    use actix_web::error::PayloadError;
+
+    let bucket = bucket.into();
+    let key = key.into();
+    let message = err.to_string();
+    match &err {
+        PayloadError::Incomplete(_)
+        | PayloadError::EncodingCorrupted
+        | PayloadError::UnknownLength => {
+            tracing::debug!(%bucket, %key, %message, "bad request body");
+            AppError(CoreError::BadRequestBody {
+                bucket,
+                key,
+                message,
+            })
+        }
+        _ => AppError(CoreError::InternalError {
+            bucket,
+            key,
+            operation: "read body".to_owned(),
+            message,
+        }),
+    }
+}
 
 impl std::fmt::Display for AppError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -91,7 +127,8 @@ impl ResponseError for AppError {
             | CoreError::Query { .. }
             | CoreError::InvalidAcl { .. }
             | CoreError::InvalidPersonaRequest { .. }
-            | CoreError::InvalidStaleLockThreshold { .. } => StatusCode::BAD_REQUEST,
+            | CoreError::InvalidStaleLockThreshold { .. }
+            | CoreError::BadRequestBody { .. } => StatusCode::BAD_REQUEST,
             CoreError::Locked { .. }
             | CoreError::RebuildAlreadyRunning
             | CoreError::TooManyBucketKeyEpochs { .. }
@@ -191,5 +228,48 @@ mod tests {
         });
         let text = body_text(&err);
         assert!(text.contains("b") && text.contains("k"));
+    }
+
+    #[test]
+    fn incomplete_payload_maps_to_bad_request_body_400() {
+        let err =
+            map_payload_read_error("b", "k", actix_web::error::PayloadError::Incomplete(None));
+        assert!(matches!(
+            err.0,
+            CoreError::BadRequestBody {
+                ref bucket,
+                ref key,
+                ..
+            } if bucket == "b" && key == "k"
+        ));
+        assert_eq!(err.status_code(), StatusCode::BAD_REQUEST);
+        let text = body_text(&err);
+        assert!(!text.contains("internal error"));
+        assert!(text.contains("bad request body"));
+    }
+
+    #[test]
+    fn encoding_corrupted_payload_maps_to_bad_request_body_400() {
+        let err =
+            map_payload_read_error("b", "k", actix_web::error::PayloadError::EncodingCorrupted);
+        assert!(matches!(err.0, CoreError::BadRequestBody { .. }));
+        assert_eq!(err.status_code(), StatusCode::BAD_REQUEST);
+        let text = body_text(&err);
+        assert!(!text.contains("internal error"));
+    }
+
+    #[test]
+    fn overflow_payload_still_maps_to_internal_error_500() {
+        let err = map_payload_read_error("b", "k", actix_web::error::PayloadError::Overflow);
+        assert!(matches!(
+            err.0,
+            CoreError::InternalError {
+                ref operation,
+                ..
+            } if operation == "read body"
+        ));
+        assert_eq!(err.status_code(), StatusCode::INTERNAL_SERVER_ERROR);
+        let text = body_text(&err);
+        assert!(text.contains("internal error"));
     }
 }
