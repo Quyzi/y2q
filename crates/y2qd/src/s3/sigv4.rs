@@ -96,6 +96,19 @@ pub fn payload_hash_token(payload: &PayloadHash) -> &str {
     }
 }
 
+impl PayloadHash {
+    /// `true` when an `aws-chunked` body carries a trailer block after the
+    /// terminal `0` chunk: both `…-TRAILER` modes. Plain
+    /// `STREAMING-AWS4-HMAC-SHA256-PAYLOAD` ends at the terminal chunk's blank
+    /// line. `false` for the non-chunked modes (no decoder runs for them).
+    pub fn has_trailer(&self) -> bool {
+        matches!(
+            self,
+            Self::StreamingSigned { trailer: true } | Self::StreamingUnsigned
+        )
+    }
+}
+
 /// A parsed (but not yet verified) SigV4 request.
 #[derive(Debug, Clone)]
 pub struct SignedRequest {
@@ -563,6 +576,24 @@ pub fn trailer_string_to_sign(
 mod tests {
     use super::*;
     use actix_web::http::header::{HeaderMap, HeaderName, HeaderValue};
+
+    // Pins the mode -> trailer mapping that feeds `ChunkedOptions::expect_trailer`
+    // in `s3::body::upload`.
+    #[test]
+    fn payload_mode_tokens_map_to_trailer_expectation() {
+        for (token, want) in [
+            (STREAMING_SIGNED, false),
+            (STREAMING_SIGNED_TRAILER, true),
+            (STREAMING_UNSIGNED_TRAILER, true),
+            (UNSIGNED_PAYLOAD, false),
+            (
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                false,
+            ),
+        ] {
+            assert_eq!(classify_payload_hash(token).has_trailer(), want, "{token}");
+        }
+    }
 
     #[test]
     fn canonical_query_sorts_and_encodes() {

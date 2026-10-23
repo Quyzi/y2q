@@ -494,6 +494,13 @@ above, especially session expiry.
   faithful mapping onto y2q's persona-keyed grants (ACLs, bucket policy,
   SSE-C, lifecycle, and others) return `501 NotImplemented` rather than
   silently accepting and ignoring them.
+- **Signed `aws-chunked` uploads are verified chunk by chunk, before
+  commit.** For every signed streaming payload mode
+  (`STREAMING-AWS4-HMAC-SHA256-PAYLOAD` and its `-TRAILER` variant) each
+  data chunk and the terminal chunk must carry a valid signature chained
+  from the request's seed signature, and the `-TRAILER` variant's trailer
+  must be signed as well. Any mismatch aborts the stream before the object
+  is committed, so a forged or tampered body is never persisted.
 
 Full protocol reference: [docs/api.md#s3-gateway](docs/api.md#s3-gateway).
 
