@@ -141,7 +141,7 @@ make image          # y2q:latest
 
 1. Create host directories, a node key, and write a config:
    ```sh
-   mkdir -p ~/y2q/data ~/y2q/keys
+   mkdir -p ~/y2q/data && mkdir -m 0700 ~/y2q/keys
    y2q admin gen-node-key --output ~/y2q/node.key
    cp config.default.toml ~/y2q/config.toml
    # edit ~/y2q/config.toml -- at minimum set base_path and keystore_dir
@@ -166,6 +166,8 @@ make image          # y2q:latest
    - `-e Y2QD_NODE_KEY` - the node key, same as native. Never bake it into the image or the mounted config; pass it at run time from wherever your secret store puts it
 
 3. **Read the root password** from `<keystore_dir>/initial-root-password` on the keys volume (mode `0600`). It is written once and is not printed to stdout or the container log. Move the file somewhere safe and delete it.
+
+   A bind-mounted host keys dir replaces the image's `0700` one: it must be `chmod 0700`, or the daemon logs a startup warning that other local users can list the secret filenames inside it.
 
 ### Config in containers
 
@@ -492,7 +494,8 @@ Why: a compromised daemon uid cannot re-fetch NK or RMK (it can connect, but onl
    ```sh
    install -d -m 1770 -o y2qd -g y2q /var/lib/y2q/keystore
    ```
-   Both uids must be in group `y2q`. The daemon's flock file `<keystore_dir>/.lock` is created by whichever process touches it first, with that process's umask; if the key uid creates it `0600`/`0644` (for example `y2q admin device init`), the daemon uid gets `Permission denied` opening it read+write and refuses to boot. `deploy/y2q-keyd.tmpfiles.conf` therefore pre-creates it (`f /var/lib/y2q/keystore/.lock 0660 y2qd y2q -`; edit the path to your `keystore_dir`), so the units' `UMask=0077` does not matter. If you skip tmpfiles, create it yourself: `install -m 0660 -o y2qd -g y2q /dev/null /var/lib/y2q/keystore/.lock`.
+   Both uids must be in group `y2q`. The daemon's flock file `<keystore_dir>/.lock` is created by whichever process touches it first, with mode at most `0600` (subject to umask); if the key uid creates it (for example `y2q admin device init`), the daemon uid gets `Permission denied` opening it read+write and refuses to boot. `deploy/y2q-keyd.tmpfiles.conf` therefore pre-creates it (`f /var/lib/y2q/keystore/.lock 0660 y2qd y2q -`; edit the path to your `keystore_dir`), so the units' `UMask=0077` does not matter. If you skip tmpfiles, create it yourself: `install -m 0660 -o y2qd -g y2q /dev/null /var/lib/y2q/keystore/.lock`.
+   If the key-helper uid runs against a missing keystore directory, core would create it owned by that uid with mode `0700`, locking the daemon uid out; always create it first with `install -d -m 1770 ...` (above) or `y2qd setup`. Existing keystore directories are never chmod-ed (a pre-existing `0755` one is only reported by a startup warning): run `chmod 0700 <keystore_dir>` (or `1770` for helper mode) to harden it.
    `users.redb`/`keystore.json` belong to `y2qd`; `devices.json` and `.devices.lock` are mode 0600 owned by `y2q-keyd` (the daemon uid gets `Permission denied` reading `devices.json`, and cannot replace or delete it; verified in a two-uid smoke run). Keep `ReadWritePaths=` in `y2q-keyd@.service` and `y2q-keyd-sweep.service` equal to your `keystore_dir`.
 3. Run every registry-touching CLI command **directly as the registry owner**, with `y2qd` stopped for mutating commands: `sudo -u y2q-keyd y2q admin device init --keystore-dir /var/lib/y2q/keystore ...` (likewise `add-tpm`, `add-fido2`, `remove`, `refresh`, `set-home-factor`, ...), and `--rotate-node-key` the same way. Do not run them as root or `y2qd`: they would create `devices.json` with the wrong owner.
 4. Install the units and tmpfiles entry, then enable the socket (the timer comes after the daemon, step 5):

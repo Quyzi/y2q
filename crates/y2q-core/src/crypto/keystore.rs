@@ -4,8 +4,8 @@
 //!
 //! - `keystore.json` — the [`KeystoreManifest`]: the node-key verifier.
 //! - `users.redb` — the user store ([`super::user_store::UserStore`]).
-//! - `.lock` — POSIX advisory lock acquired for daemon process lifetime by
-//!   the caller; no code in this module touches it.
+//! - `.lock` — POSIX advisory lock acquired via [`acquire_lock`] and held for
+//!   daemon process lifetime by the caller.
 //!
 //! A directory still holding the pre-hierarchy `pubkey.json` is refused
 //! outright with [`CryptoError::LegacyKeystore`] — there is no conversion
@@ -176,7 +176,8 @@ pub fn verify_node_key(dir: &Path, nk: &[u8; 32]) -> Result<(), CryptoError> {
 /// Generate a fresh root persona, write `keystore.json` and `users.redb`,
 /// and return the user store plus the bootstrap password. The caller must
 /// store that password itself (mode `0600`); this function does not print
-/// or log it.
+/// or log it. A missing `dir` is created mode 0700 (subject to umask); an
+/// existing one is never chmod-ed.
 ///
 /// The `params` argument is the Argon2id parameter triple to use for
 /// wrapping the root user's credential slots. Callers should source these
@@ -191,8 +192,7 @@ pub fn first_run(
     nk: &[u8; 32],
 ) -> Result<FirstRunOutcome, CryptoError> {
     let files = KeystoreFiles::new(dir);
-    fs::create_dir_all(&files.root)
-        .map_err(|e| CryptoError::KeystoreIo(format!("mkdir {}: {e}", files.root.display())))?;
+    ensure_keystore_dir(&files.root)?;
     if files.manifest.exists() {
         return Err(CryptoError::KeystoreIo(format!(
             "{} already exists; refusing to overwrite",
@@ -476,18 +476,28 @@ fn now_ns() -> u64 {
         .unwrap_or(0)
 }
 
-/// Acquire a POSIX advisory exclusive lock on `<dir>/.lock`. The returned
+/// Acquire a POSIX advisory exclusive lock on `<dir>/.lock`. Creates `dir`
+/// mode 0700 and `.lock` mode 0600 if absent (subject to umask); existing
+/// dir/lock modes are never changed. The returned
 /// [`File`] must be kept alive for the duration the lock should be held —
 /// dropping it (or process exit) releases the lock.
 pub fn acquire_lock(dir: &Path) -> Result<File, CryptoError> {
-    fs::create_dir_all(dir)
-        .map_err(|e| CryptoError::KeystoreIo(format!("mkdir {}: {e}", dir.display())))?;
+    let created = ensure_keystore_dir(dir)?;
+    #[cfg(unix)]
+    if !created {
+        warn_if_dir_exposed(dir);
+    }
+    #[cfg(not(unix))]
+    let _ = created;
     let lock_path = dir.join(".lock");
-    let f = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
+    let mut opts = OpenOptions::new();
+    opts.create(true).truncate(false).read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let f = opts
         .open(&lock_path)
         .map_err(|e| CryptoError::KeystoreIo(format!("open lock {}: {e}", lock_path.display())))?;
     match f.try_lock() {
@@ -506,6 +516,50 @@ pub fn acquire_lock(dir: &Path) -> Result<File, CryptoError> {
         }
     }
     Ok(f)
+}
+
+fn mkdir_err(path: &Path, e: std::io::Error) -> CryptoError {
+    CryptoError::KeystoreIo(format!("mkdir {}: {e}", path.display()))
+}
+
+/// Create `dir` (and missing ancestors). Only the leaf is made private (0700);
+/// ancestors keep the default mode so a group-shared parent stays traversable.
+/// Never chmods an existing directory. Returns whether the leaf was created.
+fn ensure_keystore_dir(dir: &Path) -> Result<bool, CryptoError> {
+    if let Some(parent) = dir.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent).map_err(|e| mkdir_err(parent, e))?;
+    }
+    #[cfg(unix)]
+    let mut b = fs::DirBuilder::new();
+    #[cfg(not(unix))]
+    let b = fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        b.mode(0o700);
+    }
+    match b.create(dir) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && dir.is_dir() => Ok(false),
+        Err(e) => Err(mkdir_err(dir, e)),
+    }
+}
+
+/// Warn when a pre-existing keystore directory is accessible to "other".
+#[cfg(unix)]
+fn warn_if_dir_exposed(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let Ok(meta) = fs::metadata(dir) else { return };
+    let mode = meta.permissions().mode() & 0o7777;
+    if mode & 0o007 != 0 {
+        tracing::warn!(
+            path = %dir.display(),
+            mode = format_args!("{mode:04o}"),
+            "keystore directory is accessible to other users; every local user can list the secret filenames inside it. Fix: chmod 0700 (or 1770 for a group-shared key-helper deployment)"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -616,5 +670,95 @@ mod tests {
             load(dir.path(), &nk(1)),
             Err(CryptoError::KeystoreCorrupt { .. })
         ));
+    }
+
+    #[cfg(unix)]
+    const CHILD_ENV: &str = "Y2Q_KEYSTORE_UMASK_CHILD_DIR";
+
+    /// Child half: real assertions. No-op unless the parent set `CHILD_ENV`.
+    #[cfg(unix)]
+    #[test]
+    fn umask_child_body() {
+        use std::os::unix::fs::PermissionsExt;
+        let Some(root) = std::env::var_os(CHILD_ENV).map(PathBuf::from) else {
+            return;
+        };
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+
+        // acquire_lock path (what y2qd boots through first)
+        let a = root.join("a/b/ks");
+        let _l = acquire_lock(&a).unwrap();
+        assert_eq!(mode(&a), 0o700);
+        assert_eq!(mode(&a.join(".lock")), 0o600);
+        // ancestors must not be narrowed (other r-x bits kept)
+        assert_eq!(mode(&root.join("a")) & 0o005, 0o005);
+        assert_eq!(mode(&root.join("a/b")) & 0o005, 0o005);
+
+        // first_run path with no prior acquire_lock
+        let f = root.join("f/ks");
+        first_run(
+            &f,
+            "root",
+            Argon2Params::with_random_salt(8 * 1024, 1, 1),
+            &nk(1),
+        )
+        .unwrap();
+        assert_eq!(mode(&f), 0o700);
+    }
+
+    /// Parent: re-exec this test binary under `umask 0` so the result cannot
+    /// depend on the CI umask.
+    #[cfg(unix)]
+    #[test]
+    fn keystore_dir_and_lock_are_private_even_under_umask_zero() {
+        let tmp = tempdir().unwrap();
+        let exe = std::env::current_exe().unwrap();
+        let out = std::process::Command::new("sh")
+            .args(["-c", "umask 0; exec \"$0\" \"$@\""])
+            .arg(&exe)
+            .args([
+                "--exact",
+                "crypto::keystore::tests::umask_child_body",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, tmp.path())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "child failed:\n{stdout}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        // guard against a filter typo silently matching 0 tests
+        assert!(stdout.contains("1 passed"), "child ran no test:\n{stdout}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn acquire_lock_leaves_existing_dir_and_lock_modes_alone() {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let tmp = tempdir().unwrap();
+        let ks = tmp.path().join("ks");
+        fs::create_dir(&ks).unwrap();
+        fs::set_permissions(&ks, fs::Permissions::from_mode(0o1770)).unwrap();
+        let lock = ks.join(".lock");
+        OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o660)
+            .open(&lock)
+            .unwrap();
+        fs::set_permissions(&lock, fs::Permissions::from_mode(0o660)).unwrap();
+        let _l = acquire_lock(&ks).unwrap();
+        assert_eq!(
+            fs::metadata(&ks).unwrap().permissions().mode() & 0o7777,
+            0o1770
+        );
+        assert_eq!(
+            fs::metadata(&lock).unwrap().permissions().mode() & 0o7777,
+            0o660
+        );
     }
 }

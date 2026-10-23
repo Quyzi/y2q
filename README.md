@@ -122,6 +122,7 @@ podman run \
 
 `--network=host` gives the container direct access to the host network stack - required for rootless podman to expose a port without NAT.
 `--userns=keep-id` maps your host UID into the container unchanged so bind-mounted directories are writable.
+The keys directory holds secrets: create it `0700` (`mkdir -m 0700 /path/to/keys`). A bind-mounted host keys dir replaces the image's `0700` one, so it must be `chmod 0700`.
 
 The image ships a default config at `/etc/y2q/config.toml` with `base_path = "/var/lib/y2q/data"` and `keystore_dir = "/var/lib/y2q/keys"`. Mount your own config over it or override individual values with environment variables (`Y2QD_SECTION__KEY=value`).
 
