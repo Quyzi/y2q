@@ -126,12 +126,20 @@ impl UringStorage {
         config: UringConfig,
     ) -> Result<Self, Error> {
         let base_path = base_path.into();
-        std::fs::create_dir_all(&base_path).map_err(|e| Error::InternalError {
-            bucket: String::new(),
-            key: String::new(),
-            operation: "open".to_owned(),
-            message: format!("create base_path: {e}"),
-        })?;
+        let mut base_dir_builder = std::fs::DirBuilder::new();
+        base_dir_builder.recursive(true);
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            base_dir_builder.mode(0o700);
+        }
+        base_dir_builder
+            .create(&base_path)
+            .map_err(|e| Error::InternalError {
+                bucket: String::new(),
+                key: String::new(),
+                operation: "open".to_owned(),
+                message: format!("create base_path: {e}"),
+            })?;
         let base_path = std::fs::canonicalize(&base_path).map_err(|e| Error::InternalError {
             bucket: String::new(),
             key: String::new(),
@@ -140,12 +148,20 @@ impl UringStorage {
         })?;
         let index_path = index_path.as_ref();
         if let Some(parent) = index_path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| Error::InternalError {
-                bucket: String::new(),
-                key: String::new(),
-                operation: "open".to_owned(),
-                message: format!("create index parent: {e}"),
-            })?;
+            let mut index_dir_builder = std::fs::DirBuilder::new();
+            index_dir_builder.recursive(true);
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                index_dir_builder.mode(0o700);
+            }
+            index_dir_builder
+                .create(parent)
+                .map_err(|e| Error::InternalError {
+                    bucket: String::new(),
+                    key: String::new(),
+                    operation: "open".to_owned(),
+                    message: format!("create index parent: {e}"),
+                })?;
         }
         let index = MetadataIndex::new(index_path);
         let mek = index.node_key_slot();
@@ -253,7 +269,11 @@ impl UringStorage {
         let tmp_path = obj_path.with_extension("tmp");
 
         if let Some(parent) = obj_path.parent() {
-            tokio::fs::create_dir_all(parent)
+            let mut shard_dir_builder = tokio::fs::DirBuilder::new();
+            shard_dir_builder.recursive(true);
+            shard_dir_builder.mode(0o700);
+            shard_dir_builder
+                .create(parent)
                 .await
                 .map_err(|e| Error::InternalError {
                     bucket: bucket.to_owned(),
@@ -1486,5 +1506,96 @@ mod tests {
             header.data_offset,
             super::super::format::MIN_DIRECT_DATA_OFFSET
         );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn base_path_and_object_file_have_restrictive_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Nested `data/` so `UringStorage::new` creates the base path (TempDir
+        // itself already exists with tempfile's own mode).
+        let dir = TempDir::new().unwrap();
+        let base_join = dir.path().join("data");
+        let storage = UringStorage::new(
+            &base_join,
+            dir.path().join("idx.redb"),
+            UringConfig {
+                workers: 1,
+                ..UringConfig::default()
+            },
+        )
+        .unwrap();
+        storage.install_node_key(&TEST_NODE_KEY);
+
+        let base = std::fs::canonicalize(&base_join).unwrap();
+        let base_mode = std::fs::metadata(&base).unwrap().permissions().mode() & 0o777;
+        assert_eq!(base_mode, 0o700, "base_path must be created 0700");
+
+        storage
+            .put("b", "k", payload(b"secret"), PutOptions::default())
+            .await
+            .unwrap();
+        let obj_path = storage.obj_path("b", "k").unwrap();
+        let obj_mode = std::fs::metadata(&obj_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(obj_mode, 0o600, "object file must be created 0600");
+        let shard_mode = std::fs::metadata(obj_path.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(shard_mode, 0o700, "shard dir must be created 0700");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn o_direct_object_file_has_restrictive_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = disk_backed_tempdir();
+        let storage = make_storage_with_threshold(&dir, 1, 8 * 1024);
+        let body = vec![5u8; 16 * 1024];
+        storage
+            .put("b", "k", payload(&body), PutOptions::default())
+            .await
+            .unwrap();
+
+        let obj_path = storage.obj_path("b", "k").unwrap();
+        let bytes = std::fs::read(&obj_path).unwrap();
+        let header_arr: [u8; super::super::format::HEADER_SIZE] = bytes
+            [..super::super::format::HEADER_SIZE]
+            .try_into()
+            .unwrap();
+        let chk = crate::crypto::derive_container_header_key(&TEST_NODE_KEY);
+        let object_id = crate::storage::filesystem::object_id_from_path(&obj_path).unwrap();
+        let header = super::super::format::Header::decode(&header_arr, &chk, object_id).unwrap();
+        assert_ne!(
+            header.flags & super::super::format::flags::WRITTEN_O_DIRECT,
+            0,
+            "expected WRITTEN_O_DIRECT flag; underlying FS may not support O_DIRECT"
+        );
+
+        let obj_mode = std::fs::metadata(&obj_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(obj_mode, 0o600, "O_DIRECT object file must be created 0600");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn streaming_put_tmp_has_restrictive_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let storage = make_storage(&dir, 1);
+        let (guard, _writer) = storage.begin_streaming_put("b", "sk").await.unwrap();
+        let tmp_path = storage.obj_path("b", "sk").unwrap().with_extension("tmp");
+        let tmp_mode = std::fs::metadata(&tmp_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(tmp_mode, 0o600, "streaming tmp must be created 0600");
+        let shard_mode = std::fs::metadata(tmp_path.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(shard_mode, 0o700, "streaming shard dir must be created 0700");
+        drop(guard);
     }
 }
