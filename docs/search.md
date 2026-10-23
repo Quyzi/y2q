@@ -127,6 +127,9 @@ title == "quarterly report"
 note   =~ "draft (v2)"
 ```
 
+Parenthesis characters inside quoted text still count toward the query's
+32-level parenthesis limit; see [Parentheses](#parentheses).
+
 Notes and limitations:
 
 - **The empty value** can only be written quoted: `name == ""` matches a label
@@ -194,7 +197,14 @@ Use `( ... )` to override precedence or group for clarity:
 (env == prod or env == stage) and tier != test
 ```
 
-Parentheses may nest arbitrarily.
+Parentheses may nest up to 32 levels deep. Parenthesis characters inside
+quoted text also count toward this limit: every `(` counts, and a `)` between
+the first and last `"` of the query does not reduce the count (it may be part
+of a quoted value). So a query with quoted values and more than 32 groups
+between its first and last quote is rejected even if the real nesting is
+shallower. A query may also contain at most 128 `not`/`and`/`or` operators in
+total, counting operators inside nested groups. For big OR lists, split the
+search or use regex alternation (`env =~ "^(a|b|c)$"`).
 
 ### `not`
 
@@ -240,6 +250,9 @@ ext  =~ "\\.(jpg|png|gif)$"   # value ends with an image extension
 > Quote regexes that contain spaces, `)`, or shell metacharacters. In a shell,
 > wrap the whole `--query` argument in single quotes so the shell does not touch
 > the backslashes or `$`.
+
+> A `(` or `)` inside a quoted regex counts toward the 32-level parenthesis
+> limit - see [Parentheses](#parentheses).
 
 ---
 
@@ -323,7 +336,7 @@ done
 
 | Status | Cause |
 |---|---|
-| `400` | The query failed to parse, or contained an invalid regex, or `bucket` is invalid. The response body's `error` field describes what went wrong. |
+| `400` | The query failed to parse, contained an invalid regex, nested parentheses deeper than 32 levels (parenthesis characters inside quoted text also count - see [Parentheses](#parentheses)), contained more than 128 `not`/`and`/`or` operators in total, or `bucket` is invalid. The response body's `error` field describes what went wrong. |
 | `401` | Missing or invalid bearer token. |
 | `500` | Index or storage failure. |
 
@@ -334,6 +347,8 @@ The daemon is the single source of truth for query validity; the CLI surfaces a
 env ==                 # missing value
 == prod                # missing label name
 env =~ "["             # invalid regex (unclosed character class)
+((((...33 levels...))))   # parentheses nested deeper than 32 levels
+a==1 and a==1 and ...   # more than 128 operators in total (129 or more)
 ```
 
 ---
@@ -388,6 +403,12 @@ curl -s -H "Authorization: Bearer $TOKEN" --get \
   larger result sets.
 - Matching is linear-time in the value length even for regexes, so queries are
   safe to expose to untrusted callers (subject to normal auth).
+- A query may nest parentheses at most 32 levels deep and contain at most 128
+  `not`/`and`/`or` operators in total (counting operators inside nested
+  groups). Exceeding either limit is a `400`. See
+  [Parentheses](#parentheses) for the quoted-text caveat on the nesting count; for
+  large OR lists, split the search or use regex alternation
+  (`env =~ "^(a|b|c)$"`).
 
 ---
 

@@ -578,6 +578,11 @@ Leaves combine with `and` / `&&`, `or` / `||`, `not` / `!`, and parentheses.
 Precedence, lowest to highest: `or` < `and` < `not`. Example:
 `env == prod and (tier =~ "web.*" or not region $= -dev)`
 
+Parentheses may nest at most 32 levels, and a query may contain at most 128
+`not`/`and`/`or` operators in total, including nested groups. Parenthesis
+characters inside quoted text also count; closing parens inside quoted text do
+not reduce the count.
+
 See [search.md](search.md) for the complete query-language reference: value
 quoting, missing-label semantics, regex behavior, tokenization rules, and a
 formal grammar.
@@ -588,7 +593,7 @@ object metadata plus an opaque `next` cursor).
 | Code | Meaning |
 |---|---|
 | 200 | Page returned |
-| 400 | Invalid query (parse error or bad regex) or invalid bucket |
+| 400 | Invalid query (parse error, bad regex, or complexity limit exceeded: 32 parenthesis levels / 128 operators; closing parens inside quoted text do not reduce the count, see [search.md](search.md#parentheses)) or invalid bucket |
 | 401 | Token missing or invalid |
 | 500 | Index or storage failure |
 

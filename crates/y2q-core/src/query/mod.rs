@@ -96,7 +96,26 @@ pub enum MatchOp {
 /// process with a stack overflow before any bucket-authorization check runs.
 /// 32 is comfortably deeper than any real query while staying far below where
 /// stack exhaustion becomes a risk.
+///
+/// The check runs before pest, on raw characters. Every `(` counts, but a `)`
+/// lowers the count only when it lies outside the span between the first and
+/// last `"` of the input, because inside that span it may be quoted text
+/// rather than a group closer. This never under-counts, at the price of
+/// rejecting some well-formed queries that have many groups between their
+/// first and last quote. See also [`MAX_QUERY_OPERATORS`], which bounds the
+/// remaining recursion (Pratt build, tree depth, `matches`, `Drop`).
 const MAX_PAREN_DEPTH: u32 = 32;
+
+/// Maximum number of `not`/`and`/`or` operators a query may contain in total,
+/// counting those inside nested groups.
+///
+/// The pest parse loops over prefixes and infix operators, but the Pratt build,
+/// the resulting [`LabelQuery`] tree depth, [`LabelQuery::matches`] and the
+/// compiler-generated `Drop` all recurse once per operator (plus once per
+/// paren level). Together with [`MAX_PAREN_DEPTH`] this keeps every such
+/// recursion far below the observed overflow depth. Real queries use a
+/// handful of operators; 128 still admits generated OR-lists of that size.
+const MAX_QUERY_OPERATORS: usize = 128;
 
 impl LabelQuery {
     /// Parse a query string into an evaluable [`LabelQuery`].
@@ -105,20 +124,30 @@ impl LabelQuery {
     /// rather than failing later during evaluation. Rejects inputs whose
     /// parenthesis nesting exceeds [`MAX_PAREN_DEPTH`] before doing any actual
     /// parsing, since the recursion depth is what could otherwise be driven
-    /// into a stack overflow.
+    /// into a stack overflow, and inputs containing more than
+    /// [`MAX_QUERY_OPERATORS`] operators (checked after pest parsing, before
+    /// the tree is built).
     pub fn parse(input: &str) -> Result<LabelQuery, Error> {
+        let quoted = input.find('"').zip(input.rfind('"'));
         let mut depth: u32 = 0;
-        for c in input.chars() {
+        for (i, c) in input.char_indices() {
             match c {
                 '(' => {
                     depth += 1;
                     if depth > MAX_PAREN_DEPTH {
                         return Err(Error::Query {
-                            message: format!("query nesting exceeds {MAX_PAREN_DEPTH} levels"),
+                            message: format!(
+                                "query parenthesis nesting exceeds {MAX_PAREN_DEPTH} levels \
+                                 (parenthesis characters inside quoted text also count toward the limit)"
+                            ),
                         });
                     }
                 }
-                ')' => depth = depth.saturating_sub(1),
+                // A `)` between the first and last `"` may be quoted text, not
+                // a group closer; never let it lower the depth.
+                ')' if !quoted.is_some_and(|(first, last)| first < i && i < last) => {
+                    depth = depth.saturating_sub(1);
+                }
                 _ => {}
             }
         }
@@ -135,6 +164,20 @@ impl LabelQuery {
             .ok_or_else(|| Error::Query {
                 message: "empty query".to_owned(),
             })?;
+        let too_many_ops = expr
+            .clone()
+            .into_inner()
+            .flatten()
+            .filter(|p| matches!(p.as_rule(), Rule::not | Rule::and | Rule::or))
+            .nth(MAX_QUERY_OPERATORS)
+            .is_some();
+        if too_many_ops {
+            return Err(Error::Query {
+                message: format!(
+                    "query contains more than {MAX_QUERY_OPERATORS} operators (and/or/not)"
+                ),
+            });
+        }
         build_expr(expr.into_inner())
     }
 
@@ -291,6 +334,132 @@ mod tests {
             LabelQuery::parse(&query),
             Err(Error::Query { .. })
         ));
+    }
+
+    fn is_nesting_error(result: Result<LabelQuery, Error>) -> bool {
+        matches!(result, Err(Error::Query { message }) if message.contains("parenthesis nesting"))
+    }
+
+    fn is_operator_error(result: Result<LabelQuery, Error>) -> bool {
+        matches!(result, Err(Error::Query { message }) if message.contains("operators"))
+    }
+
+    fn chain(term: &str, count: usize, sep: &str) -> String {
+        std::iter::repeat_n(term, count)
+            .collect::<Vec<_>>()
+            .join(sep)
+    }
+
+    #[test]
+    fn deep_not_prefix_run_is_rejected() {
+        let query = "!".repeat(100_000) + " env == prod";
+        assert!(is_operator_error(LabelQuery::parse(&query)));
+    }
+
+    #[test]
+    fn deep_not_keyword_run_is_rejected() {
+        let query = "not ".repeat(100_000) + "env == prod";
+        assert!(is_operator_error(LabelQuery::parse(&query)));
+    }
+
+    #[test]
+    fn not_run_at_the_limit_is_accepted_and_evaluates() {
+        let query = "!".repeat(MAX_QUERY_OPERATORS) + " env == prod";
+        let q = LabelQuery::parse(&query).unwrap();
+        assert!(q.matches(&labels(&[("env", "prod")])));
+        assert!(!q.matches(&labels(&[("env", "dev")])));
+    }
+
+    #[test]
+    fn not_run_one_over_the_limit_is_rejected() {
+        let query = "!".repeat(MAX_QUERY_OPERATORS + 1) + " env == prod";
+        assert!(is_operator_error(LabelQuery::parse(&query)));
+    }
+
+    #[test]
+    fn long_and_chain_is_rejected() {
+        let query = chain("a == 1", MAX_QUERY_OPERATORS + 2, " and ");
+        assert!(is_operator_error(LabelQuery::parse(&query)));
+        let at_limit = chain("a == 1", MAX_QUERY_OPERATORS + 1, " and ");
+        let q = LabelQuery::parse(&at_limit).unwrap();
+        assert!(q.matches(&labels(&[("a", "1")])));
+    }
+
+    #[test]
+    fn long_or_chain_is_rejected() {
+        let query = chain("a == 1", MAX_QUERY_OPERATORS + 2, " or ");
+        assert!(is_operator_error(LabelQuery::parse(&query)));
+        let at_limit = chain("a == 1", MAX_QUERY_OPERATORS + 1, " or ");
+        assert!(LabelQuery::parse(&at_limit).is_ok());
+    }
+
+    #[test]
+    fn operator_budget_is_global_across_parens() {
+        let query = "(".repeat(10)
+            + &"! ".repeat(MAX_QUERY_OPERATORS + 1)
+            + "env == prod"
+            + &")".repeat(10);
+        assert!(is_operator_error(LabelQuery::parse(&query)));
+
+        let split =
+            "(".to_owned() + &"! ".repeat(100) + "a == 1) and (" + &"! ".repeat(100) + "a == 1)";
+        assert!(is_operator_error(LabelQuery::parse(&split)));
+    }
+
+    // Guard, not a regression test: passes on the pre-fix code too. It checks
+    // that only real operator tokens are counted, not `!`/words inside values.
+    #[test]
+    fn bang_in_values_and_ne_are_not_operators() {
+        let bangs = "a == ".to_owned() + &"!".repeat(500);
+        assert!(LabelQuery::parse(&bangs).is_ok());
+        assert!(LabelQuery::parse(r#"a == "and or not &&""#).is_ok());
+        assert!(LabelQuery::parse("a != b").is_ok());
+    }
+
+    #[test]
+    fn quoted_closers_cannot_hide_paren_depth() {
+        let unit = "(".repeat(32) + r#"a == ""# + &")".repeat(32) + "\"";
+        let query = chain(&unit, 2000, " and ");
+        assert!(is_nesting_error(LabelQuery::parse(&query)));
+    }
+
+    // Pins the conservative false-reject: closers between the first and last
+    // quote never lower the count, so this well-formed query is rejected. May
+    // be relaxed if the scan becomes smarter.
+    #[test]
+    fn quoted_closers_keep_depth_conservative() {
+        let unit = "(".repeat(32) + r#"a == ""# + &")".repeat(32) + "\"" + &")".repeat(32);
+        let query = chain(&unit, 2, " and ");
+        assert!(is_nesting_error(LabelQuery::parse(&query)));
+    }
+
+    // Guard, not a regression test: passes on the pre-fix code too.
+    #[test]
+    fn unterminated_quote_does_not_bypass_paren_scan() {
+        let query = r#"a == "foo "#.to_owned() + &"(".repeat(MAX_PAREN_DEPTH as usize + 1);
+        assert!(is_nesting_error(LabelQuery::parse(&query)));
+    }
+
+    // Guard, not a regression test: passes on the pre-fix code too.
+    #[test]
+    fn quote_desync_via_bare_cannot_hide_paren_depth() {
+        let query = "(".repeat(40) + r#"a == x" and b == ")))))""#;
+        assert!(is_nesting_error(LabelQuery::parse(&query)));
+    }
+
+    #[test]
+    fn parens_and_quotes_in_values_are_accepted() {
+        let q = LabelQuery::parse(r#"(a == "(" and b == ")") or (c == "x(y")"#).unwrap();
+        assert!(q.matches(&labels(&[("a", "("), ("b", ")")])));
+    }
+
+    #[test]
+    fn many_sequential_groups_are_accepted() {
+        let groups = chain("(a == 1)", 40, " and ");
+        let q = LabelQuery::parse(&groups).unwrap();
+        assert!(q.matches(&labels(&[("a", "1")])));
+        let after_quote = r#"z == "x" and "#.to_owned() + &groups;
+        assert!(LabelQuery::parse(&after_quote).is_ok());
     }
 
     #[test]
