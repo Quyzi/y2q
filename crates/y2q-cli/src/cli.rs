@@ -431,7 +431,16 @@ pub enum AdminCmd {
     /// Generate a random 32-byte node key (standard base64), for
     /// `[crypto] node_key_file` or `Y2QD_NODE_KEY`. Pure local generator —
     /// takes no alias, makes no HTTP call.
-    GenNodeKey,
+    ///
+    /// Without --output the key is printed to stdout; a shell redirect
+    /// (`> file`) creates the file with your umask (usually world-readable) and
+    /// the daemon refuses to start on such a file. Prefer --output.
+    GenNodeKey {
+        /// Write the key to PATH instead of stdout. The file is created
+        /// exclusively with mode 0400 (unix); an existing path is never overwritten.
+        #[arg(long, short = 'o', value_name = "PATH")]
+        output: Option<std::path::PathBuf>,
+    },
     /// Manage the hardware devices that can unlock this deployment's node key.
     /// Local keystore surgery: no alias, no HTTP. Mutating subcommands require the
     /// daemon to be stopped (`systemctl stop y2qd`), because it holds the keystore lock.
@@ -694,7 +703,8 @@ pub enum DeviceCmd {
         #[arg(long)]
         adopt_existing_node_key: bool,
         /// File holding the existing node key (with --adopt-existing-node-key);
-        /// `Y2QD_NODE_KEY` is honoured.
+        /// `Y2QD_NODE_KEY` is honoured. The file must have no group/other
+        /// permission bits (e.g. 0400).
         #[arg(long, value_name = "PATH")]
         node_key_file: Option<std::path::PathBuf>,
         /// Accept a PCR-7 policy that any bootable medium can satisfy (Secure Boot

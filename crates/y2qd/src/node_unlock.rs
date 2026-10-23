@@ -476,6 +476,31 @@ mod tests {
         clear_env();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn operator_key_file_mode_gates_boot() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_env();
+        let ks = tempfile::tempdir().unwrap();
+        let st = tempfile::tempdir().unwrap();
+        let kd = tempfile::tempdir().unwrap();
+        let key = kd.path().join("node.key");
+        std::fs::write(&key, operator_key_text()).unwrap();
+        let mut cfg = cfg_for(ks.path(), st.path());
+        cfg.crypto.node_key_file = key.to_string_lossy().into_owned();
+
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let err = resolve(&cfg, ks.path())
+            .err()
+            .expect("loose mode must fail");
+        assert!(err.to_string().contains("mode 0644"), "{err}");
+
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o400)).unwrap();
+        let r = resolve(&cfg, ks.path()).expect("0400 key resolves");
+        assert!(matches!(r.source, Source::Operator));
+    }
+
     #[test]
     fn no_key_error_text_is_exact() {
         let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());

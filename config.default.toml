@@ -203,8 +203,14 @@ keystore_dir = "/var/lib/y2q/keys"  # required
 # It MUST be CSPRNG output. A passphrase will be accepted if it happens to
 # decode to 32+ bytes, and it will be crackable: anyone holding the storage
 # tree can test candidates offline at HMAC speed. Generate it with
-# `y2q admin gen-node-key`, `openssl rand -base64 32`, or
-# `head -c 32 /dev/urandom > node.key`.
+# `y2q admin gen-node-key --output PATH` (creates it mode 0400, refuses to
+# overwrite), `openssl rand -base64 32`, or `head -c 32 /dev/urandom`: for the
+# latter two use `(umask 077; ... > node.key)` and `chmod 0400`.
+#
+# The daemon refuses to start if the file is accessible to group or other
+# (mode & 0o077 != 0; e.g. 0400 or 0600 is fine, 0644 or 0440 is not) and
+# requires a regular file of at most 4 KiB. The daemon user must own/read it.
+# The mode rule does not apply to Y2QD_NODE_KEY.
 #
 # Do NOT place this file inside storage.base_path or crypto.keystore_dir —
 # the daemon refuses to start if you do, because a copy of the data would

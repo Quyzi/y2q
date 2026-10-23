@@ -401,6 +401,10 @@ pub struct CryptoConfig {
     /// output, not a passphrase: an attacker with the storage tree can test
     /// candidates offline at HMAC speed. Must not live inside
     /// `storage.base_path` or `crypto.keystore_dir` (enforced at startup).
+    /// The file must be a regular file of at most 4 KiB with no group/other
+    /// permission bits (e.g. `0400`; checked on the opened file, fatal
+    /// otherwise). Create it with `y2q admin gen-node-key --output PATH`. The
+    /// mode rule does not apply to `Y2QD_NODE_KEY`.
     /// Without either, the daemon unlocks the node key from the device
     /// registry `<keystore_dir>/devices.json` (see `[crypto.devices]`), or
     /// refuses to start.
@@ -906,7 +910,8 @@ impl Config {
             return Err(Box::new(figment::Error::from(
                 "[crypto] node_key_file, Y2QD_NODE_KEY, a device registry at \
                  <crypto.keystore_dir>/devices.json, or Y2QD_EMERGENCY_KEY is required; \
-                 generate a key with `y2q admin gen-node-key`, or register a device with \
+                 generate a key file with `y2q admin gen-node-key --output PATH` (the file \
+                 must have no group/other permissions), or register a device with \
                  `y2q admin device init`"
                     .to_string(),
             )));

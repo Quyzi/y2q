@@ -61,7 +61,8 @@ pub struct Cli {
     pub prompt_emergency_code: bool,
 
     /// New node key material for `--rotate-node-key`, as a file path (same
-    /// hex/base64/raw encoding rules as `[crypto] node_key_file`).
+    /// hex/base64/raw encoding and no-group/other-permissions rules as
+    /// `[crypto] node_key_file`).
     /// `Y2QD_NEW_NODE_KEY` takes precedence when set.
     #[arg(long, value_name = "FILE")]
     pub new_node_key_file: Option<PathBuf>,

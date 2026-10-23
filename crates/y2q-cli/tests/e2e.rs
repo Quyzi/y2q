@@ -1046,6 +1046,31 @@ fn y2q_isolated(home: &std::path::Path, args: &[&str], input: &[u8]) -> std::pro
     child.wait_with_output().expect("wait y2q")
 }
 
+/// `gen-node-key --output` must yield mode 0400 even under a umask that would
+/// otherwise strip the owner's read bit (umask 577 leaves the `open(2)` mode
+/// at 0, so only the `fchmod` can make it 0400). The umask is process-global,
+/// hence a `sh` subprocess.
+#[cfg(unix)]
+#[test]
+fn e2e_gen_node_key_output_is_0400_under_restrictive_umask() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = isolated_home("gen-node-key-umask");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("node.key");
+    let out = Command::new("sh")
+        .arg("-c")
+        .arg(r#"umask 577; exec "$CARGO_BIN_EXE_y2q" admin gen-node-key --output "$KEY_PATH""#)
+        .env("CARGO_BIN_EXE_y2q", y2q_bin())
+        .env("KEY_PATH", &path)
+        .output()
+        .expect("spawn sh");
+    assert!(ok(&out), "{}", output_text(&out));
+    assert!(out.stdout.is_empty(), "key must not reach stdout");
+    let meta = std::fs::metadata(&path).unwrap();
+    assert_eq!(meta.permissions().mode() & 0o7777, 0o400);
+    assert_eq!(meta.len(), 45);
+}
+
 fn isolated_home(tag: &str) -> PathBuf {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

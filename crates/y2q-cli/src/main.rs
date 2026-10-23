@@ -212,7 +212,7 @@ async fn dispatch_rest(command: Commands, mode: OutputMode) -> Result<(), CliErr
             }
             AdminCmd::Rekey { cmd } => cmd::admin::rekey(cmd, mode).await,
             AdminCmd::Trace { alias, errors } => cmd::admin::trace(&alias, errors).await,
-            AdminCmd::GenNodeKey => cmd::admin::gen_node_key(),
+            AdminCmd::GenNodeKey { output } => cmd::admin::gen_node_key(output.as_deref()),
             AdminCmd::Device { cmd } => cmd::device::run(cmd, mode),
             AdminCmd::EmergencyKeys { keystore_dir } => {
                 cmd::device::emergency_keys(&keystore_dir, mode)
