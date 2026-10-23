@@ -792,6 +792,8 @@ aws --endpoint-url https://y2qd.example:9000 --region y2q \
 
 Object metadata maps to y2q labels: system headers (`Content-Type`, `Content-Encoding`, `Cache-Control`, ...) and `x-amz-meta-*` round-trip through GET/HEAD; every non-`amz-`-prefixed label is exposed as an S3 object tag. `x-amz-checksum-crc32`/`x-amz-checksum-sha256` are verified; other checksum algorithms are rejected with `400 InvalidRequest` rather than silently accepted unverified. `Content-MD5` is accepted but not verified.
 
+`PutObject`/`UploadPart` accept `UNSIGNED-PAYLOAD`, an explicit hex SHA-256, `STREAMING-AWS4-HMAC-SHA256-PAYLOAD`, `STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER` and `STREAMING-UNSIGNED-PAYLOAD-TRAILER`. For the signed `aws-chunked` modes every chunk, the terminal chunk and (in the `-TRAILER` mode) the trailer are verified against the request's seed signature before the object is committed; a chunk, terminal-chunk or trailer signature mismatch is `SignatureDoesNotMatch`, and malformed or truncated framing is `InvalidArgument`. An `x-amz-trailer` header sent with plain `STREAMING-AWS4-HMAC-SHA256-PAYLOAD` is rejected at end of stream.
+
 S3 sub-resources with no faithful mapping onto y2q's persona-keyed cryptographic grants - `?acl`, `?policy`, `?lifecycle`, `?cors`, `?encryption` (SSE-C), `?replication`, `?object-lock`, and others - return `501 NotImplemented` rather than silently accepting and ignoring them. Bucket access control continues to go through `PUT /api/v1/buckets/{bucket}/acl` on the native listener.
 
 ### Authentication and errors

@@ -1,5 +1,17 @@
 //! Upload-side body adapters: `aws-chunked` decoding, whole-body
 //! payload/checksum verification, and the session-leashed upload stream.
+//!
+//! `aws-chunked` bodies (CRLF after every line; sizes are lowercase hex):
+//!
+//! ```text
+//! STREAMING-AWS4-HMAC-SHA256-PAYLOAD
+//!   { <size>;chunk-signature=<sig> CRLF <data> CRLF }*  0;chunk-signature=<sig> CRLF CRLF
+//! STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER
+//!   { …same… }*  0;chunk-signature=<sig> CRLF  { <name>:<value> CRLF }*
+//!   x-amz-trailer-signature:<sig> CRLF  CRLF
+//! STREAMING-UNSIGNED-PAYLOAD-TRAILER
+//!   { <size> CRLF <data> CRLF }*  0 CRLF  { <name>:<value> CRLF }*  CRLF
+//! ```
 
 use actix_web::http::header::HeaderMap;
 use base64::Engine;
@@ -251,6 +263,10 @@ pub(crate) struct ChunkedOptions {
     pub trailer_checksum: Option<ChecksumAlgo>,
     pub max_frame_bytes: u64,
     pub sideband: ErrorSideband,
+    /// `true` for the two `…-TRAILER` modes; `false` for plain
+    /// `STREAMING-AWS4-HMAC-SHA256-PAYLOAD`, where the terminal chunk is
+    /// followed only by its blank line.
+    pub expect_trailer: bool,
     pub bucket: String,
 }
 
@@ -259,8 +275,8 @@ struct ChunkedState<S> {
     buf: bytes::BytesMut,
     inner_done: bool,
     signing: Option<ChunkSigningState>,
-    /// `true` for both `…-TRAILER` payload modes; a trailer block (possibly
-    /// empty) is always read, signed or not.
+    /// `false` only for `STREAMING-AWS4-HMAC-SHA256-PAYLOAD`: no trailer
+    /// block follows the terminal chunk.
     expect_trailer: bool,
     max_frame_bytes: u64,
     trailer_checksum: Option<ChecksumAlgo>,
@@ -506,7 +522,7 @@ where
 /// payload bytes, verifying the per-chunk and trailer signature chain when
 /// `options.chunk_signing` is present. `options.trailer_checksum`, when
 /// set, is verified against a running digest of the decoded payload once
-/// the trailer block (parsed regardless of signing mode) is read.
+/// the trailer block (read only when `expect_trailer`) is read.
 fn decode_aws_chunked<S>(
     inner: S,
     options: ChunkedOptions,
@@ -526,7 +542,7 @@ where
         buf: bytes::BytesMut::new(),
         inner_done: false,
         signing,
-        expect_trailer: true,
+        expect_trailer: options.expect_trailer,
         max_frame_bytes: options.max_frame_bytes,
         trailer_checksum: options.trailer_checksum,
         checksum_hasher,
@@ -630,6 +646,7 @@ pub fn upload_stream(
                 ChunkedOptions {
                     chunk_signing: auth.chunk_signing.clone(),
                     trailer_checksum,
+                    expect_trailer: auth.payload.has_trailer(),
                     max_frame_bytes,
                     sideband: sideband.clone(),
                     bucket: bucket.clone(),
@@ -657,4 +674,194 @@ pub fn upload_stream(
         sideband,
         bucket,
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zeroize::Zeroizing;
+
+    // Mutation check: with `expect_trailer: true` hardcoded in
+    // `decode_aws_chunked`, three tests fail:
+    // `plain_signed_streaming_accepts_aws_vector`,
+    // `plain_signed_streaming_one_chunk_final_crlf_arrives_alone` and
+    // `plain_signed_streaming_rejects_a_trailer_block`.
+
+    const AWS_SECRET: &str = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+    const AWS_DATE: &str = "20130524T000000Z";
+    const AWS_SCOPE: &str = "20130524/us-east-1/s3/aws4_request";
+
+    const PLAIN_SEED: &str = "4f232c4386841ef735655705268965c44a0e4690baa4adea153f7db9fa80a0a9";
+    const PLAIN_SIGS: [&str; 3] = [
+        "ad80c730a21e5b8d04586a2213dd63b9a0e99e0e2307b0ade35a65485a288648",
+        "0055627c9e194cb4542bae2aa5492e3c1575bbb81b612b7d234b86a503ef5497",
+        "b6c6ea8a5354eaf15b3cb7646744f4275b71ea724fed81ceb9323e279d449df9",
+    ];
+    const TRAILER_SEED: &str = "106e2a8a18243abcf37539882f36619c00e2dfc72633413f02d3b74544bfeb8e";
+    const TRAILER_SIGS: [&str; 3] = [
+        "b474d8862b1487a5145d686f57f013e54db672cee1c953b3010fb58501ef5aa2",
+        "1c1344b170168f8e65b41376b44b20fe354e373826ccbbe2c1d40a8cae51e5c7",
+        "2ca2aba2005185cf7159c6277faf83795951dd77a3a99e6e65d5c9f85863f992",
+    ];
+    const TRAILER_SIG: &str = "d81f82fc3505edab99d459891051a732e8730629a2e4a59689829ca17fe2e435";
+
+    fn signing(seed: &str) -> ChunkSigning {
+        ChunkSigning {
+            signing_key: Zeroizing::new(sigv4::signing_key(
+                AWS_SECRET.as_bytes(),
+                "20130524",
+                "us-east-1",
+                "s3",
+            )),
+            scope: AWS_SCOPE.to_owned(),
+            amz_date: AWS_DATE.to_owned(),
+            seed_signature: seed.to_owned(),
+        }
+    }
+
+    /// 65536 + 1024 `a` bytes in AWS's two frames, then
+    /// `0;chunk-signature=<sigs[2]>\r\n` + `tail`.
+    fn aws_body(sigs: &[&str; 3], tail: &str) -> Vec<u8> {
+        let mut w = Vec::new();
+        for (size_hex, len, sig) in [("10000", 65_536usize, sigs[0]), ("400", 1_024, sigs[1])] {
+            w.extend_from_slice(format!("{size_hex};chunk-signature={sig}\r\n").as_bytes());
+            w.resize(w.len() + len, b'a');
+            w.extend_from_slice(b"\r\n");
+        }
+        w.extend_from_slice(format!("0;chunk-signature={}\r\n", sigs[2]).as_bytes());
+        w.extend_from_slice(tail.as_bytes());
+        w
+    }
+
+    /// One signed data frame carrying a non-empty `body`, then the signed
+    /// terminal frame, chained from `PLAIN_SEED`, then `tail`. Uses the
+    /// production primitives, so it checks framing only; the AWS vectors
+    /// check conformance.
+    fn signed_wire(body: &[u8], tail: &str) -> Vec<u8> {
+        let key = sigv4::signing_key(AWS_SECRET.as_bytes(), "20130524", "us-east-1", "s3");
+        let sign = |prev: &str, data: &[u8]| {
+            let sts =
+                sigv4::chunk_string_to_sign(AWS_DATE, AWS_SCOPE, prev, &sigv4::sha256_hex(data));
+            sigv4::hex_hmac_sha256(&key, sts.as_bytes())
+        };
+        let data_sig = sign(PLAIN_SEED, body);
+        let final_sig = sign(&data_sig, b"");
+        let mut w = Vec::new();
+        w.extend_from_slice(format!("{:x};chunk-signature={data_sig}\r\n", body.len()).as_bytes());
+        w.extend_from_slice(body);
+        w.extend_from_slice(b"\r\n");
+        w.extend_from_slice(format!("0;chunk-signature={final_sig}\r\n").as_bytes());
+        w.extend_from_slice(tail.as_bytes());
+        w
+    }
+
+    /// Feed `wire` in pieces of at most `piece` bytes; return decoded bytes,
+    /// or the S3 error `code` recorded in the sideband when the stream aborts.
+    async fn decode(
+        wire: &[u8],
+        piece: usize,
+        signing: Option<ChunkSigning>,
+        expect_trailer: bool,
+        trailer_checksum: Option<ChecksumAlgo>,
+    ) -> Result<Vec<u8>, &'static str> {
+        let sideband = ErrorSideband::new();
+        let pieces: Vec<Result<Bytes, AppError>> = wire
+            .chunks(piece)
+            .map(|c| Ok(Bytes::copy_from_slice(c)))
+            .collect();
+        let mut out = decode_aws_chunked(
+            futures_util::stream::iter(pieces),
+            ChunkedOptions {
+                chunk_signing: signing,
+                trailer_checksum,
+                expect_trailer,
+                max_frame_bytes: 1 << 20,
+                sideband: sideband.clone(),
+                bucket: "bkt".to_owned(),
+            },
+        );
+        let mut body = Vec::new();
+        while let Some(item) = out.next().await {
+            match item {
+                Ok(b) => body.extend_from_slice(&b),
+                Err(_) => return Err(sideband.take().map_or("no sideband error", |e| e.code)),
+            }
+        }
+        Ok(body)
+    }
+
+    #[tokio::test]
+    async fn plain_signed_streaming_accepts_aws_vector() {
+        let wire = aws_body(&PLAIN_SIGS, "\r\n");
+        let expected = vec![b'a'; 66_560];
+        for piece in [wire.len(), 4099] {
+            let got = decode(&wire, piece, Some(signing(PLAIN_SEED)), false, None).await;
+            assert_eq!(got.map(|b| b == expected), Ok(true), "piece {piece}");
+        }
+    }
+
+    #[tokio::test]
+    async fn plain_signed_streaming_one_chunk_final_crlf_arrives_alone() {
+        let wire = signed_wire(b"hello", "\r\n");
+        let got = decode(&wire, 1, Some(signing(PLAIN_SEED)), false, None).await;
+        assert_eq!(got, Ok(b"hello".to_vec()));
+    }
+
+    #[tokio::test]
+    async fn plain_signed_streaming_rejects_forged_terminal_signature() {
+        let mut wire = signed_wire(b"hello", "\r\n");
+        let i = wire.len() - 5;
+        wire[i] = if wire[i] == b'0' { b'1' } else { b'0' };
+        let got = decode(&wire, wire.len(), Some(signing(PLAIN_SEED)), false, None).await;
+        assert_eq!(got, Err("SignatureDoesNotMatch"));
+    }
+
+    #[tokio::test]
+    async fn plain_signed_streaming_rejects_tampered_data() {
+        let mut wire = signed_wire(b"hello", "\r\n");
+        let i = wire
+            .windows(5)
+            .position(|w| w == b"hello")
+            .expect("data present");
+        wire[i] = b'j';
+        let got = decode(&wire, wire.len(), Some(signing(PLAIN_SEED)), false, None).await;
+        assert_eq!(got, Err("SignatureDoesNotMatch"));
+    }
+
+    #[tokio::test]
+    async fn plain_signed_streaming_rejects_a_trailer_block() {
+        let wire = signed_wire(b"hello", "x-amz-checksum-crc32:NhCmhg==\r\n\r\n");
+        let got = decode(&wire, wire.len(), Some(signing(PLAIN_SEED)), false, None).await;
+        assert_eq!(got, Err("InvalidArgument"));
+    }
+
+    #[tokio::test]
+    async fn signed_trailer_streaming_accepts_aws_vector() {
+        let wire = aws_body(
+            &TRAILER_SIGS,
+            &format!(
+                "x-amz-checksum-crc32c:sOO8/Q==\r\nx-amz-trailer-signature:{TRAILER_SIG}\r\n\r\n"
+            ),
+        );
+        let expected = vec![b'a'; 66_560];
+        let got = decode(&wire, 4099, Some(signing(TRAILER_SEED)), true, None).await;
+        assert_eq!(got.map(|b| b == expected), Ok(true));
+    }
+
+    #[tokio::test]
+    async fn signed_trailer_streaming_still_requires_trailer_signature() {
+        let wire = aws_body(&TRAILER_SIGS, "x-amz-checksum-crc32c:sOO8/Q==\r\n\r\n");
+        let got = decode(&wire, wire.len(), Some(signing(TRAILER_SEED)), true, None).await;
+        assert_eq!(got, Err("SignatureDoesNotMatch"));
+    }
+
+    #[tokio::test]
+    async fn unsigned_trailer_streaming_reads_trailer_block() {
+        let with = b"5\r\nhello\r\n0\r\nx-amz-checksum-crc32:NhCmhg==\r\n\r\n";
+        let got = decode(with, with.len(), None, true, Some(ChecksumAlgo::Crc32)).await;
+        assert_eq!(got, Ok(b"hello".to_vec()));
+        let empty = b"5\r\nhello\r\n0\r\n\r\n";
+        let got = decode(empty, empty.len(), None, true, None).await;
+        assert_eq!(got, Ok(b"hello".to_vec()));
+    }
 }
