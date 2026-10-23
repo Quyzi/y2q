@@ -25,8 +25,9 @@ pub fn to_errno(e: &y2q_client::ClientError) -> fuser::Errno {
         ClientError::Unauthenticated => fuser::Errno::EACCES,
         ClientError::Conflict { .. } => fuser::Errno::EEXIST,
         ClientError::BadRequest { .. } => fuser::Errno::EINVAL,
-        ClientError::ServerError { .. } | ClientError::Io(_) | ClientError::Http(_) => {
-            fuser::Errno::EIO
-        }
+        ClientError::ServerError { .. }
+        | ClientError::Redirect { .. }
+        | ClientError::Io(_)
+        | ClientError::Http(_) => fuser::Errno::EIO,
     }
 }
