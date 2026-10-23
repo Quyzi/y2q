@@ -250,6 +250,11 @@ impl From<AppError> for S3Error {
                 StatusCode::PAYLOAD_TOO_LARGE,
                 format!("Your proposed upload exceeds the maximum allowed size ({limit} bytes)."),
             ),
+            CoreError::BadRequestBody { message, .. } => S3Error::new(
+                "IncompleteBody",
+                StatusCode::BAD_REQUEST,
+                message,
+            ),
             CoreError::InvalidAcl { reason }
             | CoreError::InvalidPersonaRequest { reason }
             | CoreError::Query { message: reason }
@@ -389,6 +394,19 @@ mod tests {
         .into();
         assert_eq!(e.code, "AccessDenied");
         assert_eq!(e.status, StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn bad_request_body_maps_to_incomplete_body_400() {
+        let e: S3Error = AppError(CoreError::BadRequestBody {
+            bucket: "b".to_owned(),
+            key: "k".to_owned(),
+            message: "payload reached EOF before completing: None".to_owned(),
+        })
+        .into();
+        assert_eq!(e.code, "IncompleteBody");
+        assert_eq!(e.status, StatusCode::BAD_REQUEST);
+        assert!(e.message.contains("payload reached EOF"));
     }
 
     #[test]

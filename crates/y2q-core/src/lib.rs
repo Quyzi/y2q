@@ -414,6 +414,18 @@ pub enum Error {
         limit: u64,
     },
 
+    /// Request body was incomplete or corrupted (client closed early,
+    /// Content-Length mismatch, bad content-encoding, …).
+    #[error("bad request body for {bucket}/{key}: {message}")]
+    BadRequestBody {
+        /// Bucket the object was being written to.
+        bucket: String,
+        /// Key the object was being written to.
+        key: String,
+        /// Human-readable description of the body fault.
+        message: String,
+    },
+
     /// The authenticated caller is not permitted to perform the requested
     /// action on `bucket`. Produced by the daemon's authorization layer (the
     /// caller can already see the bucket but lacks the required permission

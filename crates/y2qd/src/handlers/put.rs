@@ -45,7 +45,7 @@ use crate::handlers::labels::extract_labels;
     responses(
         (status = 201, description = "Object created"),
         (status = 200, description = "Object replaced (key already existed)"),
-        (status = 400, description = "Invalid bucket, key, or label", body = ErrorBody, content_type = "application/json"),
+        (status = 400, description = "Invalid bucket, key, or label; incomplete or truncated body", body = ErrorBody, content_type = "application/json"),
         (status = 401, description = "Authentication required", body = ErrorBody, content_type = "application/json"),
         (status = 409, description = "Object is locked (write in progress)", body = ErrorBody, content_type = "application/json"),
         (status = 500, description = "Internal error", body = ErrorBody, content_type = "application/json"),
@@ -117,12 +117,7 @@ pub async fn handle(
     let bucket_for_err = bucket.clone();
     let key_for_err = key.clone();
     let mapped_payload = futures_util::TryStreamExt::map_err(payload, move |e| {
-        AppError(y2q_core::Error::InternalError {
-            bucket: bucket_for_err.clone(),
-            key: key_for_err.clone(),
-            operation: "read body".to_owned(),
-            message: e.to_string(),
-        })
+        crate::error::map_payload_read_error(bucket_for_err.clone(), key_for_err.clone(), e)
     });
     let (sink, plaintext_metrics, cipher_metadata) = cipher::stream_encrypt_for_put(
         &bucket_pk,

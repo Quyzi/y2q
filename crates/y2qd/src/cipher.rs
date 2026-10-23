@@ -530,12 +530,7 @@ mod tests {
     ) -> Result<HttpResponse, AppError> {
         let sink = tempfile_sink().await;
         let mapped = futures_util::TryStreamExt::map_err(payload, |e| {
-            AppError(y2q_core::Error::InternalError {
-                bucket: "bucket".to_owned(),
-                key: "key".to_owned(),
-                operation: "read body".to_owned(),
-                message: e.to_string(),
-            })
+            crate::error::map_payload_read_error("bucket", "key", e)
         });
         let (_, _, _) = stream_encrypt_for_put(
             &pk,
