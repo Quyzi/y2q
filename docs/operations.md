@@ -329,11 +329,11 @@ Removing someone from a bucket's ACL does not, by itself, make old ciphertext un
 
 1. **Remove the grant.**
    ```sh
-   curl -X PUT https://y2qd.example/api/v1/buckets/mybucket/acl \
-     -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
-     -d '{"grants": {"alice": null}}'
+   y2q admin acl revoke myalias mybucket alice
    ```
-   This also kills every live session the removed user holds - their existing bearer tokens stop working immediately.
+   For raw HTTP, GET the ACL, drop `alice` from `grants`, and PUT the result back: the body replaces all grants, so send `{"grants":{}}` only to remove everyone.
+
+   This also kills every live session the removed read-capable user holds - their existing bearer tokens stop working immediately.
 
 2. **Rotate the bucket key.**
    ```sh
