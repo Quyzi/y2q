@@ -561,6 +561,10 @@ mode on one port (run two `y2qd` processes on different ports for that).
 private CA, `--client-cert`/`--client-key` supply a client certificate for
 mutual TLS.
 
+The client never follows HTTP redirects (3xx is returned as an error), so a
+compromised or MITM'd endpoint cannot bounce the login body or bearer token to
+another URL.
+
 ## Node key and keystore
 
 The node key (tier 0) is the one piece of key material every other secret

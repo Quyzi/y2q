@@ -93,6 +93,12 @@ impl Y2qClient {
         let rustls_cfg = build_rustls_client_config(&config.tls)?;
         let inner = reqwest::ClientBuilder::new()
             .use_preconfigured_tls(rustls_cfg)
+            // reqwest strips `Authorization` on host/port/scheme changes, but a
+            // 307/308 would still replay the login body (username + password)
+            // to `Location`, and same-origin redirects keep the bearer token.
+            // The configured server URL is the only origin the operator vetted,
+            // so 3xx is surfaced as `ClientError::Redirect`, never followed.
+            .redirect(reqwest::redirect::Policy::none())
             .build()?;
         Ok(Self {
             inner,
@@ -172,6 +178,9 @@ impl Y2qClient {
         if status.is_success() {
             return Ok(resp);
         }
+        if status.is_redirection() {
+            return Err(redirect_error(&resp));
+        }
         let message = match resp.json::<serde_json::Value>().await {
             Ok(v) => v["error"].as_str().unwrap_or("unknown error").to_owned(),
             Err(_) => status
@@ -189,6 +198,31 @@ impl Y2qClient {
                 message,
             },
         })
+    }
+}
+
+/// Build the redirect error without reading the (untrusted) response body.
+/// `Location` is resolved against the request URL and reduced to
+/// scheme/host/port/path: userinfo, query and fragment are dropped so
+/// credentials embedded in the target are never echoed. Non-http(s) targets
+/// are not echoed at all.
+fn redirect_error(resp: &Response) -> ClientError {
+    let location = resp
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|l| resp.url().join(l).ok())
+        .filter(|u| matches!(u.scheme(), "http" | "https"))
+        .map(|mut u| {
+            let _ = u.set_username("");
+            let _ = u.set_password(None);
+            u.set_query(None);
+            u.set_fragment(None);
+            u.to_string()
+        });
+    ClientError::Redirect {
+        status: resp.status().as_u16(),
+        location,
     }
 }
 

@@ -31,6 +31,7 @@ impl CliError {
             Self::Client(ClientError::Conflict { .. }) => 4,
             Self::Client(ClientError::BadRequest { .. }) => 5,
             Self::Client(ClientError::ServerError { .. }) => 6,
+            Self::Client(ClientError::Redirect { .. }) => 6,
             Self::Client(ClientError::Io(_) | ClientError::Http(_)) => 1,
             Self::Config(ConfigError::UnknownAlias(_)) => 9,
             Self::Config(_) => 8,
@@ -69,6 +70,13 @@ mod tests {
                 CliError::Client(ClientError::ServerError {
                     status: 500,
                     message: msg("x"),
+                }),
+                6,
+            ),
+            (
+                CliError::Client(ClientError::Redirect {
+                    status: 307,
+                    location: None,
                 }),
                 6,
             ),

@@ -766,6 +766,8 @@ When `enabled = true` the daemon binds HTTPS at `[server] port` and refuses plai
 
 `y2q` and `y2q-warp` verify the server certificate by default; use `--ca-cert <pem>` to trust a private CA, `--client-cert`/`--client-key` on an alias for mutual TLS, or `--insecure` for self-signed dev endpoints.
 
+`y2q`, `y2q-warp` and `y2q-fuse` never follow HTTP redirects: a 307/308 would replay the login body (username and password) to the redirect target. A 3xx response fails with `server redirected the request (NNN) to <url> ...` (CLI exit code 6). Point the configured server URL (alias or `--nodes`) at the final URL, and make sure any proxy in front of the API does not redirect API paths (http to https, trailing slash, and so on).
+
 ### Behind a reverse proxy
 
 Alternatively (or in addition) run `y2qd` behind a reverse proxy (nginx, Caddy, traefik) that:
