@@ -1,5 +1,4 @@
-//! Download-side body adapters: session-leashed plaintext streaming and the
-//! `HeadObject` sized-empty-body workaround.
+//! Download-side body adapter: session-leashed plaintext streaming.
 
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -47,32 +46,5 @@ where
             Poll::Ready(None) => Poll::Ready(None),
             Poll::Pending => Poll::Pending,
         }
-    }
-}
-
-/// A body that declares a real size but carries no bytes to poll.
-///
-/// `HttpResponse::finish()` attaches a genuinely-zero-length body, and
-/// actix's h1 encoder writes `Content-Length` from the body's *actual*
-/// `BodySize` — overriding any `Content-Length` header the handler
-/// inserted manually — so a `HeadObject` response built with `.finish()`
-/// always reports `Content-Length: 0` regardless of the object's real
-/// size. Attaching this body instead reports the true size; actix's HEAD
-/// handling already skips writing body bytes to the wire for any body
-/// type, so `poll_next` is never actually reached for a HEAD request.
-pub struct SizedEmptyBody(pub u64);
-
-impl actix_web::body::MessageBody for SizedEmptyBody {
-    type Error = std::convert::Infallible;
-
-    fn size(&self) -> actix_web::body::BodySize {
-        actix_web::body::BodySize::Sized(self.0)
-    }
-
-    fn poll_next(
-        self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Bytes, Self::Error>>> {
-        Poll::Ready(None)
     }
 }

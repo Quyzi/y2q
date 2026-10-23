@@ -7,10 +7,11 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+use actix_web::body::{BodySize, MessageBody};
 use actix_web::http::Method;
 use actix_web::http::header::HeaderMap;
 use actix_web::test::{self, TestRequest};
-use actix_web::{App, web};
+use actix_web::{App, HttpServer, web};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use y2q_core::crypto::{self, Argon2Params, CredentialSlot, Role, UserRecord, UserStore, kem};
 use y2q_core::secmem::SecretVec;
@@ -133,25 +134,32 @@ impl Harness {
     }
 }
 
+fn configure_app(
+    cfg: &mut web::ServiceConfig,
+    storage: &web::Data<Arc<AnyStorage>>,
+    auth_state: &web::Data<AuthState>,
+) {
+    cfg.app_data(storage.clone());
+    cfg.app_data(web::Data::new(LabelLimits {
+        max_labels: 32,
+        max_label_name_bytes: 64,
+        max_label_value_bytes: 1024,
+    }));
+    cfg.app_data(web::Data::new(SyncLevel::Durable));
+    cfg.app_data(web::Data::new(EncryptionParams {
+        chunk_size_bytes: 4 * 1024 * 1024,
+        max_body_bytes: 8 * 1024 * 1024,
+    }));
+    cfg.app_data(auth_state.clone());
+    cfg.app_data(web::PayloadConfig::new(8 * 1024 * 1024));
+    handlers::configure(cfg);
+}
+
 #[actix_web::test]
 async fn get_200_matches_head_metadata_headers() {
     let harness = Harness::new();
     let app = test::init_service(
-        App::new()
-            .app_data(harness.storage.clone())
-            .app_data(web::Data::new(LabelLimits {
-                max_labels: 32,
-                max_label_name_bytes: 64,
-                max_label_value_bytes: 1024,
-            }))
-            .app_data(web::Data::new(SyncLevel::Durable))
-            .app_data(web::Data::new(EncryptionParams {
-                chunk_size_bytes: 4 * 1024 * 1024,
-                max_body_bytes: 8 * 1024 * 1024,
-            }))
-            .app_data(harness.auth_state.clone())
-            .app_data(web::PayloadConfig::new(8 * 1024 * 1024))
-            .configure(handlers::configure),
+        App::new().configure(|c| configure_app(c, &harness.storage, &harness.auth_state)),
     )
     .await;
 
@@ -186,6 +194,11 @@ async fn get_200_matches_head_metadata_headers() {
         let head_resp = test::call_service(&app, head).await;
         assert_eq!(head_resp.status(), 200, "HEAD {uri}");
         let head_meta = metadata_headers(head_resp.headers());
+        assert_eq!(
+            head_resp.response().body().size(),
+            BodySize::Sized(body.len() as u64),
+            "HEAD must advertise the plaintext size via its body size, not an empty body"
+        );
 
         let get = TestRequest::get()
             .uri(&uri)
@@ -230,4 +243,100 @@ async fn get_200_matches_head_metadata_headers() {
         );
         assert_eq!(&get_body[..], body);
     }
+}
+
+/// Send one raw HTTP/1.1 request (`Connection: close`) and return the status,
+/// lowercased-name headers, and the bytes following the header terminator.
+async fn raw(
+    addr: std::net::SocketAddr,
+    method: &str,
+    path: &str,
+    bearer: &str,
+    body: Option<&[u8]>,
+) -> (u16, BTreeMap<String, String>, Vec<u8>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut req = format!(
+        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {bearer}\r\nConnection: close\r\n"
+    );
+    if let Some(b) = body {
+        req.push_str(&format!("Content-Length: {}\r\n", b.len()));
+    }
+    req.push_str("\r\n");
+    let mut bytes = req.into_bytes();
+    if let Some(b) = body {
+        bytes.extend_from_slice(b);
+    }
+
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    stream.write_all(&bytes).await.unwrap();
+    let mut buf = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut buf))
+        .await
+        .expect("read timed out")
+        .unwrap();
+
+    let split = buf
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .expect("header terminator");
+    let head = std::str::from_utf8(&buf[..split]).unwrap();
+    let mut lines = head.split("\r\n");
+    let status: u16 = lines
+        .next()
+        .unwrap()
+        .split(' ')
+        .nth(1)
+        .unwrap()
+        .parse()
+        .unwrap();
+    let headers = lines
+        .filter_map(|l| l.split_once(':'))
+        .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_owned()))
+        .collect();
+    (status, headers, buf[split + 4..].to_vec())
+}
+
+/// Regression for #127: the encoder takes `Content-Length` from the body's
+/// size, so HEAD must report the real object size on the wire.
+#[actix_web::test]
+async fn head_content_length_over_the_wire_is_plaintext_size() {
+    let harness = Harness::new();
+    let storage = harness.storage.clone();
+    let auth_state = harness.auth_state.clone();
+    let srv = HttpServer::new(move || {
+        let storage = storage.clone();
+        let auth_state = auth_state.clone();
+        App::new().configure(move |c| configure_app(c, &storage, &auth_state))
+    })
+    .workers(1)
+    .disable_signals()
+    .bind(("127.0.0.1", 0))
+    .unwrap();
+    let addr = srv.addrs()[0];
+    let server = srv.run();
+    let handle = server.handle();
+    actix_web::rt::spawn(server);
+
+    let bearer = harness.bearer.clone();
+    for (key, body) in [("hello", &b"hello world"[..]), ("empty", &b""[..])] {
+        let path = format!("/pics/{key}");
+        let (status, _, _) = raw(addr, "PUT", &path, &bearer, Some(body)).await;
+        assert_eq!(status, 201, "PUT {path}");
+
+        let (status, headers, wire_body) = raw(addr, "HEAD", &path, &bearer, None).await;
+        assert_eq!(status, 200, "HEAD {path}");
+        let len = body.len().to_string();
+        assert_eq!(headers.get("content-length"), Some(&len), "HEAD {path}");
+        assert_eq!(headers.get("x-y2q-size"), Some(&len), "HEAD {path}");
+        assert!(wire_body.is_empty(), "HEAD must write no body bytes");
+
+        let (status, headers, wire_body) = raw(addr, "GET", &path, &bearer, None).await;
+        assert_eq!(status, 200, "GET {path}");
+        assert_eq!(headers.get("content-length"), Some(&len), "GET {path}");
+        assert_eq!(wire_body, body);
+    }
+
+    handle.stop(true).await;
+    drop(harness);
 }

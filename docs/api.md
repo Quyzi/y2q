@@ -387,7 +387,7 @@ Retrieve and decrypt an object.
 
 ### `HEAD /{bucket}/{key}`
 
-Metadata only - no body.
+Metadata only - no body bytes are sent, but `Content-Length` is the plaintext size a GET of the object would send (RFC 9110 §8.6); `X-Y2Q-Size` always equals it.
 
 **Response (200):** empty body. Metadata is exposed as headers:
 
