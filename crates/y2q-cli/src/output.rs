@@ -1,11 +1,27 @@
 use chrono::{DateTime, Local};
 use serde::Serialize;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum OutputMode {
     #[default]
     Human,
     Json,
+}
+
+static QUIET: AtomicBool = AtomicBool::new(false);
+
+/// Record the global `-q/--quiet` flag for this process. Called once at
+/// startup, before any command runs.
+pub fn set_quiet(quiet: bool) {
+    QUIET.store(quiet, Ordering::Relaxed);
+}
+
+/// Whether `-q/--quiet` was passed: suppresses transfer progress and the
+/// human success lines of object transfer commands. Errors, warnings and
+/// requested output (including `--json`) are never suppressed.
+pub fn is_quiet() -> bool {
+    QUIET.load(Ordering::Relaxed)
 }
 
 pub fn print_json<T: Serialize>(value: &T) {

@@ -12,7 +12,9 @@ pub struct Cli {
     #[arg(long, short, global = true, action = clap::ArgAction::Count)]
     pub verbose: u8,
 
-    /// Silence progress / non-error output. Errors still print on stderr.
+    /// Silence transfer progress and the success lines of put/cp/get/pipe/mv/rm/mirror.
+    /// Warnings (including the password-on-command-line warning) and errors still print on
+    /// stderr; requested output and `--json` are unaffected.
     #[arg(long, short, global = true)]
     pub quiet: bool,
 

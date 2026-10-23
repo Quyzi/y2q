@@ -2403,3 +2403,164 @@ fn e2e_device_unlock_swtpm() {
 
     let _ = std::fs::remove_dir_all(&base);
 }
+
+/// Regression for #136: the password-on-command-line warning is a security
+/// notice; neither `-q` nor `RUST_LOG` may hide it, and `--json` stdout stays clean.
+#[test]
+fn e2e_password_warning_survives_quiet() {
+    let home = isolated_home("pw-warning");
+    write_mailto_alias(&home);
+    let run = |args: &[&str]| {
+        Command::new(y2q_bin())
+            .env("XDG_CONFIG_HOME", home.join("config"))
+            .env("XDG_DATA_HOME", home.join("data"))
+            .env("NO_COLOR", "1")
+            .env("RUST_LOG", "off")
+            .args(args)
+            .stdin(Stdio::null())
+            .output()
+            .expect("spawn y2q")
+    };
+    for args in [
+        &["-q", "login", "m", "--password", "x"][..],
+        &["login", "m", "--password", "x"][..],
+        &["--json", "-q", "login", "m", "--password", "x"][..],
+    ] {
+        let out = run(args);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("warning: "), "{args:?}: {stderr}");
+        assert!(
+            stderr.contains("password was passed on the command line"),
+            "{args:?}: {stderr}"
+        );
+        assert!(
+            !String::from_utf8_lossy(&out.stdout).contains("password was passed"),
+            "{args:?}: warning leaked to stdout"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// Regression for #136: `-q` silences transfer progress and success lines of
+/// the transfer family, while `--json` results, data output and warnings remain.
+#[test]
+fn e2e_quiet_silences_transfer_output() {
+    let Some(server) = start_server() else {
+        return;
+    };
+    let url = server.url();
+    server.ok(&["alias", "set", "test", &url, "--user", "root"]);
+    let pw = server.password.clone();
+    server.ok(&["login", "test", "--password", &pw]);
+    server.ok(&["mb", "test/bucket"]);
+
+    let src = server.base.join("q-src.txt");
+    std::fs::write(&src, b"quiet payload").unwrap();
+    let src_s = src.to_str().unwrap();
+
+    // Baseline (stderr is a pipe, so the plain reporter runs): guards against
+    // the quiet assertions below passing vacuously.
+    let out = server.y2q(&["cp", src_s, "test/bucket/a"]);
+    assert!(ok(&out), "{}", output_text(&out));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("Stored:"));
+    let base_err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        base_err.contains("0 B") && base_err.contains(" → test/bucket/"),
+        "baseline progress missing: {base_err:?}"
+    );
+
+    let silent = |out: &std::process::Output, what: &str| {
+        assert!(ok(out), "{what}: {}", output_text(out));
+        assert!(out.stdout.is_empty(), "{what}: stdout {:?}", out.stdout);
+        assert!(out.stderr.is_empty(), "{what}: stderr {:?}", out.stderr);
+    };
+    let arrived = |key: &str| {
+        let o = server.y2q(&["stat", &format!("test/bucket/{key}")]);
+        assert!(ok(&o), "{key} missing: {}", output_text(&o));
+    };
+
+    silent(&server.y2q(&["-q", "cp", src_s, "test/bucket/b"]), "cp");
+    arrived("b");
+    silent(&server.y2q(&["-q", "put", src_s, "test/bucket/p"]), "put");
+    arrived("p");
+
+    let tree = server.base.join("q-tree");
+    std::fs::create_dir_all(tree.join("sub")).unwrap();
+    std::fs::write(tree.join("one.txt"), b"1").unwrap();
+    std::fs::write(tree.join("sub").join("two.txt"), b"2").unwrap();
+    silent(
+        &server.y2q(&["-q", "cp", "-r", tree.to_str().unwrap(), "test/bucket/rec"]),
+        "cp -r",
+    );
+    let listing = server.y2q(&["ls", "test/bucket/rec"]);
+    assert!(output_text(&listing).contains("two.txt"));
+
+    let glob = format!("{}/q-tree/*.txt", server.base.display());
+    silent(
+        &server.y2q(&["-q", "cp", &glob, "test/bucket/globbed/"]),
+        "cp glob",
+    );
+    let listing = server.y2q(&["ls", "test/bucket/globbed"]);
+    assert!(output_text(&listing).contains("one.txt"));
+
+    silent(
+        &server.y2q_stdin(&["-q", "pipe", "test/bucket/piped"], b"piped bytes"),
+        "pipe",
+    );
+    let got = server.y2q(&["-q", "get", "test/bucket/piped", "-"]);
+    assert!(ok(&got));
+    assert_eq!(got.stdout, b"piped bytes", "-q get - must still emit bytes");
+
+    let dst = server.base.join("q-dst.txt");
+    silent(
+        &server.y2q(&["-q", "get", "test/bucket/b", dst.to_str().unwrap()]),
+        "get",
+    );
+    assert_eq!(std::fs::read(&dst).unwrap(), b"quiet payload");
+
+    let dst2 = server.base.join("q-dst2.txt");
+    silent(
+        &server.y2q(&["-q", "mv", "test/bucket/b", dst2.to_str().unwrap()]),
+        "mv",
+    );
+    assert_eq!(std::fs::read(&dst2).unwrap(), b"quiet payload");
+    assert_eq!(
+        server.y2q(&["stat", "test/bucket/b"]).status.code(),
+        Some(3)
+    );
+
+    silent(
+        &server.y2q(&["-q", "mirror", tree.to_str().unwrap(), "test/bucket/m"]),
+        "mirror",
+    );
+    let listing = server.y2q(&["ls", "test/bucket/m"]);
+    assert!(output_text(&listing).contains("one.txt"));
+
+    silent(&server.y2q(&["-q", "rm", "test/bucket/a"]), "rm");
+    assert_eq!(
+        server.y2q(&["stat", "test/bucket/a"]).status.code(),
+        Some(3)
+    );
+
+    // `--json` is requested output and survives `-q`.
+    let out = server.y2q(&["--json", "-q", "cp", src_s, "test/bucket/j"]);
+    assert!(ok(&out), "{}", output_text(&out));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json stdout");
+    assert_eq!(v["created"], true);
+
+    // The password warning of `admin user add` still prints under `-q`.
+    let out = server.y2q(&[
+        "-q",
+        "admin",
+        "user",
+        "add",
+        "test",
+        "u1",
+        "--password",
+        "pw-u1-long-enough",
+    ]);
+    assert!(ok(&out), "{}", output_text(&out));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("password was passed on the command line")
+    );
+}

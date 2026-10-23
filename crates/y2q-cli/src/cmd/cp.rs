@@ -6,7 +6,7 @@ use y2q_client::Y2qClient;
 use crate::client_builder::{client_from_alias, resolve_config_path};
 use crate::config::{CliConfig, default_tokens_path};
 use crate::error::CliError;
-use crate::output::{OutputMode, fmt_bytes, print_json};
+use crate::output::{OutputMode, fmt_bytes, is_quiet, print_json};
 use crate::path::{CpEndpoint, RemotePath};
 use crate::progress::{CountingReader, make_reporter};
 use crate::staged_file::StagedFile;
@@ -167,10 +167,12 @@ async fn upload_single(
     let result_path = format!("{}/{bucket}/{key}", remote.alias);
     if mode == OutputMode::Json {
         print_json(&serde_json::json!({ "path": result_path, "created": created }));
-    } else if created {
-        println!("Stored: {result_path}");
-    } else {
-        println!("Updated: {result_path}");
+    } else if !is_quiet() {
+        if created {
+            println!("Stored: {result_path}");
+        } else {
+            println!("Updated: {result_path}");
+        }
     }
     Ok(())
 }
@@ -312,10 +314,12 @@ async fn upload_file(path: &Path, key: &str, ctx: &UploadCtx<'_>) -> Result<(), 
 
     if ctx.mode == OutputMode::Json {
         print_json(&serde_json::json!({ "path": result_path, "created": created }));
-    } else if created {
-        println!("Stored: {result_path}");
-    } else {
-        println!("Updated: {result_path}");
+    } else if !is_quiet() {
+        if created {
+            println!("Stored: {result_path}");
+        } else {
+            println!("Updated: {result_path}");
+        }
     }
     Ok(())
 }
@@ -358,11 +362,13 @@ async fn download(
             None => client.get_to_writer(bucket, key, out.file_mut()).await?,
         };
         out.commit().await?;
-        eprintln!(
-            "Downloaded {} ← {}/{bucket}/{key}",
-            fmt_bytes(n),
-            remote.alias
-        );
+        if !is_quiet() {
+            eprintln!(
+                "Downloaded {} ← {}/{bucket}/{key}",
+                fmt_bytes(n),
+                remote.alias
+            );
+        }
         n
     };
 

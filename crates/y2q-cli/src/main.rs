@@ -72,6 +72,8 @@ async fn run(cli: Cli) -> Result<(), CliError> {
             .map(|p| p.to_string_lossy().into_owned()),
     });
 
+    output::set_quiet(cli.quiet);
+
     // A global --config path overrides the default location for every command.
     client_builder::set_config_path_override(cli.config.clone());
 

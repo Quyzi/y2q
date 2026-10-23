@@ -14,7 +14,7 @@ use crate::error::CliError;
 use crate::ops::listing::{
     DiffEntries, MirrorAction, collect_local_entries, collect_remote_entries, mirror_plan,
 };
-use crate::output::{OutputMode, fmt_bytes, print_json};
+use crate::output::{OutputMode, fmt_bytes, is_quiet, print_json};
 use crate::path::CpEndpoint;
 
 #[derive(Default, Debug)]
@@ -76,7 +76,7 @@ pub async fn run(
             MirrorAction::Copy => stats.copied += 1,
             MirrorAction::Update => stats.updated += 1,
         }
-        if mode != OutputMode::Json {
+        if mode != OutputMode::Json && !is_quiet() {
             println!("{:<6} {key} ({})", action.label(), fmt_bytes(size));
         }
     }
@@ -85,7 +85,7 @@ pub async fn run(
         for key in &plan.deletions {
             delete_one(&dst_ep, key).await?;
             stats.deleted += 1;
-            if mode != OutputMode::Json {
+            if mode != OutputMode::Json && !is_quiet() {
                 println!("delete {key}");
             }
         }
@@ -97,7 +97,7 @@ pub async fn run(
             "dst": dst,
             "stats": stats,
         }));
-    } else {
+    } else if !is_quiet() {
         println!(
             "\nMirror summary: copied={} updated={} deleted={} skipped={} bytes={}",
             stats.copied,

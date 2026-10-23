@@ -3,7 +3,7 @@ use y2q_client::Y2qClient;
 use crate::client_builder::{client_from_alias, resolve_config_path};
 use crate::config::{CliConfig, default_tokens_path};
 use crate::error::CliError;
-use crate::output::{OutputMode, fmt_bytes, fmt_ns, print_json};
+use crate::output::{OutputMode, fmt_bytes, fmt_ns, is_quiet, print_json};
 use crate::path::RemotePath;
 use crate::token::TokenStore;
 
@@ -47,7 +47,7 @@ pub async fn rm(path: String, force: bool, mode: OutputMode) -> Result<(), CliEr
         crate::ops::objects::delete(&client, bucket, key_pattern).await?;
         if mode == OutputMode::Json {
             print_json(&serde_json::json!({ "deleted": path }));
-        } else {
+        } else if !is_quiet() {
             println!("Deleted {path}");
         }
         return Ok(());
@@ -82,7 +82,7 @@ pub async fn rm(path: String, force: bool, mode: OutputMode) -> Result<(), CliEr
     for key in &matching_keys {
         client.delete(bucket, key).await?;
         let full = format!("{}/{bucket}/{key}", remote.alias);
-        if mode != OutputMode::Json {
+        if mode != OutputMode::Json && !is_quiet() {
             println!("Deleted {full}");
         }
         deleted.push(full);
