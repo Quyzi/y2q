@@ -596,7 +596,14 @@ async fn do_put(
     chk: [u8; 32],
 ) -> Result<(bool, Metadata), Error> {
     if let Some(parent) = obj_path.parent() {
-        std::fs::create_dir_all(parent)
+        let mut shard_dir_builder = std::fs::DirBuilder::new();
+        shard_dir_builder.recursive(true);
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            shard_dir_builder.mode(0o700);
+        }
+        shard_dir_builder
+            .create(parent)
             .map_err(|e| internal(&bucket, &key, "put", format!("mkdir: {e}")))?;
     }
 
@@ -765,6 +772,7 @@ async fn put_via_buffered(
         .write(true)
         .create(true)
         .truncate(true)
+        .mode(0o600)
         .open(tmp_path)
         .await
         .map_err(|e| internal(bucket, key, "put", format!("open tmp: {e}")))?;
@@ -827,6 +835,7 @@ async fn put_via_direct(
         .write(true)
         .create(true)
         .truncate(true)
+        .mode(0o600)
         .custom_flags(libc::O_DIRECT)
         .open(tmp_path)
         .await;
@@ -999,6 +1008,7 @@ async fn do_stream_create(path: PathBuf, placeholder: Vec<u8>) -> Result<(), Err
         .read(true)
         .create(true)
         .truncate(true)
+        .mode(0o600)
         .open(&path)
         .await
         .map_err(|e| stream_err(&path, "stream_create", format!("open: {e}")))?;

@@ -581,7 +581,12 @@ pub(crate) async fn set_bucket_config_impl(
         })?;
     let path = dir.join(BUCKET_CONFIG_FILE);
     let tmp = dir.join(".y2q-bucket.json.tmp");
-    tokio::fs::write(&tmp, &ciphertext)
+    let mut open_opts = tokio::fs::OpenOptions::new();
+    open_opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    open_opts.mode(0o600);
+    let mut file = open_opts
+        .open(&tmp)
         .await
         .map_err(|e| Error::InternalError {
             bucket: bucket.to_owned(),
@@ -589,6 +594,15 @@ pub(crate) async fn set_bucket_config_impl(
             operation: "set_bucket_config".to_owned(),
             message: format!("write config: {e}"),
         })?;
+    file.write_all(&ciphertext)
+        .await
+        .map_err(|e| Error::InternalError {
+            bucket: bucket.to_owned(),
+            key: String::new(),
+            operation: "set_bucket_config".to_owned(),
+            message: format!("write config: {e}"),
+        })?;
+    drop(file);
     tokio::fs::rename(&tmp, &path)
         .await
         .map_err(|e| Error::InternalError {
@@ -2628,6 +2642,22 @@ mod tests {
         let raw = tokio::fs::read(&sidecar).await.unwrap();
         assert!(!raw.windows(4).any(|w| w == b"4096"));
         assert!(!raw.windows(11).any(|w| w == b"quota_bytes"));
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn bucket_config_sidecar_has_restrictive_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (s, dir) = make_storage();
+        s.set_bucket_config("secret-bucket", &crate::BucketConfig::default())
+            .await
+            .unwrap();
+        let path_key = test_path_key();
+        let sidecar = bucket_dir_path(&dir.path().join("data"), &path_key, "secret-bucket")
+            .join(BUCKET_CONFIG_FILE);
+        let mode = std::fs::metadata(&sidecar).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "bucket config sidecar must be created 0600");
     }
 
     #[tokio::test]
