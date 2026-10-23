@@ -305,14 +305,14 @@ Supported shells: `bash`, `zsh`, `fish`, `powershell`, `elvish`.
 |---|---|---|---|
 | `--json` | `-j` | `Y2Q_OUTPUT` | Output as JSON |
 | `--verbose` | `-v` | - | Increase log verbosity (repeatable) |
-| `--quiet` | `-q` | - | Silence progress/non-error output |
+| `--quiet` | `-q` | - | Silence transfer progress and success lines of put/cp/get/pipe/mv/rm/mirror; warnings and errors still print |
 | `--no-color` | - | `NO_COLOR` | Disable ANSI colors |
 | `--debug` | - | - | Maximum verbosity |
 | `--insecure` | - | - | Skip TLS cert verification (dev/staging only) |
 | `--ca-cert <path>` | - | - | Trust this PEM CA bundle for this invocation |
 | `--config <path>` | - | - | Override config file location |
 
-`RUST_LOG`, if set, overrides `--verbose`/`--quiet`/`--debug` entirely (see [docs/configuration.md#logging](docs/configuration.md#logging)).
+`RUST_LOG`, if set, overrides the log verbosity set by `--verbose`/`--quiet`/`--debug` only; `-q` also independently suppresses transfer progress/success lines of put/cp/get/pipe/mv/rm/mirror, and the password-on-command-line warning is not tracing-based so it always prints (see [docs/configuration.md#logging](docs/configuration.md#logging)).
 
 ## Load Benchmarking (`y2q-warp`)
 

@@ -285,7 +285,7 @@ Per-request spans flow through `tracing-actix-web`. Each HTTP request gets a spa
 
 The other binaries have no `[observability]` config section - they log to stderr and are controlled by `RUST_LOG` alone:
 
-- **`y2q`** - defaults to `warn`; `--verbose`/`-v` (repeatable) raises it to `info`/`debug`/`trace`, `--debug` forces `trace`, `--quiet` forces `error`. `RUST_LOG`, if set, always wins over these flags.
+- **`y2q`** - defaults to `warn`; `--verbose`/`-v` (repeatable) raises it to `info`/`debug`/`trace`, `--debug` forces `trace`, `--quiet` forces `error`. `RUST_LOG`, if set, always wins over these flags for log verbosity only. `--quiet` additionally and independently suppresses transfer progress and success lines of put/cp/get/pipe/mv/rm/mirror. The password-on-command-line warning is written directly to stderr and is not affected by `-q` or `RUST_LOG`.
 - **`y2q-warp`** - defaults to `error` (`EnvFilter::from_default_env()`'s built-in default) when `RUST_LOG` is unset; there is no `-v` flag.
 - **`y2q-fuse`** - defaults to `warn` when `RUST_LOG` is unset.
 

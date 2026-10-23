@@ -11,7 +11,19 @@ pub trait ProgressReporter: Send {
     fn finish(&mut self, bytes_done: u64);
 }
 
+/// Reporter used under `-q`: draws nothing.
+struct NoopProgressReporter;
+
+impl ProgressReporter for NoopProgressReporter {
+    fn start(&mut self, _label: &str, _total_bytes: Option<u64>) {}
+    fn update(&mut self, _bytes_done: u64, _speed_bps: u64) {}
+    fn finish(&mut self, _bytes_done: u64) {}
+}
+
 pub fn make_reporter(label: &str, total_bytes: Option<u64>) -> Box<dyn ProgressReporter> {
+    if crate::output::is_quiet() {
+        return Box::new(NoopProgressReporter);
+    }
     if std::io::stderr().is_terminal() {
         let mut r = tui::TuiProgressReporter::new();
         r.start(label, total_bytes);

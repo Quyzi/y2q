@@ -14,12 +14,13 @@ pub(crate) fn prompt_password(prompt: &str) -> Result<Zeroizing<String>, CliErro
 
 /// A password on the command line is visible to any local user via `ps`/
 /// `/proc/<pid>/cmdline`, and typically persists in shell history. Omit the
-/// flag to use the interactive (non-echoing) prompt instead.
+/// flag to use the interactive (non-echoing) prompt instead. Written with
+/// `eprintln!`, not `tracing`, so `-q`/`RUST_LOG` cannot suppress it.
 pub(crate) fn warn_password_on_cli_flag() {
-    tracing::warn!(
-        "a password was passed on the command line; it is visible to other local users \
-         (via `ps`/`/proc`) and may be saved in shell history. Omit the flag to be prompted \
-         interactively instead."
+    eprintln!(
+        "warning: a password was passed on the command line; it is visible to other local \
+         users (via `ps`/`/proc`) and may be saved in shell history. Omit the flag to be \
+         prompted interactively instead."
     );
 }
 
