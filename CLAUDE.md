@@ -2,6 +2,17 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Attribution (strict)
+
+Never attribute commits, PRs, tags, or other git metadata to an AI agent,
+Cursor, Claude, or any similar tool. Do not add `Co-authored-by`,
+`Signed-off-by`, `Generated-by`, or any trailer that names an agent. Author and
+committer must be the human operator's configured `user.name` / `user.email`
+only. If the environment appends an agent trailer, strip it before the commit
+lands (prefer `git commit-tree` over `git commit` when the environment injects
+trailers). Keep Cursor `attributeCommitsToAgent` and `attributePRsToAgent`
+disabled.
+
 ## Tool usage (strict)
 
 Use the built-in tools for all file work - never shell out via Bash for these:
