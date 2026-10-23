@@ -93,7 +93,12 @@ pub async fn run(
             }
             download(remote, local_path, range, mode).await
         }
-        _ => unreachable!(),
+        (CpEndpoint::Local(_), CpEndpoint::Local(_)) => Err(CliError::Other(
+            "local→local copy is not supported; use cp(1)".into(),
+        )),
+        (CpEndpoint::Remote(_), CpEndpoint::Remote(_)) => {
+            unreachable!("remote→remote checked above")
+        }
     }
 }
 
@@ -390,4 +395,41 @@ async fn make_client(alias: &str) -> Result<Y2qClient, CliError> {
         .token_for(alias)
         .ok_or(CliError::Client(y2q_client::ClientError::Unauthenticated))?;
     client_from_alias(entry, Some(token))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn local_to_local_returns_error() {
+        let err = run(
+            "a.txt".into(),
+            "b.txt".into(),
+            Vec::new(),
+            None,
+            false,
+            None,
+            OutputMode::Human,
+        )
+        .await
+        .expect_err("local→local must not panic");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("local→local") && msg.contains("cp(1)"),
+            "unexpected message: {msg}"
+        );
+    }
+
+    #[test]
+    fn glob_looking_remote_dst_is_not_local_to_local() {
+        let src = CpEndpoint::parse("-");
+        let dst = CpEndpoint::parse("alias/bucket/x[1].txt");
+        assert!(matches!(src, CpEndpoint::Local(_)));
+        assert!(matches!(dst, CpEndpoint::Remote(_)));
+        assert!(
+            !(matches!(src, CpEndpoint::Local(_)) && matches!(dst, CpEndpoint::Local(_))),
+            "pipe dst with [ in key must not classify as Local→Local"
+        );
+    }
 }
