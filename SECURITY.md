@@ -593,6 +593,10 @@ encryption (index, paths, metadata, bucket-config sidecars). It:
   interruption). Object bodies are never touched by a rotation — only
   metadata sidecars, bucket-config sidecars, and the index are
   re-encrypted under the new key.
+- On first use the keystore directory is created at most `0700` and `.lock`
+  at most `0600` (subject to umask); secret files inside are `0600`. An
+  existing directory is never chmod-ed; the daemon logs a warning if it is
+  accessible to other users.
 
 If the key is supplied via the environment, the daemon overwrites and
 unsets that variable before serving; the key file on disk is unchanged

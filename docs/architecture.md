@@ -126,10 +126,10 @@ Each user's `UserRecord` records the parameters used at the time of password wri
 ### Key file layout
 
 ```
-<keystore_dir>/
+<keystore_dir>/   created at most 0700 on first use (subject to umask; a stricter umask only narrows)
   keystore.json  node-key verifier (never the key itself)
   users.redb     one row per user (four credential slots + Argon2 params + metadata)
-  .lock          POSIX advisory exclusive flock, held while daemon runs
+  .lock          POSIX advisory exclusive flock, held while daemon runs; created at most 0600
 ```
 
 A directory still holding a pre-hierarchy `pubkey.json` is refused outright (`CryptoError::LegacyKeystore`) — there is no conversion path; re-initialize the deployment.

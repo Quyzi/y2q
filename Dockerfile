@@ -47,6 +47,7 @@ RUN mkdir -p \
         rootfs/var/lib/y2q/data \
         rootfs/var/lib/y2q/keys \
         rootfs/etc/y2q && \
+    chmod 0700 rootfs/var/lib/y2q/keys && \
     cp target/release/y2qd     rootfs/usr/local/bin/y2qd     && \
     cp target/release/y2q      rootfs/usr/local/bin/y2q      && \
     cp target/release/y2q-warp rootfs/usr/local/bin/y2q-warp && \
