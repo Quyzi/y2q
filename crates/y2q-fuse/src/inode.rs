@@ -99,6 +99,26 @@ impl InodeTable {
         }
     }
 
+    /// Record a locally-known size (truncate/O_TRUNC) in the cached metadata so
+    /// getattr()/read() don't report or clamp to the pre-truncate size. No-op
+    /// when nothing is cached for `ino`.
+    pub fn set_size(&mut self, ino: u64, size: u64) {
+        if let Some(e) = self.by_ino.get_mut(&ino)
+            && let Some(m) = e.cached_meta.as_mut()
+        {
+            m.size = size;
+            e.cached_at = Some(Instant::now());
+        }
+    }
+
+    /// Record the exact size just written to the server, then force the next
+    /// getattr() to re-HEAD for the true mtime/checksum. read() keeps clamping
+    /// on the recorded size (it ignores freshness).
+    pub fn note_written(&mut self, ino: u64, size: u64) {
+        self.set_size(ino, size);
+        self.invalidate_meta(ino);
+    }
+
     pub fn remove(&mut self, ino: u64) {
         if let Some(e) = self.by_ino.remove(&ino) {
             self.by_path.remove(&e.path);
@@ -147,5 +167,57 @@ mod tests {
         // Re-assign allocates a new ino (path gone from by_path).
         let ino2 = t.get_or_assign(path);
         assert_ne!(ino, ino2);
+    }
+
+    fn meta(size: u64) -> CachedMeta {
+        CachedMeta {
+            size,
+            created: 0,
+            modified: 0,
+            checksum_gxhash: String::new(),
+            labels: BTreeSet::new(),
+            cipher_size: None,
+            cipher_checksum: None,
+            kem_alg: None,
+            aead_alg: None,
+            envelope_version: None,
+        }
+    }
+
+    fn object_path() -> InodePath {
+        InodePath::Object {
+            bucket: "b".into(),
+            key: "k".into(),
+        }
+    }
+
+    #[test]
+    fn set_size_updates_cached_size_only_when_cached() {
+        let mut t = InodeTable::new();
+        let ino = t.get_or_assign(object_path());
+        t.set_size(ino, 4);
+        let e = t.get(ino).unwrap();
+        assert!(e.cached_meta.is_none());
+        assert!(!e.meta_fresh());
+
+        t.update_meta(ino, meta(10));
+        t.invalidate_meta(ino);
+        assert!(!t.get(ino).unwrap().meta_fresh());
+        t.set_size(ino, 4);
+        let e = t.get(ino).unwrap();
+        assert_eq!(e.cached_meta.as_ref().unwrap().size, 4);
+        assert!(e.meta_fresh());
+    }
+
+    #[test]
+    fn note_written_sets_exact_size_and_forces_refresh() {
+        let mut t = InodeTable::new();
+        let ino = t.get_or_assign(object_path());
+        t.update_meta(ino, meta(10));
+        t.set_size(ino, 0);
+        t.note_written(ino, 2);
+        let e = t.get(ino).unwrap();
+        assert_eq!(e.cached_meta.as_ref().unwrap().size, 2);
+        assert!(!e.meta_fresh());
     }
 }

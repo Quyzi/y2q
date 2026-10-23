@@ -401,6 +401,8 @@ Unmount with Ctrl+C, SIGTERM, or manually: `fusermount3 -u /mnt/y2q` on Linux, `
 | `--allow-other` | Allow other users to access the mount; requires `user_allow_other` in `/etc/fuse.conf`. Without `--allow-other-gid`, every local user gets read access to every file (mode `0644`/`0755`), not just the intended one |
 | `--allow-other-gid <GID>` | Used with `--allow-other`: restrict the extra access it grants to group `GID` (mode `0640`/`0750`, group-owned by `GID`) instead of every local user |
 
+Overwriting a file with `>` / `O_TRUNC`, `truncate(2)` and `ftruncate(2)` take effect: the new content is written to the server on close/flush, and readers see it after the close. A `truncate` with no open handle rewrites the whole object (labels are preserved). File and directory permissions and ownership are fixed: `chmod`/`chown` to anything other than the synthetic mode (`0644`, or `0640` with `--allow-other-gid`; directories `0755`, or `0750` with `--allow-other-gid`) and the mount's owner/group fail with `EPERM`, while values equal to the synthetic ones are accepted as no-ops. Tools that request a different mode or owner (for example `cp -p`, cross-filesystem `mv`, `install -m`, `install -d` under `--allow-other-gid`, or `tar -x` and `rsync -a` run as root, which chown by default) may print permission errors. This was not verified against each tool's exact behaviour. Timestamp changes (`touch`) are accepted but not stored.
+
 `y2q-fuse` logs to stderr via `RUST_LOG`, defaulting to `warn` when unset. See [docs/configuration.md#logging](docs/configuration.md#logging).
 
 ## Configuration

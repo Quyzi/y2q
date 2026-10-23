@@ -7,9 +7,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fuser::{
     AccessFlags, BsdFileFlags, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags,
-    Generation, INodeNo, LockOwner, OpenFlags, RenameFlags, ReplyAttr, ReplyCreate, ReplyData,
-    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr,
-    Request, WriteFlags,
+    Generation, INodeNo, InitFlags, KernelConfig, LockOwner, OpenFlags, RenameFlags, ReplyAttr,
+    ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs,
+    ReplyWrite, ReplyXattr, Request, WriteFlags,
 };
 use tempfile::NamedTempFile;
 use y2q_client::{AclBody, BucketConfig, ClientError, ListOptions, Y2qClient};
@@ -38,11 +38,12 @@ fn new_write_tempfile(dir: Option<&Path>) -> std::io::Result<NamedTempFile> {
     }
 }
 
-/// Overwrite `f`'s first `len` bytes with zeros, in bounded chunks so an
-/// arbitrarily large write buffer doesn't require an arbitrarily large
-/// zero-fill allocation. Leaves the write cursor after the zeroed region.
-fn zero_fill<T: IoWrite + Seek>(f: &mut T, len: u64) -> std::io::Result<()> {
-    f.seek(SeekFrom::Start(0))?;
+/// Overwrite `len` bytes of `f` starting at `start` with zeros, in bounded
+/// chunks so an arbitrarily large write buffer doesn't require an
+/// arbitrarily large zero-fill allocation. Leaves the write cursor after the
+/// zeroed region.
+fn zero_range<T: IoWrite + Seek>(f: &mut T, start: u64, len: u64) -> std::io::Result<()> {
+    f.seek(SeekFrom::Start(start))?;
     const CHUNK: usize = 64 * 1024;
     let zeros = [0u8; CHUNK];
     let mut remaining = len;
@@ -52,6 +53,33 @@ fn zero_fill<T: IoWrite + Seek>(f: &mut T, len: u64) -> std::io::Result<()> {
         remaining -= n as u64;
     }
     f.flush()
+}
+
+/// Overwrite `f`'s first `len` bytes with zeros. Leaves the write cursor
+/// after the zeroed region.
+fn zero_fill<T: IoWrite + Seek>(f: &mut T, len: u64) -> std::io::Result<()> {
+    zero_range(f, 0, len)
+}
+
+/// Zero the bytes in `[new_len, cur)` that a shrink to `new_len` is about to
+/// cut off; a no-op when `new_len >= cur`. Only zeroes: the caller still has
+/// to `set_len`.
+fn scrub_cut_tail<T: IoWrite + Seek>(f: &mut T, cur: u64, new_len: u64) -> std::io::Result<()> {
+    if new_len < cur {
+        zero_range(f, new_len, cur - new_len)
+    } else {
+        Ok(())
+    }
+}
+
+/// Resize a write buffer to exactly `new_len` bytes (growing zero-fills
+/// sparsely). The write buffer holds decrypted plaintext, so a shrink zeroes
+/// the cut tail first rather than leaving it in freed blocks. The cursor
+/// position is irrelevant afterwards: `write()` always seeks explicitly.
+fn set_buffer_len(tmp: &mut NamedTempFile, new_len: u64) -> std::io::Result<()> {
+    let cur = tmp.as_file().metadata()?.len();
+    scrub_cut_tail(tmp.as_file_mut(), cur, new_len)?;
+    tmp.as_file().set_len(new_len)
 }
 
 /// Overwrite a write-buffer temp file's current on-disk contents with
@@ -157,6 +185,125 @@ struct OpenFile {
     dirty: bool,
     /// Set after flush() attempts the PUT so release() knows not to retry.
     flushed: bool,
+}
+
+/// What a truncate of `(bucket, key)` has to do, decided from `open_files`
+/// before anything is modified.
+#[derive(Debug, PartialEq, Eq)]
+struct TruncatePlan {
+    /// The initiating handle is a writable handle of this object: the
+    /// truncate is buffer-only and is carried to the server by that handle's
+    /// flush/release.
+    initiator_writable: bool,
+    /// Some writable handle of this object will still PUT its own buffer
+    /// (`dirty && !flushed`), e.g. an unflushed `create()` handle.
+    put_pending: bool,
+}
+
+fn truncate_plan(
+    open_files: &HashMap<u64, OpenFile>,
+    bucket: &str,
+    key: &str,
+    initiator: Option<u64>,
+) -> TruncatePlan {
+    let initiator_writable = initiator
+        .and_then(|fh| open_files.get(&fh))
+        .is_some_and(|of| of.bucket == bucket && of.key == key && of.write_buf.is_some());
+    let put_pending = open_files.values().any(|of| {
+        of.bucket == bucket && of.key == key && of.write_buf.is_some() && of.dirty && !of.flushed
+    });
+    TruncatePlan {
+        initiator_writable,
+        put_pending,
+    }
+}
+
+/// Resize the write buffer of EVERY writable handle of `(bucket, key)` to
+/// `new_len`, so no handle can later resurrect the old body. Only the
+/// `initiator` is marked for PUT (`dirty`, `!flushed`), and only if the
+/// truncate changed its buffer or it was already dirty: a size-preserving
+/// truncate of a clean seeded handle must stay clean, otherwise its stale
+/// open()-time seed would be PUT over content written meanwhile. No other
+/// handle's `dirty`/`flushed` is modified.
+///
+/// Runs under the `open_files` mutex and scrubs the cut tail there. A
+/// mid-way error leaves earlier buffers resized (best effort).
+fn truncate_open_buffers(
+    open_files: &mut HashMap<u64, OpenFile>,
+    bucket: &str,
+    key: &str,
+    new_len: u64,
+    initiator: Option<u64>,
+) -> std::io::Result<()> {
+    for (fh, of) in open_files.iter_mut() {
+        if of.bucket != bucket || of.key != key {
+            continue;
+        }
+        let Some(buf) = of.write_buf.as_mut() else {
+            continue;
+        };
+        let cur_len = buf.as_file().metadata()?.len();
+        set_buffer_len(buf, new_len)?;
+        if Some(*fh) == initiator && (cur_len != new_len || of.dirty) {
+            of.dirty = true;
+            of.flushed = false;
+        }
+    }
+    Ok(())
+}
+
+/// The `(bucket, key)` a size change applies to: the handle's object if `fh`
+/// names an open handle, else the inode's own object; `None` for
+/// directories/buckets/root.
+fn truncate_target(
+    fh: Option<u64>,
+    open_files: &HashMap<u64, OpenFile>,
+    path: &InodePath,
+) -> Option<(String, String)> {
+    if let Some(of) = fh.and_then(|f| open_files.get(&f)) {
+        return Some((of.bucket.clone(), of.key.clone()));
+    }
+    match path {
+        InodePath::Object { bucket, key } => Some((bucket.clone(), key.clone())),
+        _ => None,
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct OpenPlan {
+    /// Allocate a write buffer (writable open, or `O_TRUNC`, which Linux
+    /// honours even on an `O_RDONLY` open when atomic-O_TRUNC is negotiated).
+    write_buf: bool,
+    /// Seed the write buffer with the current object (no `O_TRUNC`).
+    seed_from_remote: bool,
+}
+
+fn open_flags_plan(flags: i32) -> OpenPlan {
+    let trunc = flags & libc::O_TRUNC != 0;
+    let write_buf = flags & (libc::O_WRONLY | libc::O_RDWR) != 0 || trunc;
+    OpenPlan {
+        write_buf,
+        seed_from_remote: write_buf && !trunc,
+    }
+}
+
+/// chmod/chown can't be stored: accept a request only if every present value
+/// equals the synthetic one, else `EPERM`. The kernel sends the full
+/// `ia_mode` including the type bits, so the mode is masked.
+fn check_attr_change_supported(
+    mode: Option<u32>,
+    uid: Option<u32>,
+    gid: Option<u32>,
+    cur: &FileAttr,
+) -> Result<(), Errno> {
+    let mode_ok = mode.is_none_or(|m| m & 0o7777 == u32::from(cur.perm));
+    let uid_ok = uid.is_none_or(|u| u == cur.uid);
+    let gid_ok = gid.is_none_or(|g| g == cur.gid);
+    if mode_ok && uid_ok && gid_ok {
+        Ok(())
+    } else {
+        Err(Errno::EPERM)
+    }
 }
 
 pub struct Y2qFuse {
@@ -291,6 +438,18 @@ impl Y2qFuse {
 }
 
 impl Filesystem for Y2qFuse {
+    fn init(&mut self, _req: &Request, config: &mut KernelConfig) -> std::io::Result<()> {
+        // Deliver O_TRUNC to open() instead of having the kernel strip it and
+        // send a separate SETATTR size=0. setattr() still handles that fallback.
+        if let Err(unsupported) = config.add_capabilities(InitFlags::FUSE_ATOMIC_O_TRUNC) {
+            tracing::warn!(
+                ?unsupported,
+                "kernel lacks FUSE_ATOMIC_O_TRUNC; relying on SETATTR size handling"
+            );
+        }
+        Ok(())
+    }
+
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &std::ffi::OsStr, reply: ReplyEntry) {
         let parent = parent.0;
         let name = name.to_string_lossy().into_owned();
@@ -732,14 +891,13 @@ impl Filesystem for Y2qFuse {
             }
         };
 
-        let write_requested = flags & libc::O_WRONLY != 0 || flags & libc::O_RDWR != 0;
-        if write_requested && self.read_only {
+        let plan = open_flags_plan(flags);
+        if plan.write_buf && self.read_only {
             reply.error(Errno::EROFS);
             return;
         }
 
-        let (write_buf, dirty) = if write_requested {
-            let trunc = flags & libc::O_TRUNC != 0;
+        let (write_buf, dirty) = if plan.write_buf {
             let mut tmp = match new_write_tempfile(self.write_buf_dir.as_deref()) {
                 Ok(f) => f,
                 Err(e) => {
@@ -748,7 +906,7 @@ impl Filesystem for Y2qFuse {
                     return;
                 }
             };
-            if !trunc {
+            if plan.seed_from_remote {
                 // Without O_TRUNC, seed the write buffer with the current
                 // object so partial writes don't silently truncate the tail.
                 let write_copy = match tmp.reopen() {
@@ -787,10 +945,20 @@ impl Filesystem for Y2qFuse {
         };
 
         let fh = self.alloc_fh();
-        self.open_files
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(
+        let truncating = plan.write_buf && !plan.seed_from_remote;
+        {
+            let mut guard = self.open_files.lock().unwrap_or_else(|e| e.into_inner());
+            // Same effect as OPEN + SETATTR size=0 with this fh: every other
+            // writable handle of the object is resized too. The new handle is
+            // dirty so close always PUTs an (empty) object, as `>` requires.
+            if truncating
+                && let Err(e) = truncate_open_buffers(&mut guard, &bucket, &key, 0, Some(fh))
+            {
+                tracing::error!("open truncate {bucket}/{key}: {e}");
+                reply.error(Errno::EIO);
+                return;
+            }
+            guard.insert(
                 fh,
                 OpenFile {
                     bucket,
@@ -800,6 +968,15 @@ impl Filesystem for Y2qFuse {
                     flushed: false,
                 },
             );
+        }
+        if truncating {
+            // Size 0 is always a shrink: keep getattr()/read() from using
+            // the pre-truncate size.
+            self.inodes
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .set_size(ino, 0);
+        }
         reply.opened(FileHandle(fh), FopenFlags::empty());
     }
 
@@ -1006,7 +1183,7 @@ impl Filesystem for Y2qFuse {
     fn release(
         &self,
         _req: &Request,
-        _ino: INodeNo,
+        ino: INodeNo,
         fh: FileHandle,
         _flags: OpenFlags,
         _lock_owner: Option<LockOwner>,
@@ -1031,7 +1208,12 @@ impl Filesystem for Y2qFuse {
             && !of.flushed
             && let Some(t) = tmp.as_mut()
         {
-            self.put_write_buffer(&of.bucket, &of.key, t);
+            let put = self.put_write_buffer(&of.bucket, &of.key, t);
+            let mut inodes = self.inodes.lock().unwrap_or_else(|e| e.into_inner());
+            match put {
+                Some(size) => inodes.note_written(ino.0, size),
+                None => inodes.invalidate_meta(ino.0),
+            }
         }
         // Zero the write buffer's on-disk contents (it held the fully
         // decrypted object body) before it's unlinked, so the plaintext
@@ -1044,9 +1226,9 @@ impl Filesystem for Y2qFuse {
         &self,
         _req: &Request,
         ino: INodeNo,
-        _mode: Option<u32>,
-        _uid: Option<u32>,
-        _gid: Option<u32>,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
         size: Option<u64>,
         _atime: Option<fuser::TimeOrNow>,
         _mtime: Option<fuser::TimeOrNow>,
@@ -1059,50 +1241,55 @@ impl Filesystem for Y2qFuse {
         reply: ReplyAttr,
     ) {
         let ino = ino.0;
-        if let Some(0) = size {
-            // O_TRUNC: replace write buffer with a fresh empty file.
-            if let Some(fh) = fh {
-                let fh = fh.0;
-                let mut guard = self.open_files.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some(of) = guard.get_mut(&fh) {
-                    match new_write_tempfile(self.write_buf_dir.as_deref()) {
-                        Ok(fresh) => {
-                            // The old buffer may hold a decrypted read-modify-
-                            // write seed (open() without O_TRUNC); scrub it
-                            // before it's replaced and dropped.
-                            scrub_write_tempfile(of.write_buf.replace(fresh));
-                            of.dirty = true;
-                            of.flushed = false; // truncate after flush must re-PUT
-                        }
-                        Err(e) => {
-                            tracing::error!("tempfile truncate: {e}");
-                            reply.error(Errno::EIO);
-                            return;
-                        }
-                    }
-                }
-            }
-        }
-        // Return current attrs (synthetic).
-        let attr = {
+        let path = {
             let inodes = self.inodes.lock().unwrap_or_else(|e| e.into_inner());
             match inodes.get(ino) {
-                Some(e) => match &e.path {
-                    InodePath::Object { .. } => {
-                        if let Some(meta) = &e.cached_meta {
-                            self.file_attr(ino, meta.size, meta.created, meta.modified)
-                        } else {
-                            self.file_attr(ino, 0, 0, 0)
-                        }
-                    }
-                    _ => self.dir_attr(ino),
-                },
+                Some(e) => e.path.clone(),
                 None => {
                     reply.error(Errno::ENOENT);
                     return;
                 }
             }
         };
+        if (size.is_some() || mode.is_some() || uid.is_some() || gid.is_some()) && self.read_only {
+            reply.error(Errno::EROFS);
+            return;
+        }
+
+        if !matches!(path, InodePath::Object { .. }) {
+            // The VFS rejects truncate() on directories before FUSE sees it.
+            let attr = self.dir_attr(ino);
+            if let Err(e) = check_attr_change_supported(mode, uid, gid, &attr) {
+                reply.error(e);
+                return;
+            }
+            reply.attr(&ATTR_TTL, &attr);
+            return;
+        }
+
+        // A rejected request has no side effects. atime/mtime/ctime stay
+        // accepted-and-ignored so `touch` keeps succeeding.
+        if let Err(e) = check_attr_change_supported(mode, uid, gid, &self.file_attr(ino, 0, 0, 0)) {
+            reply.error(e);
+            return;
+        }
+        if let Some(new_len) = size
+            && let Err(e) = self.truncate_object(ino, &path, fh.map(|f| f.0), new_len)
+        {
+            reply.error(e);
+            return;
+        }
+
+        let (cached_size, created, modified) = {
+            let inodes = self.inodes.lock().unwrap_or_else(|e| e.into_inner());
+            let meta = inodes.get(ino).and_then(|e| e.cached_meta.as_ref());
+            (
+                meta.map(|m| m.size),
+                meta.map_or(0, |m| m.created),
+                meta.map_or(0, |m| m.modified),
+            )
+        };
+        let attr = self.file_attr(ino, size.or(cached_size).unwrap_or(0), created, modified);
         reply.attr(&ATTR_TTL, &attr);
     }
 
@@ -1391,7 +1578,7 @@ impl Filesystem for Y2qFuse {
     fn flush(
         &self,
         _req: &Request,
-        _ino: INodeNo,
+        ino: INodeNo,
         fh: FileHandle,
         _lock_owner: LockOwner,
         reply: ReplyEmpty,
@@ -1449,9 +1636,21 @@ impl Filesystem for Y2qFuse {
                 .await
         });
         match result {
-            Ok(_) => reply.ok(),
+            Ok(_) => {
+                self.inodes
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .note_written(ino.0, size);
+                reply.ok();
+            }
             Err(e) => {
                 tracing::error!("flush PUT {bucket}/{key}: {e}");
+                // The server object is unchanged; drop the cache's freshness
+                // so the next getattr() re-HEADs the true size.
+                self.inodes
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .invalidate_meta(ino.0);
                 reply.error(to_errno(&e));
             }
         }
@@ -2018,27 +2217,28 @@ impl Y2qFuse {
     }
 
     /// Best-effort PUT of a write-buffer tempfile that `flush()` didn't
-    /// already send (i.e. `dirty && !flushed`). Errors are logged only —
-    /// `release()` always replies `Ok` regardless, matching its existing
-    /// "best effort" contract (a FUSE `close()` can't observe `release`'s
-    /// result anyway).
-    fn put_write_buffer(&self, bucket: &str, key: &str, tmp: &mut NamedTempFile) {
+    /// already send (i.e. `dirty && !flushed`). Returns `Some(size)` of the
+    /// object PUT on success so `release()` can `note_written`, `None` on
+    /// failure (already logged). `release()` still always replies `Ok`,
+    /// matching its existing "best effort" contract (a FUSE `close()` can't
+    /// observe `release`'s result anyway).
+    fn put_write_buffer(&self, bucket: &str, key: &str, tmp: &mut NamedTempFile) -> Option<u64> {
         let size = match tmp.as_file().metadata() {
             Ok(m) => m.len(),
             Err(e) => {
                 tracing::error!("release stat: {e}");
-                return;
+                return None;
             }
         };
         if let Err(e) = tmp.seek(SeekFrom::Start(0)) {
             tracing::error!("release seek: {e}");
-            return;
+            return None;
         }
         let std_file = match tmp.reopen() {
             Ok(f) => f,
             Err(e) => {
                 tracing::error!("release reopen: {e}");
-                return;
+                return None;
             }
         };
         let client = self.client_clone();
@@ -2050,9 +2250,131 @@ impl Y2qFuse {
                 .put_from_reader(&b, &k, async_file, Some(size), &Default::default(), None)
                 .await
         });
-        if let Err(e) = result {
-            tracing::error!("release PUT {bucket}/{key}: {e}");
+        match result {
+            Ok(_) => Some(size),
+            Err(e) => {
+                tracing::error!("release PUT {bucket}/{key}: {e}");
+                None
+            }
         }
+    }
+
+    /// Set the cached size to `new_len` if that shrinks it. A grow leaves the
+    /// cache alone: read() would otherwise request a range past the smaller
+    /// server object.
+    fn shrink_cached_size(&self, ino: u64, new_len: u64) {
+        let mut inodes = self.inodes.lock().unwrap_or_else(|e| e.into_inner());
+        let cached = inodes
+            .get(ino)
+            .and_then(|e| e.cached_meta.as_ref())
+            .map(|m| m.size);
+        if cached.is_some_and(|c| new_len < c) {
+            inodes.set_size(ino, new_len);
+        }
+    }
+
+    /// Apply a size change to the object behind inode `ino`.
+    ///
+    /// A writable initiating handle is buffer-only: the truncate reaches the
+    /// server with that handle's flush/release. Otherwise (no handle, a
+    /// read-only handle, only clean handles) the server object is rewritten
+    /// NOW via [`Self::truncate_remote`], and only after that succeeds (or
+    /// the object is absent but a handle will still PUT) are the open
+    /// buffers resized, so a failed remote call leaves every buffer intact.
+    fn truncate_object(
+        &self,
+        ino: u64,
+        path: &InodePath,
+        fh: Option<u64>,
+        new_len: u64,
+    ) -> Result<(), Errno> {
+        let mut guard = self.open_files.lock().unwrap_or_else(|e| e.into_inner());
+        let Some((bucket, key)) = truncate_target(fh, &guard, path) else {
+            return Ok(());
+        };
+        let plan = truncate_plan(&guard, &bucket, &key, fh);
+        if plan.initiator_writable {
+            let r = truncate_open_buffers(&mut guard, &bucket, &key, new_len, fh);
+            drop(guard);
+            if let Err(e) = r {
+                tracing::error!("truncate {bucket}/{key}: {e}");
+                return Err(Errno::EIO);
+            }
+            self.shrink_cached_size(ino, new_len);
+            return Ok(());
+        }
+        drop(guard);
+
+        let remote = self.truncate_remote(&bucket, &key, new_len);
+        match &remote {
+            Ok(()) => {}
+            Err(ClientError::NotFound { .. }) if plan.put_pending => {}
+            Err(e) => return Err(to_errno(e)),
+        }
+        let r = {
+            let mut guard = self.open_files.lock().unwrap_or_else(|e| e.into_inner());
+            truncate_open_buffers(&mut guard, &bucket, &key, new_len, None)
+        };
+        if let Err(e) = r {
+            tracing::error!("truncate {bucket}/{key}: {e}");
+            return Err(Errno::EIO);
+        }
+        if remote.is_ok() {
+            self.inodes
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .note_written(ino, new_len);
+        } else {
+            self.shrink_cached_size(ino, new_len);
+        }
+        Ok(())
+    }
+
+    /// Rewrite the server object at `new_len` bytes (GET, resize, PUT), with
+    /// no lock held. Labels are preserved; the client exposes no
+    /// content-type, so none is carried. A no-op when the size already
+    /// matches. `NotFound` propagates.
+    fn truncate_remote(&self, bucket: &str, key: &str, new_len: u64) -> Result<(), ClientError> {
+        let client = self.client_clone();
+        let head = self.rt.block_on(client.head(bucket, key))?;
+        if head.size == new_len {
+            return Ok(());
+        }
+        let mut tmp = new_write_tempfile(self.write_buf_dir.as_deref())?;
+        let result =
+            self.truncate_remote_put(&client, bucket, key, new_len, &head.labels, &mut tmp);
+        // The buffer held decrypted plaintext: scrub on success and failure.
+        scrub_write_tempfile(Some(tmp));
+        result
+    }
+
+    fn truncate_remote_put(
+        &self,
+        client: &Y2qClient,
+        bucket: &str,
+        key: &str,
+        new_len: u64,
+        labels: &BTreeSet<(String, String)>,
+        tmp: &mut NamedTempFile,
+    ) -> Result<(), ClientError> {
+        if new_len > 0 {
+            let write_copy = tmp.reopen()?;
+            self.rt.block_on(async {
+                let mut writer = tokio::fs::File::from_std(write_copy);
+                client.get_to_writer(bucket, key, &mut writer).await
+            })?;
+            set_buffer_len(tmp, new_len)?;
+        }
+        let reader = tokio::fs::File::from_std(tmp.reopen()?);
+        self.rt.block_on(client.put_from_reader(
+            bucket,
+            key,
+            reader,
+            Some(new_len),
+            labels,
+            None,
+        ))?;
+        Ok(())
     }
 }
 
@@ -2213,6 +2535,7 @@ fn bucket_xattr_get(cfg: &BucketConfig, acl: &AclBody, name: &str) -> Option<Vec
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
     use y2q_client::{ClientConfig, Y2qClient};
 
     fn test_fs(allow_other_gid: Option<u32>) -> Y2qFuse {
@@ -2382,5 +2705,344 @@ mod tests {
         assert_eq!(compute_read_range(90, 100, Some(100)), Some((90, 99)));
         // No cached size: nothing to clamp against.
         assert_eq!(compute_read_range(5, 10, None), Some((5, 14)));
+    }
+
+    fn read_all(tmp: &NamedTempFile) -> Vec<u8> {
+        std::fs::read(tmp.path()).unwrap()
+    }
+
+    fn buf_with(dir: &Path, data: &[u8]) -> NamedTempFile {
+        let mut tmp = new_write_tempfile(Some(dir)).unwrap();
+        tmp.write_all(data).unwrap();
+        tmp
+    }
+
+    fn open_file(bucket: &str, key: &str, buf: Option<NamedTempFile>) -> OpenFile {
+        OpenFile {
+            bucket: bucket.to_owned(),
+            key: key.to_owned(),
+            write_buf: buf,
+            dirty: false,
+            flushed: false,
+        }
+    }
+
+    fn write_at_start(of: &mut OpenFile, data: &[u8]) {
+        let f = of.write_buf.as_mut().unwrap();
+        f.seek(SeekFrom::Start(0)).unwrap();
+        f.write_all(data).unwrap();
+    }
+
+    #[test]
+    fn truncate_open_buffers_shrinks_to_zero_then_write_yields_only_new_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut m = HashMap::new();
+        m.insert(
+            1,
+            open_file("b", "k", Some(buf_with(dir.path(), b"LONGLONGLONG"))),
+        );
+        assert_eq!(
+            truncate_plan(&m, "b", "k", Some(1)),
+            TruncatePlan {
+                initiator_writable: true,
+                put_pending: false
+            }
+        );
+        truncate_open_buffers(&mut m, "b", "k", 0, Some(1)).unwrap();
+        let x = m.get_mut(&1).unwrap();
+        write_at_start(x, b"xy");
+        assert_eq!(read_all(x.write_buf.as_ref().unwrap()), b"xy");
+        assert!(x.dirty);
+        assert!(!x.flushed);
+    }
+
+    #[test]
+    fn truncate_open_buffers_marks_only_initiator_and_resizes_all_writers() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = b"0123456789";
+        let mut m = HashMap::new();
+        let mut a = open_file("b", "k", Some(buf_with(dir.path(), data)));
+        a.flushed = true;
+        m.insert(1, a);
+        m.insert(2, open_file("b", "k", Some(buf_with(dir.path(), data))));
+        m.insert(3, open_file("b", "other", Some(buf_with(dir.path(), data))));
+        m.insert(4, open_file("b", "k", None));
+        assert_eq!(
+            truncate_plan(&m, "b", "k", Some(1)),
+            TruncatePlan {
+                initiator_writable: true,
+                put_pending: false
+            }
+        );
+        truncate_open_buffers(&mut m, "b", "k", 3, Some(1)).unwrap();
+        let (a, b, c, d) = (&m[&1], &m[&2], &m[&3], &m[&4]);
+        assert_eq!(read_all(a.write_buf.as_ref().unwrap()).len(), 3);
+        assert_eq!(read_all(b.write_buf.as_ref().unwrap()).len(), 3);
+        assert!(a.dirty);
+        assert!(!a.flushed);
+        assert!(!b.dirty);
+        assert!(!b.flushed);
+        assert_eq!(read_all(c.write_buf.as_ref().unwrap()), data);
+        assert!(!c.dirty);
+        assert!(d.write_buf.is_none());
+    }
+
+    #[test]
+    fn truncate_open_buffers_size_preserving_keeps_clean_initiator_clean() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = b"0123456789";
+        let mut m = HashMap::new();
+        m.insert(1, open_file("b", "k", Some(buf_with(dir.path(), data))));
+        assert_eq!(
+            truncate_plan(&m, "b", "k", Some(1)),
+            TruncatePlan {
+                initiator_writable: true,
+                put_pending: false
+            }
+        );
+        truncate_open_buffers(&mut m, "b", "k", 10, Some(1)).unwrap();
+        let x = &m[&1];
+        assert!(!x.dirty);
+        assert!(!x.flushed);
+        assert_eq!(read_all(x.write_buf.as_ref().unwrap()), data);
+
+        truncate_open_buffers(&mut m, "b", "k", 4, Some(1)).unwrap();
+        let x = &m[&1];
+        assert!(x.dirty);
+        assert!(!x.flushed);
+
+        let y = m.get_mut(&1).unwrap();
+        y.dirty = true;
+        y.flushed = true;
+        truncate_open_buffers(&mut m, "b", "k", 4, Some(1)).unwrap();
+        let x = &m[&1];
+        assert!(x.dirty);
+        assert!(!x.flushed);
+    }
+
+    #[test]
+    fn truncate_plan_without_initiator_never_flags_clean_handles() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = b"0123456789";
+        let mut m = HashMap::new();
+        m.insert(1, open_file("b", "k", Some(buf_with(dir.path(), data))));
+        m.insert(2, open_file("b", "k", Some(buf_with(dir.path(), data))));
+        m.insert(4, open_file("b", "k", None));
+        let none = TruncatePlan {
+            initiator_writable: false,
+            put_pending: false,
+        };
+        assert_eq!(truncate_plan(&m, "b", "k", None), none);
+        assert_eq!(truncate_plan(&m, "b", "k", Some(99)), none);
+        assert_eq!(truncate_plan(&m, "b", "k", Some(4)), none);
+        truncate_open_buffers(&mut m, "b", "k", 3, None).unwrap();
+        assert_eq!(read_all(m[&1].write_buf.as_ref().unwrap()).len(), 3);
+        assert_eq!(read_all(m[&2].write_buf.as_ref().unwrap()).len(), 3);
+        assert!(!m[&1].dirty);
+        assert!(!m[&2].dirty);
+    }
+
+    #[test]
+    fn truncate_plan_put_pending_reflects_dirty_unflushed_handles() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = b"0123456789";
+        let mut m = HashMap::new();
+        let mut e = open_file("b", "k", Some(buf_with(dir.path(), data)));
+        e.dirty = true;
+        m.insert(1, e);
+        m.insert(2, open_file("b", "k", Some(buf_with(dir.path(), data))));
+        assert_eq!(
+            truncate_plan(&m, "b", "k", None),
+            TruncatePlan {
+                initiator_writable: false,
+                put_pending: true
+            }
+        );
+        truncate_open_buffers(&mut m, "b", "k", 5, None).unwrap();
+        assert!(m[&1].dirty);
+        assert!(!m[&1].flushed);
+        assert!(!m[&2].dirty);
+
+        let mut f = HashMap::new();
+        let mut flushed = open_file("b", "k", Some(buf_with(dir.path(), data)));
+        flushed.dirty = true;
+        flushed.flushed = true;
+        f.insert(1, flushed);
+        let mut other = open_file("b", "other", Some(buf_with(dir.path(), data)));
+        other.dirty = true;
+        f.insert(2, other);
+        assert_eq!(
+            truncate_plan(&f, "b", "k", None),
+            TruncatePlan {
+                initiator_writable: false,
+                put_pending: false
+            }
+        );
+        truncate_open_buffers(&mut f, "b", "k", 5, None).unwrap();
+        assert!(f[&1].flushed);
+    }
+
+    #[test]
+    fn truncate_open_buffers_nonzero_shrink_and_grow() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut m = HashMap::new();
+        m.insert(
+            1,
+            open_file("b", "k", Some(buf_with(dir.path(), b"0123456789"))),
+        );
+        truncate_open_buffers(&mut m, "b", "k", 4, Some(1)).unwrap();
+        assert_eq!(read_all(m[&1].write_buf.as_ref().unwrap()), b"0123");
+        truncate_open_buffers(&mut m, "b", "k", 8, Some(1)).unwrap();
+        assert_eq!(read_all(m[&1].write_buf.as_ref().unwrap()), b"0123\0\0\0\0");
+    }
+
+    #[test]
+    fn set_buffer_len_shrink_then_regrow_keeps_prefix_and_zero_extends() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut tmp = buf_with(dir.path(), &[0xAB; 4096]);
+        set_buffer_len(&mut tmp, 10).unwrap();
+        assert_eq!(read_all(&tmp).len(), 10);
+        set_buffer_len(&mut tmp, 4096).unwrap();
+        let all = read_all(&tmp);
+        assert!(all[..10].iter().all(|&b| b == 0xAB));
+        assert!(all[10..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn scrub_cut_tail_zeroes_exactly_cut_range() {
+        let mut c = Cursor::new(vec![0xAB; 100]);
+        scrub_cut_tail(&mut c, 100, 30).unwrap();
+        let v = c.into_inner();
+        assert_eq!(v.len(), 100);
+        assert!(v[..30].iter().all(|&b| b == 0xAB));
+        assert!(v[30..].iter().all(|&b| b == 0));
+
+        let mut c = Cursor::new(vec![0xAB; 100]);
+        scrub_cut_tail(&mut c, 100, 100).unwrap();
+        scrub_cut_tail(&mut c, 100, 200).unwrap();
+        assert_eq!(c.into_inner(), vec![0xAB; 100]);
+    }
+
+    #[test]
+    fn zero_range_zeroes_only_requested_span() {
+        let mut c = Cursor::new(vec![0xAB; 10]);
+        zero_range(&mut c, 3, 4).unwrap();
+        assert_eq!(
+            c.into_inner(),
+            [0xAB, 0xAB, 0xAB, 0, 0, 0, 0, 0xAB, 0xAB, 0xAB]
+        );
+
+        let mut c = Cursor::new(vec![0x5A; 70_000]);
+        zero_range(&mut c, 100, 69_800).unwrap();
+        let v = c.into_inner();
+        assert!(v[..100].iter().all(|&b| b == 0x5A));
+        assert!(v[100..69_900].iter().all(|&b| b == 0));
+        assert!(v[69_900..].iter().all(|&b| b == 0x5A));
+    }
+
+    #[test]
+    fn truncate_target_resolves_handle_then_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut m = HashMap::new();
+        m.insert(7, open_file("b", "k1", Some(buf_with(dir.path(), b"x"))));
+        let obj = InodePath::Object {
+            bucket: "b".into(),
+            key: "k2".into(),
+        };
+        let k1 = Some(("b".to_owned(), "k1".to_owned()));
+        let k2 = Some(("b".to_owned(), "k2".to_owned()));
+        assert_eq!(truncate_target(Some(7), &m, &obj), k1);
+        assert_eq!(truncate_target(None, &m, &obj), k2);
+        assert_eq!(truncate_target(Some(99), &m, &obj), k2);
+        assert_eq!(
+            truncate_target(None, &m, &InodePath::Bucket("b".into())),
+            None
+        );
+        assert_eq!(truncate_target(None, &m, &InodePath::Root), None);
+    }
+
+    #[test]
+    fn open_flags_plan_table() {
+        // `O_LARGEFILE` as the Linux kernel delivers it on x86_64 (the issue's
+        // open log shows flags=0x8001 = O_WRONLY|0x8000). libc::O_LARGEFILE is
+        // 0 on gnu x86_64, so the literal is needed to reproduce the real flags.
+        const O_LARGEFILE_X86_64: i32 = 0o100000;
+        let read = OpenPlan {
+            write_buf: false,
+            seed_from_remote: false,
+        };
+        let seeded = OpenPlan {
+            write_buf: true,
+            seed_from_remote: true,
+        };
+        let truncated = OpenPlan {
+            write_buf: true,
+            seed_from_remote: false,
+        };
+        for extra in [0, libc::O_APPEND, O_LARGEFILE_X86_64] {
+            assert_eq!(open_flags_plan(libc::O_RDONLY | extra), read);
+            assert_eq!(open_flags_plan(libc::O_WRONLY | extra), seeded);
+            assert_eq!(open_flags_plan(libc::O_RDWR | extra), seeded);
+            assert_eq!(
+                open_flags_plan(libc::O_WRONLY | libc::O_TRUNC | extra),
+                truncated
+            );
+            assert_eq!(
+                open_flags_plan(libc::O_RDWR | libc::O_TRUNC | extra),
+                truncated
+            );
+            assert_eq!(
+                open_flags_plan(libc::O_RDONLY | libc::O_TRUNC | extra),
+                truncated
+            );
+        }
+    }
+
+    #[test]
+    fn check_attr_change_supported_accepts_only_synthetic_values() {
+        let cur = test_fs(None).file_attr(1, 0, 0, 0);
+        assert_eq!(check_attr_change_supported(None, None, None, &cur), Ok(()));
+        assert_eq!(
+            check_attr_change_supported(Some(0o100644), None, None, &cur),
+            Ok(())
+        );
+        assert_eq!(
+            check_attr_change_supported(Some(0o644), None, None, &cur),
+            Ok(())
+        );
+        assert_eq!(
+            check_attr_change_supported(Some(0o100600), None, None, &cur),
+            Err(Errno::EPERM)
+        );
+        assert_eq!(
+            check_attr_change_supported(None, Some(1000), None, &cur),
+            Ok(())
+        );
+        assert_eq!(
+            check_attr_change_supported(None, Some(0), None, &cur),
+            Err(Errno::EPERM)
+        );
+        assert_eq!(
+            check_attr_change_supported(None, None, Some(1000), &cur),
+            Ok(())
+        );
+        assert_eq!(
+            check_attr_change_supported(None, None, Some(0), &cur),
+            Err(Errno::EPERM)
+        );
+
+        let cur = test_fs(Some(4242)).file_attr(1, 0, 0, 0);
+        assert_eq!(
+            check_attr_change_supported(Some(0o640), None, None, &cur),
+            Ok(())
+        );
+        assert_eq!(
+            check_attr_change_supported(Some(0o644), None, None, &cur),
+            Err(Errno::EPERM)
+        );
+        assert_eq!(
+            check_attr_change_supported(None, None, Some(4242), &cur),
+            Ok(())
+        );
     }
 }
