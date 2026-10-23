@@ -681,12 +681,6 @@ mod tests {
     use super::*;
     use zeroize::Zeroizing;
 
-    // Mutation check: with `expect_trailer: true` hardcoded in
-    // `decode_aws_chunked`, three tests fail:
-    // `plain_signed_streaming_accepts_aws_vector`,
-    // `plain_signed_streaming_one_chunk_final_crlf_arrives_alone` and
-    // `plain_signed_streaming_rejects_a_trailer_block`.
-
     const AWS_SECRET: &str = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
     const AWS_DATE: &str = "20130524T000000Z";
     const AWS_SCOPE: &str = "20130524/us-east-1/s3/aws4_request";
