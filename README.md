@@ -194,6 +194,8 @@ y2q tree prod/media/ --depth 3     # directory tree
 y2q find prod/logs/ --name '*.log' --size +10Mi --older-than 7d
 ```
 
+`y2q get` (and `cp`/`mv` from a remote path to a local one) downloads into a hidden `.y2q-part-*` file next to the destination (or in the system temp dir if the destination's directory isn't writable) and moves it into place only after the whole transfer succeeds, so a failed download (missing key, bad range, network error) never touches an existing local file. The replacement keeps the file's permission bits but not its owner/group, hard links or extended attributes, and needs room for the old and new copies at once. Output to `/dev/stdout` and other special files is written directly. If `y2q` is killed or interrupted (including Ctrl+C), the leftover `.y2q-part-*` file is not cleaned up; delete it.
+
 ### Searching by label
 
 Boolean query over labels. Operators: `==` `!=` `=~` (regex) `^=` (prefix) `$=` (suffix); combine with `and`/`or`/`not` and parentheses.

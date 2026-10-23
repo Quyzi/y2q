@@ -954,6 +954,80 @@ fn e2e_full_cli_flow() {
     server.ok(&["logout", "test"]);
 }
 
+/// Regression for #135: a failed `get` must not touch an existing local file
+/// (the destination used to be truncated before the remote GET was attempted).
+#[test]
+fn e2e_get_failure_preserves_destination() {
+    let Some(server) = start_server() else {
+        return;
+    };
+
+    let url = server.url();
+    server.ok(&["alias", "set", "test", &url, "--user", "root"]);
+    let pw = server.password.clone();
+    server.ok(&["login", "test", "--password", &pw]);
+    server.ok(&["mb", "test/bucket"]);
+
+    let src = server.base.join("src.txt");
+    std::fs::write(&src, b"short").unwrap();
+    server.ok(&["cp", src.to_str().unwrap(), "test/bucket/small.txt"]);
+
+    // Dedicated directory so "no stage leftovers" is a clean assertion.
+    let dir = server.base.join("get-dest");
+    std::fs::create_dir(&dir).unwrap();
+    let dest = dir.join("precious.txt");
+    let dest_s = dest.to_str().unwrap();
+    let leftovers = || {
+        std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n != "precious.txt")
+            .collect::<Vec<_>>()
+    };
+
+    // Missing key (404).
+    std::fs::write(&dest, b"PRECIOUS DATA").unwrap();
+    let out = server.y2q(&["get", "test/bucket/nope", dest_s]);
+    assert_eq!(out.status.code(), Some(3), "404 must still exit 3");
+    assert_eq!(std::fs::read(&dest).unwrap(), b"PRECIOUS DATA");
+    assert!(
+        leftovers().is_empty(),
+        "stage left behind: {:?}",
+        leftovers()
+    );
+
+    // Unsatisfiable range (416).
+    let out = server.y2q(&[
+        "get",
+        "test/bucket/small.txt",
+        dest_s,
+        "--range",
+        "9999-10000",
+    ]);
+    assert!(!out.status.success(), "out-of-bounds range must fail");
+    assert_eq!(std::fs::read(&dest).unwrap(), b"PRECIOUS DATA");
+    assert!(
+        leftovers().is_empty(),
+        "stage left behind: {:?}",
+        leftovers()
+    );
+
+    // Success over a longer existing file: exactly the new bytes, no stale tail.
+    server.ok(&["get", "test/bucket/small.txt", dest_s]);
+    assert_eq!(std::fs::read(&dest).unwrap(), b"short");
+    assert!(
+        leftovers().is_empty(),
+        "stage left behind: {:?}",
+        leftovers()
+    );
+
+    // Failed get to a path that does not exist yet must not create it.
+    let fresh = dir.join("fresh.txt");
+    let out = server.y2q(&["get", "test/bucket/nope", fresh.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(3));
+    assert!(!fresh.exists(), "failed get created the destination");
+}
+
 /// Run `y2q` against an isolated config home (no daemon needed); stdin is
 /// `input`.
 fn y2q_isolated(home: &std::path::Path, args: &[&str], input: &[u8]) -> std::process::Output {

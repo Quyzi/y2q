@@ -26,7 +26,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: install system dependencies
-        run: sudo apt-get install -y libfuse3-dev libtss2-dev libudev-dev pkg-config
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libfuse3-dev libtss2-dev libudev-dev pkg-config
 
       - name: cargo fmt --check
         run: cargo fmt --all -- --check

@@ -9,6 +9,7 @@ use crate::error::CliError;
 use crate::output::{OutputMode, fmt_bytes, print_json};
 use crate::path::{CpEndpoint, RemotePath};
 use crate::progress::{CountingReader, make_reporter};
+use crate::staged_file::StagedFile;
 use crate::token::TokenStore;
 
 fn has_glob(s: &str) -> bool {
@@ -345,15 +346,18 @@ async fn download(
             None => client.get_to_writer(bucket, key, &mut stdout).await?,
         }
     } else {
-        let mut file = tokio::fs::File::create(local_path).await?;
+        let mut out = StagedFile::create(Path::new(local_path)).await?;
+        // Fetch into the stage; `?` drops it, so a failed GET (404, 416, 5xx,
+        // dropped connection) leaves an existing destination untouched.
         let n = match range {
             Some((start, end)) => {
                 client
-                    .get_range_to_writer(bucket, key, start, end, &mut file)
+                    .get_range_to_writer(bucket, key, start, end, out.file_mut())
                     .await?
             }
-            None => client.get_to_writer(bucket, key, &mut file).await?,
+            None => client.get_to_writer(bucket, key, out.file_mut()).await?,
         };
+        out.commit().await?;
         eprintln!(
             "Downloaded {} ← {}/{bucket}/{key}",
             fmt_bytes(n),
