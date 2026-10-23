@@ -230,86 +230,10 @@ pub async fn login(
 
     match result {
         Ok((rec, slot_idx, payload)) => {
-            // A disabled persona authenticates but may not obtain a session.
-            // The account's cleartext role (`rec.role`) is the authoritative
-            // ceiling and can be lowered at any time via `PUT
-            // /users/{user}/role` — but the server cannot rewrite a
-            // password-wrapped slot's baked-in `payload.role` (it doesn't
-            // hold the password). Enforce the ceiling here too: a persona
-            // whose role no longer fits under the current account ceiling
-            // (including the account being fully disabled) is refused
-            // login, identically to an explicitly disabled slot, until the
-            // slot is recreated or the ceiling is raised again — otherwise
-            // a demotion or disable is undone by the persona's next login.
-            if payload.role == Role::Disabled
-                || rec.role == Role::Disabled
-                || !crate::authz::role_permits(payload.role, rec.role)
-            {
-                record_login("disabled", None);
-                apply_floor(state.config.min_login_response_ms, started).await;
-                return Err(AuthError::AccountDisabled);
-            }
-            let identity_sk = payload.identity_sk;
-            // Only needed transiently below if this is a duress login — a
-            // second guarded copy, since `NewSession` takes ownership of
-            // the first.
-            let duress_sk = payload
-                .revoke_other_sessions
-                .then(|| SecretVec::from_slice(&identity_sk))
-                .transpose()
-                .map_err(|e| AuthError::Backend(e.to_string()))?;
-
-            let token = state.sessions.insert(NewSession {
-                username: rec.username.clone(),
-                role: payload.role,
-                created_at: SystemTime::now(),
-                expires_at,
-                persona: slot_idx as u8,
-                revoke_other_sessions: payload.revoke_other_sessions,
-                identity_sk,
-            })?;
-            record_login("success", Some(state.sessions.len()));
-
-            // A duress-flagged persona silently takes over every other live
-            // session on this account, in place — no revocation, no alert,
-            // no log line distinguishing it from an ordinary login. Whoever
-            // holds one of those tokens keeps working exactly as before,
-            // just now scoped to the duress persona's own access, rather
-            // than visibly losing their session (a dead session is itself
-            // a tell that something happened).
-            if let Some(duress_sk) = &duress_sk {
-                state.sessions.switch_user_to_persona(
-                    &rec.username,
-                    slot_idx as u8,
-                    payload.role,
-                    payload.revoke_other_sessions,
-                    duress_sk,
-                );
-            }
-
-            // Update last_login + reset failure counter.
-            let mut updated = rec.clone();
-            updated.last_login = Some(now_ns());
-            if let Err(e) = state.user_store.upsert(&updated) {
-                tracing::warn!(error = %e, "failed to persist last_login update");
-            }
-            state
-                .login_attempts
-                .lock()
-                .unwrap()
-                .record_success(&username);
-
-            // Enforce min response time floor.
-            apply_floor(state.config.min_login_response_ms, started).await;
-
-            token_response(TokenResponse {
-                token: token.0,
-                expires_at: expires_at
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs(),
-                username: rec.username,
-            })
+            finalize_login_after_unwrap(
+                &state, &username, &rec, slot_idx, payload, expires_at, started,
+            )
+            .await
         }
         Err(e) => {
             // Unknown usernames and bad passwords share one label so a
@@ -928,6 +852,138 @@ async fn scrub_deleted_user_acl_entries(
     Ok(())
 }
 
+/// Post-Argon2 login completion: re-validate against a fresh store row,
+/// touch `last_login` without rewriting slots/role/kdf, then mint the
+/// session. `snapshot` is the pre-KDF record that successfully unwrapped;
+/// it must not be written back.
+async fn finalize_login_after_unwrap(
+    state: &AuthState,
+    username: &str,
+    snapshot: &UserRecord,
+    slot_idx: usize,
+    payload: SlotPayload,
+    expires_at: SystemTime,
+    started: std::time::Instant,
+) -> Result<HttpResponse, AuthError> {
+    let fresh = state
+        .user_store
+        .get(username)
+        .map_err(|e| AuthError::Backend(e.to_string()))?;
+    let Some(fresh) = fresh else {
+        record_login("wrong_password", None);
+        apply_floor(state.config.min_login_response_ms, started).await;
+        return Err(AuthError::InvalidCredentials);
+    };
+
+    // Password / identity rotation won the race: the KDF we just paid for
+    // no longer matches the live row. Fail closed; do not persist.
+    if fresh.kdf != snapshot.kdf || fresh.slots != snapshot.slots {
+        record_login("wrong_password", None);
+        apply_floor(state.config.min_login_response_ms, started).await;
+        return Err(AuthError::InvalidCredentials);
+    }
+
+    // A disabled persona authenticates but may not obtain a session.
+    // The account's cleartext role (`fresh.role`) is the authoritative
+    // ceiling and can be lowered at any time via `PUT
+    // /users/{user}/role` — but the server cannot rewrite a
+    // password-wrapped slot's baked-in `payload.role` (it doesn't
+    // hold the password). Enforce the ceiling here too: a persona
+    // whose role no longer fits under the current account ceiling
+    // (including the account being fully disabled) is refused
+    // login, identically to an explicitly disabled slot, until the
+    // slot is recreated or the ceiling is raised again — otherwise
+    // a demotion or disable is undone by the persona's next login.
+    if payload.role == Role::Disabled
+        || fresh.role == Role::Disabled
+        || !crate::authz::role_permits(payload.role, fresh.role)
+    {
+        record_login("disabled", None);
+        apply_floor(state.config.min_login_response_ms, started).await;
+        return Err(AuthError::AccountDisabled);
+    }
+
+    let touched = state
+        .user_store
+        .update_last_login(username, now_ns())
+        .map_err(|e| AuthError::Backend(e.to_string()))?;
+    if touched.is_none() {
+        record_login("wrong_password", None);
+        apply_floor(state.config.min_login_response_ms, started).await;
+        return Err(AuthError::InvalidCredentials);
+    }
+
+    let identity_sk = payload.identity_sk;
+    // Only needed transiently below if this is a duress login — a
+    // second guarded copy, since `NewSession` takes ownership of
+    // the first.
+    let duress_sk = payload
+        .revoke_other_sessions
+        .then(|| SecretVec::from_slice(&identity_sk))
+        .transpose()
+        .map_err(|e| AuthError::Backend(e.to_string()))?;
+
+    let token = state.sessions.insert(NewSession {
+        username: username.to_owned(),
+        role: payload.role,
+        created_at: SystemTime::now(),
+        expires_at,
+        persona: slot_idx as u8,
+        revoke_other_sessions: payload.revoke_other_sessions,
+        identity_sk,
+    })?;
+
+    // Narrow race: delete landing between touch and insert must not leave
+    // a live token for a gone account.
+    if state
+        .user_store
+        .get(username)
+        .map_err(|e| AuthError::Backend(e.to_string()))?
+        .is_none()
+    {
+        state.sessions.revoke_user(username);
+        record_login("wrong_password", None);
+        apply_floor(state.config.min_login_response_ms, started).await;
+        return Err(AuthError::InvalidCredentials);
+    }
+
+    record_login("success", Some(state.sessions.len()));
+
+    // A duress-flagged persona silently takes over every other live
+    // session on this account, in place — no revocation, no alert,
+    // no log line distinguishing it from an ordinary login. Whoever
+    // holds one of those tokens keeps working exactly as before,
+    // just now scoped to the duress persona's own access, rather
+    // than visibly losing their session (a dead session is itself
+    // a tell that something happened).
+    if let Some(duress_sk) = &duress_sk {
+        state.sessions.switch_user_to_persona(
+            username,
+            slot_idx as u8,
+            payload.role,
+            payload.revoke_other_sessions,
+            duress_sk,
+        );
+    }
+
+    state
+        .login_attempts
+        .lock()
+        .unwrap()
+        .record_success(username);
+
+    apply_floor(state.config.min_login_response_ms, started).await;
+
+    token_response(TokenResponse {
+        token: token.0,
+        expires_at: expires_at
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+        username: username.to_owned(),
+    })
+}
+
 /// Run Argon2id-derivation + all-four-slot-unwrap on a worker thread
 /// (CPU-bound). Tries every slot's AEAD open regardless of whether an
 /// earlier one already matched — timing must not reveal which slot opened
@@ -1242,4 +1298,177 @@ pub async fn whoami_persona(auth: Authenticated) -> Result<HttpResponse, AuthErr
         slot: auth.session.persona,
         role: auth.session.role,
     }))
+}
+
+#[cfg(test)]
+mod login_stale_record_tests {
+    use super::*;
+    use crate::config::{Argon2Config, AuthConfig};
+    use std::time::Duration;
+    use tempfile::tempdir;
+    use y2q_core::crypto::{Argon2Params, UserStore};
+
+    const PASSWORD: &[u8] = b"login-race-password";
+
+    fn cheap_argon2() -> Argon2Config {
+        Argon2Config {
+            m_cost_kib: 8,
+            t_cost: 1,
+            p_cost: 1,
+        }
+    }
+
+    fn auth_config() -> AuthConfig {
+        AuthConfig {
+            default_ttl_seconds: 3600,
+            max_ttl_seconds: 86_400,
+            session_sweep_interval_seconds: 300,
+            min_login_response_ms: 0,
+            max_failed_logins: 10,
+            lockout_seconds: 900,
+            enforce_authorization: true,
+            max_refreshes: 0,
+        }
+    }
+
+    fn make_record(username: &str, role: Role) -> UserRecord {
+        let params = Argon2Params::with_random_salt(8, 1, 1);
+        let (slots, primary) =
+            kdf::new_slots_random(username, PASSWORD, &params, role, false).unwrap();
+        UserRecord {
+            username: username.to_owned(),
+            created_at: 1,
+            last_login: None,
+            kdf: params,
+            slots,
+            primary_slot: u8::try_from(primary).unwrap(),
+            role,
+        }
+    }
+
+    fn harness(record: &UserRecord) -> (tempfile::TempDir, AuthState) {
+        let dir = tempdir().unwrap();
+        let store = UserStore::open(&dir.path().join("users.redb"), &[9u8; 32]).unwrap();
+        store.upsert(record).unwrap();
+        let state = AuthState::new(store, auth_config(), cheap_argon2()).unwrap();
+        (dir, state)
+    }
+
+    async fn unwrap_snapshot(snapshot: UserRecord) -> (UserRecord, usize, SlotPayload) {
+        let password = SecretString::from_str(std::str::from_utf8(PASSWORD).unwrap()).unwrap();
+        attempt_unwrap(snapshot, password).await.unwrap()
+    }
+
+    fn expires_soon() -> SystemTime {
+        SystemTime::now() + Duration::from_secs(3600)
+    }
+
+    #[tokio::test]
+    async fn happy_path_updates_last_login_and_mints_session() {
+        let snapshot = make_record("alice", Role::User);
+        let (_dir, state) = harness(&snapshot);
+        let (rec, slot_idx, payload) = unwrap_snapshot(snapshot.clone()).await;
+
+        let resp = finalize_login_after_unwrap(
+            &state,
+            "alice",
+            &rec,
+            slot_idx,
+            payload,
+            expires_soon(),
+            std::time::Instant::now(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), actix_web::http::StatusCode::OK);
+        assert_eq!(state.sessions.len(), 1);
+
+        let stored = state.user_store.get("alice").unwrap().unwrap();
+        assert!(stored.last_login.is_some());
+        assert_eq!(stored.role, Role::User);
+        assert_eq!(stored.slots, snapshot.slots);
+        assert_eq!(stored.kdf, snapshot.kdf);
+    }
+
+    #[tokio::test]
+    async fn deleted_during_kdf_window_fails_and_stays_deleted() {
+        let snapshot = make_record("alice", Role::User);
+        let (_dir, state) = harness(&snapshot);
+        let (rec, slot_idx, payload) = unwrap_snapshot(snapshot).await;
+
+        assert!(state.user_store.delete("alice").unwrap());
+
+        let err = finalize_login_after_unwrap(
+            &state,
+            "alice",
+            &rec,
+            slot_idx,
+            payload,
+            expires_soon(),
+            std::time::Instant::now(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, AuthError::InvalidCredentials));
+        assert!(state.user_store.get("alice").unwrap().is_none());
+        assert_eq!(state.sessions.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn disabled_during_kdf_window_fails_without_restoring_role() {
+        let snapshot = make_record("alice", Role::User);
+        let (_dir, state) = harness(&snapshot);
+        let (rec, slot_idx, payload) = unwrap_snapshot(snapshot.clone()).await;
+
+        let mut disabled = state.user_store.get("alice").unwrap().unwrap();
+        disabled.role = Role::Disabled;
+        state.user_store.upsert(&disabled).unwrap();
+
+        let err = finalize_login_after_unwrap(
+            &state,
+            "alice",
+            &rec,
+            slot_idx,
+            payload,
+            expires_soon(),
+            std::time::Instant::now(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, AuthError::AccountDisabled));
+
+        let stored = state.user_store.get("alice").unwrap().unwrap();
+        assert_eq!(stored.role, Role::Disabled);
+        assert_eq!(stored.slots, snapshot.slots);
+        assert_eq!(state.sessions.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn slot_rotation_during_kdf_window_fails_without_restoring_slots() {
+        let snapshot = make_record("alice", Role::User);
+        let (_dir, state) = harness(&snapshot);
+        let (rec, slot_idx, payload) = unwrap_snapshot(snapshot.clone()).await;
+
+        let rotated = make_record("alice", Role::User);
+        state.user_store.upsert(&rotated).unwrap();
+
+        let err = finalize_login_after_unwrap(
+            &state,
+            "alice",
+            &rec,
+            slot_idx,
+            payload,
+            expires_soon(),
+            std::time::Instant::now(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, AuthError::InvalidCredentials));
+
+        let stored = state.user_store.get("alice").unwrap().unwrap();
+        assert_eq!(stored.slots, rotated.slots);
+        assert_eq!(stored.kdf, rotated.kdf);
+        assert_ne!(stored.slots, snapshot.slots);
+        assert_eq!(state.sessions.len(), 0);
+    }
 }

@@ -304,6 +304,50 @@ impl UserStore {
         Ok(())
     }
 
+    /// Set `last_login` on an existing row inside one write transaction.
+    ///
+    /// Returns `Ok(None)` when `username` is absent — never inserts. Unlike
+    /// [`Self::upsert`], this cannot resurrect a deleted account or clobber
+    /// a concurrent role / slots / kdf change with a stale snapshot.
+    pub fn update_last_login(
+        &self,
+        username: &str,
+        ts: u64,
+    ) -> Result<Option<UserRecord>, CryptoError> {
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| CryptoError::UserStore(format!("begin_write: {e}")))?;
+        let updated = {
+            let mut t = txn
+                .open_table(USERS)
+                .map_err(|e| CryptoError::UserStore(format!("open table: {e}")))?;
+            let existing = t
+                .get(username)
+                .map_err(|e| CryptoError::UserStore(format!("get: {e}")))?
+                .map(|guard| {
+                    let record: UserRecord = serde_json::from_slice(guard.value())
+                        .map_err(|e| CryptoError::UserStore(format!("deserialize record: {e}")))?;
+                    Ok::<UserRecord, CryptoError>(record)
+                })
+                .transpose()?;
+            match existing {
+                None => None,
+                Some(mut record) => {
+                    record.last_login = Some(ts);
+                    let payload = serde_json::to_vec(&record)
+                        .map_err(|e| CryptoError::UserStore(format!("serialize record: {e}")))?;
+                    t.insert(username, payload.as_slice())
+                        .map_err(|e| CryptoError::UserStore(format!("insert: {e}")))?;
+                    Some(record)
+                }
+            }
+        };
+        txn.commit()
+            .map_err(|e| CryptoError::UserStore(format!("commit: {e}")))?;
+        Ok(updated)
+    }
+
     /// Look up a user record by username. Returns `Ok(None)` if absent.
     pub fn get(&self, username: &str) -> Result<Option<UserRecord>, CryptoError> {
         let txn = self
@@ -658,6 +702,74 @@ mod tests {
         assert!(s.delete("alice").unwrap());
         assert!(!s.delete("alice").unwrap());
         assert_eq!(s.count().unwrap(), 1);
+    }
+
+    #[test]
+    fn update_last_login_preserves_identity_fields() {
+        let dir = tempdir().unwrap();
+        let s = UserStore::open(&dir.path().join("u.redb"), &[7u8; 32]).unwrap();
+        let mut original = rec("alice");
+        original.role = Role::Admin;
+        original.primary_slot = 2;
+        original.created_at = 42;
+        original.last_login = None;
+        s.upsert(&original).unwrap();
+
+        let updated = s.update_last_login("alice", 99).unwrap().unwrap();
+        assert_eq!(updated.last_login, Some(99));
+        assert_eq!(updated.role, original.role);
+        assert_eq!(updated.slots, original.slots);
+        assert_eq!(updated.kdf, original.kdf);
+        assert_eq!(updated.primary_slot, original.primary_slot);
+        assert_eq!(updated.created_at, original.created_at);
+
+        let got = s.get("alice").unwrap().unwrap();
+        assert_eq!(got, updated);
+    }
+
+    #[test]
+    fn update_last_login_after_delete_returns_none() {
+        let dir = tempdir().unwrap();
+        let s = UserStore::open(&dir.path().join("u.redb"), &[7u8; 32]).unwrap();
+        s.upsert(&rec("alice")).unwrap();
+        assert!(s.delete("alice").unwrap());
+
+        assert!(s.update_last_login("alice", 1).unwrap().is_none());
+        assert!(s.get("alice").unwrap().is_none());
+        assert_eq!(s.count().unwrap(), 0);
+    }
+
+    #[test]
+    fn update_last_login_does_not_clobber_concurrent_role_or_slots() {
+        let dir = tempdir().unwrap();
+        let s = UserStore::open(&dir.path().join("u.redb"), &[7u8; 32]).unwrap();
+        let snapshot = rec("alice");
+        s.upsert(&snapshot).unwrap();
+
+        // Concurrent admin/password path wins: new role + new slots land
+        // while a login still holds the pre-KDF snapshot.
+        let mut concurrent = rec("alice");
+        concurrent.role = Role::Disabled;
+        concurrent.created_at = snapshot.created_at;
+        concurrent.last_login = Some(7);
+        s.upsert(&concurrent).unwrap();
+
+        // Stale whole-record upsert (the old login bug) would restore the
+        // snapshot role/slots. update_last_login must leave them alone.
+        let mut stale = snapshot.clone();
+        stale.last_login = Some(100);
+        s.upsert(&stale).unwrap();
+        let after_stale = s.get("alice").unwrap().unwrap();
+        assert_eq!(after_stale.role, Role::User);
+        assert_eq!(after_stale.slots, snapshot.slots);
+
+        // Reset to the concurrent write, then touch via update_last_login.
+        s.upsert(&concurrent).unwrap();
+        let touched = s.update_last_login("alice", 200).unwrap().unwrap();
+        assert_eq!(touched.last_login, Some(200));
+        assert_eq!(touched.role, Role::Disabled);
+        assert_eq!(touched.slots, concurrent.slots);
+        assert_eq!(touched.kdf, concurrent.kdf);
     }
 
     #[test]
