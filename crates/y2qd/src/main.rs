@@ -28,6 +28,8 @@
 //! The daemon refuses to start without a node key. In operator mode it is
 //! supplied by the operator (`Y2QD_NODE_KEY` env var or `[crypto]
 //! node_key_file`) and is never auto-generated; when set it takes precedence.
+//! A key file must be private to its owner (no group/other permission bits,
+//! e.g. `0400`) or the daemon refuses to start.
 //! In device mode (`<keystore_dir>/devices.json`, created by `y2q admin device
 //! init`) it is recovered from a registered TPM, FIDO2 authenticator or
 //! emergency code — see [`node_unlock`]. Given a valid node key and no

@@ -1,7 +1,10 @@
+use std::path::Path;
+
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use futures_util::StreamExt;
 use y2q_client::Y2qClient;
+use zeroize::Zeroizing;
 
 use crate::cli::{LocksCmd, RebuildCmd, RekeyCmd};
 use crate::client_builder::{client_from_alias, resolve_config_path};
@@ -105,7 +108,6 @@ pub async fn reset_identity(
     password: Option<String>,
     mode: OutputMode,
 ) -> Result<(), CliError> {
-    use zeroize::Zeroizing;
     let pw = if let Some(p) = password {
         crate::cmd::auth::warn_password_on_cli_flag();
         Zeroizing::new(p)
@@ -131,16 +133,67 @@ pub async fn reset_identity(
     Ok(())
 }
 
-/// Generate a random 32-byte node key and print it to stdout as standard
-/// base64, with no trailing prose — so `y2q admin gen-node-key >
-/// /run/secrets/y2q-node-key` works. Pure local generator: no alias, no HTTP
-/// call.
-pub fn gen_node_key() -> Result<(), CliError> {
+/// Generate a random 32-byte node key (standard base64 plus a newline).
+///
+/// Without `output` the key goes to stdout with no other prose. With
+/// `output` it is written to a new file created exclusively with mode 0400;
+/// nothing goes to stdout. Pure local generator: no alias, no HTTP call.
+pub fn gen_node_key(output: Option<&Path>) -> Result<(), CliError> {
     use rand::Rng;
-    let mut key = [0u8; 32];
-    rand::rng().fill_bytes(&mut key);
-    println!("{}", STANDARD.encode(key));
+    let mut key = Zeroizing::new([0u8; 32]);
+    rand::rng().fill_bytes(&mut *key);
+    let mut text = Zeroizing::new(STANDARD.encode(key.as_slice()));
+    text.push('\n');
+    match output {
+        None => {
+            print!("{}", text.as_str());
+            Ok(())
+        }
+        Some(path) => write_new_key_file(path, text.as_bytes()),
+    }
+}
+
+/// Create `path` with `O_CREAT|O_EXCL` and mode 0400, write `text`, and
+/// report on stderr. `O_EXCL` also refuses a pre-planted symlink. No cleanup
+/// on a failed write: a path-based unlink could race a swapped path.
+#[cfg(unix)]
+fn write_new_key_file(path: &Path, text: &[u8]) -> Result<(), CliError> {
+    use std::io::Write as _;
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o400)
+        .open(path)
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                CliError::Other(format!(
+                    "{} already exists; refusing to overwrite",
+                    path.display()
+                ))
+            } else {
+                CliError::Other(format!("create {}: {e}", path.display()))
+            }
+        })?;
+    let write_err = |e: std::io::Error| CliError::Other(format!("write {}: {e}", path.display()));
+    file.write_all(text).map_err(write_err)?;
+    // fchmod: a restrictive umask would otherwise leave the file without
+    // owner read permission.
+    file.set_permissions(std::fs::Permissions::from_mode(0o400))
+        .map_err(write_err)?;
+    file.sync_all().map_err(write_err)?;
+    eprintln!("wrote node key to {} (mode 0400)", path.display());
     Ok(())
+}
+
+#[cfg(not(unix))]
+fn write_new_key_file(_path: &Path, _text: &[u8]) -> Result<(), CliError> {
+    Err(CliError::Other(
+        "--output requires unix file modes; this platform cannot create an owner-only file \
+         safely — print to stdout and protect the file with ACLs"
+            .into(),
+    ))
 }
 
 pub async fn locks(cmd: LocksCmd, mode: OutputMode) -> Result<(), CliError> {
@@ -243,7 +296,65 @@ async fn make_client(alias: &str) -> Result<Y2qClient, CliError> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use super::gen_node_key;
     use super::status_color;
+    #[cfg(unix)]
+    use base64::Engine as _;
+    #[cfg(unix)]
+    use base64::engine::general_purpose::STANDARD;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt as _;
+
+    #[cfg(unix)]
+    #[test]
+    fn output_creates_0400_45_byte_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut keys = Vec::new();
+        for name in ["a", "b"] {
+            let path = dir.path().join(name);
+            gen_node_key(Some(&path)).unwrap();
+            let meta = std::fs::metadata(&path).unwrap();
+            assert_eq!(meta.permissions().mode() & 0o7777, 0o400);
+            assert_eq!(meta.len(), 45);
+            let text = std::fs::read_to_string(&path).unwrap();
+            assert!(text.ends_with('\n'));
+            assert_eq!(STANDARD.decode(text.trim()).unwrap().len(), 32);
+            keys.push(text);
+        }
+        assert_ne!(keys[0], keys[1]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_refuses_existing_path_and_keeps_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("key");
+        std::fs::write(&path, "keep").unwrap();
+        let err = gen_node_key(Some(&path)).unwrap_err();
+        assert!(err.to_string().contains("already exists"), "{err}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "keep");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_refuses_symlink_even_if_dangling() {
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim");
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&victim, &link).unwrap();
+        assert!(gen_node_key(Some(&link)).is_err());
+        assert!(!victim.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_missing_parent_fails_without_creating() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("nope");
+        assert!(gen_node_key(Some(&parent.join("key"))).is_err());
+        assert!(!parent.exists());
+    }
 
     #[test]
     fn status_color_classes() {

@@ -934,13 +934,6 @@ fn existing_key_file_warnings(
         return;
     }
     let daemon_uid = daemon_uid_gid(a, cx).map(|(u, _)| u);
-    if info.mode & 0o077 != 0 {
-        v.push(warn(
-            S,
-            field,
-            format!("key file mode is {:04o}; it should be 0400", info.mode),
-        ));
-    }
     if info.uid != 0 && Some(info.uid) != daemon_uid {
         v.push(warn(
             S,

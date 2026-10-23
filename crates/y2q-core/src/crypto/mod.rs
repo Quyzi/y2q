@@ -111,6 +111,14 @@ pub enum CryptoError {
     #[error("node key malformed: {0}")]
     NodeKeyMalformed(String),
 
+    /// The node key file is accessible to group or other. Any local user
+    /// who can read it holds the node key.
+    #[error(
+        "{path} has mode {mode:04o}: group/other access is not allowed; run `chmod 0400 {path}`; \
+         if the key may have been exposed, rotate it (`y2qd --rotate-node-key`)"
+    )]
+    NodeKeyFilePermissions { path: String, mode: u32 },
+
     /// The supplied node key's verifier does not match the one stored in
     /// `keystore.json` — wrong key, or a keystore from another deployment.
     #[error(
@@ -408,6 +416,12 @@ impl CryptoError {
                 key: key.to_owned(),
                 operation: "node-key".to_owned(),
                 message: reason,
+            },
+            CryptoError::NodeKeyFilePermissions { .. } => Error::InternalError {
+                bucket: bucket.to_owned(),
+                key: key.to_owned(),
+                operation: "node-key".to_owned(),
+                message: "node key file permissions too broad".to_owned(),
             },
             CryptoError::NodeKeyMismatch => Error::InternalError {
                 bucket: bucket.to_owned(),

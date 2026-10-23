@@ -139,7 +139,11 @@ either tree can never accidentally carry the key that protects it. A length
 floor (≥32 bytes) guards against a truncated paste, but does **not** prove
 entropy — a passphrase that happens to decode to 32+ bytes will be accepted
 and will be crackable offline at HMAC speed by anyone holding the storage
-tree. Use `y2q admin gen-node-key`, not a memorized passphrase.
+tree. Use `y2q admin gen-node-key --output PATH`, not a memorized passphrase.
+A `node_key_file` is refused at startup unless only its owner can access it
+(no group/other permission bits, checked on the opened file); `--output`
+creates it exclusively with mode `0400`. The mode rule does not apply to
+`Y2QD_NODE_KEY`.
 
 In **device mode** the node key *is* generated (by `y2q admin device init`)
 and *is* persisted, wrapped, inside `crypto.keystore_dir` (`devices.json`).
