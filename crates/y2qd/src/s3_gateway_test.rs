@@ -19,9 +19,7 @@ use actix_web::middleware::from_fn;
 use actix_web::test::{self, TestRequest};
 use actix_web::{App, web};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use y2q_core::crypto::{
-    self, Argon2Params, CredentialSlot, Role, UserRecord, UserStore, kem,
-};
+use y2q_core::crypto::{self, Argon2Params, CredentialSlot, Role, UserRecord, UserStore, kem};
 use y2q_core::secmem::SecretVec;
 use y2q_core::{AnyStorage, FilesystemStorage, Listing};
 
@@ -422,15 +420,9 @@ async fn virtual_hosted_object_put_get_round_trip() {
 
     for (key, payload) in [("keep.txt", &b"keep-me"[..]), ("noperiod", &b"plain"[..])] {
         let path = format!("/{key}");
-        let put = signed_req(
-            &harness,
-            actix_web::http::Method::PUT,
-            &path,
-            "",
-            &host,
-        )
-        .set_payload(payload.to_vec())
-        .to_request();
+        let put = signed_req(&harness, actix_web::http::Method::PUT, &path, "", &host)
+            .set_payload(payload.to_vec())
+            .to_request();
         let put_resp = test::call_service(&app, put).await;
         let put_status = put_resp.status();
         let put_body = test::read_body(put_resp).await;
@@ -441,14 +433,7 @@ async fn virtual_hosted_object_put_get_round_trip() {
             String::from_utf8_lossy(&put_body)
         );
 
-        let get = signed_req(
-            &harness,
-            actix_web::http::Method::GET,
-            &path,
-            "",
-            &host,
-        )
-        .to_request();
+        let get = signed_req(&harness, actix_web::http::Method::GET, &path, "", &host).to_request();
         let get_resp = test::call_service(&app, get).await;
         let get_status = get_resp.status();
         let get_body = test::read_body(get_resp).await;
