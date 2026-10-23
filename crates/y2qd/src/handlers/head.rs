@@ -8,10 +8,12 @@ use y2q_core::{AnyStorage, BucketPermission, Metadata, Storage};
 use crate::auth::Authenticated;
 use crate::authz::authorize_bucket;
 use crate::error::{AppError, ErrorBody};
+use crate::sized_body::SizedEmptyBody;
 
 /// Retrieve object metadata without transferring the body.
 ///
-/// Returns 200 OK with no body. Object metadata is exposed as response headers:
+/// Returns 200 OK with no body bytes; `Content-Length` advertises the size a GET would send.
+/// Object metadata is exposed as response headers:
 ///
 /// | Header | Value |
 /// |--------|-------|
@@ -33,7 +35,8 @@ use crate::error::{AppError, ErrorBody};
         ("key" = String, Path, description = "Object key; may contain `/` to represent nested paths"),
     ),
     responses(
-        (status = 200, description = "Object exists. Metadata is returned in response headers: \
+        (status = 200, description = "Object exists. No body bytes are sent; `Content-Length` and \
+            `X-Y2Q-Size` carry the plaintext size a GET would return. Metadata is returned in response headers: \
             `X-Y2Q-Created` (ns since epoch), `X-Y2Q-Modified` (ns since epoch), \
             `X-Y2Q-Checksum-GxHash` (base64, 12 chars), \
             plus any `X-Y2Q-<label>` headers attached on PUT. \
@@ -67,7 +70,7 @@ pub async fn handle(
 fn build_response(meta: &Metadata) -> HttpResponse {
     let mut builder = HttpResponse::Ok();
     insert_object_metadata_headers(&mut builder, meta);
-    builder.finish()
+    builder.body(SizedEmptyBody(meta.size))
 }
 
 /// Insert the object-metadata header set shared by `HEAD` and a `200` GET.
@@ -75,6 +78,9 @@ fn build_response(meta: &Metadata) -> HttpResponse {
 /// `Content-Type` is always `application/octet-stream`. A label name may
 /// repeat with different values; append (not insert) so every value emits
 /// its own header line instead of overwriting the prior.
+///
+/// On the wire actix derives `Content-Length` from the body's `BodySize`, not
+/// this header; HEAD therefore attaches `SizedEmptyBody` in `build_response`.
 pub(crate) fn insert_object_metadata_headers(builder: &mut HttpResponseBuilder, meta: &Metadata) {
     builder
         .insert_header(("Content-Length", meta.size.to_string()))

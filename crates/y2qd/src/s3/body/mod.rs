@@ -21,7 +21,7 @@ use crate::s3::error::S3Error;
 mod download;
 mod upload;
 
-pub use download::{LeashedDownload, SizedEmptyBody};
+pub use download::LeashedDownload;
 pub use upload::{leashed_upload, upload_stream};
 
 /// Boxed, type-erased byte stream feeding `cipher::stream_encrypt_for_put`

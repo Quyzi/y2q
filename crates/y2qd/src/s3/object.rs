@@ -208,7 +208,7 @@ pub async fn head(
     let sub = SubResource::parse(req.query_string());
     let mut builder = HttpResponse::Ok();
     meta::apply_object_headers(&mut builder, &md, &sub);
-    Ok(builder.body(crate::s3::body::SizedEmptyBody(md.size)))
+    Ok(builder.body(crate::sized_body::SizedEmptyBody(md.size)))
 }
 
 /// `DeleteObject`, `DeleteObjectTagging` when `?tagging` is present, or

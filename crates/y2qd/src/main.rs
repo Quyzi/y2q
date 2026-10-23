@@ -111,6 +111,7 @@ mod s3_gateway_test;
 #[cfg(test)]
 mod session_residency_test;
 mod setup;
+mod sized_body;
 mod span;
 mod tls;
 mod trace;
