@@ -5,6 +5,7 @@ mod fs;
 mod inode;
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use clap::Parser;
 use fuser::{Config, MountOption, SessionACL};
@@ -102,8 +103,15 @@ fn main() -> Result<(), FuseError> {
     let rt = tokio::runtime::Runtime::new().map_err(FuseError::Io)?;
     let handle = rt.handle().clone();
 
-    let (client, expires_at) = auth::resolve_client(args.config.as_deref(), &args.alias)?;
-    auth::spawn_token_refresh(handle.clone(), client.clone(), expires_at);
+    let (client, expires_at, config_path) =
+        auth::resolve_client(args.config.as_deref(), &args.alias)?;
+    auth::spawn_token_refresh(
+        handle.clone(),
+        client.clone(),
+        expires_at,
+        args.alias.clone(),
+        config_path,
+    );
 
     let mode = match args.bucket {
         Some(ref b) => MountMode::Single(b.clone()),
@@ -146,35 +154,64 @@ fn main() -> Result<(), FuseError> {
     } else {
         SessionACL::Owner
     };
+    // Multiple dispatch threads so one slow HTTP call doesn't stall every
+    // unrelated syscall on the mount. Linux-only in fuser 0.18.
+    #[cfg(target_os = "linux")]
+    {
+        config.n_threads = Some(4);
+        config.clone_fd = true;
+    }
 
     let mountpoint = args.mountpoint.clone();
     tracing::info!(mountpoint = %mountpoint.display(), "mounting y2q");
 
-    let mut session = fuser::Session::new(fs, &mountpoint, &config).map_err(FuseError::Io)?;
-    let mut unmounter = session.unmount_callable();
+    let session = fuser::Session::new(fs, &mountpoint, &config).map_err(FuseError::Io)?;
+    // `spawn` moves the Mount into BackgroundSession; calling
+    // `unmount_callable()` beforehand leaves a dangling unmounter that is a
+    // silent no-op. Own the session via `umount_and_join` instead.
     let bg = session.spawn().map_err(FuseError::Io)?;
 
-    // Block until SIGINT or SIGTERM, then unmount and exit cleanly.
+    // Block until SIGINT/SIGTERM, or until an external `fusermount -u` ends
+    // the session thread (so we don't leak a process holding a live token).
     handle.block_on(async {
         #[cfg(unix)]
         {
             use tokio::signal::unix::{SignalKind, signal};
             let mut sigterm = signal(SignalKind::terminate()).expect("SIGTERM handler");
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {}
-                _ = sigterm.recv() => {}
+            loop {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => break,
+                    _ = sigterm.recv() => break,
+                    _ = tokio::time::sleep(Duration::from_millis(250)) => {
+                        if bg.guard.is_finished() {
+                            break;
+                        }
+                    }
+                }
             }
         }
         #[cfg(not(unix))]
-        tokio::signal::ctrl_c().await.ok();
+        {
+            loop {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => break,
+                    _ = tokio::time::sleep(Duration::from_millis(250)) => {
+                        if bg.guard.is_finished() {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
     });
 
     tracing::info!(mountpoint = %mountpoint.display(), "unmounting y2q");
-    if let Err(e) = unmounter.unmount() {
-        tracing::warn!("unmount: {e}");
-    }
-    if let Err(e) = bg.join() {
-        tracing::warn!("session join: {e}");
+    if bg.guard.is_finished() {
+        if let Err(e) = bg.join() {
+            tracing::warn!("session join: {e}");
+        }
+    } else if let Err(e) = bg.umount_and_join() {
+        tracing::warn!("umount_and_join: {e}");
     }
 
     Ok(())

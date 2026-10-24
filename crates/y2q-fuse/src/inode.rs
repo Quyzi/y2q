@@ -100,13 +100,27 @@ impl InodeTable {
     }
 
     /// Record a locally-known size (truncate/O_TRUNC) in the cached metadata so
-    /// getattr()/read() don't report or clamp to the pre-truncate size. No-op
-    /// when nothing is cached for `ino`.
+    /// getattr()/read() don't report or clamp to the pre-truncate size. Creates
+    /// a stub `CachedMeta` when none is cached yet (e.g. after `create`).
     pub fn set_size(&mut self, ino: u64, size: u64) {
-        if let Some(e) = self.by_ino.get_mut(&ino)
-            && let Some(m) = e.cached_meta.as_mut()
-        {
-            m.size = size;
+        if let Some(e) = self.by_ino.get_mut(&ino) {
+            match e.cached_meta.as_mut() {
+                Some(m) => m.size = size,
+                None => {
+                    e.cached_meta = Some(CachedMeta {
+                        size,
+                        created: 0,
+                        modified: 0,
+                        checksum_gxhash: String::new(),
+                        labels: BTreeSet::new(),
+                        cipher_size: None,
+                        cipher_checksum: None,
+                        kem_alg: None,
+                        aead_alg: None,
+                        envelope_version: None,
+                    });
+                }
+            }
             e.cached_at = Some(Instant::now());
         }
     }
@@ -119,10 +133,36 @@ impl InodeTable {
         self.invalidate_meta(ino);
     }
 
+    /// Move an inode's path mapping from `from` to `to`, preserving the inode
+    /// number and cached metadata. No-op when `from` is unknown.
+    pub fn repath(&mut self, from: &InodePath, to: InodePath) {
+        let Some(ino) = self.by_path.remove(from) else {
+            return;
+        };
+        if let Some(e) = self.by_ino.get_mut(&ino) {
+            e.path = to.clone();
+        }
+        // If `to` was already mapped, drop the stale inode entry.
+        if let Some(old) = self.by_path.insert(to, ino)
+            && old != ino
+        {
+            self.by_ino.remove(&old);
+        }
+    }
+
     pub fn remove(&mut self, ino: u64) {
         if let Some(e) = self.by_ino.remove(&ino) {
             self.by_path.remove(&e.path);
         }
+    }
+
+    /// Snapshot of every `(ino, path)` currently known — used by directory
+    /// rename to rewrite child prefixes.
+    pub fn paths(&self) -> Vec<(u64, InodePath)> {
+        self.by_ino
+            .iter()
+            .map(|(&ino, e)| (ino, e.path.clone()))
+            .collect()
     }
 }
 
@@ -192,13 +232,13 @@ mod tests {
     }
 
     #[test]
-    fn set_size_updates_cached_size_only_when_cached() {
+    fn set_size_creates_stub_meta_when_uncached() {
         let mut t = InodeTable::new();
         let ino = t.get_or_assign(object_path());
         t.set_size(ino, 4);
         let e = t.get(ino).unwrap();
-        assert!(e.cached_meta.is_none());
-        assert!(!e.meta_fresh());
+        assert_eq!(e.cached_meta.as_ref().unwrap().size, 4);
+        assert!(e.meta_fresh());
 
         t.update_meta(ino, meta(10));
         t.invalidate_meta(ino);
@@ -207,6 +247,23 @@ mod tests {
         let e = t.get(ino).unwrap();
         assert_eq!(e.cached_meta.as_ref().unwrap().size, 4);
         assert!(e.meta_fresh());
+    }
+
+    #[test]
+    fn repath_preserves_ino_and_meta() {
+        let mut t = InodeTable::new();
+        let from = object_path();
+        let ino = t.get_or_assign(from.clone());
+        t.update_meta(ino, meta(7));
+        let to = InodePath::Object {
+            bucket: "b".into(),
+            key: "k2".into(),
+        };
+        t.repath(&from, to.clone());
+        assert!(t.get(ino).is_some());
+        assert_eq!(t.get(ino).unwrap().path, to);
+        assert_eq!(t.get(ino).unwrap().cached_meta.as_ref().unwrap().size, 7);
+        assert_eq!(t.get_or_assign(to), ino);
     }
 
     #[test]
