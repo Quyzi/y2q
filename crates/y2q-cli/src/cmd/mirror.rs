@@ -315,7 +315,7 @@ async fn tunnel_remote_to_remote(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ops::listing::{DiffEntry, DiffEntries, mirror_plan};
+    use crate::ops::listing::{DiffEntries, DiffEntry, mirror_plan};
     use std::collections::BTreeMap;
 
     #[test]
