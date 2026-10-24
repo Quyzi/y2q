@@ -42,7 +42,9 @@ pub enum AuthError {
     TtlOutOfRange { max: u64 },
 
     /// Account has too many recent failed logins; locked until `until`.
-    #[error("account locked until {until:?}")]
+    /// `until` drives the `Retry-After` header; the Display string stays
+    /// opaque so clients never see `SystemTime` Debug output.
+    #[error("account temporarily locked; retry later")]
     LockedOut { until: SystemTime },
 
     /// `PUT /api/v1/users/add` for a username that already exists.
@@ -257,5 +259,42 @@ mod tests {
         let text = String::from_utf8(body.to_vec()).unwrap();
         assert!(!text.contains("/var/lib/y2q"));
         assert!(text.contains("internal error"));
+    }
+
+    #[test]
+    fn locked_out_body_is_stable_and_not_debug() {
+        use std::time::Duration;
+
+        const MSG: &str = "account temporarily locked; retry later";
+        let err = AuthError::LockedOut {
+            until: SystemTime::now() + Duration::from_secs(90),
+        };
+        assert_eq!(err.to_string(), MSG);
+
+        let resp = err.error_response();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        let retry_after = resp
+            .headers()
+            .get(header::RETRY_AFTER)
+            .expect("Retry-After present")
+            .to_str()
+            .unwrap()
+            .parse::<u64>()
+            .expect("Retry-After is integer seconds");
+        assert!(
+            (1..=90).contains(&retry_after),
+            "Retry-After={retry_after} out of expected 1..=90"
+        );
+
+        let body = actix_web::body::to_bytes(resp.into_body());
+        let body = actix_web::rt::System::new().block_on(body).unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&body).expect("ErrorBody JSON");
+        assert_eq!(parsed["error"], MSG);
+        assert!(!text.contains("SystemTime"));
+        assert!(!text.contains("tv_sec"));
+        assert!(!text.contains("tv_nsec"));
     }
 }
