@@ -812,7 +812,18 @@ pub async fn run() -> std::io::Result<()> {
         tracing::warn!(
             "TLS disabled — y2qd is serving plaintext HTTP. Set [server.tls] enabled = true for production."
         );
+        if config::host_is_loopback(&cfg.server.host) {
+            tracing::warn!(
+                "plaintext loopback bind: on a multi-user host any local uid can \
+                 re-bind this port while y2qd is stopped and harvest passwords / \
+                 Bearer tokens. Prefer [server.tls] even on loopback, or enable \
+                 deploy/y2qd.socket so systemd holds the port across restarts."
+            );
+        }
     }
+    // Prefer a systemd-activated listener (LISTEN_FDS) so the port stays held
+    // across restarts and cannot be stolen by another local uid.
+    let activated = take_systemd_tcp_listener()?;
     let server = if cfg.server.tls.enabled {
         let cert_path = cfg.server.tls.cert_path.as_deref().ok_or_else(|| {
             std::io::Error::other("server.tls.enabled = true but server.tls.cert_path is unset")
@@ -848,7 +859,15 @@ pub async fn run() -> std::io::Result<()> {
                 "TLS enabled"
             ),
         }
-        server.bind_rustls_0_23(bind_addr, tls_cfg)?
+        if let Some(listener) = activated {
+            tracing::info!("REST listener: systemd socket activation (TLS)");
+            server.listen_rustls_0_23(listener, tls_cfg)?
+        } else {
+            server.bind_rustls_0_23(bind_addr, tls_cfg)?
+        }
+    } else if let Some(listener) = activated {
+        tracing::info!("REST listener: systemd socket activation");
+        server.listen(listener)?
     } else {
         server.bind(bind_addr)?
     };
@@ -1057,6 +1076,50 @@ fn initial_root_password_notice(path: &std::path::Path) -> String {
          Move that file somewhere safe and delete it. The secret is not printed.\n",
         p = path.display()
     )
+}
+
+/// Take fd 3 from systemd socket activation (`LISTEN_FDS` / `LISTEN_PID`).
+/// Returns `None` when not socket-activated. Clears the env vars so child
+/// processes do not inherit a stale descriptor claim.
+fn take_systemd_tcp_listener() -> std::io::Result<Option<std::net::TcpListener>> {
+    use std::os::fd::{FromRawFd, RawFd};
+
+    let Ok(listen_pid) = std::env::var("LISTEN_PID") else {
+        return Ok(None);
+    };
+    let Ok(listen_fds) = std::env::var("LISTEN_FDS") else {
+        return Ok(None);
+    };
+    let pid: u32 = listen_pid
+        .parse()
+        .map_err(|e| std::io::Error::other(format!("LISTEN_PID: {e}")))?;
+    if pid != std::process::id() {
+        return Ok(None);
+    }
+    let n: u32 = listen_fds
+        .parse()
+        .map_err(|e| std::io::Error::other(format!("LISTEN_FDS: {e}")))?;
+    if n < 1 {
+        return Ok(None);
+    }
+    // SD_LISTEN_FDS_START == 3
+    let fd: RawFd = 3;
+    // SAFETY: systemd handed us this listening socket; we take ownership once.
+    let listener = unsafe { std::net::TcpListener::from_raw_fd(fd) };
+    listener.set_nonblocking(true)?;
+    // Prevent double-close / inheritance by children.
+    unsafe {
+        std::env::remove_var("LISTEN_PID");
+        std::env::remove_var("LISTEN_FDS");
+        std::env::remove_var("LISTEN_FDNAMES");
+    }
+    if n > 1 {
+        tracing::warn!(
+            extra_fds = n - 1,
+            "LISTEN_FDS={n}: only the first socket is used for the REST listener"
+        );
+    }
+    Ok(Some(listener))
 }
 
 /// Lowercase-hex encode `bytes`.

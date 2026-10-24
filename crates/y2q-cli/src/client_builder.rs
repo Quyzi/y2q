@@ -5,8 +5,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-use y2q_client::{ClientConfig, TlsOptions, Y2qClient};
-use y2q_config::Alias;
+use y2q_client::{ClientConfig, ClientError, TlsOptions, Y2qClient};
+use y2q_config::{Alias, TokenStore};
 use zeroize::Zeroizing;
 
 use crate::config::default_config_path;
@@ -55,6 +55,24 @@ pub fn resolve_config_path() -> Result<PathBuf, CliError> {
         Some(path) => Ok(path.clone()),
         None => default_config_path().map_err(CliError::from),
     }
+}
+
+/// Resolve the tokens-file path: a `tokens.toml` sibling of the active
+/// config file. Keeps `--config other.toml` from reusing the default
+/// profile's cached bearers against a different deployment.
+pub fn resolve_tokens_path() -> Result<PathBuf, CliError> {
+    let config = resolve_config_path()?;
+    Ok(config.with_file_name("tokens.toml"))
+}
+
+/// Load a bearer for `alias_name` only when it is still bound to that
+/// alias's current URL and username.
+pub fn load_bound_token(alias_name: &str, alias: &Alias) -> Result<Zeroizing<String>, CliError> {
+    let tokens_path = resolve_tokens_path()?;
+    let store = TokenStore::load(&tokens_path)?;
+    store
+        .token_for_bound(alias_name, &alias.url, &alias.username)
+        .ok_or(CliError::Client(ClientError::Unauthenticated))
 }
 
 /// Build a [`ClientConfig`] from an alias entry, attaching the optional bearer

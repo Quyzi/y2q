@@ -475,7 +475,7 @@ mod tests {
         let s = &f[0].content;
         assert!(!s.contains("Requires="));
         assert!(!s.contains("ExecStartPre"));
-        assert!(!s.contains("The node key is fetched once"));
+        assert!(!s.contains("Prefer socket activation"));
         assert!(!s.contains("Unattended arm as root"));
         assert!(s.contains("After=network.target\n"));
         assert!(s.contains("Wants=network.target\n"));
@@ -493,7 +493,7 @@ mod tests {
         assert!(!s.contains("Unattended arm as root"));
         assert!(!s.contains("sudo y2q-keyarm"));
         assert!(s.contains("Requires=y2q-keyd.socket"));
-        assert!(s.contains("The node key is fetched once"));
+        assert!(s.contains("Prefer socket activation"));
         assert!(s.contains("Type=simple\nExecStart="));
     }
 

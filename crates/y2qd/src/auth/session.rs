@@ -465,6 +465,32 @@ impl SessionStore {
         n
     }
 
+    /// Revoke every session for `(username, persona)` except `keep`. Used by
+    /// password change so a fuse mount / other token holder is locked out
+    /// while the caller's own session stays live. Scope is the persona so a
+    /// duress-password change does not disturb the real persona's sessions.
+    pub fn revoke_user_persona_except(
+        &self,
+        username: &str,
+        persona: u8,
+        keep: &[u8; 32],
+    ) -> usize {
+        let victims: Vec<[u8; 32]> = self
+            .inner
+            .iter()
+            .filter_map(|r| {
+                let info = r.value();
+                (info.username == username && info.persona == persona && r.key() != keep)
+                    .then_some(*r.key())
+            })
+            .collect();
+        let n = victims.len();
+        for k in victims {
+            self.inner.remove(&k);
+        }
+        n
+    }
+
     /// Total number of (possibly expired) entries currently in the store.
     pub fn len(&self) -> usize {
         self.inner.len()
@@ -734,5 +760,28 @@ mod tests {
         ));
         // A different user's session at the same persona index is untouched.
         assert!(s.get_active(&tok_c.hash()).is_ok());
+    }
+
+    #[test]
+    fn revoke_user_persona_except_keeps_caller() {
+        let s = SessionStore::new().unwrap();
+        let future = SystemTime::now() + Duration::from_secs(60);
+        let keep = s
+            .insert(new_session("alice", 0, future, &[0u8; 8]))
+            .unwrap();
+        let other = s
+            .insert(new_session("alice", 0, future, &[1u8; 8]))
+            .unwrap();
+        let other_persona = s
+            .insert(new_session("alice", 1, future, &[2u8; 8]))
+            .unwrap();
+
+        assert_eq!(s.revoke_user_persona_except("alice", 0, &keep.hash()), 1);
+        assert!(s.get_active(&keep.hash()).is_ok());
+        assert!(matches!(
+            s.get_active(&other.hash()),
+            Err(AuthError::TokenInvalid)
+        ));
+        assert!(s.get_active(&other_persona.hash()).is_ok());
     }
 }

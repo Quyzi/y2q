@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use y2q_client::{ClientConfig, TlsOptions, Y2qClient};
-use y2q_config::{Alias, CliConfig, TokenStore, default_config_path, default_tokens_path};
+use y2q_config::{Alias, CliConfig, TokenStore, default_config_path};
 use zeroize::Zeroizing;
 
 use crate::error::FuseError;
@@ -21,10 +21,12 @@ pub fn resolve_client(
     let config = CliConfig::load(&config_path)?;
     let alias = config.get_alias(alias_name)?;
 
-    let tokens_path = default_tokens_path()?;
+    // Sibling of the active config so `--config other.toml` cannot reuse the
+    // default profile's cached bearer against a different URL.
+    let tokens_path = config_path.with_file_name("tokens.toml");
     let store = TokenStore::load(&tokens_path)?;
     let entry = store
-        .get_valid(alias_name)
+        .get_bound(alias_name, &alias.url, &alias.username)
         .ok_or_else(|| FuseError::NotLoggedIn(alias_name.to_owned()))?;
 
     let expires_at = entry.expires_at;

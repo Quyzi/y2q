@@ -1190,7 +1190,7 @@ fn e2e_login_with_non_http_alias_is_an_error_not_a_panic() {
 }
 
 /// A session token cached for an alias whose URL is unusable can still be
-/// dropped locally; the user is told the server session was not revoked.
+/// dropped locally; the user is warned the server session may still be live.
 #[test]
 fn e2e_logout_clears_token_of_non_http_alias() {
     let home = isolated_home("alias-logout");
@@ -1204,10 +1204,11 @@ fn e2e_logout_clears_token_of_non_http_alias() {
 
     let out = y2q_isolated(&home, &["logout", "m"], b"");
     assert!(out.status.success(), "{}", output_text(&out));
+    let text = output_text(&out);
     assert!(
-        output_text(&out).contains("not revoked"),
-        "{}",
-        output_text(&out)
+        text.contains("removed the local token")
+            && text.contains("server session may still be live"),
+        "{text}"
     );
     let left = std::fs::read_to_string(&tokens).unwrap_or_default();
     assert!(!left.contains("SECRET-TOKEN"), "token not cleared: {left}");

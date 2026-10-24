@@ -66,6 +66,9 @@ pub struct AclBody {
     /// Retained bucket key epochs, ascending. Read-only.
     #[serde(default)]
     pub key_epochs: Vec<u32>,
+    /// Compare-and-swap token from `GET`; echo on `PUT` or the server 409s.
+    #[serde(default)]
+    pub generation: u64,
 }
 
 // ── Objects ───────────────────────────────────────────────────────────────────

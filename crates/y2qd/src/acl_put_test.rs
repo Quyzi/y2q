@@ -281,7 +281,12 @@ async fn acl_put_empty_grants_object_clears_all_grants() {
     let (status, _) = put_acl!(app, &alice_token, "bkt", r#"{"grants":{"bob":"read"}}"#);
     assert_eq!(status, 200);
 
-    let (status, body) = put_acl!(app, &alice_token, "bkt", r#"{"grants":{}}"#);
+    // PUT must echo the generation from GET (CAS); empty grants clear all.
+    let (status, got) = get_acl!(app, &alice_token, "bkt");
+    assert_eq!(status, 200);
+    let mut clear: serde_json::Value = serde_json::from_slice(&got).unwrap();
+    clear["grants"] = serde_json::json!({});
+    let (status, body) = put_acl!(app, &alice_token, "bkt", clear.to_string());
     assert_eq!(status, 200);
     let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(body["grants"], serde_json::json!({}));

@@ -51,7 +51,9 @@ Each bucket has an **owner** (full control) and an optional **ACL** mapping othe
 
 **New buckets are private to the persona that created them.** A `PUT /{bucket}/` or the first object `PUT` into a non-existent bucket makes the caller its owner (only if their role permits writing) and seals the epoch-0 key to that persona. Until someone with a grant shares it, no other persona — including other global admins and the owner's own duress slots — can see it.
 
-**Existence is hidden.** A bucket this persona cannot decrypt is indistinguishable from one that does not exist: it is omitted from `GET /`, search, and S3 listings, and GET/HEAD/PUT/DELETE/ACL return **404** - never 403. That includes a global admin or auditor with no sealed grant, and it includes write and delete, not only read. **403** is returned only when the persona can already see the bucket but lacks the verb (grant level, role ceiling, or both). The exception is an ACL relationship of exactly `writeonly`: write and delete stay allowed with no sealed secret (a drop box), and a read is **403** because that caller was given the bucket.
+**Existence is hidden for readers.** A bucket this persona cannot decrypt is indistinguishable from one that does not exist: it is omitted from `GET /`, search, and S3 listings, and GET/HEAD/DELETE/ACL return **404** - never 403. That includes a global admin or auditor with no sealed grant. **403** is returned only when the persona can already see the bucket but lacks the verb (grant level, role ceiling, or both). The exception is an ACL relationship of exactly `writeonly`: write and delete stay allowed with no sealed secret (a drop box), and a read is **403** because that caller was given the bucket.
+
+**Write-capable callers can learn whether a bucket name is taken.** Bucket names are one global namespace. `PUT /{bucket}/` and object `PUT` into a free name claim it (`200`/`201`); the same call against someone else's hidden bucket returns **404**. That split is inherent to create-on-write with a shared name space (the same class of leak as S3 `BucketAlreadyExists`). Closing it would require per-owner or blinded names.
 
 **Legacy buckets** (no recorded owner and no sealed grant) are hidden from everyone while authorization is enforced, including admins. There is no break-glass path that lists them or assigns an owner without a grant.
 
@@ -147,7 +149,7 @@ Revoke the caller's current token.
 
 ### `POST /api/v1/auth/password`
 
-Change the caller's password for the **session's persona slot only**. `current` must open that slot; a password that opens a different slot is rejected and does not rewrite any slot. Re-wraps under the new password using the record's existing Argon2 salt (and the *current* `[crypto.argon2]` cost parameters for the wrap).
+Change the caller's password for the **session's persona slot only**. `current` must open that slot; a password that opens a different slot is rejected and does not rewrite any slot. Re-wraps under the new password using the record's existing Argon2 salt (and the *current* `[crypto.argon2]` cost parameters for the wrap). On success, every other live session for the same `(username, persona)` is revoked (the caller's session is kept), so a forgotten fuse mount or leaked token stops working.
 
 Shares login's per-username lockout counters (`max_failed_logins` / `lockout_seconds`) and `min_login_response_ms` timing floor. IP rate limiting is applied before the handler.
 
@@ -624,11 +626,12 @@ Manage a bucket's owner and per-user grants. See [Authorization](#authorization)
 {
   "owner": "alice",
   "grants": { "bob": "read", "carol": "write" },
-  "key_epochs": [0]
+  "key_epochs": [0],
+  "generation": 3
 }
 ```
 
-`owner` is `null` only for an unclaimed legacy bucket. `grants` maps username → `"read"` | `"write"` | `"writeonly"` | `"admin"`; the owner is never listed (they have implicit full control). `key_epochs` (retained bucket key epochs, ascending) is returned when non-empty.
+`owner` is `null` only for an unclaimed legacy bucket. `grants` maps username → `"read"` | `"write"` | `"writeonly"` | `"admin"`; the owner is never listed (they have implicit full control). `key_epochs` (retained bucket key epochs, ascending) is returned when non-empty. `generation` is a compare-and-swap token: echo it on `PUT` or the server returns **409**.
 
 | Code | Meaning |
 |---|---|
@@ -645,11 +648,12 @@ Replace the ACL, and optionally transfer ownership by setting `owner`. The body 
 ```json
 {
   "owner": "alice",
-  "grants": { "bob": "write" }
+  "grants": { "bob": "write" },
+  "generation": 3
 }
 ```
 
-A new `owner` must be an existing user; grantees are not checked for existence (a grant to an unknown user is inert, and validating it would leak which usernames exist). Granting to the current owner is rejected as redundant. **Response (200)** echoes the stored owner and ACL.
+A new `owner` must be an existing user; grantees are not checked for existence (a grant to an unknown user is inert, and validating it would leak which usernames exist). Granting to the current owner is rejected as redundant. **Response (200)** echoes the stored owner and ACL (with the bumped `generation`). Concurrent grant/revoke without CAS would silently clobber each other; the CLI retries on 409.
 
 | Code | Meaning |
 |---|---|
@@ -658,6 +662,7 @@ A new `owner` must be an existing user; grantees are not checked for existence (
 | 401 | Token missing or invalid |
 | 403 | Caller may not manage this ACL, or may not transfer ownership |
 | 404 | Bucket not found (or not visible to the caller) |
+| 409 | `generation` mismatch; re-GET and retry |
 
 CLI equivalents:
 ```sh

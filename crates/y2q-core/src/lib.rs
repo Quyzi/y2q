@@ -445,6 +445,15 @@ pub enum Error {
         reason: String,
     },
 
+    /// An ACL PUT's `generation` did not match the bucket's current
+    /// `acl_generation` — another writer landed first. Clients should re-GET
+    /// and retry.
+    #[error("acl conflict: {reason}")]
+    AclConflict {
+        /// Human-readable reason (stale generation).
+        reason: String,
+    },
+
     /// A persona-management request was rejected: an out-of-range slot, or
     /// (for `POST /api/v1/personas`) a caller's own record vanished
     /// mid-request. Produced by the daemon's persona endpoints.
@@ -668,6 +677,14 @@ pub struct BucketConfig {
     /// through the API.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub keys: Vec<BucketKeyVersion>,
+    /// Monotonic ACL generation. Bumped on every successful ACL PUT so
+    /// concurrent read-modify-write clients can detect clobber (409) and retry.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub acl_generation: u64,
+}
+
+fn is_zero_u64(v: &u64) -> bool {
+    *v == 0
 }
 
 /// One epoch of a bucket's ML-KEM-768 keypair, plus who can currently open
