@@ -27,6 +27,7 @@ pub fn to_errno(e: &y2q_client::ClientError) -> fuser::Errno {
         ClientError::BadRequest { .. } => fuser::Errno::EINVAL,
         // Permission denied (e.g. ACL grant lacks the verb) — not a disk fault.
         ClientError::ServerError { status: 403, .. } => fuser::Errno::EACCES,
+        ClientError::Http(e) if e.is_timeout() || e.is_connect() => fuser::Errno::ETIMEDOUT,
         ClientError::ServerError { .. }
         | ClientError::Redirect { .. }
         | ClientError::Io(_)
