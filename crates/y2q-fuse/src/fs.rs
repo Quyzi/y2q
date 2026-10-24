@@ -2196,7 +2196,6 @@ impl Y2qFuse {
         match classify_bucket_xattr(xname) {
             BucketXattrKind::Other => {
                 reply.error(Errno::NO_XATTR);
-                return;
             }
             BucketXattrKind::Config => {
                 let client = self.client_clone();
