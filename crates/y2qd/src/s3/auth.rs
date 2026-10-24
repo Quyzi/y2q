@@ -236,6 +236,29 @@ fn verify(req: &HttpRequest) -> Result<S3Authenticated, S3Error> {
     })
 }
 
+/// Verify a fully-buffered request body against `x-amz-content-sha256`.
+///
+/// Used by XML-body handlers (`DeleteObjects`, `CompleteMultipartUpload`,
+/// `PutObjectTagging`) that never go through `upload_stream`. Exact must
+/// match `sha256(body)`; `UNSIGNED-PAYLOAD` is a no-op; streaming modes are
+/// rejected because these handlers cannot decode `aws-chunked` framing.
+pub(crate) fn verify_buffered_payload(payload: &PayloadHash, body: &[u8]) -> Result<(), S3Error> {
+    match payload {
+        PayloadHash::Exact(expected) => {
+            if sigv4::sha256_hex(body) != *expected {
+                return Err(S3Error::x_amz_content_sha256_mismatch());
+            }
+            Ok(())
+        }
+        PayloadHash::Unsigned => Ok(()),
+        PayloadHash::StreamingSigned { .. } | PayloadHash::StreamingUnsigned => {
+            Err(S3Error::invalid_request(
+                "aws-chunked payload encoding is not supported for this operation",
+            ))
+        }
+    }
+}
+
 /// Re-validates that the session behind an in-flight S3 transfer is still
 /// the same live session it was when the request was authenticated. Held by
 /// the streaming body adapters (`crate::s3::body`); not `Clone` — a leash
@@ -539,5 +562,39 @@ mod tests {
             "a header-signed request with the same stale date must still be rejected for skew: {:?}",
             header_result.map(|_| ())
         );
+    }
+
+    #[test]
+    fn verify_buffered_payload_exact_match_ok() {
+        let body = b"<Delete><Object><Key>a</Key></Object></Delete>";
+        let hex = sigv4::sha256_hex(body);
+        assert!(verify_buffered_payload(&PayloadHash::Exact(hex), body).is_ok());
+    }
+
+    #[test]
+    fn verify_buffered_payload_exact_mismatch_errors() {
+        let body = b"<Delete><Object><Key>a</Key></Object></Delete>";
+        let other = sigv4::sha256_hex(b"different-body");
+        let err = verify_buffered_payload(&PayloadHash::Exact(other), body).unwrap_err();
+        assert_eq!(err.code, "XAmzContentSHA256Mismatch");
+        assert_eq!(err.status, actix_web::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn verify_buffered_payload_unsigned_always_ok() {
+        assert!(verify_buffered_payload(&PayloadHash::Unsigned, b"").is_ok());
+        assert!(verify_buffered_payload(&PayloadHash::Unsigned, b"nonempty").is_ok());
+    }
+
+    #[test]
+    fn verify_buffered_payload_streaming_rejected() {
+        for payload in [
+            PayloadHash::StreamingSigned { trailer: false },
+            PayloadHash::StreamingSigned { trailer: true },
+            PayloadHash::StreamingUnsigned,
+        ] {
+            let err = verify_buffered_payload(&payload, b"<xml/>").unwrap_err();
+            assert_eq!(err.code, "InvalidRequest");
+        }
     }
 }

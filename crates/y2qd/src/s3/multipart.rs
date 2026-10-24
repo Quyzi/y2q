@@ -397,6 +397,8 @@ pub async fn complete(
     let decision =
         authorize_bucket(&auth.auth, &ctx.storage, &bucket, BucketPermission::Write).await?;
 
+    crate::s3::auth::verify_buffered_payload(&auth.payload, &body)?;
+
     let xml_body = std::str::from_utf8(&body)
         .map_err(|_| S3Error::malformed_xml("request body is not valid UTF-8"))?;
     let rows = xml::nested_elements(xml_body, "Part", &["PartNumber", "ETag"])?;

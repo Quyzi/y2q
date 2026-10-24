@@ -372,6 +372,7 @@ pub async fn put(
                 ));
             }
         }
+        crate::s3::auth::verify_buffered_payload(&auth.payload, &buf)?;
         return put_tagging(
             &bucket,
             &key,
