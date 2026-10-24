@@ -850,17 +850,17 @@ impl Config {
     ///
     /// Returns a [`figment::Error`] if required keys are missing or a value
     /// cannot be parsed into the expected type.
-    pub fn load(cli: &crate::cli::Cli) -> Result<Self, Box<figment::Error>> {
-        let config_path = cli
-            .config
-            .as_deref()
-            .unwrap_or_else(|| Path::new("config.toml"));
+    pub fn load(
+        config: Option<&Path>,
+        overrides: &[(String, String)],
+    ) -> Result<Self, Box<figment::Error>> {
+        let config_path = config.unwrap_or_else(|| Path::new("config.toml"));
 
         let mut figment = Figment::new()
             .merge(Toml::file(config_path))
             .merge(Env::prefixed("Y2QD_").split("__"));
 
-        for (key, val) in &cli.overrides {
+        for (key, val) in overrides {
             let parts: Vec<&str> = key.split('.').collect();
             let json_val = coerce_cli_value(val);
             let mut map = serde_json::Map::new();

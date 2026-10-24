@@ -980,7 +980,7 @@ mod imp {
         println!("home device '{home_label}' ({home_id}): second factor {old} -> {new_label}");
         if has_factor {
             println!(
-                "warning: the node can no longer boot unattended. Arm each start with `y2qd --key-arm --prompt-passcode` or `--prompt-pin`. The grant sweep timer can no longer re-mint away grants for this home device: grants refresh at attended boots and with `y2q admin device refresh`."
+                "warning: the node can no longer boot unattended. Arm each start with `y2q-keyarm --prompt-passcode` or `--prompt-pin`. The grant sweep timer can no longer re-mint away grants for this home device: grants refresh at attended boots and with `y2q admin device refresh`."
             );
         }
         Ok(())

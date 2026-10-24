@@ -789,7 +789,7 @@ pub enum DeviceCmd {
     },
     /// Set or clear the second factor of a TPM home device. With a factor the node
     /// can no longer boot unattended: each start must be armed with the factor
-    /// (`y2qd --key-arm --prompt-passcode` / `--prompt-pin`).
+    /// (`y2q-keyarm --prompt-passcode` / `--prompt-pin`).
     #[command(group(
         clap::ArgGroup::new("factor").required(true).multiple(false).args(["passcode", "fido2", "none"])
     ))]

@@ -769,16 +769,27 @@ With the **socket-activated key helper** (`y2q-keyd.socket` +
 `y2q-keyd@.service`, running `y2qd --key-serve` as uid `y2q-keyd`;
 recommended for device deployments; enabled by a non-empty `[crypto.devices]
 key_agent_socket`) no resident process holds RMK. Each connection spawns a
-fresh helper that handles exactly one request and exits. Root arms it
-(`y2qd --key-arm`, peer uid must equal `key_agent_arm_uid`, default 0) by
-storing one-time authorization material (empty for unattended hosts; an
-optional passcode, FIDO2 PIN or emergency code for attended ones) in a
-`0600` file on tmpfs under `/run/y2q-keyd`. The daemon then fetches (peer
-uid must equal `key_agent_peer_uid`); the helper reads **and deletes** the
-armed file, runs the registry unlock with that material, returns NK once
-and exits. The armed file is consumed by every fetch attempt, success or
-failure (a refused peer uid does not consume it). `key_agent_peer_uid` has no
-default; unset, the helper refuses every fetch.
+fresh helper that handles exactly one request and exits. Root arms it with
+the separate `y2q-keyarm` binary (`ExecStartPre=+`, or interactive
+`y2q-keyarm --prompt-*`; `y2qd --key-arm` is a compatibility alias). Peer uid
+must equal `key_agent_arm_uid` (default 0). Arm stores one-time authorization
+material (empty for unattended hosts; an optional passcode, FIDO2 PIN or
+emergency code for attended ones) in a `0600` file on tmpfs under
+`/run/y2q-keyd`. The daemon then fetches (peer uid must equal
+`key_agent_peer_uid`); the helper reads **and deletes** the armed file, runs
+the registry unlock with that material, returns NK once and exits. The armed
+file is consumed by every fetch attempt, success or failure (a refused peer
+uid does not consume it). `key_agent_peer_uid` has no default; unset, the
+helper refuses every fetch.
+
+**Privilege boundary:** `y2q-keyarm` must be a separate file from `y2qd`
+(mode `0700 root:root`, or `0750 root:y2q` if group inspectability is
+required; never a hardlink). Replacing only the daemon binary must not
+replace the root-pre hook. The arm binary remains a high-value root-exec
+target and must stay outside deploy-writable paths; operator sudoers should
+allow `systemctl restart y2qd` (and related non-edit actions) only — not write
+access to unit files, `ExecStart*` drop-ins, `/usr/local/bin/y2qd`, or
+`/usr/local/bin/y2q-keyarm`.
 
 What a compromised daemon uid therefore gets, stated honestly:
 

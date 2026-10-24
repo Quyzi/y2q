@@ -19,6 +19,8 @@ const SHIPPED_RW_ROOT: &str = "/var/lib/y2q";
 #[derive(Debug, Clone)]
 pub struct UnitParams {
     pub bin: String,
+    /// Root-pre arm helper (`y2q-keyarm`); must be a separate inode from [`Self::bin`].
+    pub arm_bin: String,
     pub config: String,
     pub daemon_user: String,
     pub key_user: String,
@@ -40,6 +42,7 @@ impl UnitParams {
     pub fn shipped() -> Self {
         Self {
             bin: "/usr/local/bin/y2qd".into(),
+            arm_bin: "/usr/local/bin/y2q-keyarm".into(),
             config: "/etc/y2q/config.toml".into(),
             daemon_user: "y2qd".into(),
             key_user: "y2q-keyd".into(),
@@ -92,6 +95,7 @@ fn check(what: &str, value: &str, absolute: bool) -> Result<(), String> {
 
 fn validate(p: &UnitParams) -> Result<(), String> {
     check("binary path", &p.bin, true)?;
+    check("arm binary path", &p.arm_bin, true)?;
     check("config path", &p.config, true)?;
     check("daemon user", &p.daemon_user, false)?;
     check("key user", &p.key_user, false)?;
@@ -196,7 +200,7 @@ fn render_y2qd(p: &UnitParams) -> String {
                 if !p.helper || !p.arm_on_start {
                     Action::Drop
                 } else {
-                    exec_line(key, value, &p.bin, &p.config)
+                    exec_line(key, value, &p.arm_bin, &p.config)
                 }
             }
             "ExecStart" => exec_line(key, value, &p.bin, &p.config),
@@ -372,6 +376,7 @@ mod tests {
     fn custom() -> UnitParams {
         UnitParams {
             bin: "/opt/y2/bin/y2qd".into(),
+            arm_bin: "/opt/y2/bin/y2q-keyarm".into(),
             config: "/srv/y2/config.toml".into(),
             daemon_user: "svc".into(),
             key_user: "keyu".into(),
@@ -399,7 +404,7 @@ mod tests {
         assert_eq!(
             new,
             [
-                "ExecStartPre=+/opt/y2/bin/y2qd --key-arm --config /srv/y2/config.toml",
+                "ExecStartPre=+/opt/y2/bin/y2q-keyarm --config /srv/y2/config.toml",
                 "ExecStart=/opt/y2/bin/y2qd --config /srv/y2/config.toml",
                 "User=svc",
                 "Group=grp",
@@ -486,7 +491,7 @@ mod tests {
         let s = find(&f, "systemd/system/y2qd.service");
         assert!(!s.contains("ExecStartPre"));
         assert!(!s.contains("Unattended arm as root"));
-        assert!(!s.contains("sudo y2qd --key-arm"));
+        assert!(!s.contains("sudo y2q-keyarm"));
         assert!(s.contains("Requires=y2q-keyd.socket"));
         assert!(s.contains("The node key is fetched once"));
         assert!(s.contains("Type=simple\nExecStart="));
@@ -556,6 +561,9 @@ mod tests {
         }
         let mut p = UnitParams::shipped();
         p.bin = "bin/y2qd".into();
+        assert!(render(&p, false).unwrap_err().contains("absolute"));
+        let mut p = UnitParams::shipped();
+        p.arm_bin = "bin/y2q-keyarm".into();
         assert!(render(&p, false).unwrap_err().contains("absolute"));
         let mut p = UnitParams::shipped();
         p.group = String::new();
