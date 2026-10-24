@@ -752,7 +752,7 @@ Force-release every active lock older than `older_than`. Use carefully - releasi
 
 ### `GET /api/v1/trace`
 
-Server-sent-events stream of every request the daemon handles, in real time. **Admin or auditor.** Each event carries timestamp, method, path, status, latency, and request/response sizes. The server has no overhead when no trace client is connected. The CLI wrapper is `y2q admin trace <alias> [--errors]`.
+Server-sent-events stream of requests the daemon handles, in real time. **Admin or auditor.** Each event carries timestamp, method, path, status, latency, and request/response sizes (plaintext wire sizes). Events for bucket/object routes are limited to buckets the caller's persona can already read — the same sealed-grant rule as `GET /`; the admin/auditor role alone is not a visibility bypass. Non-bucket admin routes (locks, rebuild status, trace itself, …) are always included. The server has no overhead when no trace client is connected. The CLI wrapper is `y2q admin trace <alias> [--errors]`.
 
 | Code | Meaning |
 |---|---|

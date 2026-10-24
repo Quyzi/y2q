@@ -117,6 +117,8 @@ mod sized_body;
 mod span;
 mod tls;
 mod trace;
+#[cfg(test)]
+mod trace_bucket_filter_test;
 
 use crate::auth::AuthState;
 use crate::trace::TraceHub;
