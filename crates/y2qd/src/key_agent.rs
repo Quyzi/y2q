@@ -15,7 +15,7 @@
 //!   `<key_agent_state_dir>/armed` (tmpfs, dir `0700`, file `0600`, owned by
 //!   the key uid). Unattended hosts arm with empty authorization from
 //!   `ExecStartPre=+` before every daemon start; attended hosts arm
-//!   interactively with `y2qd --key-arm --prompt-*`, which sends the secrets
+//!   interactively with `y2q-keyarm --prompt-*` (or `y2qd --key-arm --prompt-*`), which sends the secrets
 //!   over the socket instead of an environment variable or a file.
 //! * **fetch** (peer uid must be `key_agent_peer_uid`, the daemon uid): the
 //!   helper consumes the armed file (every attempt deletes it, success or
@@ -83,13 +83,13 @@ const ARMED_TAKING: &str = "armed.taking";
 /// substring `not armed` to add its hint.
 #[cfg(all(target_os = "linux", feature = "devices"))]
 pub const NOT_ARMED: &str =
-    "key agent is not armed; run `y2qd --key-arm` as root before starting the daemon";
+    "key agent is not armed; run `y2q-keyarm` as root before starting the daemon";
 
 // ---------------------------------------------------------------------------
 // Arm client (every Linux build)
 // ---------------------------------------------------------------------------
 
-/// Which secrets `y2qd --key-arm` prompts for. With none set it arms with
+/// Which secrets the arm client prompts for. With none set it arms with
 /// empty authorization.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ArmFlags {
@@ -98,8 +98,9 @@ pub struct ArmFlags {
     pub emergency_code: bool,
 }
 
-/// `y2qd --key-arm`: prompt on `/dev/tty` and send one `arm` request to
-/// `[crypto.devices] key_agent_socket`. Secrets are never echoed or logged.
+/// Arm client (`y2q-keyarm` / `y2qd --key-arm`): prompt on `/dev/tty` and send
+/// one `arm` request to `[crypto.devices] key_agent_socket`. Secrets are never
+/// echoed or logged.
 pub fn run_arm(cfg: &crate::config::Config, flags: ArmFlags) -> std::io::Result<()> {
     let dev = &cfg.crypto.devices;
     if dev.key_agent_socket.is_empty() {
@@ -186,7 +187,7 @@ impl PinProvider for ArmedAuth {
             .ok_or_else(|| {
                 CryptoError::DeviceBackend(format!(
                     "fido2: away device '{label}' requires a PIN but none was armed: run \
-                     `y2qd --key-arm --prompt-pin` as root before starting the daemon"
+                     `y2q-keyarm --prompt-pin` as root before starting the daemon"
                 ))
             })
     }
@@ -199,7 +200,7 @@ impl PinProvider for ArmedAuth {
             .ok_or_else(|| {
                 CryptoError::DeviceBackend(format!(
                     "home device '{label}' requires a passcode but none was armed: run \
-                     `y2qd --key-arm --prompt-passcode` as root before starting the daemon"
+                     `y2q-keyarm --prompt-passcode` as root before starting the daemon"
                 ))
             })
     }
@@ -793,7 +794,7 @@ mod tests {
         fetch_with(&fx, fx.ctx(my_uid(), my_uid())).expect("first fetch");
         let text = err_text(fetch_with(&fx, fx.ctx(my_uid(), my_uid())));
         assert!(text.contains("not armed"), "{text}");
-        assert!(text.contains("y2qd --key-arm"), "{text}");
+        assert!(text.contains("y2q-keyarm"), "{text}");
     }
 
     #[test]

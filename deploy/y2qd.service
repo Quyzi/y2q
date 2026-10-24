@@ -18,10 +18,11 @@ Type=simple
 # helper consumes on the fetch. Hosts whose home device has a second factor (passcode or
 # FIDO2 PIN) MUST remove this line (drop-in override: `ExecStartPre=` clears it) and an
 # operator arms interactively first:
-#   sudo y2qd --key-arm --prompt-passcode --prompt-pin ; systemctl start y2qd
+#   sudo y2q-keyarm --prompt-passcode --prompt-pin ; systemctl start y2qd
+# Install `y2q-keyarm` as a separate file (mode 0700 root:root; not a hardlink of y2qd).
 # The armed file is consumed by every fetch, so on such hosts a crash restart fails until
 # an operator re-arms.
-ExecStartPre=+/usr/local/bin/y2qd --key-arm --config /etc/y2q/config.toml
+ExecStartPre=+/usr/local/bin/y2q-keyarm --config /etc/y2q/config.toml
 ExecStart=/usr/local/bin/y2qd --config /etc/y2q/config.toml
 Restart=on-failure
 RestartSec=5s

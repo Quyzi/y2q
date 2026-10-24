@@ -244,11 +244,12 @@ grant_timer_interval_seconds = 900
 #   arm   (peer uid = key_agent_arm_uid, default root): stores ONE-TIME
 #         authorization (passcode, FIDO2 PIN, emergency code) in
 #         <key_agent_state_dir>/armed. Unattended hosts arm with empty
-#         authorization from `ExecStartPre=+y2qd --key-arm` before every daemon
-#         start; attended hosts (a home device with a second factor) arm
-#         interactively: `y2qd --key-arm --prompt-passcode|--prompt-pin|
+#         authorization from `ExecStartPre=+/usr/local/bin/y2q-keyarm` before
+#         every daemon start; attended hosts (a home device with a second factor)
+#         arm interactively: `y2q-keyarm --prompt-passcode|--prompt-pin|
 #         --prompt-emergency-code` sends the secret over the socket, never via
-#         an environment variable or a file.
+#         an environment variable or a file. `y2qd --key-arm` remains a
+#         compatibility alias.
 #   fetch (peer uid = key_agent_peer_uid, the daemon's uid): the helper consumes
 #         the armed file (every attempt deletes it), unlocks the registry with
 #         that material and returns the node key once. A fetch without a prior

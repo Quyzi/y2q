@@ -146,7 +146,7 @@ pub fn helper_effective(a: &Answers) -> bool {
     a.device.use_helper && a.involves_registry()
 }
 
-/// Whether `ExecStartPre=+... --key-arm` is kept in `y2qd.service`.
+/// Whether `ExecStartPre=+/.../y2q-keyarm` is kept in `y2qd.service`.
 pub fn arm_on_start(a: &Answers, probes: &dyn Probes) -> bool {
     match &a.authority {
         Some(Authority::NewRegistry(n)) => n.first == FirstKind::Tpm,
@@ -207,9 +207,19 @@ fn rw_dirs(a: &Answers) -> Vec<String> {
     v
 }
 
+fn arm_bin_for(daemon_bin: &str) -> String {
+    match Path::new(daemon_bin).parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => {
+            dir.join("y2q-keyarm").to_string_lossy().into_owned()
+        }
+        _ => "/usr/local/bin/y2q-keyarm".into(),
+    }
+}
+
 fn unit_params(a: &Answers, probes: &dyn Probes) -> UnitParams {
     UnitParams {
         bin: a.binary_path.clone(),
+        arm_bin: arm_bin_for(&a.binary_path),
         config: a.config_path.to_string_lossy().into_owned(),
         daemon_user: a.daemon_user.clone(),
         key_user: a.device.key_user.clone(),
@@ -1114,7 +1124,7 @@ pub fn summary(
         out.push("  y2q admin device check-time ...  (verify Roughtime)".to_owned());
         if helper && !arm_on_start(a, probes) {
             out.push(format!(
-                "  sudo y2qd --key-arm --prompt-passcode --prompt-pin --config {}   (before each start)",
+                "  sudo y2q-keyarm --prompt-passcode --prompt-pin --config {}   (before each start)",
                 q(&plan.config_path)
             ));
         }

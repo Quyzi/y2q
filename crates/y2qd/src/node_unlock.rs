@@ -9,7 +9,7 @@
 //!    is fetched once from a socket-activated one-shot `y2qd --key-serve`,
 //!    which owns the hardware and RMK for the length of one request; the
 //!    daemon never touches either. The helper must have been armed
-//!    (`y2qd --key-arm`) beforehand.
+//!    (`y2q-keyarm`) beforehand.
 //! 3. **Device mode** — `<keystore_dir>/devices.json` exists. The node key is
 //!    recovered in-process from a registered TPM home device, a FIDO2 away
 //!    device or a one-time emergency code (`y2q_core::crypto::devices`).
@@ -160,8 +160,8 @@ fn resolve_agent(cfg: &crate::config::Config) -> Result<Resolved, std::io::Error
         let text = e.to_string();
         let hint = if text.contains("not armed") {
             "; the key helper must be armed before the daemon starts: unattended hosts arm \
-             with empty authorization from ExecStartPre=+ (`y2qd --key-arm`), attended hosts \
-             arm interactively (`y2qd --key-arm --prompt-passcode`, `--prompt-pin` or \
+             with empty authorization from ExecStartPre=+ (`y2q-keyarm`), attended hosts \
+             arm interactively (`y2q-keyarm --prompt-passcode`, `--prompt-pin` or \
              `--prompt-emergency-code`) first"
         } else {
             ""
@@ -550,10 +550,13 @@ mod tests {
         )
         .unwrap();
         let cli = crate::cli::Cli::parse_from(["y2qd", "--config", cfg_path.to_str().unwrap()]);
-        crate::config::Config::load(&cli).expect("registry alone satisfies the node-key rule");
+        crate::config::Config::load(cli.config.as_deref(), &cli.overrides)
+            .expect("registry alone satisfies the node-key rule");
 
         std::fs::remove_file(ks.path().join("devices.json")).unwrap();
-        let err = crate::config::Config::load(&cli).err().unwrap();
+        let err = crate::config::Config::load(cli.config.as_deref(), &cli.overrides)
+            .err()
+            .unwrap();
         assert!(err.to_string().contains("devices.json"), "{err}");
     }
 
