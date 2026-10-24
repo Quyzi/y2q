@@ -33,7 +33,8 @@ impl Y2qClient {
     /// Delete a user. `force` bypasses the server's guard against stranding
     /// a bucket this user owns (see `?force=true` on the endpoint).
     pub async fn delete_user(&self, username: &str, force: bool) -> Result<(), ClientError> {
-        let url = self.url(&format!("api/v1/users/{username}"));
+        super::validate_username_segment(username)?;
+        let url = self.resource_url(&["api", "v1", "users"], username, &[])?;
         let req = self.authed(self.inner.delete(url));
         let req = if force {
             req.query(&[("force", "true")])
@@ -48,7 +49,8 @@ impl Y2qClient {
     /// Change a user's global role (`admin`/`user`/`readonly`/`writeonly`/
     /// `auditor`/`disabled`). Takes effect immediately (revokes their sessions).
     pub async fn set_user_role(&self, username: &str, role: &str) -> Result<(), ClientError> {
-        let url = self.url(&format!("api/v1/users/{username}/role"));
+        super::validate_username_segment(username)?;
+        let url = self.resource_url(&["api", "v1", "users"], username, &["role"])?;
         let body = serde_json::json!({ "role": role });
         let resp = self.authed(self.inner.put(url)).json(&body).send().await?;
         Self::check_status(resp).await?;
@@ -63,7 +65,8 @@ impl Y2qClient {
         username: &str,
         password: &str,
     ) -> Result<ResetIdentityResponse, ClientError> {
-        let url = self.url(&format!("api/v1/users/{username}/reset-identity"));
+        super::validate_username_segment(username)?;
+        let url = self.resource_url(&["api", "v1", "users"], username, &["reset-identity"])?;
         let body = serde_json::json!({ "password": password });
         let resp = self.authed(self.inner.post(url)).json(&body).send().await?;
         let resp = Self::check_status(resp).await?;

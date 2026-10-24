@@ -80,6 +80,34 @@ pub fn validate_base_url(s: &str) -> Result<(), ClientError> {
     parse_base_url(s).map(drop)
 }
 
+/// Keep in sync with `y2qd::auth::users::validate` (charset + 64-byte cap).
+const MAX_USERNAME_BYTES: usize = 64;
+
+/// Client-side username path-segment check. Mirrors
+/// `y2qd::auth::users::validate` so admin URL builders reject rewrite-prone
+/// or charset-illegal names before they touch [`Url::join`] / segment push.
+pub(crate) fn validate_username_segment(username: &str) -> Result<(), ClientError> {
+    if username.is_empty() {
+        return Err(ClientError::BadRequest {
+            message: "invalid username: empty".into(),
+        });
+    }
+    if username.len() > MAX_USERNAME_BYTES {
+        return Err(ClientError::BadRequest {
+            message: "invalid username: too long".into(),
+        });
+    }
+    if !username
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+    {
+        return Err(ClientError::BadRequest {
+            message: "invalid username: only [A-Za-z0-9_.-] allowed".into(),
+        });
+    }
+    Ok(())
+}
+
 #[derive(Clone)]
 pub struct Y2qClient {
     pub(crate) inner: reqwest::Client,
@@ -160,6 +188,49 @@ impl Y2qClient {
                         ),
                     });
                 }
+                segs.push(part);
+            }
+        }
+        Ok(url)
+    }
+
+    /// Build a URL whose path is `static_prefix` + one dynamic segment +
+    /// `static_suffix`, without going through [`Url::join`] on a formatted
+    /// string (which would apply RFC 3986 dot-segment resolution and treat
+    /// `#`/`?` as fragment/query).
+    ///
+    /// Rejects an empty / `.` / `..` dynamic segment and any that contain
+    /// `/` or `\`, for the same reason [`Self::object_url`] rejects those
+    /// components: `path_segments_mut` would silently drop `.`/`..`.
+    pub(crate) fn resource_url(
+        &self,
+        static_prefix: &[&str],
+        dynamic: &str,
+        static_suffix: &[&str],
+    ) -> Result<Url, ClientError> {
+        if dynamic.is_empty()
+            || dynamic == "."
+            || dynamic == ".."
+            || dynamic.contains('/')
+            || dynamic.contains('\\')
+        {
+            return Err(ClientError::BadRequest {
+                message: format!(
+                    "invalid path segment {dynamic:?}: empty, \".\", \"..\", and \
+                     names containing '/' or '\\\\' are not allowed"
+                ),
+            });
+        }
+        let mut url = self.base_url.clone();
+        {
+            let mut segs = url
+                .path_segments_mut()
+                .expect("base_url is not a cannot-be-a-base URL");
+            for part in static_prefix {
+                segs.push(part);
+            }
+            segs.push(dynamic);
+            for part in static_suffix {
                 segs.push(part);
             }
         }
@@ -438,5 +509,113 @@ mod tests {
     fn base_url_error_does_not_echo_credentials() {
         let err = validate_base_url("ftp://user:s3cret@example.com/").unwrap_err();
         assert!(!err.to_string().contains("s3cret"), "{err}");
+    }
+
+    #[test]
+    fn resource_url_rejects_dot_segment_usernames_instead_of_rewriting() {
+        // `Url::join` on `api/v1/users/ghost/../f2carol` would silently
+        // request `/api/v1/users/f2carol`. Segment push + validation must
+        // refuse instead.
+        for bad in [
+            "ghost/../f2carol",
+            "../f2carol",
+            "f2carol/../x",
+            ".",
+            "..",
+            "",
+        ] {
+            assert!(
+                matches!(
+                    client().resource_url(&["api", "v1", "users"], bad, &[]),
+                    Err(ClientError::BadRequest { .. })
+                ),
+                "{bad:?}"
+            );
+        }
+        // Charset mirror of y2qd::auth::users::validate (blocks `/`; `.`/`..`
+        // are charset-legal but still rejected by resource_url above).
+        for bad in ["ghost/../f2carol", "../f2carol", "f2carol/../x", ""] {
+            assert!(validate_username_segment(bad).is_err(), "{bad:?} charset");
+        }
+    }
+
+    #[test]
+    fn resource_url_builds_valid_user_paths() {
+        let url = client()
+            .resource_url(&["api", "v1", "users"], "alice", &[])
+            .unwrap();
+        assert_eq!(url.path(), "/api/v1/users/alice");
+
+        let url = client()
+            .resource_url(&["api", "v1", "users"], "alice", &["role"])
+            .unwrap();
+        assert_eq!(url.path(), "/api/v1/users/alice/role");
+
+        let url = client()
+            .resource_url(&["api", "v1", "users"], "alice", &["reset-identity"])
+            .unwrap();
+        assert_eq!(url.path(), "/api/v1/users/alice/reset-identity");
+
+        assert!(validate_username_segment("alice").is_ok());
+    }
+
+    #[test]
+    fn validate_username_rejects_hash_query_and_space() {
+        // Charset check blocks `#`/`?`/space so they never truncate via join.
+        for bad in ["alice#x", "alice?x=1", "alice bob"] {
+            assert!(
+                matches!(
+                    validate_username_segment(bad),
+                    Err(ClientError::BadRequest { .. })
+                ),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn resource_url_rejects_dot_segment_buckets() {
+        for bad in ["x/../y", "../y", "y/../z", ".", "..", "", "a\\b"] {
+            assert!(
+                matches!(
+                    client().resource_url(&["api", "v1", "buckets"], bad, &["config"]),
+                    Err(ClientError::BadRequest { .. })
+                ),
+                "config {bad:?}"
+            );
+            assert!(
+                matches!(
+                    client().resource_url(&[], bad, &[""]),
+                    Err(ClientError::BadRequest { .. })
+                ),
+                "root {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn resource_url_builds_valid_bucket_paths() {
+        let url = client()
+            .resource_url(&["api", "v1", "buckets"], "b", &["config"])
+            .unwrap();
+        assert_eq!(url.path(), "/api/v1/buckets/b/config");
+
+        let url = client()
+            .resource_url(&["api", "v1", "buckets"], "b", &["acl"])
+            .unwrap();
+        assert_eq!(url.path(), "/api/v1/buckets/b/acl");
+
+        let url = client()
+            .resource_url(&["api", "v1", "buckets"], "b", &["rotate-key"])
+            .unwrap();
+        assert_eq!(url.path(), "/api/v1/buckets/b/rotate-key");
+
+        let url = client()
+            .resource_url(&["api", "v1", "buckets"], "b", &["rekey"])
+            .unwrap();
+        assert_eq!(url.path(), "/api/v1/buckets/b/rekey");
+
+        let url = client().resource_url(&[], "b", &[""]).unwrap();
+        assert_eq!(url.path(), "/b/");
     }
 }
