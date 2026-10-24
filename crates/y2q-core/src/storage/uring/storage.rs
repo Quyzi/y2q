@@ -22,6 +22,7 @@ use crate::{
     Metadata, MetadataIndex, Object, PutOptions, StaleLock, Storage, StorageExt, SyncLevel,
     storage::filesystem::{
         obj_path_for, require_container_header_key, require_object_metadata_key, require_path_key,
+        validate_key,
     },
     storage::locks::LockRegistry,
     storage::record_write_phase,
@@ -389,17 +390,6 @@ fn validate_bucket(bucket: &str) -> Result<(), Error> {
     {
         return Err(Error::InvalidBucket {
             bucket: bucket.to_owned(),
-        });
-    }
-    Ok(())
-}
-
-/// Validate that `key` is a legal object key.
-fn validate_key(key: &str) -> Result<(), Error> {
-    const MAX_KEY_LEN: usize = 1024;
-    if key.is_empty() || key.contains('\0') || key.len() > MAX_KEY_LEN {
-        return Err(Error::InvalidKey {
-            key: key.to_owned(),
         });
     }
     Ok(())
@@ -1182,6 +1172,14 @@ mod tests {
         let storage = make_storage(&dir, 1);
         let err = storage.get("../escape", "k").await.unwrap_err();
         assert!(matches!(err, Error::InvalidBucket { .. }));
+    }
+
+    #[tokio::test]
+    async fn invalid_key_dotdot_is_rejected_before_dispatch() {
+        let dir = TempDir::new().unwrap();
+        let storage = make_storage(&dir, 1);
+        let err = storage.get("b", "../escape").await.unwrap_err();
+        assert!(matches!(err, Error::InvalidKey { .. }));
     }
 
     /// Round-trip a payload whose size is an exact multiple of the 4 KiB

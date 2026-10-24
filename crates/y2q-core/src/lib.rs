@@ -291,7 +291,8 @@ pub enum Error {
         bucket: String,
     },
 
-    /// The key is empty, contains null bytes, or exceeds the maximum length.
+    /// The key is empty, contains null bytes, exceeds the maximum length, or
+    /// contains empty / `.` / `..` path components.
     #[error("invalid key: {key}")]
     InvalidKey {
         /// The rejected key.

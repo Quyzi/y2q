@@ -322,7 +322,7 @@ Revoke one of the caller's own S3 credentials.
 Object paths take the form `/{bucket}/{key}`. Keys may contain `/` characters and are matched by a greedy tail pattern - `/photos/2024/05/cat.jpg` is bucket `photos`, key `2024/05/cat.jpg`.
 
 Bucket names: ASCII alphanumeric plus `-` and `_`. The case-insensitive name `api` is reserved.
-Keys: up to 1024 bytes, no null bytes, non-empty.
+Keys: up to 1024 bytes, no null bytes, non-empty, no empty / `.` / `..` path components.
 
 ### `PUT /{bucket}/{key}`
 
