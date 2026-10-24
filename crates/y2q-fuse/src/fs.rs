@@ -1,5 +1,7 @@
 use std::collections::{BTreeSet, HashMap};
+use std::fs::{OpenOptions, TryLockError};
 use std::io::{Seek, SeekFrom, Write as IoWrite};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -32,10 +34,14 @@ const WRITE_BUF_TEMPFILE_PREFIX: &str = "y2q-fuse-writebuf-";
 fn new_write_tempfile(dir: Option<&Path>) -> std::io::Result<NamedTempFile> {
     let mut builder = tempfile::Builder::new();
     builder.prefix(WRITE_BUF_TEMPFILE_PREFIX);
-    match dir {
-        Some(dir) => builder.tempfile_in(dir),
-        None => builder.tempfile(),
-    }
+    let tmp = match dir {
+        Some(dir) => builder.tempfile_in(dir)?,
+        None => builder.tempfile()?,
+    };
+    // Exclusive flock held for the life of this fd so a concurrent mount's
+    // startup sweep (`try_lock`) skips our live buffer instead of zeroing it.
+    tmp.as_file().lock()?;
+    Ok(tmp)
 }
 
 /// Overwrite `len` bytes of `f` starting at `start` with zeros, in bounded
@@ -102,13 +108,53 @@ fn scrub_write_tempfile(tmp: Option<NamedTempFile>) {
     // `tmp` drops here, unlinking the file.
 }
 
-/// Overwrite the file at `path` with zeros before it's removed. Used by
-/// [`sweep_orphaned_tempfiles`] on files this process didn't create the
-/// `NamedTempFile` handle for (they're discovered by name after a crash).
-fn scrub_file_before_remove(path: &Path) -> std::io::Result<()> {
-    let mut file = std::fs::OpenOptions::new().write(true).open(path)?;
-    let len = file.metadata()?.len();
-    zero_fill(&mut file, len)
+/// Claim an orphaned write-buffer tempfile for scrub+remove, or skip it.
+///
+/// Opens with `O_NOFOLLOW` (never follows planted symlinks), requires a
+/// regular file owned by the current uid with `nlink == 1`, then takes a
+/// non-blocking exclusive flock. Only a successfully claimed file is
+/// zero-filled and unlinked. A matching symlink is removed without touching
+/// its target; anything else is left alone.
+fn try_reap_writebuf(path: &Path) -> std::io::Result<()> {
+    let open = OpenOptions::new()
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path);
+    let mut file = match open {
+        Ok(f) => f,
+        Err(_) => {
+            match std::fs::symlink_metadata(path) {
+                Ok(meta) if meta.file_type().is_symlink() => {
+                    std::fs::remove_file(path)?;
+                    tracing::info!(
+                        path = %path.display(),
+                        "removed planted write-buffer symlink"
+                    );
+                }
+                // Directory / gone / unreadable: leave alone (never fall through
+                // to a destructive remove of a path we did not claim).
+                _ => {}
+            }
+            return Ok(());
+        }
+    };
+
+    let meta = file.metadata()?;
+    if !meta.file_type().is_file() || meta.uid() != unsafe { libc::getuid() } || meta.nlink() != 1 {
+        return Ok(());
+    }
+
+    match file.try_lock() {
+        Ok(()) => {}
+        Err(TryLockError::WouldBlock) => return Ok(()),
+        Err(TryLockError::Error(e)) => return Err(e),
+    }
+
+    let len = meta.len();
+    zero_fill(&mut file, len)?;
+    std::fs::remove_file(path)?;
+    tracing::info!(path = %path.display(), "removed orphaned write-buffer tempfile");
+    Ok(())
 }
 
 /// Best-effort cleanup of write-buffer temp files orphaned by a prior
@@ -116,9 +162,10 @@ fn scrub_file_before_remove(path: &Path) -> std::io::Result<()> {
 /// on an abrupt kill). Only removes files whose name starts with
 /// [`WRITE_BUF_TEMPFILE_PREFIX`] in the OS temp directory, and (when
 /// `extra_dir` is set, i.e. `--write-buf-dir` is in use) that directory too.
-/// Never touches anything else there. Each matching file has its contents
-/// zeroed before removal (see [`scrub_file_before_remove`]). Never blocks or
-/// fails the mount: every error is logged and skipped.
+/// Never touches anything else there. Each matching candidate is claimed via
+/// [`try_reap_writebuf`] (O_NOFOLLOW + owner/nlink/flock checks); unclaimed
+/// paths are left alone. Never blocks or fails the mount: every error is
+/// logged and skipped.
 pub fn sweep_orphaned_tempfiles(extra_dir: Option<&Path>) {
     let mut dirs = vec![std::env::temp_dir()];
     if let Some(d) = extra_dir {
@@ -149,15 +196,8 @@ fn sweep_dir(dir: &Path) {
             continue;
         }
         let path = entry.path();
-        if let Err(e) = scrub_file_before_remove(&path) {
-            tracing::debug!(path = %path.display(), error = %e, "tempfile sweep: scrub failed");
-            // Fall through and remove it anyway — unscrubbed-but-unlinked is
-            // no worse than this file was before this fix existed.
-        }
-        if let Err(e) = std::fs::remove_file(&path) {
-            tracing::debug!(path = %path.display(), error = %e, "tempfile sweep: remove failed");
-        } else {
-            tracing::info!(path = %path.display(), "removed orphaned write-buffer tempfile");
+        if let Err(e) = try_reap_writebuf(&path) {
+            tracing::debug!(path = %path.display(), error = %e, "tempfile sweep: reap failed");
         }
     }
 }
@@ -2755,20 +2795,100 @@ mod tests {
     }
 
     #[test]
-    fn scrub_file_before_remove_zeroes_contents_spanning_multiple_chunks() {
+    fn try_reap_writebuf_zeroes_and_removes_orphan_spanning_multiple_chunks() {
         // Larger than the 64KiB scrub chunk size, to exercise the loop.
-        let dir = std::env::temp_dir();
+        // Keep a read fd across the reap so we can assert the inode was
+        // zeroed even after the directory entry is unlinked.
+        let dir = tempfile::tempdir().unwrap();
         let unique = format!("{}-{}", std::process::id(), line!());
-        let path = dir.join(format!("{WRITE_BUF_TEMPFILE_PREFIX}scrub-{unique}"));
+        let path = dir
+            .path()
+            .join(format!("{WRITE_BUF_TEMPFILE_PREFIX}scrub-{unique}"));
         std::fs::write(&path, vec![0x5Au8; 70_000]).unwrap();
+        let mut reader = std::fs::File::open(&path).unwrap();
 
-        scrub_file_before_remove(&path).unwrap();
+        try_reap_writebuf(&path).unwrap();
 
-        let bytes = std::fs::read(&path).unwrap();
+        assert!(!path.exists(), "orphaned writebuf must be removed");
+        use std::io::Read;
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).unwrap();
         assert_eq!(bytes.len(), 70_000);
         assert!(bytes.iter().all(|&b| b == 0));
+    }
 
-        std::fs::remove_file(&path).unwrap();
+    #[test]
+    fn sweep_does_not_follow_planted_writebuf_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, b"do-not-clobber").unwrap();
+        let link = dir.path().join(format!(
+            "{WRITE_BUF_TEMPFILE_PREFIX}planted-{}",
+            std::process::id()
+        ));
+        std::os::unix::fs::symlink(&victim, &link).unwrap();
+
+        sweep_dir(dir.path());
+
+        assert_eq!(std::fs::read(&victim).unwrap(), b"do-not-clobber");
+        assert!(
+            !link.exists(),
+            "planted symlink must be removed without following"
+        );
+    }
+
+    #[test]
+    fn sweep_skips_non_regular_prefix_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join(format!(
+            "{WRITE_BUF_TEMPFILE_PREFIX}dir-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&nested).unwrap();
+
+        sweep_dir(dir.path());
+
+        assert!(
+            nested.exists(),
+            "directory named like a writebuf must not be removed"
+        );
+    }
+
+    #[test]
+    fn sweep_skips_hardlinked_writebuf() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(format!(
+            "{WRITE_BUF_TEMPFILE_PREFIX}hl-{}",
+            std::process::id()
+        ));
+        std::fs::write(&path, b"shared-inode").unwrap();
+        let link = dir.path().join("extra-link");
+        std::fs::hard_link(&path, &link).unwrap();
+
+        sweep_dir(dir.path());
+
+        assert!(path.exists());
+        assert_eq!(std::fs::read(&path).unwrap(), b"shared-inode");
+        assert!(link.exists());
+    }
+
+    #[test]
+    fn sweep_skips_live_flocked_writebuf() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut tmp = new_write_tempfile(Some(dir.path())).unwrap();
+        tmp.write_all(b"live-buffer").unwrap();
+        tmp.flush().unwrap();
+        let path = tmp.path().to_path_buf();
+
+        sweep_dir(dir.path());
+
+        assert!(path.exists(), "live flocked writebuf must survive sweep");
+        assert_eq!(std::fs::read(&path).unwrap(), b"live-buffer");
+
+        // Drop the flocked fd without unlinking so a later sweep can reclaim.
+        let _ = tmp.into_file();
+        sweep_dir(dir.path());
+        assert!(!path.exists(), "unlocked orphan must be reaped");
     }
 
     #[test]
