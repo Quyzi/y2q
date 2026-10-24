@@ -88,11 +88,7 @@ pub async fn trace_middleware<B: MessageBody>(
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0);
-        let bucket = res
-            .request()
-            .match_info()
-            .get("bucket")
-            .map(str::to_owned);
+        let bucket = res.request().match_info().get("bucket").map(str::to_owned);
         hub.publish(TraceEvent {
             request_id,
             timestamp_ns,
@@ -122,22 +118,23 @@ pub async fn stream(
     let rx = hub.subscribe();
     let storage = storage.into_inner();
     let auth = auth.0;
-    let event_stream = futures_util::stream::unfold((rx, storage, auth), |(mut rx, storage, auth)| async move {
-        loop {
-            match rx.recv().await {
-                Ok(event) => {
-                    if !trace_event_visible(&auth, storage.as_ref(), &event).await {
-                        continue;
+    let event_stream =
+        futures_util::stream::unfold((rx, storage, auth), |(mut rx, storage, auth)| async move {
+            loop {
+                match rx.recv().await {
+                    Ok(event) => {
+                        if !trace_event_visible(&auth, storage.as_ref(), &event).await {
+                            continue;
+                        }
+                        let json = serde_json::to_string(&event).unwrap_or_default();
+                        let bytes = Bytes::from(format!("data: {json}\n\n"));
+                        return Some((Ok::<_, actix_web::Error>(bytes), (rx, storage, auth)));
                     }
-                    let json = serde_json::to_string(&event).unwrap_or_default();
-                    let bytes = Bytes::from(format!("data: {json}\n\n"));
-                    return Some((Ok::<_, actix_web::Error>(bytes), (rx, storage, auth)));
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => return None,
                 }
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(broadcast::error::RecvError::Closed) => return None,
             }
-        }
-    });
+        });
     HttpResponse::Ok()
         .content_type("text/event-stream")
         .insert_header(("Cache-Control", "no-cache"))

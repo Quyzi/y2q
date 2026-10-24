@@ -238,9 +238,7 @@ async fn collect_sse_events(body: BoxBody, wait: Duration) -> Vec<serde_json::Va
 }
 
 fn find_sse_frame_end(buf: &[u8]) -> Option<usize> {
-    buf.windows(2)
-        .position(|w| w == b"\n\n")
-        .map(|i| i + 2)
+    buf.windows(2).position(|w| w == b"\n\n").map(|i| i + 2)
 }
 
 fn paths_containing(events: &[serde_json::Value], needle: &str) -> Vec<String> {
@@ -376,11 +374,7 @@ async fn middleware_captures_bucket_from_match_info() {
     )
     .await;
 
-    let resp = test::call_service(
-        &app,
-        TestRequest::get().uri("/secret/obj").to_request(),
-    )
-    .await;
+    let resp = test::call_service(&app, TestRequest::get().uri("/secret/obj").to_request()).await;
     assert_eq!(resp.status().as_u16(), 200);
     let event = rx.recv().await.expect("object route event");
     assert_eq!(event.bucket.as_deref(), Some("secret"));
@@ -397,11 +391,7 @@ async fn middleware_captures_bucket_from_match_info() {
     let event = rx.recv().await.expect("acl route event");
     assert_eq!(event.bucket.as_deref(), Some("secret"));
 
-    let resp = test::call_service(
-        &app,
-        TestRequest::get().uri("/api/v1/locks").to_request(),
-    )
-    .await;
+    let resp = test::call_service(&app, TestRequest::get().uri("/api/v1/locks").to_request()).await;
     assert_eq!(resp.status().as_u16(), 200);
     let event = rx.recv().await.expect("locks route event");
     assert_eq!(event.bucket, None);
