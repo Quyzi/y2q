@@ -224,10 +224,10 @@ async fn collect_sse_events(body: BoxBody, wait: Duration) -> Vec<serde_json::Va
                 while let Some(end) = find_sse_frame_end(&buf) {
                     let frame = String::from_utf8_lossy(&buf[..end]).into_owned();
                     buf.drain(..end);
-                    if let Some(json) = frame.strip_prefix("data: ") {
-                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(json.trim()) {
-                            events.push(v);
-                        }
+                    if let Some(json) = frame.strip_prefix("data: ")
+                        && let Ok(v) = serde_json::from_str::<serde_json::Value>(json.trim())
+                    {
+                        events.push(v);
                     }
                 }
             }
