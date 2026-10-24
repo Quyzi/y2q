@@ -797,10 +797,7 @@ impl Filesystem for Y2qFuse {
                 }
 
                 if let Some((size, created, modified)) = cached {
-                    reply.attr(
-                        &ATTR_TTL,
-                        &self.file_attr(ino, size, created, modified),
-                    );
+                    reply.attr(&ATTR_TTL, &self.file_attr(ino, size, created, modified));
                     return;
                 }
 
@@ -2730,9 +2727,9 @@ impl Y2qFuse {
         let mut labels = buf_labels.unwrap_or_default();
         let used_open_buf = {
             let guard = self.open_files.lock().unwrap_or_else(|e| e.into_inner());
-            let src_of = guard.values().find(|of| {
-                of.bucket == bucket && of.key == src_key && of.write_buf.is_some()
-            });
+            let src_of = guard
+                .values()
+                .find(|of| of.bucket == bucket && of.key == src_key && of.write_buf.is_some());
             if let Some(of) = src_of {
                 labels = of.labels.clone();
                 let src_tmp = of.write_buf.as_ref().unwrap();
@@ -2838,16 +2835,19 @@ impl Y2qFuse {
                 }
             }
         }
-        self.inodes.lock().unwrap_or_else(|e| e.into_inner()).repath(
-            &InodePath::Object {
-                bucket: bucket.to_owned(),
-                key: src_key.to_owned(),
-            },
-            InodePath::Object {
-                bucket: bucket.to_owned(),
-                key: dst_key.to_owned(),
-            },
-        );
+        self.inodes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .repath(
+                &InodePath::Object {
+                    bucket: bucket.to_owned(),
+                    key: src_key.to_owned(),
+                },
+                InodePath::Object {
+                    bucket: bucket.to_owned(),
+                    key: dst_key.to_owned(),
+                },
+            );
         Ok(())
     }
 
@@ -2980,10 +2980,7 @@ impl Y2qFuse {
             let paths = inodes.paths();
             for (_, path) in paths {
                 match &path {
-                    InodePath::VirtualDir {
-                        bucket: b,
-                        prefix,
-                    } if b == bucket => {
+                    InodePath::VirtualDir { bucket: b, prefix } if b == bucket => {
                         let new_prefix = if prefix == src_key {
                             Some(dst_key.to_owned())
                         } else {
@@ -3004,10 +3001,7 @@ impl Y2qFuse {
                             );
                         }
                     }
-                    InodePath::Object {
-                        bucket: b,
-                        key,
-                    } if b == bucket => {
+                    InodePath::Object { bucket: b, key } if b == bucket => {
                         // Objects already rewritten above; catch any that were
                         // only known locally (no server listing).
                         if let Some(rest) = key.strip_prefix(&src_prefix) {
