@@ -2453,6 +2453,7 @@ impl App {
                 let resp = crate::ops::auth::login(&client, &username, &password, None)
                     .await
                     .map_err(|e| e.to_string())?;
+                let url = profile.url.clone();
                 let mut store = TokenStore::load(&tokens_path).map_err(|e| e.to_string())?;
                 store.set(
                     &alias_clone,
@@ -2460,6 +2461,7 @@ impl App {
                         token: resp.token,
                         expires_at: resp.expires_at,
                         username: resp.username,
+                        url,
                     },
                 );
                 store.save(&tokens_path).map_err(|e| e.to_string())?;

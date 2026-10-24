@@ -56,6 +56,7 @@ pub async fn login(
         token: token_resp.token,
         expires_at: token_resp.expires_at,
         username: token_resp.username.clone(),
+        url: entry.url.clone(),
     };
     let mut store = TokenStore::load(&tokens_path)?;
     store.set(alias, token_entry.clone());
