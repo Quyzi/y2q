@@ -82,6 +82,19 @@ pub static S3_CREDENTIAL_GOVERNOR_CONFIG: LazyLock<
     builder.finish().expect("valid governor config")
 });
 
+/// Rate-limit config for `POST /api/v1/auth/password`: bursts of up to 5
+/// requests per source IP, replenishing one every 10 seconds thereafter.
+/// Authenticated password change is an online password oracle (current
+/// password verification via Argon2); legitimate use is rare, so the same
+/// cap as persona creation applies.
+pub static PASSWORD_GOVERNOR_CONFIG: LazyLock<GovernorConfig<RealIpKeyExtractor, NoOpMiddleware>> =
+    LazyLock::new(|| {
+        let mut builder = GovernorConfigBuilder::default();
+        let mut builder = builder.key_extractor(RealIpKeyExtractor);
+        builder.burst_size(5).seconds_per_request(10);
+        builder.finish().expect("valid governor config")
+    });
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -134,6 +147,50 @@ mod tests {
         let other: SocketAddr = "10.0.0.2:12345".parse().unwrap();
         let req = test::TestRequest::post()
             .uri("/login")
+            .peer_addr(other)
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 200);
+    }
+
+    #[actix_web::test]
+    async fn password_route_limits_by_source_ip() {
+        // Tight local config (burst 2); extractor/wiring match production
+        // `PASSWORD_GOVERNOR_CONFIG` on `/api/v1/auth/password`.
+        let mut builder = GovernorConfigBuilder::default();
+        let mut builder = builder.key_extractor(RealIpKeyExtractor);
+        builder.burst_size(2).seconds_per_request(60);
+        let config = builder.finish().expect("valid governor config");
+
+        let app = test::init_service(
+            App::new().service(
+                web::resource("/api/v1/auth/password")
+                    .wrap(Governor::new(&config))
+                    .route(web::post().to(ok)),
+            ),
+        )
+        .await;
+
+        let attacker: SocketAddr = "10.0.0.1:12345".parse().unwrap();
+        for _ in 0..2 {
+            let req = test::TestRequest::post()
+                .uri("/api/v1/auth/password")
+                .peer_addr(attacker)
+                .to_request();
+            let resp = test::call_service(&app, req).await;
+            assert_eq!(resp.status(), 200);
+        }
+
+        let req = test::TestRequest::post()
+            .uri("/api/v1/auth/password")
+            .peer_addr(attacker)
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), 429);
+
+        let other: SocketAddr = "10.0.0.2:12345".parse().unwrap();
+        let req = test::TestRequest::post()
+            .uri("/api/v1/auth/password")
             .peer_addr(other)
             .to_request();
         let resp = test::call_service(&app, req).await;

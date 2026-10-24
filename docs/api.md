@@ -147,7 +147,9 @@ Revoke the caller's current token.
 
 ### `POST /api/v1/auth/password`
 
-Change the caller's password. Re-wraps the SK under the new password using the *current* `[crypto.argon2]` parameters.
+Change the caller's password for the **session's persona slot only**. `current` must open that slot; a password that opens a different slot is rejected and does not rewrite any slot. Re-wraps under the new password using the record's existing Argon2 salt (and the *current* `[crypto.argon2]` cost parameters for the wrap).
+
+Shares login's per-username lockout counters (`max_failed_logins` / `lockout_seconds`) and `min_login_response_ms` timing floor. IP rate limiting is applied before the handler.
 
 **Request:**
 ```json
@@ -162,7 +164,8 @@ Change the caller's password. Re-wraps the SK under the new password using the *
 | Code | Meaning |
 |---|---|
 | 204 | Password changed |
-| 401 | Current password did not verify, or token invalid |
+| 401 | Current password did not verify for this session's persona, or token invalid |
+| 429 | Per-source-IP rate limit exceeded (checked first, before credentials), or account locked out after repeated failures - the latter sets `Retry-After` |
 
 ### `PUT /api/v1/users/add`
 
