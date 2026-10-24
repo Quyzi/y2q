@@ -308,6 +308,9 @@ pub async fn logout(
 }
 
 /// `POST /api/v1/auth/password` — change the caller's password (re-wrap SK).
+///
+/// Verifies `current` and re-wraps only the session's persona slot. Shares
+/// login's per-username lockout counters and response-time floor.
 #[utoipa::path(
     post,
     path = "/api/v1/auth/password",
@@ -315,7 +318,9 @@ pub async fn logout(
     responses(
         (status = 204, description = "Password changed"),
         (status = 401, description = "Current password did not verify, or token invalid"),
+        (status = 429, description = "Per-source-IP rate limit exceeded, or account locked out after repeated failures (lockout sets Retry-After)"),
     ),
+    security(("bearer" = [])),
     tag = "auth",
 )]
 #[tracing::instrument(skip(state, auth, body), fields(username = %auth.username))]
@@ -334,18 +339,54 @@ pub async fn change_password(
         });
     }
 
-    let rec = state
+    {
+        let mut attempts = state.login_attempts.lock().unwrap();
+        if let Err(until) = attempts.check_lockout(&username) {
+            return Err(AuthError::LockedOut {
+                until: SystemTime::now()
+                    + until.saturating_duration_since(std::time::Instant::now()),
+            });
+        }
+    }
+
+    let started = std::time::Instant::now();
+    let slot_idx = auth.session.persona as usize;
+
+    let rec = match state
         .user_store
         .get(&username)
         .map_err(|e| AuthError::Backend(e.to_string()))?
-        .ok_or(AuthError::InvalidCredentials)?;
-    let (rec, slot_idx, payload) = attempt_unwrap(rec, current).await?;
+    {
+        Some(rec) => rec,
+        None => {
+            state.login_attempts.lock().unwrap().record_failure(
+                &username,
+                state.config.max_failed_logins,
+                Duration::from_secs(state.config.lockout_seconds),
+            );
+            apply_floor(state.config.min_login_response_ms, started).await;
+            return Err(AuthError::InvalidCredentials);
+        }
+    };
 
-    // Re-wrap ONLY this slot, under the record's EXISTING salt (a fresh salt
-    // would invalidate the other three slots' KEK derivation, since all four
-    // share one Argon2Params). Every other slot, and every persona's grants,
-    // are untouched — changing a duress password must not disturb the real
-    // one and vice versa.
+    let (rec, slot_idx, payload) = match attempt_unwrap_slot(rec, current, slot_idx).await {
+        Ok(opened) => opened,
+        Err(e) => {
+            state.login_attempts.lock().unwrap().record_failure(
+                &username,
+                state.config.max_failed_logins,
+                Duration::from_secs(state.config.lockout_seconds),
+            );
+            apply_floor(state.config.min_login_response_ms, started).await;
+            return Err(e);
+        }
+    };
+
+    // Re-wrap ONLY this session's persona slot, under the record's EXISTING
+    // salt (a fresh salt would invalidate the other three slots' KEK
+    // derivation, since all four share one Argon2Params). Every other slot,
+    // and every persona's grants, are untouched — changing a duress password
+    // must not disturb the real one and vice versa.
     let params = rec.kdf.clone();
     let username_for_aad = rec.username.clone();
     let new_password = new;
@@ -369,6 +410,13 @@ pub async fn change_password(
         .user_store
         .upsert(&updated)
         .map_err(|e| AuthError::Backend(e.to_string()))?;
+
+    state
+        .login_attempts
+        .lock()
+        .unwrap()
+        .record_success(&username);
+    apply_floor(state.config.min_login_response_ms, started).await;
     Ok(HttpResponse::NoContent().finish())
 }
 
@@ -1017,6 +1065,34 @@ async fn attempt_unwrap(
     }
 }
 
+/// Argon2id + unwrap of a single credential slot. Used by password change so
+/// a correct password for a *different* slot cannot succeed or rewrite that
+/// slot. Login continues to use [`attempt_unwrap`] (all four).
+async fn attempt_unwrap_slot(
+    rec: UserRecord,
+    password: SecretString,
+    slot_idx: usize,
+) -> Result<(UserRecord, usize, SlotPayload), AuthError> {
+    if !(0..CREDENTIAL_SLOTS).contains(&slot_idx) {
+        return Err(AuthError::InvalidCredentials);
+    }
+    let params = rec.kdf.clone();
+    let slot = rec.slots[slot_idx].clone();
+    let username = rec.username.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let kek = Zeroizing::new(params.derive_kek(password.as_bytes()).ok()?);
+        let aad = kdf::slot_wrap_aad(&username, slot_idx);
+        let payload_bytes = kdf::unwrap_slot(&slot.wrapped, &kek, &aad).ok()?;
+        SlotPayload::from_bytes(&payload_bytes).ok()
+    })
+    .await
+    .map_err(|e| AuthError::Backend(format!("kdf join: {e}")))?;
+    match result {
+        Some(payload) => Ok((rec, slot_idx, payload)),
+        None => Err(AuthError::InvalidCredentials),
+    }
+}
+
 /// Make sure failed-login responses take at least `floor_ms` to send.
 async fn apply_floor(floor_ms: u64, started: std::time::Instant) {
     let elapsed = started.elapsed();
@@ -1470,5 +1546,238 @@ mod login_stale_record_tests {
         assert_eq!(stored.kdf, rotated.kdf);
         assert_ne!(stored.slots, snapshot.slots);
         assert_eq!(state.sessions.len(), 0);
+    }
+}
+
+#[cfg(test)]
+mod change_password_tests {
+    use super::*;
+    use crate::auth::authenticate_token_hash;
+    use crate::config::{Argon2Config, AuthConfig};
+    use std::time::{Duration, Instant};
+    use tempfile::tempdir;
+    use y2q_core::crypto::{Argon2Params, UserStore};
+
+    const PASSWORD_A: &str = "change-pw-slot-a";
+    const PASSWORD_B: &str = "change-pw-slot-b";
+    const PASSWORD_NEW: &str = "change-pw-new";
+
+    fn cheap_argon2() -> Argon2Config {
+        Argon2Config {
+            m_cost_kib: 8,
+            t_cost: 1,
+            p_cost: 1,
+        }
+    }
+
+    fn auth_config(max_failed: u32, floor_ms: u64) -> AuthConfig {
+        AuthConfig {
+            default_ttl_seconds: 3600,
+            max_ttl_seconds: 86_400,
+            session_sweep_interval_seconds: 300,
+            min_login_response_ms: floor_ms,
+            max_failed_logins: max_failed,
+            lockout_seconds: 900,
+            enforce_authorization: true,
+            max_refreshes: 0,
+        }
+    }
+
+    fn make_two_slot_record(username: &str) -> (UserRecord, usize, usize) {
+        let params = Argon2Params::with_random_salt(8, 1, 1);
+        let (mut slots, primary) =
+            kdf::new_slots_random(username, PASSWORD_A.as_bytes(), &params, Role::User, false)
+                .unwrap();
+        let other = (primary + 1) % CREDENTIAL_SLOTS;
+        slots[other] = kdf::new_slot(
+            username,
+            other,
+            PASSWORD_B.as_bytes(),
+            &params,
+            Role::User,
+            false,
+        )
+        .unwrap();
+        let rec = UserRecord {
+            username: username.to_owned(),
+            created_at: 1,
+            last_login: None,
+            kdf: params,
+            slots,
+            primary_slot: u8::try_from(primary).unwrap(),
+            role: Role::User,
+        };
+        (rec, primary, other)
+    }
+
+    fn harness(
+        record: &UserRecord,
+        max_failed: u32,
+        floor_ms: u64,
+    ) -> (tempfile::TempDir, AuthState) {
+        let dir = tempdir().unwrap();
+        let store = UserStore::open(&dir.path().join("users.redb"), &[9u8; 32]).unwrap();
+        store.upsert(record).unwrap();
+        let state =
+            AuthState::new(store, auth_config(max_failed, floor_ms), cheap_argon2()).unwrap();
+        (dir, state)
+    }
+
+    async fn session_as(
+        state: &AuthState,
+        rec: &UserRecord,
+        slot_idx: usize,
+        password: &str,
+    ) -> Authenticated {
+        let password = SecretString::from_str(password).unwrap();
+        let (rec, opened_idx, payload) = attempt_unwrap_slot(rec.clone(), password, slot_idx)
+            .await
+            .unwrap();
+        assert_eq!(opened_idx, slot_idx);
+        let token = state
+            .sessions
+            .insert(NewSession {
+                username: rec.username.clone(),
+                role: payload.role,
+                created_at: SystemTime::now(),
+                expires_at: SystemTime::now() + Duration::from_secs(3600),
+                persona: slot_idx as u8,
+                revoke_other_sessions: payload.revoke_other_sessions,
+                identity_sk: payload.identity_sk,
+            })
+            .unwrap();
+        authenticate_token_hash(state, token.hash()).unwrap()
+    }
+
+    fn secret(s: &str) -> SecretString {
+        SecretString::from_str(s).unwrap()
+    }
+
+    #[tokio::test]
+    async fn happy_path_rewrites_only_session_slot() {
+        let (rec, primary, other) = make_two_slot_record("alice");
+        let before = rec.slots.clone();
+        let (_dir, state) = harness(&rec, 10, 0);
+        let auth = session_as(&state, &rec, primary, PASSWORD_A).await;
+        let state = web::Data::new(state);
+
+        let resp = change_password(
+            state.clone(),
+            auth,
+            SecretJson(ChangePasswordRequest {
+                current: secret(PASSWORD_A),
+                new: secret(PASSWORD_NEW),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), actix_web::http::StatusCode::NO_CONTENT);
+
+        let stored = state.user_store.get("alice").unwrap().unwrap();
+        assert_ne!(stored.slots[primary], before[primary]);
+        assert_eq!(stored.slots[other], before[other]);
+        for (i, (got, expected)) in stored.slots.iter().zip(before.iter()).enumerate() {
+            if i != primary && i != other {
+                assert_eq!(got, expected);
+            }
+        }
+
+        attempt_unwrap_slot(stored.clone(), secret(PASSWORD_NEW), primary)
+            .await
+            .expect("new password opens primary");
+        attempt_unwrap_slot(stored, secret(PASSWORD_B), other)
+            .await
+            .expect("other slot unchanged");
+    }
+
+    #[tokio::test]
+    async fn cross_slot_password_rejected_without_rewrite() {
+        let (rec, primary, other) = make_two_slot_record("alice");
+        let before = rec.slots.clone();
+        let (_dir, state) = harness(&rec, 10, 0);
+        let auth = session_as(&state, &rec, primary, PASSWORD_A).await;
+        let state = web::Data::new(state);
+
+        let err = change_password(
+            state.clone(),
+            auth,
+            SecretJson(ChangePasswordRequest {
+                current: secret(PASSWORD_B),
+                new: secret(PASSWORD_NEW),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, AuthError::InvalidCredentials));
+
+        let stored = state.user_store.get("alice").unwrap().unwrap();
+        assert_eq!(stored.slots, before);
+        attempt_unwrap_slot(stored.clone(), secret(PASSWORD_B), other)
+            .await
+            .expect("other slot still opens with B");
+        attempt_unwrap_slot(stored, secret(PASSWORD_A), primary)
+            .await
+            .expect("primary still opens with A");
+    }
+
+    #[tokio::test]
+    async fn wrong_current_increments_lockout_shared_with_login() {
+        let (rec, primary, _other) = make_two_slot_record("alice");
+        let (_dir, state) = harness(&rec, 2, 0);
+        let auth = session_as(&state, &rec, primary, PASSWORD_A).await;
+        let state = web::Data::new(state);
+
+        for _ in 0..2 {
+            let err = change_password(
+                state.clone(),
+                auth.clone(),
+                SecretJson(ChangePasswordRequest {
+                    current: secret("wrong-password"),
+                    new: secret(PASSWORD_NEW),
+                }),
+            )
+            .await
+            .unwrap_err();
+            assert!(matches!(err, AuthError::InvalidCredentials));
+        }
+
+        let err = change_password(
+            state.clone(),
+            auth,
+            SecretJson(ChangePasswordRequest {
+                current: secret(PASSWORD_A),
+                new: secret(PASSWORD_NEW),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, AuthError::LockedOut { .. }));
+
+        // Shared counters: login is locked out too.
+        {
+            let mut attempts = state.login_attempts.lock().unwrap();
+            assert!(attempts.check_lockout("alice").is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_change_honors_response_floor() {
+        let (rec, primary, _other) = make_two_slot_record("alice");
+        let (_dir, state) = harness(&rec, 10, 50);
+        let auth = session_as(&state, &rec, primary, PASSWORD_A).await;
+
+        let started = Instant::now();
+        let err = change_password(
+            web::Data::new(state),
+            auth,
+            SecretJson(ChangePasswordRequest {
+                current: secret("wrong-password"),
+                new: secret(PASSWORD_NEW),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, AuthError::InvalidCredentials));
+        assert!(started.elapsed() >= Duration::from_millis(50));
     }
 }

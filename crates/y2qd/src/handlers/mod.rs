@@ -45,6 +45,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
     cfg.service(web::resource("/api/v1/auth/logout").route(web::post().to(auth_handlers::logout)));
     cfg.service(
         web::resource("/api/v1/auth/password")
+            .wrap(Governor::new(&crate::rate_limit::PASSWORD_GOVERNOR_CONFIG))
             .route(web::post().to(auth_handlers::change_password)),
     );
     cfg.service(web::resource("/api/v1/users/add").route(web::put().to(auth_handlers::add_user)));
