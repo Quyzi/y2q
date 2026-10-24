@@ -646,12 +646,19 @@ pub(crate) async fn bucket_usage_impl(index: &MetadataIndex, bucket: &str) -> Re
     Ok(total)
 }
 
-fn validate_key(key: &str) -> Result<(), Error> {
+pub(crate) fn validate_key(key: &str) -> Result<(), Error> {
     const MAX_KEY_LEN: usize = 1024;
     if key.is_empty() || key.contains('\0') || key.len() > MAX_KEY_LEN {
         return Err(Error::InvalidKey {
             key: key.to_owned(),
         });
+    }
+    for part in key.split('/') {
+        if part.is_empty() || part == "." || part == ".." {
+            return Err(Error::InvalidKey {
+                key: key.to_owned(),
+            });
+        }
     }
     Ok(())
 }
@@ -2321,6 +2328,54 @@ mod tests {
         assert!(matches!(err, crate::Error::InvalidBucket { .. }));
         let err2 = s.get("../escape", "k").await.unwrap_err();
         assert!(matches!(err2, crate::Error::InvalidBucket { .. }));
+    }
+
+    #[tokio::test]
+    async fn invalid_key_dotdot_components_rejected() {
+        let (s, _dir) = make_storage();
+        let bad = [
+            "..",
+            ".",
+            "foo/../bar",
+            "foo/./bar",
+            "../outside",
+            "a//b",
+            "/abs",
+            "a/",
+        ];
+        for key in bad {
+            for op in ["put", "get", "delete", "describe"] {
+                let err = match op {
+                    "put" => s
+                        .put("b", key, make_object(b"x"), PutOptions::default())
+                        .await
+                        .unwrap_err(),
+                    "get" => s.get("b", key).await.unwrap_err(),
+                    "delete" => s.delete("b", key).await.unwrap_err(),
+                    "describe" => s.describe("b", key).await.unwrap_err(),
+                    _ => unreachable!(),
+                };
+                assert!(
+                    matches!(err, crate::Error::InvalidKey { .. }),
+                    "{op}({key:?}) => {err:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn legal_keys_with_dots_and_slashes_accepted() {
+        let (s, _dir) = make_storage();
+        let max = "a".repeat(1024);
+        for key in ["foo/bar", "foo..bar", "a.b", "normal-key", max.as_str()] {
+            s.put("b", key, make_object(b"x"), PutOptions::default())
+                .await
+                .unwrap();
+            let got = s.get("b", key).await.unwrap();
+            assert_eq!(&got[..], b"x");
+            s.describe("b", key).await.unwrap();
+            s.delete("b", key).await.unwrap();
+        }
     }
 
     #[tokio::test]

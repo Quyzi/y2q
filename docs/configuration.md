@@ -104,7 +104,7 @@ Optional. When `enabled = true` the daemon binds **HTTPS** at `[server] port` us
 | `sync_flush_interval_secs` | u64 | `5` | How often (in seconds) the background best-effort flusher wakes to drain pending writes. Minimum 1. Only relevant when `default_sync = "best-effort"` or when requests override to `X-Y2Q-Sync: best-effort`. |
 | `sync_flush_limit` | usize | `64` | Queue depth at which the flusher wakes early (before the timer fires). Acts as a watermark; entries are never dropped. |
 
-The reserved bucket name `"api"` (case-insensitive) is rejected - it would collide with the `/api/v1/...` admin routes. Object keys are also bounded to 1024 bytes and must not contain null bytes.
+The reserved bucket name `"api"` (case-insensitive) is rejected - it would collide with the `/api/v1/...` admin routes. Object keys are also bounded to 1024 bytes, must not contain null bytes, and must not contain empty / `.` / `..` path components.
 
 ### `[crypto]`
 
