@@ -290,8 +290,7 @@ mod tests {
         let body = actix_web::body::to_bytes(resp.into_body());
         let body = actix_web::rt::System::new().block_on(body).unwrap();
         let text = String::from_utf8(body.to_vec()).unwrap();
-        let parsed: serde_json::Value =
-            serde_json::from_slice(&body).expect("ErrorBody JSON");
+        let parsed: serde_json::Value = serde_json::from_slice(&body).expect("ErrorBody JSON");
         assert_eq!(parsed["error"], MSG);
         assert!(!text.contains("SystemTime"));
         assert!(!text.contains("tv_sec"));
