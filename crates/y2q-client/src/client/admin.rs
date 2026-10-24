@@ -44,7 +44,7 @@ impl Y2qClient {
 
     /// Create a new bucket key epoch (`POST /api/v1/buckets/{bucket}/rotate-key`).
     pub async fn rotate_bucket_key(&self, bucket: &str) -> Result<RotateKeyResponse, ClientError> {
-        let url = self.url(&format!("api/v1/buckets/{bucket}/rotate-key"));
+        let url = self.resource_url(&["api", "v1", "buckets"], bucket, &["rotate-key"])?;
         let resp = self.authed(self.inner.post(url)).send().await?;
         let resp = Self::check_status(resp).await?;
         Ok(resp.json::<RotateKeyResponse>().await?)
@@ -52,7 +52,7 @@ impl Y2qClient {
 
     /// Start a bucket rekey (`POST /api/v1/buckets/{bucket}/rekey`).
     pub async fn rekey_start(&self, bucket: &str) -> Result<(), ClientError> {
-        let url = self.url(&format!("api/v1/buckets/{bucket}/rekey"));
+        let url = self.resource_url(&["api", "v1", "buckets"], bucket, &["rekey"])?;
         let resp = self.authed(self.inner.post(url)).send().await?;
         Self::check_status(resp).await?;
         Ok(())
@@ -60,7 +60,7 @@ impl Y2qClient {
 
     /// Query a bucket's rekey status (`GET /api/v1/buckets/{bucket}/rekey`).
     pub async fn rekey_status(&self, bucket: &str) -> Result<RekeyStatus, ClientError> {
-        let url = self.url(&format!("api/v1/buckets/{bucket}/rekey"));
+        let url = self.resource_url(&["api", "v1", "buckets"], bucket, &["rekey"])?;
         let resp = self.authed(self.inner.get(url)).send().await?;
         let resp = Self::check_status(resp).await?;
         Ok(resp.json::<RekeyStatus>().await?)

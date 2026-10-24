@@ -14,7 +14,8 @@ impl Y2qClient {
     /// Create a bucket. Returns `true` if newly created, `false` if it already
     /// existed.
     pub async fn create_bucket(&self, bucket: &str) -> Result<bool, ClientError> {
-        let url = self.url(&format!("{bucket}/"));
+        // Empty final segment preserves the historical `/{bucket}/` trailing slash.
+        let url = self.resource_url(&[], bucket, &[""])?;
         let resp = self.authed(self.inner.put(url)).send().await?;
         let resp = Self::check_status(resp).await?;
         let body = resp.json::<serde_json::Value>().await?;
@@ -24,7 +25,7 @@ impl Y2qClient {
     /// Delete a bucket and all of its objects. Returns the number of objects
     /// removed.
     pub async fn delete_bucket(&self, bucket: &str) -> Result<u64, ClientError> {
-        let url = self.url(&format!("{bucket}/"));
+        let url = self.resource_url(&[], bucket, &[""])?;
         let resp = self.authed(self.inner.delete(url)).send().await?;
         let resp = Self::check_status(resp).await?;
         let body = resp.json::<serde_json::Value>().await?;
@@ -36,7 +37,7 @@ impl Y2qClient {
         &self,
         bucket: &str,
     ) -> Result<crate::model::BucketConfig, ClientError> {
-        let url = self.url(&format!("api/v1/buckets/{bucket}/config"));
+        let url = self.resource_url(&["api", "v1", "buckets"], bucket, &["config"])?;
         let resp = self.authed(self.inner.get(url)).send().await?;
         let resp = Self::check_status(resp).await?;
         Ok(resp.json().await?)
@@ -48,7 +49,7 @@ impl Y2qClient {
         bucket: &str,
         config: &crate::model::BucketConfig,
     ) -> Result<crate::model::BucketConfig, ClientError> {
-        let url = self.url(&format!("api/v1/buckets/{bucket}/config"));
+        let url = self.resource_url(&["api", "v1", "buckets"], bucket, &["config"])?;
         let resp = self.authed(self.inner.put(url)).json(config).send().await?;
         let resp = Self::check_status(resp).await?;
         Ok(resp.json().await?)
@@ -56,7 +57,7 @@ impl Y2qClient {
 
     /// Fetch a bucket's owner and ACL.
     pub async fn get_bucket_acl(&self, bucket: &str) -> Result<crate::model::AclBody, ClientError> {
-        let url = self.url(&format!("api/v1/buckets/{bucket}/acl"));
+        let url = self.resource_url(&["api", "v1", "buckets"], bucket, &["acl"])?;
         let resp = self.authed(self.inner.get(url)).send().await?;
         let resp = Self::check_status(resp).await?;
         Ok(resp.json().await?)
@@ -68,7 +69,7 @@ impl Y2qClient {
         bucket: &str,
         acl: &crate::model::AclBody,
     ) -> Result<crate::model::AclBody, ClientError> {
-        let url = self.url(&format!("api/v1/buckets/{bucket}/acl"));
+        let url = self.resource_url(&["api", "v1", "buckets"], bucket, &["acl"])?;
         let resp = self.authed(self.inner.put(url)).json(acl).send().await?;
         let resp = Self::check_status(resp).await?;
         Ok(resp.json().await?)
@@ -79,7 +80,7 @@ impl Y2qClient {
         bucket: &str,
         options: &ListOptions,
     ) -> Result<ListPage, ClientError> {
-        let url = self.url(&format!("{bucket}/"));
+        let url = self.resource_url(&[], bucket, &[""])?;
         let mut req = self.authed(self.inner.get(url));
 
         if let Some(ref p) = options.prefix {
