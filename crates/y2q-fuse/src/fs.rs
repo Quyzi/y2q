@@ -540,18 +540,22 @@ impl Filesystem for Y2qFuse {
                             Generation(0),
                         );
                     }
-                    Ok((Err(ClientError::NotFound { .. }), Ok(page))) if !page.items.is_empty() => {
-                        let ino = self
-                            .inodes
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .get_or_assign(InodePath::VirtualDir {
-                                bucket,
-                                prefix: key,
-                            });
-                        reply.entry(&ENTRY_TTL, &self.dir_attr(ino), Generation(0));
+                    Ok((Err(head_err), list_res)) => {
+                        match classify_lookup_head_miss(&head_err, &list_res) {
+                            LookupHeadMiss::VirtualDir => {
+                                let ino = self
+                                    .inodes
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .get_or_assign(InodePath::VirtualDir {
+                                        bucket,
+                                        prefix: key,
+                                    });
+                                reply.entry(&ENTRY_TTL, &self.dir_attr(ino), Generation(0));
+                            }
+                            LookupHeadMiss::Err(errno) => reply.error(errno),
+                        }
                     }
-                    Ok((Err(e), _)) => reply.error(to_errno(&e)),
                     _ => reply.error(Errno::ENOENT),
                 }
             }
@@ -605,18 +609,22 @@ impl Filesystem for Y2qFuse {
                             Generation(0),
                         );
                     }
-                    Ok((Err(ClientError::NotFound { .. }), Ok(page))) if !page.items.is_empty() => {
-                        let ino = self
-                            .inodes
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .get_or_assign(InodePath::VirtualDir {
-                                bucket,
-                                prefix: key,
-                            });
-                        reply.entry(&ENTRY_TTL, &self.dir_attr(ino), Generation(0));
+                    Ok((Err(head_err), list_res)) => {
+                        match classify_lookup_head_miss(&head_err, &list_res) {
+                            LookupHeadMiss::VirtualDir => {
+                                let ino = self
+                                    .inodes
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .get_or_assign(InodePath::VirtualDir {
+                                        bucket,
+                                        prefix: key,
+                                    });
+                                reply.entry(&ENTRY_TTL, &self.dir_attr(ino), Generation(0));
+                            }
+                            LookupHeadMiss::Err(errno) => reply.error(errno),
+                        }
                     }
-                    Ok((Err(e), _)) => reply.error(to_errno(&e)),
                     _ => reply.error(Errno::ENOENT),
                 }
             }
@@ -2005,6 +2013,12 @@ impl Filesystem for Y2qFuse {
                 return;
             }
         };
+        // Kernel probes (posix_acl, selinux, …) must not trigger HTTP —
+        // ACL 403 on those would surface as EIO/EACCES on every `ls -la`.
+        if !xname.starts_with("user.y2q.") {
+            reply.error(Errno::NO_XATTR);
+            return;
+        }
 
         let (path, cached) = {
             let inodes = self.inodes.lock().unwrap_or_else(|e| e.into_inner());
@@ -2179,18 +2193,41 @@ impl Y2qFuse {
         size: u32,
         reply: ReplyXattr,
     ) {
-        let client = self.client_clone();
-        let b = bucket.to_owned();
-        match self.rt.block_on(async move {
-            let cfg = client.get_bucket_config(&b).await?;
-            let acl = client.get_bucket_acl(&b).await?;
-            Ok::<_, ClientError>((cfg, acl))
-        }) {
-            Ok((cfg, acl)) => match bucket_xattr_get(&cfg, &acl, xname) {
-                Some(v) => xattr_reply(reply, size, &v),
-                None => reply.error(Errno::NO_XATTR),
-            },
-            Err(e) => reply.error(to_errno(&e)),
+        match classify_bucket_xattr(xname) {
+            BucketXattrKind::Other => {
+                reply.error(Errno::NO_XATTR);
+                return;
+            }
+            BucketXattrKind::Config => {
+                let client = self.client_clone();
+                let b = bucket.to_owned();
+                match self
+                    .rt
+                    .block_on(async move { client.get_bucket_config(&b).await })
+                {
+                    Ok(cfg) => match bucket_xattr_get(&cfg, None, xname) {
+                        Some(v) => xattr_reply(reply, size, &v),
+                        None => reply.error(Errno::NO_XATTR),
+                    },
+                    Err(e) => reply.error(to_errno(&e)),
+                }
+            }
+            BucketXattrKind::Acl => {
+                let client = self.client_clone();
+                let b = bucket.to_owned();
+                match self
+                    .rt
+                    .block_on(async move { client.get_bucket_acl(&b).await })
+                {
+                    Ok(acl) => {
+                        match bucket_xattr_get(&BucketConfig::default(), Some(&acl), xname) {
+                            Some(v) => xattr_reply(reply, size, &v),
+                            None => reply.error(Errno::NO_XATTR),
+                        }
+                    }
+                    Err(e) => reply.error(to_errno(&e)),
+                }
+            }
         }
     }
 
@@ -2199,11 +2236,16 @@ impl Y2qFuse {
         let b = bucket.to_owned();
         match self.rt.block_on(async move {
             let cfg = client.get_bucket_config(&b).await?;
-            let acl = client.get_bucket_acl(&b).await?;
+            // Soft-fail ACL 403: still advertise config-derived names.
+            let acl = match client.get_bucket_acl(&b).await {
+                Ok(acl) => Some(acl),
+                Err(ClientError::ServerError { status: 403, .. }) => None,
+                Err(e) => return Err(e),
+            };
             Ok::<_, ClientError>((cfg, acl))
         }) {
             Ok((cfg, acl)) => {
-                let buf = bucket_xattr_list(&cfg, &acl);
+                let buf = bucket_xattr_list(&cfg, acl.as_ref());
                 if size == 0 {
                     reply.size(buf.len() as u32);
                 } else if buf.len() > size as usize {
@@ -2492,8 +2534,60 @@ fn xattr_get(meta: &CachedMeta, name: &str) -> Option<Vec<u8>> {
     }
 }
 
+/// Which HTTP source (if any) a bucket xattr name needs.
+#[derive(Debug, PartialEq, Eq)]
+enum BucketXattrKind {
+    Config,
+    Acl,
+    Other,
+}
+
+fn classify_bucket_xattr(name: &str) -> BucketXattrKind {
+    match name {
+        "user.y2q.quota.bytes" | "user.y2q.default.sse" | "user.y2q.cors.allow_origin" => {
+            BucketXattrKind::Config
+        }
+        "user.y2q.acl.owner" => BucketXattrKind::Acl,
+        n if n.starts_with("user.y2q.acl.grant.") => BucketXattrKind::Acl,
+        _ => BucketXattrKind::Other,
+    }
+}
+
+/// Outcome of a failed object HEAD during `lookup`.
+#[derive(Debug, PartialEq, Eq)]
+enum LookupHeadMiss {
+    /// Non-empty LIST under `key/` → advertise a virtual directory.
+    VirtualDir,
+    /// Reply with this errno (`ENOENT` for absence / writeonly HEAD 403).
+    Err(Errno),
+}
+
+/// Classify a lookup HEAD miss (+ optional LIST) into vdir / errno.
+///
+/// Writeonly grants return 403 on HEAD/LIST reads while still allowing PUT;
+/// mapping that to `ENOENT` lets the kernel proceed to `create`/`mknod`.
+fn classify_lookup_head_miss(
+    head_err: &ClientError,
+    list_res: &Result<y2q_client::ListPage, ClientError>,
+) -> LookupHeadMiss {
+    match head_err {
+        ClientError::NotFound { .. } => {
+            if matches!(list_res, Ok(page) if !page.items.is_empty()) {
+                LookupHeadMiss::VirtualDir
+            } else {
+                LookupHeadMiss::Err(Errno::ENOENT)
+            }
+        }
+        ClientError::ServerError { status: 403, .. } => LookupHeadMiss::Err(Errno::ENOENT),
+        e => LookupHeadMiss::Err(to_errno(e)),
+    }
+}
+
 /// Build the null-terminated xattr name list for a bucket.
-fn bucket_xattr_list(cfg: &BucketConfig, acl: &AclBody) -> Vec<u8> {
+///
+/// `acl` is optional so `listxattr` can still return config-derived names when
+/// the caller lacks ACL read permission (HTTP 403).
+fn bucket_xattr_list(cfg: &BucketConfig, acl: Option<&AclBody>) -> Vec<u8> {
     let mut buf: Vec<u8> = Vec::new();
     if cfg.quota_bytes.is_some() {
         buf.extend_from_slice(b"user.y2q.quota.bytes\0");
@@ -2504,17 +2598,21 @@ fn bucket_xattr_list(cfg: &BucketConfig, acl: &AclBody) -> Vec<u8> {
     if cfg.cors_allow_origin.is_some() {
         buf.extend_from_slice(b"user.y2q.cors.allow_origin\0");
     }
-    if acl.owner.is_some() {
-        buf.extend_from_slice(b"user.y2q.acl.owner\0");
-    }
-    for username in acl.grants.keys() {
-        buf.extend_from_slice(format!("user.y2q.acl.grant.{username}\0").as_bytes());
+    if let Some(acl) = acl {
+        if acl.owner.is_some() {
+            buf.extend_from_slice(b"user.y2q.acl.owner\0");
+        }
+        for username in acl.grants.keys() {
+            buf.extend_from_slice(format!("user.y2q.acl.grant.{username}\0").as_bytes());
+        }
     }
     buf
 }
 
 /// Return the byte value for bucket xattr `name`, or `None` if not found.
-fn bucket_xattr_get(cfg: &BucketConfig, acl: &AclBody, name: &str) -> Option<Vec<u8>> {
+///
+/// ACL-backed names need `acl`; config-only names ignore it.
+fn bucket_xattr_get(cfg: &BucketConfig, acl: Option<&AclBody>, name: &str) -> Option<Vec<u8>> {
     match name {
         "user.y2q.quota.bytes" => cfg.quota_bytes.map(|v| v.to_string().into_bytes()),
         "user.y2q.default.sse" => cfg.default_sse.as_deref().map(|v| v.as_bytes().to_vec()),
@@ -2522,10 +2620,12 @@ fn bucket_xattr_get(cfg: &BucketConfig, acl: &AclBody, name: &str) -> Option<Vec
             .cors_allow_origin
             .as_deref()
             .map(|v| v.as_bytes().to_vec()),
-        "user.y2q.acl.owner" => acl.owner.as_deref().map(|v| v.as_bytes().to_vec()),
+        "user.y2q.acl.owner" => acl
+            .and_then(|a| a.owner.as_deref())
+            .map(|v| v.as_bytes().to_vec()),
         _ => {
             if let Some(username) = name.strip_prefix("user.y2q.acl.grant.") {
-                return acl.grants.get(username).map(|v| v.as_bytes().to_vec());
+                return acl.and_then(|a| a.grants.get(username).map(|v| v.as_bytes().to_vec()));
             }
             None
         }
@@ -3043,6 +3143,135 @@ mod tests {
         assert_eq!(
             check_attr_change_supported(None, None, Some(4242), &cur),
             Ok(())
+        );
+    }
+
+    #[test]
+    fn classify_bucket_xattr_splits_config_acl_other() {
+        assert_eq!(
+            classify_bucket_xattr("user.y2q.quota.bytes"),
+            BucketXattrKind::Config
+        );
+        assert_eq!(
+            classify_bucket_xattr("user.y2q.default.sse"),
+            BucketXattrKind::Config
+        );
+        assert_eq!(
+            classify_bucket_xattr("user.y2q.cors.allow_origin"),
+            BucketXattrKind::Config
+        );
+        assert_eq!(
+            classify_bucket_xattr("user.y2q.acl.owner"),
+            BucketXattrKind::Acl
+        );
+        assert_eq!(
+            classify_bucket_xattr("user.y2q.acl.grant.alice"),
+            BucketXattrKind::Acl
+        );
+        assert_eq!(
+            classify_bucket_xattr("system.posix_acl_access"),
+            BucketXattrKind::Other
+        );
+        assert_eq!(
+            classify_bucket_xattr("security.selinux"),
+            BucketXattrKind::Other
+        );
+        assert_eq!(
+            classify_bucket_xattr("user.y2q.unknown"),
+            BucketXattrKind::Other
+        );
+    }
+
+    #[test]
+    fn bucket_xattr_list_omits_acl_names_when_acl_absent() {
+        let cfg = BucketConfig {
+            quota_bytes: Some(1024),
+            default_sse: Some("aes".into()),
+            cors_allow_origin: None,
+        };
+        let buf = bucket_xattr_list(&cfg, None);
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.contains("user.y2q.quota.bytes\0"));
+        assert!(s.contains("user.y2q.default.sse\0"));
+        assert!(!s.contains("user.y2q.acl."));
+    }
+
+    #[test]
+    fn bucket_xattr_list_includes_acl_when_present() {
+        let cfg = BucketConfig {
+            quota_bytes: Some(1),
+            default_sse: None,
+            cors_allow_origin: None,
+        };
+        let mut grants = std::collections::BTreeMap::new();
+        grants.insert("bob".into(), "read".into());
+        let acl = AclBody {
+            owner: Some("alice".into()),
+            grants,
+            key_epochs: vec![],
+        };
+        let buf = bucket_xattr_list(&cfg, Some(&acl));
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.contains("user.y2q.quota.bytes\0"));
+        assert!(s.contains("user.y2q.acl.owner\0"));
+        assert!(s.contains("user.y2q.acl.grant.bob\0"));
+    }
+
+    #[test]
+    fn classify_lookup_head_miss_table() {
+        let empty = Ok(y2q_client::ListPage {
+            items: vec![],
+            next: None,
+        });
+        let with_child = Ok(y2q_client::ListPage {
+            items: vec![y2q_client::MetadataView {
+                created: 0,
+                modified: 0,
+                size: 0,
+                checksum_gxhash: String::new(),
+                bucket: "b".into(),
+                key: "k/x".into(),
+                url_path: String::new(),
+                labels: Default::default(),
+                cipher_size: None,
+                cipher_checksum: None,
+                kem_alg: None,
+                aead_alg: None,
+                envelope_version: None,
+            }],
+            next: None,
+        });
+        let not_found = ClientError::NotFound {
+            message: "no".into(),
+        };
+        let forbidden = ClientError::ServerError {
+            status: 403,
+            message: "denied".into(),
+        };
+        let boom = ClientError::ServerError {
+            status: 500,
+            message: "boom".into(),
+        };
+
+        assert_eq!(
+            classify_lookup_head_miss(&not_found, &with_child),
+            LookupHeadMiss::VirtualDir
+        );
+        assert_eq!(
+            classify_lookup_head_miss(&not_found, &empty),
+            LookupHeadMiss::Err(Errno::ENOENT)
+        );
+        assert_eq!(
+            classify_lookup_head_miss(&forbidden, &empty),
+            LookupHeadMiss::Err(Errno::ENOENT)
+        );
+        assert_eq!(
+            classify_lookup_head_miss(&forbidden, &with_child),
+            LookupHeadMiss::Err(Errno::ENOENT)
+        );
+        assert_eq!(
+            classify_lookup_head_miss(&boom, &empty),
+            LookupHeadMiss::Err(Errno::EIO)
         );
     }
 }
