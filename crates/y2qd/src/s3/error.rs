@@ -259,13 +259,13 @@ impl From<AppError> for S3Error {
             | CoreError::InvalidStaleLockThreshold { value: reason } => {
                 S3Error::invalid_request(reason)
             }
-            CoreError::TooManyBucketKeyEpochs { .. } | CoreError::RekeyAlreadyRunning { .. } => {
-                S3Error::new(
-                    "OperationAborted",
-                    StatusCode::CONFLICT,
-                    "A conflicting operation is already in progress for this bucket.",
-                )
-            }
+            CoreError::TooManyBucketKeyEpochs { .. }
+            | CoreError::RekeyAlreadyRunning { .. }
+            | CoreError::AclConflict { .. } => S3Error::new(
+                "OperationAborted",
+                StatusCode::CONFLICT,
+                "A conflicting operation is already in progress for this bucket.",
+            ),
             CoreError::RebuildAlreadyRunning => S3Error::new(
                 "OperationAborted",
                 StatusCode::CONFLICT,

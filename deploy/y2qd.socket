@@ -1,0 +1,17 @@
+[Unit]
+Description=y2qd REST listen socket
+Documentation=https://github.com/Quyzi/y2q
+PartOf=y2qd.service
+
+[Socket]
+# Hold the REST port as root/systemd across restarts so a low-privilege local
+# uid cannot bind(127.0.0.1:port) during a crash/restart window and MITM
+# plaintext clients (passwords / Bearer tokens). Match [server] host:port in
+# /etc/y2q/config.toml (default below).
+ListenStream=127.0.0.1:8080
+# Free the address for the next start even if a prior process died hard.
+ReusePort=false
+Accept=no
+
+[Install]
+WantedBy=sockets.target

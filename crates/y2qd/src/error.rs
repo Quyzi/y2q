@@ -33,6 +33,7 @@ pub struct ErrorBody {
 /// | `RebuildAlreadyRunning`       | 409         |
 /// | `Forbidden`                   | 403         |
 /// | `InvalidAcl`                  | 400         |
+/// | `AclConflict`                 | 409         |
 /// | `InvalidPersonaRequest`       | 400         |
 /// | `Index`                       | 500 (generic body) |
 /// | `InternalError`               | 500 (generic body) |
@@ -132,7 +133,8 @@ impl ResponseError for AppError {
             CoreError::Locked { .. }
             | CoreError::RebuildAlreadyRunning
             | CoreError::TooManyBucketKeyEpochs { .. }
-            | CoreError::RekeyAlreadyRunning { .. } => StatusCode::CONFLICT,
+            | CoreError::RekeyAlreadyRunning { .. }
+            | CoreError::AclConflict { .. } => StatusCode::CONFLICT,
             CoreError::Forbidden { .. } => StatusCode::FORBIDDEN,
             CoreError::QuotaExceeded { .. } | CoreError::BodyTooLarge { .. } => {
                 StatusCode::PAYLOAD_TOO_LARGE

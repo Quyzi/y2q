@@ -38,6 +38,10 @@ pub struct AclBody {
     /// Retained bucket key epochs, ascending. Read-only: ignored on `PUT`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub key_epochs: Vec<u32>,
+    /// Compare-and-swap token. `GET` returns the current value; `PUT` must
+    /// echo it back. A mismatch means another writer landed first (409).
+    #[serde(default)]
+    pub generation: u64,
 }
 
 /// Read a bucket's owner and ACL. Requires the bucket admin capability, or a
@@ -89,6 +93,7 @@ pub async fn get_acl(
         owner: cfg.owner,
         grants: cfg.acl,
         key_epochs: cfg.keys.iter().map(|k| k.epoch).collect(),
+        generation: cfg.acl_generation,
     }))
 }
 
@@ -96,6 +101,10 @@ pub async fn get_acl(
 /// be a JSON object with a required `grants` map; `{"grants":{}}` clears all
 /// grants. Requires bucket `Admin` (owner) or global admin; assigning a new
 /// `owner` additionally requires being the current owner or a global admin.
+///
+/// Clients must echo the `generation` from a prior `GET`; a stale value
+/// returns 409 so concurrent grant/revoke RMWs cannot silently clobber each
+/// other.
 #[utoipa::path(
     put,
     operation_id = "set_bucket_acl",
@@ -108,6 +117,7 @@ pub async fn get_acl(
         (status = 401, description = "Authentication required", body = ErrorBody, content_type = "application/json"),
         (status = 403, description = "Caller may not manage this ACL or transfer ownership", body = ErrorBody, content_type = "application/json"),
         (status = 404, description = "Bucket not found (or not visible to the caller)", body = ErrorBody, content_type = "application/json"),
+        (status = 409, description = "ACL generation mismatch; re-GET and retry", body = ErrorBody, content_type = "application/json"),
         (status = 500, description = "Internal error", body = ErrorBody, content_type = "application/json"),
     ),
     security(("bearer" = [])),
@@ -138,6 +148,15 @@ pub async fn set_acl(
         .get_bucket_config(&bucket)
         .await
         .map_err(AppError::from)?;
+
+    if body.generation != cfg.acl_generation {
+        return Err(AppError(y2q_core::Error::AclConflict {
+            reason: format!(
+                "generation mismatch: client sent {}, server has {}; re-fetch the ACL and retry",
+                body.generation, cfg.acl_generation
+            ),
+        }));
+    }
 
     // Ownership transfer / assignment: only the current owner or a global admin
     // may change the owner (a mere bucket-`Admin` grantee may not).
@@ -250,6 +269,7 @@ pub async fn set_acl(
         );
     }
 
+    cfg.acl_generation = cfg.acl_generation.wrapping_add(1);
     storage
         .set_bucket_config(&bucket, &cfg)
         .await
@@ -259,6 +279,7 @@ pub async fn set_acl(
         owner: cfg.owner,
         grants: cfg.acl,
         key_epochs,
+        generation: cfg.acl_generation,
     }))
 }
 

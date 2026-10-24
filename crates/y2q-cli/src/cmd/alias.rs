@@ -3,10 +3,11 @@ use std::io::Read;
 use y2q_client::ClientError;
 
 use crate::cli::AliasCmd;
-use crate::client_builder::resolve_config_path;
+use crate::client_builder::{resolve_config_path, resolve_tokens_path};
 use crate::config::{Alias, CliConfig};
 use crate::error::CliError;
 use crate::output::{OutputMode, print_json, print_table};
+use crate::token::TokenStore;
 
 pub async fn run(cmd: AliasCmd, mode: OutputMode) -> Result<(), CliError> {
     let config_path = resolve_config_path()?;
@@ -42,8 +43,22 @@ pub async fn run(cmd: AliasCmd, mode: OutputMode) -> Result<(), CliError> {
                 client_cert_path: client_cert.map(|p| p.to_string_lossy().into_owned()),
                 client_key_path: client_key.map(|p| p.to_string_lossy().into_owned()),
             };
+            // Any change to url/username (or a fresh alias) must drop a cached
+            // bearer keyed by this name — otherwise the next command would send
+            // the old session to the new URL.
+            let previous = config.aliases.get(&alias).cloned();
+            let rebound = previous
+                .as_ref()
+                .is_none_or(|p| p.url != entry.url || p.username != entry.username);
             config.add_alias(alias.clone(), entry);
             config.save(&config_path)?;
+            if rebound {
+                let tokens_path = resolve_tokens_path()?;
+                let _ = TokenStore::update(&tokens_path, |store| {
+                    store.clear(&alias);
+                    Ok(())
+                });
+            }
             if mode == OutputMode::Json {
                 print_json(
                     &serde_json::json!({ "alias": alias, "url": url, "username": username }),
@@ -79,6 +94,11 @@ pub async fn run(cmd: AliasCmd, mode: OutputMode) -> Result<(), CliError> {
         AliasCmd::Remove { alias } => {
             if config.remove_alias(&alias) {
                 config.save(&config_path)?;
+                let tokens_path = resolve_tokens_path()?;
+                let _ = TokenStore::update(&tokens_path, |store| {
+                    store.clear(&alias);
+                    Ok(())
+                });
                 if mode == OutputMode::Json {
                     print_json(&serde_json::json!({ "removed": alias }));
                 } else {
@@ -128,14 +148,31 @@ pub async fn run(cmd: AliasCmd, mode: OutputMode) -> Result<(), CliError> {
                 }
             }
             let mut added = 0usize;
+            let mut cleared: Vec<String> = Vec::new();
             for (name, entry) in incoming {
                 if !merge && config.aliases.contains_key(&name) {
                     continue;
+                }
+                let rebound = config
+                    .aliases
+                    .get(&name)
+                    .is_none_or(|p| p.url != entry.url || p.username != entry.username);
+                if rebound {
+                    cleared.push(name.clone());
                 }
                 config.aliases.insert(name, entry);
                 added += 1;
             }
             config.save(&config_path)?;
+            if !cleared.is_empty() {
+                let tokens_path = resolve_tokens_path()?;
+                let _ = TokenStore::update(&tokens_path, |store| {
+                    for name in &cleared {
+                        store.clear(name);
+                    }
+                    Ok(())
+                });
+            }
             if mode == OutputMode::Json {
                 print_json(&serde_json::json!({ "imported": added }));
             } else {

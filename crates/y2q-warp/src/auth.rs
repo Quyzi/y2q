@@ -50,6 +50,7 @@ pub async fn resolve_token(
             token: resp.token.clone(),
             expires_at,
             username: username.to_owned(),
+            url: String::new(),
         },
     );
     store.save(&tokens_path)?;
@@ -106,6 +107,7 @@ pub fn spawn_refresh_task(
                                 token: resp.token,
                                 expires_at: resp.expires_at,
                                 username: username.clone(),
+                                url: String::new(),
                             },
                         );
                         let _ = store.save(&tokens_path);

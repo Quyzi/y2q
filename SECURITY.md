@@ -403,12 +403,16 @@ layers intersect, plus a crypto-layer gate that policy alone cannot bypass:
 2. **Per-bucket ownership + ACL** — an owner (full control) plus an
    optional grant map (`read`/`write`/`writeonly`/`admin`) for other users.
    New buckets are private to the persona that created them. A bucket this
-   persona has no sealed grant for is indistinguishable from one that
-   doesn't exist: omitted from listings, 404 (never 403) on direct access
-   — existence itself cannot be probed. 403 appears only when you can
-   already see a bucket but lack the verb for the action. The exception is
-   an ACL relationship of exactly `writeonly` (a drop box): write needs no
-   sealed secret, so write stays allowed and a read is 403.
+   persona has no sealed grant for is omitted from listings and returns
+   404 (never 403) on GET/HEAD/DELETE/ACL — existence cannot be probed by
+   those verbs. 403 appears only when you can already see a bucket but
+   lack the verb for the action. The exception is an ACL relationship of
+   exactly `writeonly` (a drop box): write needs no sealed secret, so
+   write stays allowed and a read is 403. **Write-capable roles can still
+   learn whether a name is taken:** `PUT /{bucket}/` (and object PUT into
+   a free name) returns 200/201 on claim and 404 against someone else's
+   hidden bucket. Names are one global namespace; closing that oracle
+   needs per-owner or blinded names.
 3. **Cryptographic bucket-key grant.** This is the property the per-bucket
    key hierarchy exists for. Listing, HEAD metadata, reading, writing,
    deleting, and ACL changes all require the caller's *persona* to hold a
@@ -564,8 +568,13 @@ mode on one port (run two `y2qd` processes on different ports for that).
 - When TLS is disabled, `[server] allow_insecure_bind` gates whether the
   daemon will bind a non-loopback address at all — by default it refuses,
   since that would serve session tokens, passwords, and object plaintext
-  unencrypted to the network. Loopback binds are always exempt (not
-  reachable off-host).
+  unencrypted to the network. Loopback binds are exempt from that refusal
+  (not reachable off-host), **but on a multi-user host they are still
+  unsafe without TLS**: any local uid can `bind(127.0.0.1:port)` during a
+  crash or restart window and accept the next `y2q` / `y2q-fuse` /
+  `y2q-warp` connection in cleartext. Prefer native TLS even on loopback
+  when the host is shared, and enable `deploy/y2qd.socket` so systemd
+  holds the listen port across restarts.
 
 `y2q`/`y2q-warp`/`y2q-fuse` verify the server certificate by default;
 `--insecure` skips verification (dev/staging only), `--ca-cert` trusts a

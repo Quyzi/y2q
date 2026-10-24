@@ -67,6 +67,30 @@ pub async fn acl_show(client: &Y2qClient, bucket: &str) -> Result<AclBody, Clien
     client.get_bucket_acl(bucket).await
 }
 
+const ACL_CAS_RETRIES: usize = 8;
+
+/// GET → mutate → PUT with generation CAS; retry on 409 from a concurrent writer.
+async fn acl_mutate<F>(client: &Y2qClient, bucket: &str, mutate: F) -> Result<AclBody, ClientError>
+where
+    F: Fn(&mut AclBody),
+{
+    let mut last_conflict = None;
+    for _ in 0..ACL_CAS_RETRIES {
+        let mut acl = client.get_bucket_acl(bucket).await?;
+        mutate(&mut acl);
+        match client.set_bucket_acl(bucket, &acl).await {
+            Ok(body) => return Ok(body),
+            Err(e @ ClientError::Conflict { .. }) => {
+                last_conflict = Some(e);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last_conflict.unwrap_or_else(|| ClientError::Conflict {
+        message: "acl update conflicted too many times".into(),
+    }))
+}
+
 /// Grant `username` permission `perm` (`read`/`write`/`admin`) on `bucket`.
 pub async fn acl_grant(
     client: &Y2qClient,
@@ -74,9 +98,12 @@ pub async fn acl_grant(
     username: &str,
     perm: &str,
 ) -> Result<AclBody, ClientError> {
-    let mut acl = client.get_bucket_acl(bucket).await?;
-    acl.grants.insert(username.to_owned(), perm.to_owned());
-    client.set_bucket_acl(bucket, &acl).await
+    let username = username.to_owned();
+    let perm = perm.to_owned();
+    acl_mutate(client, bucket, move |acl| {
+        acl.grants.insert(username.clone(), perm.clone());
+    })
+    .await
 }
 
 /// Revoke any grant `username` holds on `bucket`.
@@ -85,9 +112,11 @@ pub async fn acl_revoke(
     bucket: &str,
     username: &str,
 ) -> Result<AclBody, ClientError> {
-    let mut acl = client.get_bucket_acl(bucket).await?;
-    acl.grants.remove(username);
-    client.set_bucket_acl(bucket, &acl).await
+    let username = username.to_owned();
+    acl_mutate(client, bucket, move |acl| {
+        acl.grants.remove(&username);
+    })
+    .await
 }
 
 /// Transfer ownership of `bucket` to `new_owner`.
@@ -96,9 +125,11 @@ pub async fn acl_chown(
     bucket: &str,
     new_owner: &str,
 ) -> Result<AclBody, ClientError> {
-    let mut acl = client.get_bucket_acl(bucket).await?;
-    acl.owner = Some(new_owner.to_owned());
-    client.set_bucket_acl(bucket, &acl).await
+    let new_owner = new_owner.to_owned();
+    acl_mutate(client, bucket, move |acl| {
+        acl.owner = Some(new_owner.clone());
+    })
+    .await
 }
 
 /// Fetch the raw Prometheus scrape body.

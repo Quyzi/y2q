@@ -3328,6 +3328,7 @@ mod tests {
             owner: Some("alice".into()),
             grants,
             key_epochs: vec![],
+            generation: 0,
         };
         let buf = bucket_xattr_list(&cfg, Some(&acl));
         let s = String::from_utf8(buf).unwrap();

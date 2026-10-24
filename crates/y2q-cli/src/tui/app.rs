@@ -5,10 +5,11 @@ use std::time::Instant;
 use tokio::sync::mpsc::UnboundedSender;
 use y2q_client::ListOptions;
 
-use crate::client_builder::client_from_alias;
-use crate::config::{CliConfig, default_tokens_path};
+use crate::client_builder::{client_from_alias, resolve_tokens_path};
+use crate::config::CliConfig;
 use crate::output::{fmt_bytes, fmt_ns};
 use crate::progress::{CountingReader, CountingWriter, ProgressReporter};
+use crate::staged_file::StagedFile;
 use crate::token::{TokenEntry, TokenStore};
 
 use super::actions::Action;
@@ -52,7 +53,7 @@ fn build_client(
         .ok_or_else(|| format!("unknown alias `{alias}`"))?;
     let store = TokenStore::load(tokens_path).map_err(|e| e.to_string())?;
     let token = store
-        .token_for(alias)
+        .token_for_bound(alias, &profile.url, &profile.username)
         .ok_or_else(|| "not authenticated — press 'L' to log in".to_string())?;
     client_from_alias(profile, Some(token)).map_err(|e| e.to_string())
 }
@@ -807,19 +808,13 @@ impl App {
     fn fetch_buckets(&self, alias: String) {
         let tx = self.event_tx.clone();
         let config = self.config.clone();
-        let tokens_path = default_tokens_path().unwrap_or_default();
+        let tokens_path = resolve_tokens_path().unwrap_or_default();
         tokio::spawn(async move {
             let result = async {
-                let profile = config
-                    .aliases
-                    .get(&alias)
-                    .ok_or_else(|| format!("unknown alias `{alias}`"))?;
-                let store = TokenStore::load(&tokens_path).map_err(|e| e.to_string())?;
-                let token = store
-                    .token_for(&alias)
-                    .ok_or_else(|| "not authenticated".to_string())?;
-                let client = client_from_alias(profile, Some(token)).map_err(|e| e.to_string())?;
-                client.list_buckets().await.map_err(|e| e.to_string())
+                build_client(&config, &tokens_path, &alias)?
+                    .list_buckets()
+                    .await
+                    .map_err(|e| e.to_string())
             }
             .await;
             let payload = match result {
@@ -837,7 +832,7 @@ impl App {
     fn fetch_objects(&self, alias: String, bucket: String, prefix: Option<String>) {
         let tx = self.event_tx.clone();
         let config = self.config.clone();
-        let tokens_path = default_tokens_path().unwrap_or_default();
+        let tokens_path = resolve_tokens_path().unwrap_or_default();
         let bucket_clone = bucket.clone();
         tokio::spawn(async move {
             let result = async {
@@ -847,7 +842,7 @@ impl App {
                     .ok_or_else(|| format!("unknown alias `{alias}`"))?;
                 let store = TokenStore::load(&tokens_path).map_err(|e| e.to_string())?;
                 let token = store
-                    .token_for(&alias)
+                    .token_for_bound(&alias, &profile.url, &profile.username)
                     .ok_or_else(|| "not authenticated".to_string())?;
                 let client = client_from_alias(profile, Some(token)).map_err(|e| e.to_string())?;
                 let opts = ListOptions {
@@ -888,7 +883,7 @@ impl App {
     ) {
         let tx = self.event_tx.clone();
         let config = self.config.clone();
-        let tokens_path = default_tokens_path().unwrap_or_default();
+        let tokens_path = resolve_tokens_path().unwrap_or_default();
         tokio::spawn(async move {
             let result = async {
                 let client = build_client(&config, &tokens_path, &alias)?;
@@ -977,29 +972,22 @@ impl App {
                     self.push_transfer(TransferEntry::new(id, label, size));
                     let tx = self.event_tx.clone();
                     let config = self.config.clone();
-                    let tokens_path = default_tokens_path().unwrap_or_default();
+                    let tokens_path = resolve_tokens_path().unwrap_or_default();
                     tokio::spawn(async move {
                         let result = async {
-                            let profile = config
-                                .aliases
-                                .get(&alias)
-                                .ok_or_else(|| "unknown alias".to_string())?;
-                            let store =
-                                TokenStore::load(&tokens_path).map_err(|e| e.to_string())?;
-                            let token = store
-                                .token_for(&alias)
-                                .ok_or_else(|| "unauthenticated".to_string())?;
-                            let client = client_from_alias(profile, Some(token))
-                                .map_err(|e| e.to_string())?;
-                            let file = tokio::fs::File::create(&local_dst)
+                            let client = build_client(&config, &tokens_path, &alias)?;
+                            let mut staged = StagedFile::create(&local_dst)
                                 .await
                                 .map_err(|e| e.to_string())?;
                             let reporter = Box::new(TuiTransferReporter { id, tx: tx.clone() });
-                            let mut writer = CountingWriter::new(file, reporter);
-                            let n = client
-                                .get_to_writer(&bucket, &key, &mut writer)
-                                .await
-                                .map_err(|e| e.to_string())?;
+                            let n = {
+                                let mut writer = CountingWriter::new(staged.file_mut(), reporter);
+                                client
+                                    .get_to_writer(&bucket, &key, &mut writer)
+                                    .await
+                                    .map_err(|e| e.to_string())?
+                            };
+                            staged.commit().await.map_err(|e| e.to_string())?;
                             Ok::<u64, String>(n)
                         }
                         .await;
@@ -1222,19 +1210,23 @@ impl App {
         self.push_transfer(TransferEntry::new(id, label, Some(end - start + 1)));
         let tx = self.event_tx.clone();
         let config = self.config.clone();
-        let tokens_path = default_tokens_path().unwrap_or_default();
+        let tokens_path = resolve_tokens_path().unwrap_or_default();
         tokio::spawn(async move {
             let result = async {
                 let client = build_client(&config, &tokens_path, &alias)?;
-                let file = tokio::fs::File::create(&local_dst)
+                let mut staged = StagedFile::create(&local_dst)
                     .await
                     .map_err(|e| e.to_string())?;
                 let reporter = Box::new(TuiTransferReporter { id, tx: tx.clone() });
-                let mut writer = CountingWriter::new(file, reporter);
-                client
-                    .get_range_to_writer(&bucket, &key, start, end, &mut writer)
-                    .await
-                    .map_err(|e| e.to_string())
+                let n = {
+                    let mut writer = CountingWriter::new(staged.file_mut(), reporter);
+                    client
+                        .get_range_to_writer(&bucket, &key, start, end, &mut writer)
+                        .await
+                        .map_err(|e| e.to_string())?
+                };
+                staged.commit().await.map_err(|e| e.to_string())?;
+                Ok(n)
             }
             .await;
             let _ = tx.send(Event::TransferDone { id, result });
@@ -1285,7 +1277,7 @@ impl App {
             return;
         };
         let config = self.config.clone();
-        let tokens_path = default_tokens_path().unwrap_or_default();
+        let tokens_path = resolve_tokens_path().unwrap_or_default();
         let tx = self.event_tx.clone();
         let alias_clone = alias.clone();
         // Optimistically reset the UI to the alias list; the token is cleared
@@ -1298,9 +1290,11 @@ impl App {
                 if let Ok(client) = build_client(&config, &tokens_path, &alias_clone) {
                     let _ = crate::ops::auth::logout(&client).await;
                 }
-                let mut store = TokenStore::load(&tokens_path).map_err(|e| e.to_string())?;
-                store.clear(&alias_clone);
-                store.save(&tokens_path).map_err(|e| e.to_string())
+                TokenStore::update(&tokens_path, |store| {
+                    store.clear(&alias_clone);
+                    Ok(())
+                })
+                .map_err(|e| e.to_string())
             }
             .await;
             if let Err(message) = result {
@@ -1322,7 +1316,7 @@ impl App {
 
     fn spawn_passwd(&mut self, alias: String, current: String, new: String) {
         let config = self.config.clone();
-        let tokens_path = default_tokens_path().unwrap_or_default();
+        let tokens_path = resolve_tokens_path().unwrap_or_default();
         let tx = self.event_tx.clone();
         tokio::spawn(async move {
             let result = async {
@@ -1344,7 +1338,7 @@ impl App {
             return;
         };
         let config = self.config.clone();
-        let tokens_path = default_tokens_path().unwrap_or_default();
+        let tokens_path = resolve_tokens_path().unwrap_or_default();
         let tx = self.event_tx.clone();
         tokio::spawn(async move {
             let result = async {
@@ -1385,7 +1379,7 @@ impl App {
 
     fn fetch_labels(&mut self, alias: String, bucket: String, key: String) {
         let config = self.config.clone();
-        let tokens_path = default_tokens_path().unwrap_or_default();
+        let tokens_path = resolve_tokens_path().unwrap_or_default();
         let tx = self.event_tx.clone();
         tokio::spawn(async move {
             let result = async {
@@ -1420,7 +1414,7 @@ impl App {
         labels: BTreeSet<(String, String)>,
     ) {
         let config = self.config.clone();
-        let tokens_path = default_tokens_path().unwrap_or_default();
+        let tokens_path = resolve_tokens_path().unwrap_or_default();
         let tx = self.event_tx.clone();
         tokio::spawn(async move {
             let result = async {
@@ -1520,7 +1514,7 @@ impl App {
 
     fn fetch_bucket_config(&mut self, alias: String, bucket: String) {
         let config = self.config.clone();
-        let tokens_path = default_tokens_path().unwrap_or_default();
+        let tokens_path = resolve_tokens_path().unwrap_or_default();
         let tx = self.event_tx.clone();
         tokio::spawn(async move {
             let result = async {
@@ -1557,7 +1551,7 @@ impl App {
         set_sse: Option<Option<String>>,
     ) {
         let config = self.config.clone();
-        let tokens_path = default_tokens_path().unwrap_or_default();
+        let tokens_path = resolve_tokens_path().unwrap_or_default();
         let tx = self.event_tx.clone();
         tokio::spawn(async move {
             let result = async {
@@ -1704,7 +1698,7 @@ impl App {
         query: String,
     ) {
         let config = self.config.clone();
-        let tokens_path = default_tokens_path().unwrap_or_default();
+        let tokens_path = resolve_tokens_path().unwrap_or_default();
         let tx = self.event_tx.clone();
         tokio::spawn(async move {
             let result = async {
@@ -1742,7 +1736,7 @@ impl App {
 
     fn spawn_find(&mut self, alias: String, bucket: String, prefix: Option<String>, name: String) {
         let config = self.config.clone();
-        let tokens_path = default_tokens_path().unwrap_or_default();
+        let tokens_path = resolve_tokens_path().unwrap_or_default();
         let tx = self.event_tx.clone();
         tokio::spawn(async move {
             let result = async {
@@ -1812,7 +1806,7 @@ impl App {
             return;
         };
         let config = self.config.clone();
-        let tokens_path = default_tokens_path().unwrap_or_default();
+        let tokens_path = resolve_tokens_path().unwrap_or_default();
         let tx = self.event_tx.clone();
         self.remote_throbber.start();
         tokio::spawn(async move {
@@ -1870,7 +1864,7 @@ impl App {
             return;
         };
         let config = self.config.clone();
-        let tokens_path = default_tokens_path().unwrap_or_default();
+        let tokens_path = resolve_tokens_path().unwrap_or_default();
         let tx = self.event_tx.clone();
         self.remote_throbber.start();
         tokio::spawn(async move {
@@ -1908,7 +1902,7 @@ impl App {
         };
         let local = self.local.cwd.clone();
         let config = self.config.clone();
-        let tokens_path = default_tokens_path().unwrap_or_default();
+        let tokens_path = resolve_tokens_path().unwrap_or_default();
         let tx = self.event_tx.clone();
         self.remote_throbber.start();
         tokio::spawn(async move {
@@ -1964,7 +1958,7 @@ impl App {
         };
         let local = self.local.cwd.clone();
         let config = self.config.clone();
-        let tokens_path = default_tokens_path().unwrap_or_default();
+        let tokens_path = resolve_tokens_path().unwrap_or_default();
         let tx = self.event_tx.clone();
         self.remote_throbber.start();
         tokio::spawn(async move {
@@ -2024,7 +2018,7 @@ impl App {
         match action {
             ConfirmAction::DeleteRemote { alias, bucket, key } => {
                 let config = self.config.clone();
-                let tokens_path = default_tokens_path().unwrap_or_default();
+                let tokens_path = resolve_tokens_path().unwrap_or_default();
                 let tx = self.event_tx.clone();
                 let prefix = self.remote.objects_prefix();
                 tokio::spawn(async move {
@@ -2063,7 +2057,7 @@ impl App {
             }
             ConfirmAction::DeleteBucket { alias, bucket } => {
                 let config = self.config.clone();
-                let tokens_path = default_tokens_path().unwrap_or_default();
+                let tokens_path = resolve_tokens_path().unwrap_or_default();
                 let tx = self.event_tx.clone();
                 let alias_clone = alias.clone();
                 tokio::spawn(async move {
@@ -2091,7 +2085,7 @@ impl App {
             }
             ConfirmAction::ClearLocks { alias, older_than } => {
                 let config = self.config.clone();
-                let tokens_path = default_tokens_path().unwrap_or_default();
+                let tokens_path = resolve_tokens_path().unwrap_or_default();
                 let tx = self.event_tx.clone();
                 let alias_clone = alias.clone();
                 tokio::spawn(async move {
@@ -2120,7 +2114,7 @@ impl App {
             }
             ConfirmAction::DeleteUser { alias, username } => {
                 let config = self.config.clone();
-                let tokens_path = default_tokens_path().unwrap_or_default();
+                let tokens_path = resolve_tokens_path().unwrap_or_default();
                 let tx = self.event_tx.clone();
                 let alias_clone = alias.clone();
                 tokio::spawn(async move {
@@ -2131,7 +2125,7 @@ impl App {
                             .ok_or_else(|| "unknown alias".to_string())?;
                         let store = TokenStore::load(&tokens_path).map_err(|e| e.to_string())?;
                         let token = store
-                            .token_for(&alias_clone)
+                            .token_for_bound(&alias_clone, &profile.url, &profile.username)
                             .ok_or_else(|| "not authenticated".to_string())?;
                         let client =
                             client_from_alias(profile, Some(token)).map_err(|e| e.to_string())?;
@@ -2186,7 +2180,7 @@ impl App {
     fn fetch_object_stat(&self, alias: String, bucket: String, key: String, path: String) {
         let tx = self.event_tx.clone();
         let config = self.config.clone();
-        let tokens_path = default_tokens_path().unwrap_or_default();
+        let tokens_path = resolve_tokens_path().unwrap_or_default();
         tokio::spawn(async move {
             let result = async {
                 let profile = config
@@ -2195,7 +2189,7 @@ impl App {
                     .ok_or_else(|| format!("unknown alias `{alias}`"))?;
                 let store = TokenStore::load(&tokens_path).map_err(|e| e.to_string())?;
                 let token = store
-                    .token_for(&alias)
+                    .token_for_bound(&alias, &profile.url, &profile.username)
                     .ok_or_else(|| "not authenticated".to_string())?;
                 let client = client_from_alias(profile, Some(token)).map_err(|e| e.to_string())?;
                 client.head(&bucket, &key).await.map_err(|e| e.to_string())
@@ -2213,7 +2207,7 @@ impl App {
         self.users_view.loading = true;
         let tx = self.event_tx.clone();
         let config = self.config.clone();
-        let tokens_path = default_tokens_path().unwrap_or_default();
+        let tokens_path = resolve_tokens_path().unwrap_or_default();
         tokio::spawn(async move {
             let result = async {
                 let profile = config
@@ -2222,7 +2216,7 @@ impl App {
                     .ok_or_else(|| format!("unknown alias `{alias}`"))?;
                 let store = TokenStore::load(&tokens_path).map_err(|e| e.to_string())?;
                 let token = store
-                    .token_for(&alias)
+                    .token_for_bound(&alias, &profile.url, &profile.username)
                     .ok_or_else(|| "not authenticated".to_string())?;
                 let client = client_from_alias(profile, Some(token)).map_err(|e| e.to_string())?;
                 client.list_users().await.map_err(|e| e.to_string())
@@ -2242,7 +2236,7 @@ impl App {
         self.locks.loading = true;
         let tx = self.event_tx.clone();
         let config = self.config.clone();
-        let tokens_path = default_tokens_path().unwrap_or_default();
+        let tokens_path = resolve_tokens_path().unwrap_or_default();
         tokio::spawn(async move {
             let result = async {
                 let profile = config
@@ -2251,7 +2245,7 @@ impl App {
                     .ok_or_else(|| format!("unknown alias `{alias}`"))?;
                 let store = TokenStore::load(&tokens_path).map_err(|e| e.to_string())?;
                 let token = store
-                    .token_for(&alias)
+                    .token_for_bound(&alias, &profile.url, &profile.username)
                     .ok_or_else(|| "not authenticated".to_string())?;
                 let client = client_from_alias(profile, Some(token)).map_err(|e| e.to_string())?;
                 client.locks_list("5m").await.map_err(|e| e.to_string())
@@ -2281,7 +2275,7 @@ impl App {
         };
         let tx = self.event_tx.clone();
         let config = self.config.clone();
-        let tokens_path = default_tokens_path().unwrap_or_default();
+        let tokens_path = resolve_tokens_path().unwrap_or_default();
         tokio::spawn(async move {
             let result = async {
                 let client = build_client(&config, &tokens_path, &alias)?;
@@ -2313,7 +2307,7 @@ impl App {
         };
         let tx = self.event_tx.clone();
         let config = self.config.clone();
-        let tokens_path = default_tokens_path().unwrap_or_default();
+        let tokens_path = resolve_tokens_path().unwrap_or_default();
         tokio::spawn(async move {
             let result = async {
                 let client = build_client(&config, &tokens_path, &alias)?;
@@ -2349,7 +2343,7 @@ impl App {
         self.metrics_view.loading = true;
         let tx = self.event_tx.clone();
         let config = self.config.clone();
-        let tokens_path = default_tokens_path().unwrap_or_default();
+        let tokens_path = resolve_tokens_path().unwrap_or_default();
         tokio::spawn(async move {
             let result = async {
                 let profile = config
@@ -2358,7 +2352,7 @@ impl App {
                     .ok_or_else(|| format!("unknown alias `{alias}`"))?;
                 let store = TokenStore::load(&tokens_path).map_err(|e| e.to_string())?;
                 let token = store
-                    .token_for(&alias)
+                    .token_for_bound(&alias, &profile.url, &profile.username)
                     .ok_or_else(|| "not authenticated".to_string())?;
                 let client = client_from_alias(profile, Some(token)).map_err(|e| e.to_string())?;
                 crate::ops::admin::prometheus_metrics(&client)
@@ -2384,7 +2378,7 @@ impl App {
         self.events_view.error = None;
         let tx = self.event_tx.clone();
         let config = self.config.clone();
-        let tokens_path = default_tokens_path().unwrap_or_default();
+        let tokens_path = resolve_tokens_path().unwrap_or_default();
         tokio::spawn(async move {
             // Build the client first and keep it alive: the trace stream borrows
             // it for its whole lifetime, so it must outlive the loop below.
@@ -2395,7 +2389,7 @@ impl App {
                     .ok_or_else(|| format!("unknown alias `{alias}`"))?;
                 let store = TokenStore::load(&tokens_path).map_err(|e| e.to_string())?;
                 let token = store
-                    .token_for(&alias)
+                    .token_for_bound(&alias, &profile.url, &profile.username)
                     .ok_or_else(|| "not authenticated".to_string())?;
                 client_from_alias(profile, Some(token)).map_err(|e| e.to_string())
             })() {
@@ -2438,7 +2432,7 @@ impl App {
     /// Authenticate against `alias`, persist the token, then refresh buckets.
     fn spawn_login(&mut self, alias: String, username: String, password: String) {
         let config = self.config.clone();
-        let tokens_path = default_tokens_path().unwrap_or_default();
+        let tokens_path = resolve_tokens_path().unwrap_or_default();
         let tx = self.event_tx.clone();
         let alias_clone = alias.clone();
         self.active_alias = Some(alias);
@@ -2453,16 +2447,20 @@ impl App {
                 let resp = crate::ops::auth::login(&client, &username, &password, None)
                     .await
                     .map_err(|e| e.to_string())?;
-                let mut store = TokenStore::load(&tokens_path).map_err(|e| e.to_string())?;
-                store.set(
-                    &alias_clone,
-                    TokenEntry {
-                        token: resp.token,
-                        expires_at: resp.expires_at,
-                        username: resp.username,
-                    },
-                );
-                store.save(&tokens_path).map_err(|e| e.to_string())?;
+                let url = profile.url.clone();
+                TokenStore::update(&tokens_path, |store| {
+                    store.set(
+                        &alias_clone,
+                        TokenEntry {
+                            token: resp.token,
+                            expires_at: resp.expires_at,
+                            username: resp.username,
+                            url,
+                        },
+                    );
+                    Ok(())
+                })
+                .map_err(|e| e.to_string())?;
                 let authed = build_client(&config, &tokens_path, &alias_clone)?;
                 authed.list_buckets().await.map_err(|e| e.to_string())
             }
@@ -2512,7 +2510,7 @@ impl App {
                     return;
                 }
                 let config = self.config.clone();
-                let tokens_path = default_tokens_path().unwrap_or_default();
+                let tokens_path = resolve_tokens_path().unwrap_or_default();
                 let tx = self.event_tx.clone();
                 let alias_clone = alias.clone();
                 self.remote_throbber.start();
@@ -2545,7 +2543,7 @@ impl App {
                     return;
                 }
                 let config = self.config.clone();
-                let tokens_path = default_tokens_path().unwrap_or_default();
+                let tokens_path = resolve_tokens_path().unwrap_or_default();
                 let tx = self.event_tx.clone();
                 let alias_clone = alias.clone();
                 let prefix = self.remote.objects_prefix();
@@ -2759,7 +2757,7 @@ impl App {
                 }
                 let password = value;
                 let config = self.config.clone();
-                let tokens_path = default_tokens_path().unwrap_or_default();
+                let tokens_path = resolve_tokens_path().unwrap_or_default();
                 let tx = self.event_tx.clone();
                 let alias_clone = alias.clone();
                 tokio::spawn(async move {
@@ -2770,7 +2768,7 @@ impl App {
                             .ok_or_else(|| "unknown alias".to_string())?;
                         let store = TokenStore::load(&tokens_path).map_err(|e| e.to_string())?;
                         let token = store
-                            .token_for(&alias_clone)
+                            .token_for_bound(&alias_clone, &profile.url, &profile.username)
                             .ok_or_else(|| "not authenticated".to_string())?;
                         let client =
                             client_from_alias(profile, Some(token)).map_err(|e| e.to_string())?;

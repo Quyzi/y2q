@@ -1,12 +1,11 @@
 [Unit]
 Description=y2qd post-quantum secure storage daemon
 Documentation=https://github.com/Quyzi/y2q
-After=network.target y2q-keyd.socket
+After=network.target y2q-keyd.socket y2qd.socket
 Wants=network.target
-# The node key is fetched once at boot from a one-shot helper (y2q-keyd@.service,
-# socket-activated). This daemon has no TPM, no hidraw and no access to devices.json.
-# Remove the next line (and set `key_agent_socket = ""`) only for the weaker legacy
-# in-process mode or an operator-key (Y2QD_NODE_KEY) deployment.
+# Prefer socket activation so the REST port stays held across restarts
+# (see deploy/y2qd.socket). Disable with `systemctl disable y2qd.socket`
+# only when binding inside the process is intentional.
 Requires=y2q-keyd.socket
 # Keep the restart budget small so a persistently failing unlock does not loop.
 StartLimitIntervalSec=300
@@ -39,6 +38,14 @@ StateDirectory=y2q
 StateDirectoryMode=0750
 ConfigurationDirectory=y2q
 ConfigurationDirectoryMode=0750
+# Config write ≡ security-admin. Keep /etc/y2q/config.toml root-owned (0640
+# root:y2q) and do not grant limited-sudo operators edit rights. Mount it
+# read-only into the unit so a compromised ops grant cannot flip
+# allow_unprotected_memory / allow_insecure_bind / enforce_authorization
+# (or retarget storage/keystore paths) and have the next restart honor them.
+# Unlock for upgrades: `systemctl edit y2qd` with an empty
+# `BindReadOnlyPaths=` override, edit the file, then remove the drop-in.
+BindReadOnlyPaths=/etc/y2q/config.toml
 
 # Capability restrictions
 CapabilityBoundingSet=
