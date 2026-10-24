@@ -1,6 +1,6 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::{OpenOptions, TryLockError};
-use std::io::{Seek, SeekFrom, Write as IoWrite};
+use std::io::{Read as IoRead, Seek, SeekFrom, Write as IoWrite};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -225,6 +225,9 @@ struct OpenFile {
     dirty: bool,
     /// Set after flush() attempts the PUT so release() knows not to retry.
     flushed: bool,
+    /// Labels carried into every write-back PUT so a flush/rename does not
+    /// wipe the object's tags (y2qd PUT replaces labels wholesale).
+    labels: BTreeSet<(String, String)>,
 }
 
 /// What a truncate of `(bucket, key)` has to do, decided from `open_files`
@@ -365,6 +368,10 @@ pub struct Y2qFuse {
     /// created here instead of `std::env::temp_dir()` — see
     /// [`new_write_tempfile`].
     write_buf_dir: Option<PathBuf>,
+    /// Driver-created virtual directories that do not yet (or may never) have
+    /// children on the server. Merged into `lookup`/`readdir` so `mkdir`
+    /// remains visible past the kernel dentry TTL.
+    local_dirs: Mutex<HashSet<(String, String)>>,
 }
 
 impl Y2qFuse {
@@ -391,6 +398,7 @@ impl Y2qFuse {
             gid,
             allow_other_gid,
             write_buf_dir,
+            local_dirs: Mutex::new(HashSet::new()),
         }
     }
 
@@ -492,7 +500,13 @@ impl Filesystem for Y2qFuse {
 
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &std::ffi::OsStr, reply: ReplyEntry) {
         let parent = parent.0;
-        let name = name.to_string_lossy().into_owned();
+        let name = match entry_name(name) {
+            Ok(n) => n,
+            Err(e) => {
+                reply.error(e);
+                return;
+            }
+        };
 
         let parent_path = {
             let inodes = self.inodes.lock().unwrap_or_else(|e| e.into_inner());
@@ -593,7 +607,27 @@ impl Filesystem for Y2qFuse {
                                     });
                                 reply.entry(&ENTRY_TTL, &self.dir_attr(ino), Generation(0));
                             }
-                            LookupHeadMiss::Err(errno) => reply.error(errno),
+                            LookupHeadMiss::Err(errno) => {
+                                // Empty local mkdir that hasn't appeared on the server yet.
+                                let is_local = self
+                                    .local_dirs
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .contains(&(bucket.clone(), key.clone()));
+                                if is_local {
+                                    let ino = self
+                                        .inodes
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner())
+                                        .get_or_assign(InodePath::VirtualDir {
+                                            bucket,
+                                            prefix: key,
+                                        });
+                                    reply.entry(&ENTRY_TTL, &self.dir_attr(ino), Generation(0));
+                                } else {
+                                    reply.error(errno);
+                                }
+                            }
                         }
                     }
                     _ => reply.error(Errno::ENOENT),
@@ -662,7 +696,26 @@ impl Filesystem for Y2qFuse {
                                     });
                                 reply.entry(&ENTRY_TTL, &self.dir_attr(ino), Generation(0));
                             }
-                            LookupHeadMiss::Err(errno) => reply.error(errno),
+                            LookupHeadMiss::Err(errno) => {
+                                let is_local = self
+                                    .local_dirs
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .contains(&(bucket.clone(), key.clone()));
+                                if is_local {
+                                    let ino = self
+                                        .inodes
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner())
+                                        .get_or_assign(InodePath::VirtualDir {
+                                            bucket,
+                                            prefix: key,
+                                        });
+                                    reply.entry(&ENTRY_TTL, &self.dir_attr(ino), Generation(0));
+                                } else {
+                                    reply.error(errno);
+                                }
+                            }
                         }
                     }
                     _ => reply.error(Errno::ENOENT),
@@ -673,9 +726,9 @@ impl Filesystem for Y2qFuse {
         }
     }
 
-    fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
+    fn getattr(&self, _req: &Request, ino: INodeNo, fh: Option<FileHandle>, reply: ReplyAttr) {
         let ino = ino.0;
-        let path = {
+        let (path, cached) = {
             let inodes = self.inodes.lock().unwrap_or_else(|e| e.into_inner());
             let e = match inodes.get(ino) {
                 Some(e) => e,
@@ -684,13 +737,12 @@ impl Filesystem for Y2qFuse {
                     return;
                 }
             };
-            // Return from cache if fresh.
-            if let (true, Some(meta)) = (e.meta_fresh(), &e.cached_meta) {
-                let attr = self.file_attr(ino, meta.size, meta.created, meta.modified);
-                reply.attr(&ATTR_TTL, &attr);
-                return;
-            }
-            e.path.clone()
+            let cached = e
+                .cached_meta
+                .as_ref()
+                .map(|m| (m.size, m.created, m.modified));
+            let fresh = e.meta_fresh() && cached.is_some();
+            (e.path.clone(), if fresh { cached } else { None })
         };
 
         match path {
@@ -698,6 +750,60 @@ impl Filesystem for Y2qFuse {
                 reply.attr(&ATTR_TTL, &self.dir_attr(ino));
             }
             InodePath::Object { bucket, key } => {
+                // Prefer a dirty write buffer's length when one exists for this
+                // object (or the fh named in the request), so size stays current
+                // between write() and flush().
+                let buf_size = {
+                    let guard = self.open_files.lock().unwrap_or_else(|e| e.into_inner());
+                    let from_fh = fh.and_then(|f| guard.get(&f.0)).and_then(|of| {
+                        if of.bucket == bucket && of.key == key {
+                            of.write_buf
+                                .as_ref()
+                                .and_then(|t| t.as_file().metadata().ok().map(|m| m.len()))
+                        } else {
+                            None
+                        }
+                    });
+                    from_fh.or_else(|| {
+                        let mut best: Option<(bool, u64)> = None;
+                        for of in guard.values() {
+                            if of.bucket != bucket || of.key != key {
+                                continue;
+                            }
+                            let Some(len) = of
+                                .write_buf
+                                .as_ref()
+                                .and_then(|t| t.as_file().metadata().ok().map(|m| m.len()))
+                            else {
+                                continue;
+                            };
+                            let dirty = of.dirty && !of.flushed;
+                            match best {
+                                None => best = Some((dirty, len)),
+                                Some((was_dirty, _)) if dirty && !was_dirty => {
+                                    best = Some((true, len));
+                                }
+                                _ => {}
+                            }
+                        }
+                        best.map(|(_, len)| len)
+                    })
+                };
+
+                if let Some(size) = buf_size {
+                    let (created, modified) = cached.map_or((0, 0), |(_, c, m)| (c, m));
+                    reply.attr(&ATTR_TTL, &self.file_attr(ino, size, created, modified));
+                    return;
+                }
+
+                if let Some((size, created, modified)) = cached {
+                    reply.attr(
+                        &ATTR_TTL,
+                        &self.file_attr(ino, size, created, modified),
+                    );
+                    return;
+                }
+
                 let client = self.client_clone();
                 match self
                     .rt
@@ -761,7 +867,7 @@ impl Filesystem for Y2qFuse {
             path
         };
 
-        match path {
+        match &path {
             InodePath::Root => {
                 // Multi mode only after the remap above.
                 let client = self.client_clone();
@@ -794,7 +900,7 @@ impl Filesystem for Y2qFuse {
                 reply.ok();
             }
 
-            InodePath::Bucket(ref bucket) | InodePath::VirtualDir { ref bucket, .. } => {
+            InodePath::Bucket(bucket) | InodePath::VirtualDir { bucket, .. } => {
                 let prefix = match &path {
                     InodePath::Bucket(_) => String::new(),
                     InodePath::VirtualDir { prefix, .. } => format!("{prefix}/"),
@@ -848,6 +954,7 @@ impl Filesystem for Y2qFuse {
                     _ => unreachable!(),
                 };
 
+                let mut seen_names: HashSet<String> = HashSet::new();
                 for child in children {
                     match child {
                         ChildEntry::Dir { name } => {
@@ -864,6 +971,7 @@ impl Filesystem for Y2qFuse {
                                     bucket: bucket_name.clone(),
                                     prefix: child_prefix,
                                 });
+                            seen_names.insert(name.clone());
                             entries.push((cino, FileType::Directory, name));
                         }
                         ChildEntry::File { name, meta } => {
@@ -897,8 +1005,48 @@ impl Filesystem for Y2qFuse {
                                 cino
                             };
                             // `meta` is boxed; dereference silently via field access above.
+                            seen_names.insert(name.clone());
                             entries.push((cino, FileType::RegularFile, name));
                         }
+                    }
+                }
+
+                // Merge driver-local mkdir entries that the server doesn't list yet.
+                {
+                    let local = self.local_dirs.lock().unwrap_or_else(|e| e.into_inner());
+                    for (lbucket, lprefix) in local.iter() {
+                        if lbucket != &bucket_name {
+                            continue;
+                        }
+                        let child_name = if prefix_str.is_empty() {
+                            // Direct child of the bucket: prefix has no '/'.
+                            if lprefix.contains('/') {
+                                continue;
+                            }
+                            lprefix.clone()
+                        } else {
+                            // Direct child of VirtualDir `prefix_str`: one extra segment.
+                            let expected = format!("{prefix_str}/");
+                            let Some(rest) = lprefix.strip_prefix(&expected) else {
+                                continue;
+                            };
+                            if rest.is_empty() || rest.contains('/') {
+                                continue;
+                            }
+                            rest.to_owned()
+                        };
+                        if !seen_names.insert(child_name.clone()) {
+                            continue;
+                        }
+                        let cino = self
+                            .inodes
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .get_or_assign(InodePath::VirtualDir {
+                                bucket: bucket_name.clone(),
+                                prefix: lprefix.clone(),
+                            });
+                        entries.push((cino, FileType::Directory, child_name));
                     }
                 }
 
@@ -920,10 +1068,13 @@ impl Filesystem for Y2qFuse {
     fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
         let ino = ino.0;
         let flags = flags.0;
-        let path = {
+        let (path, cached_labels) = {
             let inodes = self.inodes.lock().unwrap_or_else(|e| e.into_inner());
             match inodes.get(ino) {
-                Some(e) => e.path.clone(),
+                Some(e) => (
+                    e.path.clone(),
+                    e.cached_meta.as_ref().map(|m| m.labels.clone()),
+                ),
                 None => {
                     reply.error(Errno::ENOENT);
                     return;
@@ -944,6 +1095,11 @@ impl Filesystem for Y2qFuse {
             reply.error(Errno::EROFS);
             return;
         }
+
+        // Preserve labels across flush/release PUT (and O_TRUNC). Prefer the
+        // inode cache; otherwise HEAD when seeding or opening writable.
+        let mut labels = cached_labels.unwrap_or_default();
+        let need_head_labels = labels.is_empty() && (plan.seed_from_remote || plan.write_buf);
 
         let (write_buf, dirty) = if plan.write_buf {
             let mut tmp = match new_write_tempfile(self.write_buf_dir.as_deref()) {
@@ -992,6 +1148,24 @@ impl Filesystem for Y2qFuse {
             (None, false)
         };
 
+        if need_head_labels {
+            let client = self.client_clone();
+            let b = bucket.clone();
+            let k = key.clone();
+            match self.rt.block_on(async move { client.head(&b, &k).await }) {
+                Ok(head) => labels = head.labels,
+                Err(ClientError::NotFound { .. }) => {}
+                Err(e) => {
+                    // Read-only open without cache can still proceed without
+                    // labels; writable opens need them for a correct PUT.
+                    if plan.write_buf {
+                        reply.error(to_errno(&e));
+                        return;
+                    }
+                }
+            }
+        }
+
         let fh = self.alloc_fh();
         let truncating = plan.write_buf && !plan.seed_from_remote;
         {
@@ -1014,6 +1188,7 @@ impl Filesystem for Y2qFuse {
                     write_buf,
                     dirty,
                     flushed: false,
+                    labels,
                 },
             );
         }
@@ -1041,6 +1216,47 @@ impl Filesystem for Y2qFuse {
     ) {
         let ino = ino.0;
         let fh = fh.0;
+
+        // Prefer the local write buffer when present so O_RDWR read-after-write
+        // sees unflushed bytes instead of stale server content.
+        {
+            let mut guard = self.open_files.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(of) = guard.get_mut(&fh)
+                && let Some(tmp) = of.write_buf.as_mut()
+            {
+                let file_size = match tmp.as_file().metadata() {
+                    Ok(m) => m.len(),
+                    Err(e) => {
+                        tracing::error!("read buf stat: {e}");
+                        reply.error(Errno::EIO);
+                        return;
+                    }
+                };
+                if size == 0 || offset >= file_size {
+                    reply.data(&[]);
+                    return;
+                }
+                let Some((start, end)) = compute_read_range(offset, size, Some(file_size)) else {
+                    reply.data(&[]);
+                    return;
+                };
+                let len = (end - start + 1) as usize;
+                let mut buf = vec![0u8; len];
+                if let Err(e) = tmp.seek(SeekFrom::Start(start)) {
+                    tracing::error!("read buf seek: {e}");
+                    reply.error(Errno::EIO);
+                    return;
+                }
+                if let Err(e) = tmp.read_exact(&mut buf) {
+                    tracing::error!("read buf: {e}");
+                    reply.error(Errno::EIO);
+                    return;
+                }
+                reply.data(&buf);
+                return;
+            }
+        }
+
         let (bucket, key) = {
             let guard = self.open_files.lock().unwrap_or_else(|e| e.into_inner());
             match guard.get(&fh) {
@@ -1118,11 +1334,13 @@ impl Filesystem for Y2qFuse {
             return;
         }
 
-        let name = name.to_string_lossy().into_owned();
-        if !is_valid_entry_name(&name) {
-            reply.error(Errno::EINVAL);
-            return;
-        }
+        let name = match entry_name(name) {
+            Ok(n) => n,
+            Err(e) => {
+                reply.error(e);
+                return;
+            }
+        };
 
         let (bucket, prefix) = match self.inode_to_bucket_prefix(parent) {
             Some(bp) => bp,
@@ -1163,12 +1381,15 @@ impl Filesystem for Y2qFuse {
                     write_buf: Some(buf),
                     dirty: true,
                     flushed: false,
+                    labels: BTreeSet::new(),
                 },
             );
 
         let attr = self.file_attr(ino, 0, 0, 0);
+        // Zero TTL so the kernel re-getattrs after writes/flush instead of
+        // caching the create-time size-0 attr for ENTRY_TTL/ATTR_TTL.
         reply.created(
-            &ENTRY_TTL,
+            &Duration::ZERO,
             &attr,
             Generation(0),
             FileHandle(fh),
@@ -1179,7 +1400,7 @@ impl Filesystem for Y2qFuse {
     fn write(
         &self,
         _req: &Request,
-        _ino: INodeNo,
+        ino: INodeNo,
         fh: FileHandle,
         offset: u64,
         data: &[u8],
@@ -1219,6 +1440,14 @@ impl Filesystem for Y2qFuse {
             Ok(()) => {
                 of.dirty = true;
                 of.flushed = false; // a new write invalidates any prior flush
+                let new_len = buf.as_file().metadata().map(|m| m.len()).ok();
+                drop(guard);
+                if let Some(len) = new_len {
+                    self.inodes
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .set_size(ino.0, len);
+                }
                 reply.written(data.len() as u32);
             }
             Err(e) => {
@@ -1256,7 +1485,7 @@ impl Filesystem for Y2qFuse {
             && !of.flushed
             && let Some(t) = tmp.as_mut()
         {
-            let put = self.put_write_buffer(&of.bucket, &of.key, t);
+            let put = self.put_write_buffer(&of.bucket, &of.key, t, &of.labels);
             let mut inodes = self.inodes.lock().unwrap_or_else(|e| e.into_inner());
             match put {
                 Some(size) => inodes.note_written(ino.0, size),
@@ -1348,11 +1577,13 @@ impl Filesystem for Y2qFuse {
             return;
         }
 
-        let name = name.to_string_lossy().into_owned();
-        if !is_valid_entry_name(&name) {
-            reply.error(Errno::EINVAL);
-            return;
-        }
+        let name = match entry_name(name) {
+            Ok(n) => n,
+            Err(e) => {
+                reply.error(e);
+                return;
+            }
+        };
         let (bucket, prefix) = match self.inode_to_bucket_prefix(parent) {
             Some(bp) => bp,
             None => {
@@ -1397,7 +1628,13 @@ impl Filesystem for Y2qFuse {
             return;
         }
 
-        let name = name.to_string_lossy().into_owned();
+        let name = match entry_name(name) {
+            Ok(n) => n,
+            Err(e) => {
+                reply.error(e);
+                return;
+            }
+        };
 
         let parent_path = {
             let inodes = self.inodes.lock().unwrap_or_else(|e| e.into_inner());
@@ -1435,6 +1672,10 @@ impl Filesystem for Y2qFuse {
             }
             Some(InodePath::Bucket(bucket)) => {
                 // Virtual dir: exists by convention (key prefix). No server call.
+                self.local_dirs
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert((bucket.clone(), name.clone()));
                 let ino = self
                     .inodes
                     .lock()
@@ -1447,6 +1688,10 @@ impl Filesystem for Y2qFuse {
             }
             Some(InodePath::VirtualDir { bucket, prefix }) => {
                 let child_prefix = format!("{prefix}/{name}");
+                self.local_dirs
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert((bucket.clone(), child_prefix.clone()));
                 let ino = self
                     .inodes
                     .lock()
@@ -1468,14 +1713,28 @@ impl Filesystem for Y2qFuse {
             return;
         }
 
-        let name = name.to_string_lossy().into_owned();
+        let name = match entry_name(name) {
+            Ok(n) => n,
+            Err(e) => {
+                reply.error(e);
+                return;
+            }
+        };
 
         let parent_path = {
             let inodes = self.inodes.lock().unwrap_or_else(|e| e.into_inner());
             inodes.get(parent).map(|e| e.path.clone())
         };
 
-        match parent_path {
+        // Single-bucket root remaps to the bucket so virtual-dir removal works.
+        let parent_path =
+            if let (Some(InodePath::Root), MountMode::Single(b)) = (&parent_path, &self.mode) {
+                Some(InodePath::Bucket(b.clone()))
+            } else {
+                parent_path
+            };
+
+        match &parent_path {
             Some(InodePath::Root) => {
                 if matches!(self.mode, MountMode::Single(_)) {
                     reply.error(Errno::EPERM);
@@ -1495,6 +1754,71 @@ impl Filesystem for Y2qFuse {
                     }
                     Err(e) => reply.error(to_errno(&e)),
                 }
+            }
+            Some(InodePath::Bucket(bucket)) | Some(InodePath::VirtualDir { bucket, .. }) => {
+                let prefix = match &parent_path {
+                    Some(InodePath::Bucket(_)) => name.clone(),
+                    Some(InodePath::VirtualDir { prefix, .. }) => format!("{prefix}/{name}"),
+                    _ => unreachable!(),
+                };
+                let dir_prefix = format!("{prefix}/");
+                let client = self.client_clone();
+                let b = bucket.clone();
+                let pfx = dir_prefix.clone();
+                let children = match self
+                    .rt
+                    .block_on(async move { list_children(&client, &b, &pfx).await })
+                {
+                    Ok(c) => c,
+                    Err(ClientError::NotFound { .. }) => vec![],
+                    Err(e) => {
+                        reply.error(to_errno(&e));
+                        return;
+                    }
+                };
+                if !children.is_empty() {
+                    reply.error(Errno::ENOTEMPTY);
+                    return;
+                }
+                // Refuse if a nested local mkdir still exists under us.
+                {
+                    let local = self.local_dirs.lock().unwrap_or_else(|e| e.into_inner());
+                    if local
+                        .iter()
+                        .any(|(lb, lp)| lb == bucket && lp.starts_with(&dir_prefix))
+                    {
+                        reply.error(Errno::ENOTEMPTY);
+                        return;
+                    }
+                }
+                let path = InodePath::VirtualDir {
+                    bucket: bucket.clone(),
+                    prefix: prefix.clone(),
+                };
+                let known_ino = {
+                    let inodes = self.inodes.lock().unwrap_or_else(|e| e.into_inner());
+                    inodes
+                        .paths()
+                        .into_iter()
+                        .find(|(_, p)| p == &path)
+                        .map(|(ino, _)| ino)
+                };
+                let was_local = self
+                    .local_dirs
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&(bucket.clone(), prefix));
+                if !was_local && known_ino.is_none() {
+                    reply.error(Errno::ENOENT);
+                    return;
+                }
+                if let Some(ino) = known_ino {
+                    self.inodes
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(ino);
+                }
+                reply.ok();
             }
             _ => reply.error(Errno::EPERM),
         }
@@ -1517,12 +1841,20 @@ impl Filesystem for Y2qFuse {
             return;
         }
 
-        let name = name.to_string_lossy().into_owned();
-        let newname = newname.to_string_lossy().into_owned();
-        if !is_valid_entry_name(&newname) {
-            reply.error(Errno::EINVAL);
-            return;
-        }
+        let name = match entry_name(name) {
+            Ok(n) => n,
+            Err(e) => {
+                reply.error(e);
+                return;
+            }
+        };
+        let newname = match entry_name(newname) {
+            Ok(n) => n,
+            Err(e) => {
+                reply.error(e);
+                return;
+            }
+        };
 
         let src_bkt_pfx = match self.inode_to_bucket_prefix(parent) {
             Some(bp) => bp,
@@ -1555,51 +1887,78 @@ impl Filesystem for Y2qFuse {
             return;
         }
 
-        let tmp = match new_write_tempfile(self.write_buf_dir.as_deref()) {
-            Ok(f) => f,
-            Err(e) => {
-                tracing::error!("rename tempfile: {e}");
-                reply.error(Errno::EIO);
-                return;
-            }
-        };
-        let write_copy = match tmp.reopen() {
-            Ok(f) => f,
-            Err(e) => {
-                tracing::error!("rename tempfile reopen: {e}");
-                reply.error(Errno::EIO);
-                return;
-            }
-        };
-        let client = self.client_clone();
-        let result = self.rt.block_on(async move {
-            // Stream source to tempfile (bounded by disk, not RAM).
-            let mut writer = tokio::fs::File::from_std(write_copy);
-            client
-                .get_to_writer(&src_bucket, &src_key, &mut writer)
-                .await?;
-            let size = writer.metadata().await.map_err(ClientError::Io)?.len();
-            // Reopen tempfile for reading and PUT to destination.
-            let read_copy = tmp.reopen().map_err(ClientError::Io)?;
-            let reader = tokio::fs::File::from_std(read_copy);
-            client
-                .put_from_reader(
-                    &dst_bucket,
-                    &dst_key,
-                    reader,
-                    Some(size),
-                    &Default::default(),
-                    None,
+        let is_vdir_inode = {
+            let inodes = self.inodes.lock().unwrap_or_else(|e| e.into_inner());
+            inodes.paths().iter().any(|(_, p)| {
+                matches!(
+                    p,
+                    InodePath::VirtualDir { bucket, prefix }
+                        if bucket == &src_bucket && prefix == &src_key
                 )
-                .await?;
-            client.delete(&src_bucket, &src_key).await?;
-            scrub_write_tempfile(Some(tmp));
-            Ok::<(), ClientError>(())
-        });
-        match result {
-            Ok(()) => reply.ok(),
-            Err(e) => reply.error(to_errno(&e)),
+            })
+        };
+        let is_local = self
+            .local_dirs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&(src_bucket.clone(), src_key.clone()));
+        let src_prefix = format!("{src_key}/");
+        let listed = {
+            let client = self.client_clone();
+            let b = src_bucket.clone();
+            let pfx = src_prefix.clone();
+            self.rt.block_on(async move {
+                let mut keys = Vec::new();
+                let mut cursor: Option<String> = None;
+                loop {
+                    let page = match client
+                        .list_objects(
+                            &b,
+                            &ListOptions {
+                                prefix: Some(pfx.clone()),
+                                after: cursor,
+                                limit: Some(500),
+                            },
+                        )
+                        .await
+                    {
+                        Ok(p) => p,
+                        Err(ClientError::NotFound { .. }) => break,
+                        Err(e) => return Err(e),
+                    };
+                    for item in page.items {
+                        keys.push((item.key, item.labels));
+                    }
+                    cursor = page.next;
+                    if cursor.is_none() {
+                        break;
+                    }
+                }
+                Ok::<_, ClientError>(keys)
+            })
+        };
+        let listed = match listed {
+            Ok(k) => k,
+            Err(e) => {
+                reply.error(to_errno(&e));
+                return;
+            }
+        };
+
+        if is_vdir_inode || is_local || !listed.is_empty() {
+            if let Err(e) = self.rename_directory(&src_bucket, &src_key, &dst_key, &listed) {
+                reply.error(e);
+                return;
+            }
+            reply.ok();
+            return;
         }
+
+        if let Err(e) = self.rename_file(&src_bucket, &src_key, &dst_key) {
+            reply.error(e);
+            return;
+        }
+        reply.ok();
     }
 
     fn statfs(&self, _req: &Request, _ino: INodeNo, reply: ReplyStatfs) {
@@ -1631,76 +1990,23 @@ impl Filesystem for Y2qFuse {
         _lock_owner: LockOwner,
         reply: ReplyEmpty,
     ) {
-        let fh = fh.0;
-        // Extract PUT parameters while holding the lock, then release before
-        // blocking on the async PUT so the lock is not held across await points.
-        let work = {
-            let mut guard = self.open_files.lock().unwrap_or_else(|e| e.into_inner());
-            let of = match guard.get_mut(&fh) {
-                Some(of) => of,
-                None => {
-                    return reply.ok();
-                }
-            };
-            if !of.dirty || of.flushed {
-                return reply.ok();
-            }
-            let tmp = match of.write_buf.as_mut() {
-                Some(t) => t,
-                None => {
-                    return reply.ok();
-                }
-            };
-            let size = match tmp.as_file().metadata() {
-                Ok(m) => m.len(),
-                Err(e) => {
-                    tracing::error!("flush stat: {e}");
-                    reply.error(Errno::EIO);
-                    return;
-                }
-            };
-            let read_copy = match tmp.reopen() {
-                Ok(f) => f,
-                Err(e) => {
-                    tracing::error!("flush reopen: {e}");
-                    reply.error(Errno::EIO);
-                    return;
-                }
-            };
-            // Mark flushed before releasing the lock so a concurrent flush()
-            // (from a dup'd fd) doesn't race in and issue a second PUT.
-            of.flushed = true;
-            (of.bucket.clone(), of.key.clone(), size, read_copy)
-        };
+        match self.flush_handle(ino.0, fh.0) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(e),
+        }
+    }
 
-        let (bucket, key, size, read_copy) = work;
-        let client = self.client_clone();
-        let b2 = bucket.clone();
-        let k2 = key.clone();
-        let result = self.rt.block_on(async move {
-            let reader = tokio::fs::File::from_std(read_copy);
-            client
-                .put_from_reader(&b2, &k2, reader, Some(size), &Default::default(), None)
-                .await
-        });
-        match result {
-            Ok(_) => {
-                self.inodes
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .note_written(ino.0, size);
-                reply.ok();
-            }
-            Err(e) => {
-                tracing::error!("flush PUT {bucket}/{key}: {e}");
-                // The server object is unchanged; drop the cache's freshness
-                // so the next getattr() re-HEADs the true size.
-                self.inodes
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .invalidate_meta(ino.0);
-                reply.error(to_errno(&e));
-            }
+    fn fsync(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
+        _datasync: bool,
+        reply: ReplyEmpty,
+    ) {
+        match self.flush_handle(ino.0, fh.0) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(e),
         }
     }
 
@@ -2297,13 +2603,449 @@ impl Y2qFuse {
         }
     }
 
+    /// Shared PUT path for `flush` / `fsync`: upload a dirty write buffer and
+    /// update inode size. No-op (Ok) when the handle is clean, already flushed,
+    /// missing, or read-only.
+    fn flush_handle(&self, ino: u64, fh: u64) -> Result<(), Errno> {
+        let work = {
+            let mut guard = self.open_files.lock().unwrap_or_else(|e| e.into_inner());
+            let of = match guard.get_mut(&fh) {
+                Some(of) => of,
+                None => return Ok(()),
+            };
+            if !of.dirty || of.flushed {
+                return Ok(());
+            }
+            let tmp = match of.write_buf.as_mut() {
+                Some(t) => t,
+                None => return Ok(()),
+            };
+            let size = match tmp.as_file().metadata() {
+                Ok(m) => m.len(),
+                Err(e) => {
+                    tracing::error!("flush stat: {e}");
+                    return Err(Errno::EIO);
+                }
+            };
+            let read_copy = match tmp.reopen() {
+                Ok(f) => f,
+                Err(e) => {
+                    tracing::error!("flush reopen: {e}");
+                    return Err(Errno::EIO);
+                }
+            };
+            // Mark flushed before releasing the lock so a concurrent flush()
+            // (from a dup'd fd) doesn't race in and issue a second PUT.
+            of.flushed = true;
+            (
+                of.bucket.clone(),
+                of.key.clone(),
+                of.labels.clone(),
+                size,
+                read_copy,
+            )
+        };
+
+        let (bucket, key, labels, size, read_copy) = work;
+        let client = self.client_clone();
+        let b2 = bucket.clone();
+        let k2 = key.clone();
+        let result = self.rt.block_on(async move {
+            let reader = tokio::fs::File::from_std(read_copy);
+            client
+                .put_from_reader(&b2, &k2, reader, Some(size), &labels, None)
+                .await
+        });
+        match result {
+            Ok(_) => {
+                self.inodes
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .note_written(ino, size);
+                Ok(())
+            }
+            Err(e) => {
+                tracing::error!("flush PUT {bucket}/{key}: {e}");
+                // Undo the optimistic flushed flag so a later retry can PUT.
+                if let Some(of) = self
+                    .open_files
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get_mut(&fh)
+                {
+                    of.flushed = false;
+                }
+                self.inodes
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .invalidate_meta(ino);
+                Err(to_errno(&e))
+            }
+        }
+    }
+
+    /// Rename a single object key within a bucket, preserving labels and
+    /// updating any open handles / inode mapping.
+    fn rename_file(&self, bucket: &str, src_key: &str, dst_key: &str) -> Result<(), Errno> {
+        let src_ino = {
+            let mut inodes = self.inodes.lock().unwrap_or_else(|e| e.into_inner());
+            inodes.get_or_assign(InodePath::Object {
+                bucket: bucket.to_owned(),
+                key: src_key.to_owned(),
+            })
+        };
+
+        // Flush dirty handles so a subsequent GET sees the latest bytes; also
+        // collect a write-buffer source and labels for create-not-yet-uploaded.
+        let (dirty_fhs, buf_labels) = {
+            let guard = self.open_files.lock().unwrap_or_else(|e| e.into_inner());
+            let mut dirty = Vec::new();
+            let mut labels: Option<BTreeSet<(String, String)>> = None;
+            for (&fh, of) in guard.iter() {
+                if of.bucket == bucket && of.key == src_key {
+                    if of.write_buf.is_some() && of.dirty && !of.flushed {
+                        dirty.push(fh);
+                    }
+                    if labels.is_none() {
+                        labels = Some(of.labels.clone());
+                    }
+                }
+            }
+            (dirty, labels)
+        };
+        for fh in dirty_fhs {
+            self.flush_handle(src_ino, fh)?;
+        }
+
+        // Prefer an open write buffer as the PUT source (covers create-before-
+        // close). Fall back to GET from the server.
+        let mut tmp = match new_write_tempfile(self.write_buf_dir.as_deref()) {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::error!("rename tempfile: {e}");
+                return Err(Errno::EIO);
+            }
+        };
+
+        let mut labels = buf_labels.unwrap_or_default();
+        let used_open_buf = {
+            let guard = self.open_files.lock().unwrap_or_else(|e| e.into_inner());
+            let src_of = guard.values().find(|of| {
+                of.bucket == bucket && of.key == src_key && of.write_buf.is_some()
+            });
+            if let Some(of) = src_of {
+                labels = of.labels.clone();
+                let src_tmp = of.write_buf.as_ref().unwrap();
+                let size = match src_tmp.as_file().metadata() {
+                    Ok(m) => m.len(),
+                    Err(e) => {
+                        tracing::error!("rename buf stat: {e}");
+                        return Err(Errno::EIO);
+                    }
+                };
+                let mut reader = match src_tmp.reopen() {
+                    Ok(f) => f,
+                    Err(e) => {
+                        tracing::error!("rename buf reopen: {e}");
+                        return Err(Errno::EIO);
+                    }
+                };
+                if size > 0
+                    && let Err(e) = std::io::copy(&mut reader, tmp.as_file_mut())
+                {
+                    tracing::error!("rename buf copy: {e}");
+                    return Err(Errno::EIO);
+                }
+                true
+            } else {
+                false
+            }
+        };
+
+        if !used_open_buf {
+            let write_copy = match tmp.reopen() {
+                Ok(f) => f,
+                Err(e) => {
+                    tracing::error!("rename tempfile reopen: {e}");
+                    return Err(Errno::EIO);
+                }
+            };
+            let client = self.client_clone();
+            let b = bucket.to_owned();
+            let k = src_key.to_owned();
+            let head_labels = self.rt.block_on(async {
+                let mut writer = tokio::fs::File::from_std(write_copy);
+                client.get_to_writer(&b, &k, &mut writer).await?;
+                let head = client.head(&b, &k).await?;
+                Ok::<_, ClientError>(head.labels)
+            });
+            match head_labels {
+                Ok(l) => {
+                    if labels.is_empty() {
+                        labels = l;
+                    }
+                }
+                Err(e) => {
+                    scrub_write_tempfile(Some(tmp));
+                    return Err(to_errno(&e));
+                }
+            }
+        } else if labels.is_empty() {
+            // Buffer path with empty handle labels: try HEAD (ok if missing).
+            let client = self.client_clone();
+            let b = bucket.to_owned();
+            let k = src_key.to_owned();
+            if let Ok(head) = self.rt.block_on(async move { client.head(&b, &k).await }) {
+                labels = head.labels;
+            }
+        }
+
+        let size = match tmp.as_file().metadata() {
+            Ok(m) => m.len(),
+            Err(e) => {
+                tracing::error!("rename stat: {e}");
+                scrub_write_tempfile(Some(tmp));
+                return Err(Errno::EIO);
+            }
+        };
+        let read_copy = match tmp.reopen() {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::error!("rename put reopen: {e}");
+                scrub_write_tempfile(Some(tmp));
+                return Err(Errno::EIO);
+            }
+        };
+        let client = self.client_clone();
+        let result = self.rt.block_on(async {
+            let reader = tokio::fs::File::from_std(read_copy);
+            client
+                .put_from_reader(bucket, dst_key, reader, Some(size), &labels, None)
+                .await?;
+            match client.delete(bucket, src_key).await {
+                Ok(()) | Err(ClientError::NotFound { .. }) => Ok(()),
+                Err(e) => Err(e),
+            }
+        });
+        scrub_write_tempfile(Some(tmp));
+        result.map_err(|e| to_errno(&e))?;
+
+        {
+            let mut guard = self.open_files.lock().unwrap_or_else(|e| e.into_inner());
+            for of in guard.values_mut() {
+                if of.bucket == bucket && of.key == src_key {
+                    of.key = dst_key.to_owned();
+                }
+            }
+        }
+        self.inodes.lock().unwrap_or_else(|e| e.into_inner()).repath(
+            &InodePath::Object {
+                bucket: bucket.to_owned(),
+                key: src_key.to_owned(),
+            },
+            InodePath::Object {
+                bucket: bucket.to_owned(),
+                key: dst_key.to_owned(),
+            },
+        );
+        Ok(())
+    }
+
+    /// Prefix-rename a virtual directory: move every object under `src_key/` to
+    /// `dst_key/`, rewrite `local_dirs`, and repath matching inodes.
+    fn rename_directory(
+        &self,
+        bucket: &str,
+        src_key: &str,
+        dst_key: &str,
+        listed: &[(String, BTreeSet<(String, String)>)],
+    ) -> Result<(), Errno> {
+        let src_prefix = format!("{src_key}/");
+        let dst_prefix = format!("{dst_key}/");
+
+        for (key, list_labels) in listed {
+            let Some(rest) = key.strip_prefix(&src_prefix) else {
+                continue;
+            };
+            let new_key = format!("{dst_prefix}{rest}");
+            let tmp = match new_write_tempfile(self.write_buf_dir.as_deref()) {
+                Ok(f) => f,
+                Err(e) => {
+                    tracing::error!("dir rename tempfile: {e}");
+                    return Err(Errno::EIO);
+                }
+            };
+            let write_copy = match tmp.reopen() {
+                Ok(f) => f,
+                Err(e) => {
+                    tracing::error!("dir rename reopen: {e}");
+                    return Err(Errno::EIO);
+                }
+            };
+            let client = self.client_clone();
+            let b = bucket.to_owned();
+            let k = key.clone();
+            let labels = {
+                let got = self.rt.block_on(async {
+                    let mut writer = tokio::fs::File::from_std(write_copy);
+                    client.get_to_writer(&b, &k, &mut writer).await?;
+                    match client.head(&b, &k).await {
+                        Ok(head) => Ok::<_, ClientError>(head.labels),
+                        Err(ClientError::NotFound { .. }) => Ok(list_labels.clone()),
+                        Err(e) => Err(e),
+                    }
+                });
+                match got {
+                    Ok(l) => l,
+                    Err(e) => {
+                        scrub_write_tempfile(Some(tmp));
+                        return Err(to_errno(&e));
+                    }
+                }
+            };
+            let size = match tmp.as_file().metadata() {
+                Ok(m) => m.len(),
+                Err(e) => {
+                    tracing::error!("dir rename stat: {e}");
+                    scrub_write_tempfile(Some(tmp));
+                    return Err(Errno::EIO);
+                }
+            };
+            let read_copy = match tmp.reopen() {
+                Ok(f) => f,
+                Err(e) => {
+                    tracing::error!("dir rename put reopen: {e}");
+                    scrub_write_tempfile(Some(tmp));
+                    return Err(Errno::EIO);
+                }
+            };
+            let client = self.client_clone();
+            let result = self.rt.block_on(async {
+                let reader = tokio::fs::File::from_std(read_copy);
+                client
+                    .put_from_reader(bucket, &new_key, reader, Some(size), &labels, None)
+                    .await?;
+                client.delete(bucket, key).await?;
+                Ok::<(), ClientError>(())
+            });
+            scrub_write_tempfile(Some(tmp));
+            result.map_err(|e| to_errno(&e))?;
+
+            {
+                let mut guard = self.open_files.lock().unwrap_or_else(|e| e.into_inner());
+                for of in guard.values_mut() {
+                    if of.bucket == bucket && of.key == *key {
+                        of.key = new_key.clone();
+                    }
+                }
+            }
+            self.inodes
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .repath(
+                    &InodePath::Object {
+                        bucket: bucket.to_owned(),
+                        key: key.clone(),
+                    },
+                    InodePath::Object {
+                        bucket: bucket.to_owned(),
+                        key: new_key,
+                    },
+                );
+        }
+
+        // Rewrite local_dirs entries for this prefix tree.
+        {
+            let mut local = self.local_dirs.lock().unwrap_or_else(|e| e.into_inner());
+            let mut updates = Vec::new();
+            for (lb, lp) in local.iter() {
+                if lb != bucket {
+                    continue;
+                }
+                if lp == src_key {
+                    updates.push((lp.clone(), dst_key.to_owned()));
+                } else if let Some(rest) = lp.strip_prefix(&src_prefix) {
+                    updates.push((lp.clone(), format!("{dst_prefix}{rest}")));
+                }
+            }
+            for (old, new) in updates {
+                local.remove(&(bucket.to_owned(), old));
+                local.insert((bucket.to_owned(), new));
+            }
+        }
+
+        // Repath VirtualDir inodes (the dir itself and descendants).
+        {
+            let mut inodes = self.inodes.lock().unwrap_or_else(|e| e.into_inner());
+            let paths = inodes.paths();
+            for (_, path) in paths {
+                match &path {
+                    InodePath::VirtualDir {
+                        bucket: b,
+                        prefix,
+                    } if b == bucket => {
+                        let new_prefix = if prefix == src_key {
+                            Some(dst_key.to_owned())
+                        } else {
+                            prefix
+                                .strip_prefix(&src_prefix)
+                                .map(|rest| format!("{dst_prefix}{rest}"))
+                        };
+                        if let Some(np) = new_prefix {
+                            inodes.repath(
+                                &InodePath::VirtualDir {
+                                    bucket: bucket.to_owned(),
+                                    prefix: prefix.clone(),
+                                },
+                                InodePath::VirtualDir {
+                                    bucket: bucket.to_owned(),
+                                    prefix: np,
+                                },
+                            );
+                        }
+                    }
+                    InodePath::Object {
+                        bucket: b,
+                        key,
+                    } if b == bucket => {
+                        // Objects already rewritten above; catch any that were
+                        // only known locally (no server listing).
+                        if let Some(rest) = key.strip_prefix(&src_prefix) {
+                            let nk = format!("{dst_prefix}{rest}");
+                            if key != &nk {
+                                inodes.repath(
+                                    &InodePath::Object {
+                                        bucket: bucket.to_owned(),
+                                        key: key.clone(),
+                                    },
+                                    InodePath::Object {
+                                        bucket: bucket.to_owned(),
+                                        key: nk,
+                                    },
+                                );
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Best-effort PUT of a write-buffer tempfile that `flush()` didn't
     /// already send (i.e. `dirty && !flushed`). Returns `Some(size)` of the
     /// object PUT on success so `release()` can `note_written`, `None` on
     /// failure (already logged). `release()` still always replies `Ok`,
     /// matching its existing "best effort" contract (a FUSE `close()` can't
     /// observe `release`'s result anyway).
-    fn put_write_buffer(&self, bucket: &str, key: &str, tmp: &mut NamedTempFile) -> Option<u64> {
+    fn put_write_buffer(
+        &self,
+        bucket: &str,
+        key: &str,
+        tmp: &mut NamedTempFile,
+        labels: &BTreeSet<(String, String)>,
+    ) -> Option<u64> {
         let size = match tmp.as_file().metadata() {
             Ok(m) => m.len(),
             Err(e) => {
@@ -2325,10 +3067,11 @@ impl Y2qFuse {
         let client = self.client_clone();
         let b = bucket.to_owned();
         let k = key.to_owned();
+        let labels = labels.clone();
         let result = self.rt.block_on(async move {
             let async_file = tokio::fs::File::from_std(std_file);
             client
-                .put_from_reader(&b, &k, async_file, Some(size), &Default::default(), None)
+                .put_from_reader(&b, &k, async_file, Some(size), &labels, None)
                 .await
         });
         match result {
@@ -2494,6 +3237,17 @@ fn compute_read_range(start: u64, size: u32, cached_size: Option<u64>) -> Option
 /// path-traversal-shaped input at this layer.
 fn is_valid_entry_name(name: &str) -> bool {
     !name.is_empty() && name != "." && name != ".." && !name.contains('/') && !name.contains('\0')
+}
+
+/// Decode a FUSE directory-entry name as UTF-8 and reject traversal-shaped
+/// names. Non-UTF-8 bytes become `EILSEQ` so distinct non-UTF-8 names cannot
+/// collide via `to_string_lossy` replacement characters.
+fn entry_name(name: &std::ffi::OsStr) -> Result<String, Errno> {
+    let s = name.to_str().ok_or(Errno::EILSEQ)?;
+    if !is_valid_entry_name(s) {
+        return Err(Errno::EINVAL);
+    }
+    Ok(s.to_owned())
 }
 
 fn xattr_reply(reply: ReplyXattr, size: u32, value: &[u8]) {
@@ -2943,6 +3697,7 @@ mod tests {
             write_buf: buf,
             dirty: false,
             flushed: false,
+            labels: BTreeSet::new(),
         }
     }
 
