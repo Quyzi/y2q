@@ -21,7 +21,7 @@ use actix_web::{App, web};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use y2q_core::crypto::{self, Argon2Params, CredentialSlot, Role, UserRecord, UserStore, kem};
 use y2q_core::secmem::SecretVec;
-use y2q_core::{AnyStorage, FilesystemStorage, Listing};
+use y2q_core::{AnyStorage, FilesystemStorage, Listing, Storage};
 
 use crate::auth::AuthState;
 use crate::auth::session::NewSession;
@@ -158,9 +158,21 @@ impl Harness {
 
 /// Sign `method path?query` with the harness's minted credential,
 /// returning the `Authorization` header value and the `X-Amz-Date` used.
-/// Always an unsigned-payload, header-auth request — every test here
-/// exercises routing/guard logic ahead of any body read.
+/// Header-auth SigV4 with `UNSIGNED-PAYLOAD` — default for routing/guard tests.
 fn sign(harness: &Harness, method: &str, path: &str, query: &str, host: &str) -> (String, String) {
+    sign_with_payload(harness, method, path, query, host, sigv4::UNSIGNED_PAYLOAD)
+}
+
+/// Header-auth SigV4 with an arbitrary `x-amz-content-sha256` token (Exact hex
+/// or `UNSIGNED-PAYLOAD`).
+fn sign_with_payload(
+    harness: &Harness,
+    method: &str,
+    path: &str,
+    query: &str,
+    host: &str,
+    payload_hash: &str,
+) -> (String, String) {
     let now = SystemTime::now();
     let amz_date = amz_date_from(now);
     let date_stamp = &amz_date[0..8];
@@ -177,7 +189,7 @@ fn sign(harness: &Harness, method: &str, path: &str, query: &str, host: &str) ->
     );
     headers.insert(
         HeaderName::from_static("x-amz-content-sha256"),
-        HeaderValue::from_static(sigv4::UNSIGNED_PAYLOAD),
+        HeaderValue::from_str(payload_hash).unwrap(),
     );
     headers.insert(
         HeaderName::from_static("x-amz-date"),
@@ -194,7 +206,7 @@ fn sign(harness: &Harness, method: &str, path: &str, query: &str, host: &str) ->
         &canonical_query,
         &headers_block,
         &signed_headers_joined,
-        sigv4::UNSIGNED_PAYLOAD,
+        payload_hash,
     );
     let scope = format!("{date_stamp}/{}/s3/aws4_request", harness.region);
     let sts = sigv4::string_to_sign(&amz_date, &scope, &canonical_request);
@@ -532,4 +544,240 @@ async fn path_style_still_works_with_vhost_domain_configured() {
         String::from_utf8_lossy(&get_body)
     );
     assert_eq!(&get_body[..], b"path-style");
+}
+
+fn delete_objects_xml(keys: &[&str]) -> String {
+    let mut body = String::from("<Delete>");
+    for key in keys {
+        body.push_str("<Object><Key>");
+        body.push_str(key);
+        body.push_str("</Key></Object>");
+    }
+    body.push_str("</Delete>");
+    body
+}
+
+/// Exact payload hash must bind the DeleteObjects body: signing for body_A
+/// while sending body_B yields `XAmzContentSHA256Mismatch` with no deletes.
+#[actix_web::test]
+async fn delete_objects_exact_payload_mismatch_rejects_without_deleting() {
+    let harness = Harness::new(false);
+    let app = build_app!(harness);
+
+    for (key, payload) in [("keep.txt", b"keep"), ("drop.txt", b"drop")] {
+        let put = signed_req(
+            &harness,
+            actix_web::http::Method::PUT,
+            &format!("/bkt/{key}"),
+            "",
+            HOST,
+        )
+        .set_payload(payload.to_vec())
+        .to_request();
+        let resp = test::call_service(&app, put).await;
+        let st = resp.status();
+        let b = test::read_body(resp).await;
+        assert_eq!(st, 200, "seed PUT {key}: {}", String::from_utf8_lossy(&b));
+    }
+
+    let signed_body = delete_objects_xml(&["keep.txt"]);
+    let sent_body = delete_objects_xml(&["drop.txt"]);
+    let payload_hash = sigv4::sha256_hex(signed_body.as_bytes());
+    let (auth_header, amz_date) =
+        sign_with_payload(&harness, "POST", "/bkt", "delete=", HOST, &payload_hash);
+    let req = TestRequest::post()
+        .uri("/bkt?delete=")
+        .insert_header(("host", HOST))
+        .insert_header(("x-amz-content-sha256", payload_hash.as_str()))
+        .insert_header(("x-amz-date", amz_date.as_str()))
+        .insert_header(("authorization", auth_header.as_str()))
+        .set_payload(sent_body)
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    let status = resp.status();
+    let body = test::read_body(resp).await;
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    assert_eq!(status, 400, "body: {text}");
+    assert!(text.contains("XAmzContentSHA256Mismatch"), "body: {text}");
+    assert!(
+        harness.storage.describe("bkt", "keep.txt").await.is_ok(),
+        "keep.txt must survive a mismatched DeleteObjects"
+    );
+    assert!(
+        harness.storage.describe("bkt", "drop.txt").await.is_ok(),
+        "drop.txt must survive a mismatched DeleteObjects"
+    );
+}
+
+/// Matching Exact payload hash still lets DeleteObjects succeed.
+#[actix_web::test]
+async fn delete_objects_exact_payload_match_succeeds() {
+    let harness = Harness::new(false);
+    let app = build_app!(harness);
+
+    let put = signed_req(
+        &harness,
+        actix_web::http::Method::PUT,
+        "/bkt/gone.txt",
+        "",
+        HOST,
+    )
+    .set_payload(b"bye".to_vec())
+    .to_request();
+    assert_eq!(test::call_service(&app, put).await.status(), 200);
+
+    let body = delete_objects_xml(&["gone.txt"]);
+    let payload_hash = sigv4::sha256_hex(body.as_bytes());
+    let (auth_header, amz_date) =
+        sign_with_payload(&harness, "POST", "/bkt", "delete=", HOST, &payload_hash);
+    let req = TestRequest::post()
+        .uri("/bkt?delete=")
+        .insert_header(("host", HOST))
+        .insert_header(("x-amz-content-sha256", payload_hash.as_str()))
+        .insert_header(("x-amz-date", amz_date.as_str()))
+        .insert_header(("authorization", auth_header.as_str()))
+        .set_payload(body)
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    let status = resp.status();
+    let resp_body = test::read_body(resp).await;
+    let text = String::from_utf8(resp_body.to_vec()).unwrap();
+    assert_eq!(status, 200, "body: {text}");
+    assert!(
+        harness.storage.describe("bkt", "gone.txt").await.is_err(),
+        "gone.txt must be deleted when Exact hash matches"
+    );
+}
+
+/// `UNSIGNED-PAYLOAD` DeleteObjects is unchanged (regression).
+#[actix_web::test]
+async fn delete_objects_unsigned_payload_still_succeeds() {
+    let harness = Harness::new(false);
+    let app = build_app!(harness);
+
+    let put = signed_req(
+        &harness,
+        actix_web::http::Method::PUT,
+        "/bkt/gone.txt",
+        "",
+        HOST,
+    )
+    .set_payload(b"bye".to_vec())
+    .to_request();
+    assert_eq!(test::call_service(&app, put).await.status(), 200);
+
+    let body = delete_objects_xml(&["gone.txt"]);
+    let (auth_header, amz_date) = sign(&harness, "POST", "/bkt", "delete=", HOST);
+    let req = TestRequest::post()
+        .uri("/bkt?delete=")
+        .insert_header(("host", HOST))
+        .insert_header(("x-amz-content-sha256", sigv4::UNSIGNED_PAYLOAD))
+        .insert_header(("x-amz-date", amz_date.as_str()))
+        .insert_header(("authorization", auth_header.as_str()))
+        .set_payload(body)
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 200);
+    assert!(harness.storage.describe("bkt", "gone.txt").await.is_err());
+}
+
+fn tagging_xml(key: &str, value: &str) -> String {
+    format!("<Tagging><TagSet><Tag><Key>{key}</Key><Value>{value}</Value></Tag></TagSet></Tagging>")
+}
+
+/// Exact payload hash must bind PutObjectTagging: mismatch rejects before tags change.
+#[actix_web::test]
+async fn put_object_tagging_exact_payload_mismatch_rejects() {
+    let harness = Harness::new(false);
+    let app = build_app!(harness);
+
+    let put = signed_req(
+        &harness,
+        actix_web::http::Method::PUT,
+        "/bkt/obj.txt",
+        "",
+        HOST,
+    )
+    .set_payload(b"data".to_vec())
+    .to_request();
+    assert_eq!(test::call_service(&app, put).await.status(), 200);
+
+    let signed_body = tagging_xml("env", "prod");
+    let sent_body = tagging_xml("env", "evil");
+    let payload_hash = sigv4::sha256_hex(signed_body.as_bytes());
+    let (auth_header, amz_date) = sign_with_payload(
+        &harness,
+        "PUT",
+        "/bkt/obj.txt",
+        "tagging=",
+        HOST,
+        &payload_hash,
+    );
+    let req = TestRequest::put()
+        .uri("/bkt/obj.txt?tagging=")
+        .insert_header(("host", HOST))
+        .insert_header(("x-amz-content-sha256", payload_hash.as_str()))
+        .insert_header(("x-amz-date", amz_date.as_str()))
+        .insert_header(("authorization", auth_header.as_str()))
+        .set_payload(sent_body)
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    let status = resp.status();
+    let body = test::read_body(resp).await;
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    assert_eq!(status, 400, "body: {text}");
+    assert!(text.contains("XAmzContentSHA256Mismatch"), "body: {text}");
+
+    let md = harness.storage.describe("bkt", "obj.txt").await.unwrap();
+    let tags = crate::s3::meta::tag_set(&md);
+    assert!(
+        !tags.iter().any(|(k, v)| k == "env" && v == "evil"),
+        "mismatched tagging must not write tags: {tags:?}"
+    );
+}
+
+/// Matching Exact PutObjectTagging still succeeds.
+#[actix_web::test]
+async fn put_object_tagging_exact_payload_match_succeeds() {
+    let harness = Harness::new(false);
+    let app = build_app!(harness);
+
+    let put = signed_req(
+        &harness,
+        actix_web::http::Method::PUT,
+        "/bkt/obj.txt",
+        "",
+        HOST,
+    )
+    .set_payload(b"data".to_vec())
+    .to_request();
+    assert_eq!(test::call_service(&app, put).await.status(), 200);
+
+    let body = tagging_xml("env", "prod");
+    let payload_hash = sigv4::sha256_hex(body.as_bytes());
+    let (auth_header, amz_date) = sign_with_payload(
+        &harness,
+        "PUT",
+        "/bkt/obj.txt",
+        "tagging=",
+        HOST,
+        &payload_hash,
+    );
+    let req = TestRequest::put()
+        .uri("/bkt/obj.txt?tagging=")
+        .insert_header(("host", HOST))
+        .insert_header(("x-amz-content-sha256", payload_hash.as_str()))
+        .insert_header(("x-amz-date", amz_date.as_str()))
+        .insert_header(("authorization", auth_header.as_str()))
+        .set_payload(body)
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 200);
+
+    let md = harness.storage.describe("bkt", "obj.txt").await.unwrap();
+    let tags = crate::s3::meta::tag_set(&md);
+    assert!(
+        tags.iter().any(|(k, v)| k == "env" && v == "prod"),
+        "expected env=prod tag, got {tags:?}"
+    );
 }
