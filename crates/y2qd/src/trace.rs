@@ -12,8 +12,10 @@ use actix_web::{
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
+use y2q_core::AnyStorage;
 
 use crate::auth::AdminReadAuthenticated;
+use crate::authz::bucket_readable;
 use crate::request_id::RequestIdExt;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -27,6 +29,10 @@ pub struct TraceEvent {
     pub req_bytes: Option<u64>,
     pub resp_bytes: Option<u64>,
     pub remote_addr: Option<String>,
+    /// Bucket from actix `match_info`, if the route captured one. Server-only;
+    /// omitted from the wire JSON so clients stay backward-compatible.
+    #[serde(skip)]
+    pub bucket: Option<String>,
 }
 
 pub struct TraceHub {
@@ -82,6 +88,11 @@ pub async fn trace_middleware<B: MessageBody>(
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0);
+        let bucket = res
+            .request()
+            .match_info()
+            .get("bucket")
+            .map(str::to_owned);
         hub.publish(TraceEvent {
             request_id,
             timestamp_ns,
@@ -92,21 +103,35 @@ pub async fn trace_middleware<B: MessageBody>(
             req_bytes,
             resp_bytes,
             remote_addr,
+            bucket,
         });
     }
     Ok(res)
 }
 
 /// `GET /api/v1/trace` — streams live trace events as Server-Sent Events.
-pub async fn stream(hub: web::Data<Arc<TraceHub>>, _auth: AdminReadAuthenticated) -> HttpResponse {
+///
+/// Events for bucket/object routes are limited to buckets the caller's
+/// persona can already read (same sealed-grant rule as `GET /`). Non-bucket
+/// routes are always forwarded.
+pub async fn stream(
+    hub: web::Data<Arc<TraceHub>>,
+    storage: web::Data<Arc<AnyStorage>>,
+    auth: AdminReadAuthenticated,
+) -> HttpResponse {
     let rx = hub.subscribe();
-    let event_stream = futures_util::stream::unfold(rx, |mut rx| async move {
+    let storage = storage.into_inner();
+    let auth = auth.0;
+    let event_stream = futures_util::stream::unfold((rx, storage, auth), |(mut rx, storage, auth)| async move {
         loop {
             match rx.recv().await {
                 Ok(event) => {
+                    if !trace_event_visible(&auth, storage.as_ref(), &event).await {
+                        continue;
+                    }
                     let json = serde_json::to_string(&event).unwrap_or_default();
                     let bytes = Bytes::from(format!("data: {json}\n\n"));
-                    return Some((Ok::<_, actix_web::Error>(bytes), rx));
+                    return Some((Ok::<_, actix_web::Error>(bytes), (rx, storage, auth)));
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(broadcast::error::RecvError::Closed) => return None,
@@ -118,6 +143,20 @@ pub async fn stream(hub: web::Data<Arc<TraceHub>>, _auth: AdminReadAuthenticated
         .insert_header(("Cache-Control", "no-cache"))
         .insert_header(("X-Accel-Buffering", "no"))
         .streaming(event_stream)
+}
+
+/// Whether `event` may be forwarded to this tracer. Non-bucket routes always
+/// pass; bucket routes require [`bucket_readable`]. Errors and denials drop
+/// the event so a single bad check never kills the SSE stream.
+async fn trace_event_visible(
+    auth: &crate::auth::Authenticated,
+    storage: &AnyStorage,
+    event: &TraceEvent,
+) -> bool {
+    match event.bucket.as_deref() {
+        None => true,
+        Some(bucket) => matches!(bucket_readable(auth, storage, bucket).await, Ok(true)),
+    }
 }
 
 fn content_length(headers: &header::HeaderMap) -> Option<u64> {

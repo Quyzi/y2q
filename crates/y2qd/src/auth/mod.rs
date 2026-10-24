@@ -103,10 +103,11 @@ impl FromRequest for AdminAuthenticated {
 }
 
 /// Guard extractor for admin *read* endpoints: admits full administrators and
-/// auditors (or anyone when authorization is not enforced). Used purely to gate
-/// access — it carries no identity, unlike [`AdminAuthenticated`]. The mutating
-/// admin endpoints use [`AdminAuthenticated`] instead.
-pub struct AdminReadAuthenticated;
+/// auditors (or anyone when authorization is not enforced). Carries identity
+/// so handlers like trace can apply per-bucket sealed-grant filtering. The
+/// mutating admin endpoints use [`AdminAuthenticated`] instead.
+#[derive(Clone)]
+pub struct AdminReadAuthenticated(pub Authenticated);
 
 impl FromRequest for AdminReadAuthenticated {
     type Error = AuthError;
@@ -115,7 +116,7 @@ impl FromRequest for AdminReadAuthenticated {
     fn from_request(req: &HttpRequest, _payload: &mut Payload) -> Self::Future {
         ready(extract_authenticated(req).and_then(|auth| {
             if auth.is_admin_or_auditor() {
-                Ok(AdminReadAuthenticated)
+                Ok(AdminReadAuthenticated(auth))
             } else {
                 Err(AuthError::Forbidden)
             }
