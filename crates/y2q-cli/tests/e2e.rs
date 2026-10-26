@@ -426,7 +426,7 @@ fn e2e_node_key_rotation_crash_safety() {
     );
 
     const BUCKETS: usize = 4;
-    const OBJECTS_PER_BUCKET: usize = 40;
+    const OBJECTS_PER_BUCKET: usize = 80;
     let mut expected: Vec<(String, String)> = Vec::new(); // (object path, content)
     for b in 0..BUCKETS {
         let bucket = format!("test/rotbucket{b}");
@@ -509,7 +509,7 @@ fn e2e_node_key_rotation_crash_safety() {
     copy_tree(&snapshot.join("keys"), &keys);
 
     // ── Phase 3: interrupt a real rotation partway through ─────────────────
-    let kill_after = full_duration.mul_f32(0.4).max(Duration::from_millis(2));
+    let kill_after = full_duration.mul_f32(0.25).max(Duration::from_millis(2));
     let mut rot = rotate_cmd().spawn().expect("spawn rotation");
     std::thread::sleep(kill_after);
     let still_running = matches!(rot.try_wait(), Ok(None));
