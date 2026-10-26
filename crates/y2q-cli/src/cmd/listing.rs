@@ -1,12 +1,11 @@
 use serde_json::json;
 use y2q_client::ListOptions;
 
-use crate::client_builder::{client_from_alias, resolve_config_path};
-use crate::config::{CliConfig, default_tokens_path};
+use crate::client_builder::{client_from_alias, load_bound_token, resolve_config_path};
+use crate::config::CliConfig;
 use crate::error::CliError;
 use crate::output::{OutputMode, fmt_bytes, fmt_ns, print_json, print_table};
 use crate::path::RemotePath;
-use crate::token::TokenStore;
 
 pub async fn run(
     path: Option<String>,
@@ -16,9 +15,7 @@ pub async fn run(
     mode: OutputMode,
 ) -> Result<(), CliError> {
     let config_path = resolve_config_path()?;
-    let tokens_path = default_tokens_path()?;
     let config = CliConfig::load(&config_path)?;
-    let store = TokenStore::load(&tokens_path)?;
 
     match path {
         None => {
@@ -37,9 +34,7 @@ pub async fn run(
         Some(ref p) => {
             let remote = RemotePath::parse(p)?;
             let entry = config.get_alias(&remote.alias)?;
-            let token = store
-                .token_for(&remote.alias)
-                .ok_or(CliError::Client(y2q_client::ClientError::Unauthenticated))?;
+            let token = load_bound_token(&remote.alias, entry)?;
             let client = client_from_alias(entry, Some(token))?;
 
             if remote.bucket.is_none() {

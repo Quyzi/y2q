@@ -3,11 +3,10 @@
 use y2q_client::{AclBody, Y2qClient};
 
 use crate::cli::AclCmd;
-use crate::client_builder::{client_from_alias, resolve_config_path};
-use crate::config::{CliConfig, default_tokens_path};
+use crate::client_builder::{client_from_alias, load_bound_token, resolve_config_path};
+use crate::config::CliConfig;
 use crate::error::CliError;
 use crate::output::{OutputMode, print_json, print_table};
-use crate::token::TokenStore;
 
 pub async fn run(cmd: AclCmd, mode: OutputMode) -> Result<(), CliError> {
     match cmd {
@@ -71,9 +70,6 @@ fn output(acl: &AclBody, mode: OutputMode) {
 async fn make_client(alias: &str) -> Result<Y2qClient, CliError> {
     let config = CliConfig::load(&resolve_config_path()?)?;
     let entry = config.get_alias(alias)?;
-    let store = TokenStore::load(&default_tokens_path()?)?;
-    let token = store
-        .token_for(alias)
-        .ok_or(CliError::Client(y2q_client::ClientError::Unauthenticated))?;
+    let token = load_bound_token(alias, entry)?;
     client_from_alias(entry, Some(token))
 }

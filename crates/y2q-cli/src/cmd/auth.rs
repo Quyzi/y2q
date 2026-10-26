@@ -1,7 +1,7 @@
 use zeroize::Zeroizing;
 
-use crate::client_builder::{client_from_alias, resolve_config_path};
-use crate::config::{CliConfig, default_tokens_path};
+use crate::client_builder::{client_from_alias, resolve_config_path, resolve_tokens_path};
+use crate::config::CliConfig;
 use crate::error::CliError;
 use crate::output::{OutputMode, print_json};
 use crate::token::{TokenEntry, TokenStore};
@@ -32,7 +32,7 @@ pub async fn login(
     mode: OutputMode,
 ) -> Result<(), CliError> {
     let config_path = resolve_config_path()?;
-    let tokens_path = default_tokens_path()?;
+    let tokens_path = resolve_tokens_path()?;
     let config = CliConfig::load(&config_path)?;
     let entry = config.get_alias(alias)?;
 
@@ -56,10 +56,12 @@ pub async fn login(
         token: token_resp.token,
         expires_at: token_resp.expires_at,
         username: token_resp.username.clone(),
+        url: entry.url.clone(),
     };
-    let mut store = TokenStore::load(&tokens_path)?;
-    store.set(alias, token_entry.clone());
-    store.save(&tokens_path)?;
+    TokenStore::update(&tokens_path, |store| {
+        store.set(alias, token_entry.clone());
+        Ok(())
+    })?;
 
     if mode == OutputMode::Json {
         print_json(&serde_json::json!({
@@ -84,28 +86,51 @@ pub async fn login(
 
 pub async fn logout(alias: &str, mode: OutputMode) -> Result<(), CliError> {
     let config_path = resolve_config_path()?;
-    let tokens_path = default_tokens_path()?;
+    let tokens_path = resolve_tokens_path()?;
     let config = CliConfig::load(&config_path)?;
     let entry = config.get_alias(alias)?;
 
-    let mut store = TokenStore::load(&tokens_path)?;
-    if let Some(tok) = store.get_valid(alias) {
+    let mut revoke_failed: Option<String> = None;
+    // Snapshot under the lock, attempt revoke outside it, then clear under
+    // the lock so a concurrent login cannot resurrect a just-cleared token.
+    let cached = {
+        let store = TokenStore::load(&tokens_path)?;
+        store
+            .get_bound(alias, &entry.url, &entry.username)
+            .or_else(|| store.get_valid(alias))
+            .map(|t| t.token.clone())
+    };
+    if let Some(tok) = cached {
         // Best effort: an alias whose URL/TLS config is unusable must still be
         // able to drop its cached token locally.
-        match client_from_alias(entry, Some(Zeroizing::new(tok.token.clone()))) {
+        match client_from_alias(entry, Some(Zeroizing::new(tok))) {
             Ok(client) => {
-                let _ = crate::ops::auth::logout(&client).await;
+                if let Err(e) = crate::ops::auth::logout(&client).await {
+                    revoke_failed = Some(e.to_string());
+                }
             }
-            Err(e) => eprintln!(
-                "warning: cannot reach `{alias}` ({e}); removed the local token but the server session was not revoked"
-            ),
+            Err(e) => {
+                revoke_failed = Some(format!("cannot reach `{alias}` ({e})"));
+            }
         }
     }
-    store.clear(alias);
-    store.save(&tokens_path)?;
+    TokenStore::update(&tokens_path, |store| {
+        store.clear(alias);
+        Ok(())
+    })?;
+
+    if let Some(reason) = revoke_failed.as_ref() {
+        eprintln!(
+            "warning: {reason}; removed the local token but the server session may still be live"
+        );
+    }
 
     if mode == OutputMode::Json {
-        print_json(&serde_json::json!({ "alias": alias, "logged_out": true }));
+        print_json(&serde_json::json!({
+            "alias": alias,
+            "logged_out": true,
+            "server_revoke_ok": revoke_failed.is_none(),
+        }));
     } else {
         println!("Logged out of `{alias}`");
     }
@@ -119,13 +144,13 @@ pub async fn passwd(
     mode: OutputMode,
 ) -> Result<(), CliError> {
     let config_path = resolve_config_path()?;
-    let tokens_path = default_tokens_path()?;
+    let tokens_path = resolve_tokens_path()?;
     let config = CliConfig::load(&config_path)?;
     let entry = config.get_alias(alias)?;
     let store = TokenStore::load(&tokens_path)?;
 
     let token = store
-        .token_for(alias)
+        .token_for_bound(alias, &entry.url, &entry.username)
         .ok_or_else(|| CliError::Client(y2q_client::ClientError::Unauthenticated))?;
 
     let current_pw = if let Some(p) = current {

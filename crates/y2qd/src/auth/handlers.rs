@@ -310,7 +310,10 @@ pub async fn logout(
 /// `POST /api/v1/auth/password` — change the caller's password (re-wrap SK).
 ///
 /// Verifies `current` and re-wraps only the session's persona slot. Shares
-/// login's per-username lockout counters and response-time floor.
+/// login's per-username lockout counters and response-time floor. On success,
+/// every other live session for the same `(username, persona)` is revoked so
+/// a forgotten fuse mount or leaked token cannot keep working under the old
+/// password; the caller's session is kept.
 #[utoipa::path(
     post,
     path = "/api/v1/auth/password",
@@ -416,6 +419,14 @@ pub async fn change_password(
         .lock()
         .unwrap()
         .record_success(&username);
+
+    // Kill every other live session for this persona; keep the caller's.
+    // Scoped to the persona so changing a duress password does not disturb
+    // the real one's mounts / tokens (and vice versa).
+    state
+        .sessions
+        .revoke_user_persona_except(&username, auth.session.persona, &auth.token_hash);
+
     apply_floor(state.config.min_login_response_ms, started).await;
     Ok(HttpResponse::NoContent().finish())
 }
