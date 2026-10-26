@@ -127,6 +127,10 @@ impl Y2qClient {
             // The configured server URL is the only origin the operator vetted,
             // so 3xx is surfaced as `ClientError::Redirect`, never followed.
             .redirect(reqwest::redirect::Policy::none())
+            // Bound hung servers: without these a wedged peer leaves every
+            // FUSE dispatch thread (and any CLI caller) blocked forever.
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(60))
             .build()?;
         Ok(Self {
             inner,
@@ -142,6 +146,12 @@ impl Y2qClient {
 
     pub fn set_token(&mut self, token: impl Into<String>) {
         self.token = Some(Zeroizing::new(token.into()));
+    }
+
+    /// Borrow the current bearer token, if any. Used by the FUSE driver to
+    /// detect whether `tokens.toml` has a replacement after a refresh failure.
+    pub fn token_snapshot(&self) -> Option<String> {
+        self.token.as_ref().map(|t| t.as_str().to_owned())
     }
 
     pub fn inner_client(&self) -> &reqwest::Client {
